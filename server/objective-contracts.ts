@@ -180,7 +180,14 @@ export function validatePlan(
       workers.length > 1 &&
       !integrations.some((i) => workers.every((w) => ancestry.get(i.key)!.has(w.key)))
     )
-      fail('Frentes paralelas precisam de integração comum.');
+      fail('Frentes paralelas precisam de integração comum.', {
+        workspace,
+        workers: workers.map((w) => w.key),
+        integrations: integrations.map((i) => ({
+          key: i.key,
+          cobre: workers.filter((w) => ancestry.get(i.key)!.has(w.key)).map((w) => w.key),
+        })),
+      });
     const finals = validators.filter((v) =>
       tasks
         .filter((t) => t.stage !== 'verify')
@@ -191,7 +198,18 @@ export function validatePlan(
         ),
     );
     for (const v of finals) finalValidators.add(v.key);
-    if (!finals.length) fail('Falta validação final da candidata integrada.');
+    if (!finals.length)
+      fail('Falta validação final da candidata integrada.', {
+        workspace,
+        aVerificar: tasks.filter((t) => t.stage !== 'verify').map((t) => t.key),
+        validadores: validators.map((v) => ({
+          key: v.key,
+          sourceTask: v.sourceTask ?? null,
+          alcanca: tasks
+            .filter((t) => t.stage !== 'verify' && ancestry.get(v.key)!.has(t.key))
+            .map((t) => t.key),
+        })),
+      });
   }
   const incremental = plan.incremental;
   if (incremental) {

@@ -3,7 +3,23 @@ import { randomUUID } from 'node:crypto';
 import { acquireGlmRequestSlot } from './glm-request-slot.mjs';
 import { requestModel, DeferredModelRequest } from './model-request.mjs';
 
-export const GLM_ACCOUNT = 'agentos:api:00000000-0000-4000-8000-000000000001';
+export const GLM_ACCOUNT =
+  process.env.AGENTOS_GLM_ACCOUNT_ID || 'agentos:api:00000000-0000-4000-8000-000000000001';
+
+/** The GLM lane is the configured account or any GLM model, matching how
+ * workforce-policy already identifies it in SQL. An installation that runs GLM
+ * under its own account id must still spend the same six permits. */
+export function inGlmRequestLane({ accountId, model }) {
+  return accountId === GLM_ACCOUNT || /^glm[-.]/i.test(model ?? '');
+}
+/** Measured throughput varies by router, so the budget is configured, not
+ * assumed. server/generation-timing.ts applies these same bounds and default
+ * to the planner lane; a slower endpoint needs a larger budget, not a call cut
+ * short with nothing to show for it. */
+export function glmRequestBudgetMs() {
+  const budget = Number(process.env.AGENTOS_GLM_REQUEST_TIMEOUT_MS);
+  return Number.isSafeInteger(budget) && budget >= 60000 && budget <= 3600000 ? budget : 720000;
+}
 // Private in-process evidence that a caller already owns the permit. JSON/RPC
 // callers cannot supply this identity, so they cannot bypass admission.
 export const GLM_REQUEST_ADMITTED = Symbol('agentos.glm.request.admitted');
@@ -12,7 +28,7 @@ export const GLM_REQUEST_ADMITTED = Symbol('agentos.glm.request.admitted');
 // While queued only caller cancellation applies; the provider timeout starts
 // after admission. Never bypass a missing or disconnected gate.
 export async function withGlmRequestSlot(
-  { runId, signal, emit = () => {}, socketPath, requestTimeoutMs },
+  { runId, accountId = GLM_ACCOUNT, signal, emit = () => {}, socketPath, requestTimeoutMs },
   operation,
   dependencies = {},
 ) {
@@ -24,7 +40,7 @@ export async function withGlmRequestSlot(
   if (signal?.aborted) cancelQueue();
   let slot, lost, timer, lastQueueState;
   const safeEmit = (kind, state = {}) => {
-    const payload = { runId, accountId: GLM_ACCOUNT };
+    const payload = { runId, accountId };
     for (const key of [
       'active',
       'queued',
@@ -95,11 +111,12 @@ export function withAccountRequestGate(params, signal, operation, emit, dependen
   assertModelRoute(params.accountId, params.model);
   const original = operation;
   operation = (signal) => { assertModelRoute(params.accountId, params.model); return original(signal); };
-  if (params.accountId !== GLM_ACCOUNT || admission === GLM_REQUEST_ADMITTED)
+  if (!inGlmRequestLane(params) || admission === GLM_REQUEST_ADMITTED)
     return operation(signal);
   return withGlmRequestSlot(
     {
       runId: params.runId ?? randomUUID(),
+      accountId: params.accountId ?? GLM_ACCOUNT,
       signal,
       emit,
       requestTimeoutMs: params.requestTimeoutMs,

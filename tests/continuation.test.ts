@@ -329,6 +329,57 @@ it('never routes to unauthorized or exhausted accounts', () => {
     chooseRepairRoute({ execution: {} }, {}, [{ ...a, quota: { ordinaryUsageAllowed: false } }]),
   ).toBeNull();
 });
+it('repairs on the only route when there is nothing to switch to', () => {
+  // One connected account exposing one model is a whole installation, not a
+  // misconfiguration. Requiring a different route after the third attempt left
+  // such a host with no candidate, so the task waited on an account that was
+  // connected the entire time.
+  const only = {
+    id: 'solo',
+    provider: 'openai',
+    enabled: true,
+    bridge_id: 'solo',
+    model: 'glm-5.3-flash',
+    models: ['glm-5.3-flash'],
+    allow_unknown: true,
+  };
+  const task = { attempt_count: 3, stage: 'work', execution: { profile: 'code' } };
+  const run = { account_id: 'solo', model: 'glm-5.3-flash', error_code: 'RESULT_FORMAT' };
+  expect(chooseRepairRoute(task, run, [only])).toMatchObject({
+    accountId: 'solo',
+    model: 'glm-5.3-flash',
+  });
+});
+it('still prefers a different route when one exists', () => {
+  const base = { provider: 'openai', enabled: true, allow_unknown: true };
+  const used = { ...base, id: 'used', bridge_id: 'used', model: 'glm-5.3-flash', models: ['glm-5.3-flash'] };
+  const spare = { ...base, id: 'spare', bridge_id: 'spare', model: 'gpt-6-luna', models: ['gpt-6-luna'] };
+  const task = { attempt_count: 3, stage: 'work', execution: { profile: 'code' } };
+  const run = { account_id: 'used', model: 'glm-5.3-flash', error_code: 'RESULT_FORMAT' };
+  expect(chooseRepairRoute(task, run, [used, spare])).toMatchObject({ accountId: 'spare' });
+});
+it('honours a route cooldown before falling back to the only route', () => {
+  const only = {
+    id: 'solo',
+    provider: 'openai',
+    enabled: true,
+    bridge_id: 'solo',
+    model: 'glm-5.3-flash',
+    models: ['glm-5.3-flash'],
+    allow_unknown: true,
+  };
+  const until = new Date(Date.now() + 600000).toISOString();
+  const task = {
+    attempt_count: 3,
+    stage: 'work',
+    execution: {
+      profile: 'code',
+      continuationRoutes: [{ accountId: 'solo', model: 'glm-5.3-flash', until }],
+    },
+  };
+  const run = { account_id: 'solo', model: 'glm-5.3-flash', error_code: 'RESULT_FORMAT' };
+  expect(chooseRepairRoute(task, run, [only])).toBeNull();
+});
 
 async function candidateArtifact(
   runId: string,

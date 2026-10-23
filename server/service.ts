@@ -411,8 +411,10 @@ export async function schedule(service?:'agentos-opencode',inspect=inspectPrepar
           ).rows[0].count,
         );
         const exclusive = readModelPolicy();
-        const sessionCeiling = exclusive
-          ? Math.min(a.max_concurrency, exclusive.sessionLimit - (t.stage === 'coordinate' ? 0 : 1)) : a.max_concurrency;
+        // A policy without a session limit must not turn the ceiling into NaN
+        // and silently drop the per-account session cap.
+        const sessionCeiling = Number.isSafeInteger(exclusive?.sessionLimit)
+          ? Math.min(a.max_concurrency, exclusive!.sessionLimit - (t.stage === 'coordinate' ? 0 : 1)) : a.max_concurrency;
         if (n >= sessionCeiling) {
           why = 'Vagas desta conta ocupadas.';
           continue;

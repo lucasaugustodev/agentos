@@ -20,10 +20,13 @@ async function executeFixture(prompt){
  const exited=new Promise(resolve=>{exitResolve=resolve;});
  try{
   await writeFile(fixture,"import {createHash} from 'node:crypto';let input='';for await(const chunk of process.stdin)input+=chunk;console.log(JSON.stringify({argv:process.argv.slice(2),bytes:Buffer.byteLength(input),digest:createHash('sha256').update(input).digest('hex')}));");
-  const context=vm.createContext({process:{env:{},stdout,stderr,exit:exitResolve}});
+  const context=vm.createContext({process:{env:{},stdout,stderr,exit:exitResolve,cwd:()=>root}});
   const modules={
    'node:http':{default:{createServer:()=>({once(){},listen(_port,_host,resolve){resolve();},closeAllConnections(){},close(){}})}},
    'node:fs/promises':{readFile:async file=>{if(file==='/home/agent/prompt.txt')return prompt;if(file==='/home/agent/opencode.json')return '{}';throw Error('UNEXPECTED_READ');}},
+   // The entrypoint probes for the isolated paths; a development host has none.
+   'node:fs':{existsSync:()=>false},
+   'node:path':{default:path},
    'node:child_process':{spawn:(_file,args,options)=>(child=spawn(process.execPath,[fixture,...args],{...options,cwd:root,env:process.env}))},
   };
   const module=new vm.SourceTextModule(source,{context});

@@ -248,7 +248,7 @@ export function chooseRepairRoute(task: any, run: any, accounts: any[], now = Da
       (r: any) => r.accountId === id && r.model === model && Date.parse(r.until) > now,
     );
   const switching = /AUTH|QUOTA|RATE_LIMIT/.test(run.error_code ?? '') || task.attempt_count >= 3;
-  const routes = candidates.flatMap((a) => {
+  const buildRoutes = (keepFailedRoute: boolean) => candidates.flatMap((a) => {
     const desired =
       task.execution?.profile === 'browser' || ['verify', 'integrate'].includes(task.stage)
         ? 'gpt-6-sol'
@@ -267,7 +267,7 @@ export function chooseRepairRoute(task: any, run: any, accounts: any[], now = Da
         (m) =>
           a.models.includes(m) &&
           !blocked(a.id, m) &&
-          !(switching && a.id === run.account_id && m === run.model),
+          !(switching && !keepFailedRoute && a.id === run.account_id && m === run.model),
       )
       .map((m) => ({
         accountId: a.id,
@@ -278,7 +278,15 @@ export function chooseRepairRoute(task: any, run: any, accounts: any[], now = Da
           (a.id === run.account_id ? 1 : 0),
       }));
   });
-  return routes.sort((a, b) => a.score - b.score)[0] ?? null;
+  // Switching away from the route that just failed is a preference, not a
+  // precondition. An installation with one account and one model has no other
+  // route to move to, so insisting on one leaves the repair with no candidate
+  // at all and the task waits for an account that is already connected. The
+  // cooldown in blocked() still applies, so a route that keeps failing is held
+  // back by time rather than by the absence of an alternative.
+  const routes = buildRoutes(false);
+  const usable = routes.length ? routes : buildRoutes(true);
+  return usable.sort((a, b) => a.score - b.score)[0] ?? null;
 }
 
 export async function routeVerificationRepair(sourceId: string) {

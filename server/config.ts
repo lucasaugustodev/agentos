@@ -1,6 +1,11 @@
 import 'dotenv/config';
 import path from 'node:path';
 import { randomBytes } from 'node:crypto';
+function bounded(value: string | undefined, fallback: number, min: number, max: number) {
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < min || parsed > max) return fallback;
+  return parsed;
+}
 export const config = {
   port: Number(process.env.AGENTOS_PORT ?? 4280),
   host: process.env.AGENTOS_HOST ?? '127.0.0.1',
@@ -20,6 +25,18 @@ export const config = {
   remoteExecution: process.env.AGENTOS_REMOTE_EXECUTION === '1',
   role: process.env.AGENTOS_ROLE ?? 'all',
   tailnetHost: process.env.AGENTOS_TAILNET_HOST ?? '',
+  workspacesRoot: path.resolve(process.env.AGENTOS_WORKSPACES_ROOT ?? path.join(process.env.AGENTOS_DATA_DIR ?? '.local', 'workspaces')),
+  bridgeDataDir: path.resolve(process.env.AGENTOS_BRIDGE_DATA ?? path.join(process.env.AGENTOS_DATA_DIR ?? '.local', 'bridge')),
+  runtimeMode: process.env.AGENTOS_RUNTIME_MODE ?? 'direct',
+  // Seats are counted separately from provider requests: these size the local
+  // scheduler, while the GLM gate keeps simultaneous model calls at six.
+  pgPoolMax: bounded(process.env.AGENTOS_PG_POOL_MAX, 15, 1, 200),
+  capacityMaxRuns: bounded(process.env.AGENTOS_CAPACITY_MAX_RUNS, 4, 1, 64),
+  browserSlots: bounded(process.env.AGENTOS_BROWSER_SLOTS, 2, 1, 32),
+  remoteMaxRuns: bounded(process.env.AGENTOS_REMOTE_MAX_RUNS, 2, 1, 64),
+  remoteMemoryMiB: bounded(process.env.AGENTOS_REMOTE_MEMORY_MIB, 3600, 512, 262144),
+  remoteCpuPercent: bounded(process.env.AGENTOS_REMOTE_CPU_PERCENT, 300, 50, 6400),
+  accountMaxConcurrency: bounded(process.env.AGENTOS_ACCOUNT_MAX_CONCURRENCY, 4, 1, 64),
 };
 if (!['all', 'api', 'workers'].includes(config.role)) throw Error('Invalid AgentOS role');
 if (!['127.0.0.1', '::1'].includes(config.host))

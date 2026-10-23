@@ -145,7 +145,7 @@ def verify_database(value, task_id):
     return request
 
 def secure_file(path, limit):
-    info = path.stat(follow_symlinks=False)
+    info = path.lstat()
     if path.is_symlink() or not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o077 or info.st_size > limit:
         fail('VERIFICATION_BINDING_RECEIPT_UNSAFE')
     return path.read_bytes()
@@ -165,12 +165,12 @@ def state_directory(task_id, create=False):
     if not STATE_ROOT.exists():
         if not create: fail('VERIFICATION_BINDING_RECEIPT_MISSING')
         STATE_ROOT.mkdir(mode=0o700)
-    info = STATE_ROOT.stat(follow_symlinks=False)
+    info = STATE_ROOT.lstat()
     if STATE_ROOT.is_symlink() or not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o077:
         fail('VERIFICATION_BINDING_RECEIPT_UNSAFE')
     directory = STATE_ROOT / task_id
     if create and not directory.exists(): directory.mkdir(mode=0o700)
-    info = directory.stat(follow_symlinks=False)
+    info = directory.lstat()
     if directory.is_symlink() or not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o077:
         fail('VERIFICATION_BINDING_RECEIPT_UNSAFE')
     return directory
@@ -184,7 +184,7 @@ def physical_proof(request, workspace_root='/srv/agentos/workspaces', manager_pa
     if source_path.is_symlink() or not source_path.is_dir() or target_path.exists() or target_path.is_symlink():
         fail('VERIFICATION_BINDING_WORKSPACE_STATE_CHANGED')
     marker_path = source_path / '.agentos-snapshot.json'
-    marker_info = marker_path.stat(follow_symlinks=False)
+    marker_info = marker_path.lstat()
     if marker_path.is_symlink() or not stat.S_ISREG(marker_info.st_mode) or marker_info.st_size > 4096:
         fail('VERIFICATION_BINDING_SNAPSHOT_INVALID')
     try: marker = json.loads(marker_path.read_bytes())

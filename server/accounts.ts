@@ -51,7 +51,6 @@ export function quotaFor(account: any, model: string) {
 let syncing: Promise<any> | null = null,
   lastSync = 0;
 export async function syncAccounts(force = false) {
-  if (!config.bridgeHost) return { connected: false, count: 0 };
   if (syncing) return syncing;
   if (!force && Date.now() - lastSync < 30000) return { connected: true, cached: true };
   syncing = (async () => {
@@ -63,7 +62,7 @@ export async function syncAccounts(force = false) {
           q = quotaFor(account, account.defaultModel);
         ids.push(id);
         await db.query(
-          `INSERT INTO accounts(id,label,provider,model,enabled,max_concurrency,quota_status,remaining_percent,observed_at,allow_unknown,source,bridge_id,identity,models,quota,connection_status) VALUES($1,$2,$3,$4,$5,4,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) ON CONFLICT(id) DO UPDATE SET label=excluded.label,provider=excluded.provider,model=excluded.model,enabled=excluded.enabled,quota_status=excluded.quota_status,remaining_percent=excluded.remaining_percent,observed_at=excluded.observed_at,allow_unknown=excluded.allow_unknown,source=excluded.source,bridge_id=excluded.bridge_id,identity=excluded.identity,models=excluded.models,quota=excluded.quota,connection_status=excluded.connection_status`,
+          `INSERT INTO accounts(id,label,provider,model,enabled,max_concurrency,quota_status,remaining_percent,observed_at,allow_unknown,source,bridge_id,identity,models,quota,connection_status) VALUES($1,$2,$3,$4,$5,$16,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) ON CONFLICT(id) DO UPDATE SET label=excluded.label,provider=excluded.provider,model=excluded.model,enabled=excluded.enabled,quota_status=excluded.quota_status,remaining_percent=excluded.remaining_percent,observed_at=excluded.observed_at,allow_unknown=excluded.allow_unknown,source=excluded.source,bridge_id=excluded.bridge_id,identity=excluded.identity,models=excluded.models,quota=excluded.quota,connection_status=excluded.connection_status`,
           [
             id,
             account.label,
@@ -80,6 +79,7 @@ export async function syncAccounts(force = false) {
             JSON.stringify(account.models),
             JSON.stringify(account.quota),
             account.authStatus,
+            config.accountMaxConcurrency,
           ],
         );
       }
@@ -103,7 +103,7 @@ export async function chooseChatAccount(accountId?: string, model?: string) {
     )
   ).rows;
   const exclusive = readModelPolicy();
-  if (exclusive) {
+  if (exclusive && exclusive.mode === 'glm-only') {
     if (accountId && accountId !== 'auto') assertModelRoute(accountId, model || exclusive.model, exclusive);
     if (model) assertModelRoute(exclusive.accountId, model, exclusive);
     accountId = exclusive.accountId; model = exclusive.model;

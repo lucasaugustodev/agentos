@@ -67,7 +67,7 @@ def protected_release_file(root, name):
     if relative.is_absolute() or '\\' in name or any(part in ('','.','..') for part in relative.parts): fail('REBASE_PUBLISHED_FILE_INVALID')
     current=root
     for index,part in enumerate(relative.parts):
-        current=current/part; info=current.stat(follow_symlinks=False)
+        current=current/part; info=current.lstat()
         if current.is_symlink() or info.st_uid!=0 or info.st_mode&0o022: fail('REBASE_PUBLISHED_FILE_INVALID')
         if index<len(relative.parts)-1 and not stat.S_ISDIR(info.st_mode): fail('REBASE_PUBLISHED_FILE_INVALID')
         if index==len(relative.parts)-1 and not stat.S_ISREG(info.st_mode): fail('REBASE_PUBLISHED_FILE_INVALID')
@@ -92,7 +92,7 @@ def protected_manifest():
 def protected_release_physical_files(root):
     """Hash the complete sealed tree, including files filtered by workspace-manager."""
     root=pathlib.Path(root).resolve(strict=True)
-    root_info=root.stat(follow_symlinks=False)
+    root_info=root.lstat()
     if root.is_symlink() or not stat.S_ISDIR(root_info.st_mode) or root_info.st_uid!=0 or root_info.st_mode&0o022:
         fail('REBASE_PUBLISHED_OUTPUT_INVALID')
     output={}; total=0; count=0
@@ -100,11 +100,11 @@ def protected_release_physical_files(root):
         dirs[:]=[name for name in sorted(dirs) if name not in ('node_modules','.git','.local-test')]
         names.sort()
         for directory in dirs:
-            item=pathlib.Path(folder)/directory; meta=item.stat(follow_symlinks=False)
+            item=pathlib.Path(folder)/directory; meta=item.lstat()
             if item.is_symlink() or not stat.S_ISDIR(meta.st_mode) or meta.st_uid!=0 or meta.st_mode&0o022:
                 fail('REBASE_PUBLISHED_OUTPUT_INVALID')
         for name in names:
-            item=pathlib.Path(folder)/name; meta=item.stat(follow_symlinks=False)
+            item=pathlib.Path(folder)/name; meta=item.lstat()
             if item.is_symlink() or not stat.S_ISREG(meta.st_mode) or meta.st_uid!=0 or meta.st_mode&0o022:
                 fail('REBASE_PUBLISHED_OUTPUT_INVALID')
             relative=item.relative_to(root).as_posix(); path=pathlib.PurePosixPath(relative)
@@ -268,15 +268,15 @@ def safe_baseline(req, files, published, manager):
         'workspaceManifestDigest':req['workspaceManifestDigest'],
         'publicationProofDigest':published['publicationProofDigest'],'validationProofDigest':published['validationProofDigest']}
     if baseline.exists():
-        info=baseline.stat(follow_symlinks=False)
-        marker_info=marker.stat(follow_symlinks=False) if marker.exists() else None
+        info=baseline.lstat()
+        marker_info=marker.lstat() if marker.exists() else None
         if (baseline.is_symlink() or info.st_uid!=0 or info.st_mode&0o222 or
             marker_info is None or not stat.S_ISREG(marker_info.st_mode) or marker_info.st_uid!=0 or marker_info.st_mode&0o222 or
             json.loads(marker.read_bytes()) != expected_marker): fail('REBASE_BASELINE_CONFLICT')
         actual = manager.sources(baseline)
         if set(actual) != set(files) or any(sha(actual[k]) != files[k] for k in files): fail('REBASE_BASELINE_CHANGED')
         for name in files:
-            item=(baseline/name).stat(follow_symlinks=False)
+            item=(baseline/name).lstat()
             if not stat.S_ISREG(item.st_mode) or item.st_uid!=0 or item.st_mode&0o222: fail('REBASE_BASELINE_CHANGED')
         return baseline
     baseline.parent.mkdir(mode=0o750, parents=False, exist_ok=True)
@@ -286,7 +286,7 @@ def safe_baseline(req, files, published, manager):
         total = 0
         for name, digest in sorted(files.items()):
             src = protected_release_file(release,name)
-            info = src.stat(follow_symlinks=False)
+            info = src.lstat()
             if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022: fail('REBASE_PUBLISHED_FILE_INVALID')
             data = src.read_bytes()
             if sha(data) != digest: fail('REBASE_PUBLISHED_SOURCE_DRIFT')
@@ -323,7 +323,7 @@ def prepare(action_id):
     state.mkdir(mode=0o700, parents=True, exist_ok=True)
     request_file = state / 'request.json'
     if request_file.exists():
-        info=request_file.stat(follow_symlinks=False)
+        info=request_file.lstat()
         if request_file.is_symlink() or info.st_uid != 0 or info.st_mode&0o077 or request_file.read_bytes() != canonical(req): fail('REBASE_REQUEST_RECEIPT_CONFLICT')
     else: atomic_json(request_file, req)
     manager = load_module('published_rebase_workspace_manager', ACTIVE / 'bridge/workspace-manager.py')
@@ -350,13 +350,13 @@ def prepare(action_id):
         prior_manifest_digest=source_change['priorSourceManifestDigest']
         source_change_digest=source_change['sourceChangeDigest']
         broker.stopped(candidate_run, manager)
-        needed = sum(max(4096, (ACTIVE / name).stat(follow_symlinks=False).st_size) for name in copy_files) + 16 * 1024 * 1024
+        needed = sum(max(4096, (ACTIVE / name).lstat().st_size) for name in copy_files) + 16 * 1024 * 1024
         with manager.storage_capacity.reserve(manager.ROOT, manager.DATA, needed):
             baseline = safe_baseline(req, copy_files, published, manager)
     if manager.workspace(req['targetWorkspace']).exists():
         receipt_file = state / 'prepared.json'
         if not receipt_file.exists(): fail('REBASE_TARGET_UNOWNED')
-        receipt_info=receipt_file.stat(follow_symlinks=False)
+        receipt_info=receipt_file.lstat()
         if receipt_file.is_symlink() or receipt_info.st_uid!=0 or receipt_info.st_mode&0o077: fail('REBASE_PREPARED_RECEIPT_UNSAFE')
         receipt = json.loads(receipt_file.read_bytes())
         if (receipt.get('targetWorkspace') != req['targetWorkspace'] or receipt.get('requestDigest') != req['requestDigest'] or
@@ -397,12 +397,12 @@ def read_prepared_receipt(action_id):
     req = verify_authority(authority, action_id, published, files)
     state = STATE / action_id
     if state.is_symlink() or not state.is_dir(): fail('REBASE_PREPARED_RECEIPT_MISSING')
-    state_info = state.stat(follow_symlinks=False)
+    state_info = state.lstat()
     if state_info.st_uid != 0 or state_info.st_mode & 0o077: fail('REBASE_STATE_UNSAFE')
     request_file = state / 'request.json'
     prepared_file = state / 'prepared.json'
     for path, limit in ((request_file, 2 * 1024 * 1024), (prepared_file, 128 * 1024)):
-        info = path.stat(follow_symlinks=False)
+        info = path.lstat()
         if (path.is_symlink() or not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or
             info.st_mode & 0o077 or info.st_size > limit):
             fail('REBASE_PREPARED_RECEIPT_UNSAFE')

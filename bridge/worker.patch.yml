@@ -1,6 +1,7 @@
 - id: llm-deepseek
   config:
-    protocol: chat-completions
+    # The adapter speaks Messages only and refuses a protocol override; the
+    # gateway behind this baseURL answers Messages on /v1/messages.
     baseURL: http://127.0.0.1:17820/v1
     thinking: disabled
     maxTokens: 8192

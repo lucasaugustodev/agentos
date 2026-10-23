@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { constants } from 'node:fs';
-import { open, readFile, realpath } from 'node:fs/promises';
+import { open, readFile, realpath, lstat } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { readPlannerCatalog } from './planner-catalog-transport.mjs';
@@ -153,9 +153,16 @@ async function queryMountedArtifact(bytes, expectedDigest, query) {
   try {
     const stat = await handle.stat();
     if (!stat.isFile() || stat.size !== entry.size) fail('CATALOG_ARTIFACT_DIGEST');
-    // Linux is the execution host. Checking the opened fd closes the parent
-    // symlink race rather than trusting a separate path lookup alone.
-    if (await realpath('/proc/self/fd/' + handle.fd) !== filename) fail('CATALOG_ARTIFACT_PATH');
+    // Checking the opened fd closes the parent symlink race rather than
+    // trusting a separate path lookup alone. /proc/self/fd exists only on the
+    // Linux execution host; elsewhere the same binding is proved by comparing
+    // the descriptor against lstat of the path it was opened from.
+    if (process.platform === 'linux') {
+      if (await realpath('/proc/self/fd/' + handle.fd) !== filename) fail('CATALOG_ARTIFACT_PATH');
+    } else {
+      const actual = await lstat(filename);
+      if (actual.dev !== stat.dev || actual.ino !== stat.ino) fail('CATALOG_ARTIFACT_PATH');
+    }
     artifactBytes = await handle.readFile();
   } finally { await handle.close(); }
   if (artifactBytes.length !== entry.size || sha256(artifactBytes) !== entry.digest) fail('CATALOG_ARTIFACT_DIGEST');

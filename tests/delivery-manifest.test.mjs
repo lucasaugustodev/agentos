@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, writeFile, readFile, rm, symlink, truncate } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, readFile, rm, symlink, truncate, realpath } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { randomUUID, createHash } from 'node:crypto';
@@ -40,7 +40,7 @@ test('remote preflight proof rejects model activity, wrong ownership and cancell
 
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
 async function fixture() {
-  const root = await mkdtemp(path.join(tmpdir(), 'agentos-manifest-'));
+  const root = await realpath(await mkdtemp(path.join(tmpdir(), 'agentos-manifest-')));
   const contract = deliveryContract(randomUUID()), workspaceId = `test/o-${contract.runId}`;
   const runRoot = path.join(root, 'runs'), workspaceRoot = path.join(root, 'workspaces');
   const directory = path.join(runRoot, contract.runId), home = path.join(directory, 'home');

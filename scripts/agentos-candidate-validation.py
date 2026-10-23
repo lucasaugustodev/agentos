@@ -146,7 +146,7 @@ def published_baseline(candidate_files=None, include_manifest=False):
     result = {'publishedBaseline': str(current), 'publishedBaselineDigest': None,
               'sourceDrift': {'known': False, 'code': 'PUBLISHED_SOURCE_MANIFEST_UNAVAILABLE'}}
     def protected(file):
-        info = file.stat(follow_symlinks=False)
+        info = file.lstat()
         return not file.is_symlink() and info.st_uid == 0 and info.st_mode & 0o022 == 0
     published_action = current/'scripts/agentos-release-action.py'
     if not published_action.exists() or not protected(published_action) or sha(published_action.read_bytes()) != REGISTERED_HASH: return result

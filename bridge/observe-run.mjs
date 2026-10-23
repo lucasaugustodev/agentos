@@ -1,6 +1,6 @@
 // Read-only observer for AgentOS-owned runs. Never reads assistant reasoning,
 // process arguments/environment, production sessions or credential stores.
-import { readFile, realpath, stat, readdir, open } from 'node:fs/promises';
+import { readFile, realpath, stat, lstat, readdir, open } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -84,9 +84,14 @@ async function tail(file, maxBytes) {
   try {
     // Validate the opened descriptor too: a worker may rename a writable path
     // after realpath but before open. Never read a descriptor outside that path.
-    if ((await realpath(`/proc/self/fd/${handle.fd}`)) !== file) throw Error('UNSAFE_OBSERVATION_PATH');
+    // /proc/self/fd exists only on Linux; elsewhere the descriptor identity is
+    // proved by comparing it against lstat of the same path.
+    if (process.platform === 'linux' && (await realpath(`/proc/self/fd/${handle.fd}`)) !== file)
+      throw Error('UNSAFE_OBSERVATION_PATH');
     const info = await handle.stat();
-    if (!info.isFile()) throw Error('UNSAFE_OBSERVATION_PATH');
+    const actual = await lstat(file);
+    if (!info.isFile() || actual.dev !== info.dev || actual.ino !== info.ino)
+      throw Error('UNSAFE_OBSERVATION_PATH');
     const bytes = Buffer.alloc(Math.min(info.size, maxBytes));
     await handle.read(bytes, 0, bytes.length, Math.max(0, info.size - bytes.length));
     return { text: bytes.toString('utf8'), truncated: info.size > maxBytes, modifiedAt: info.mtime.toISOString() };

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, writeFile, rm, symlink } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, rm, symlink, realpath } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { collectArtifacts, parseArtifactResult } from '../bridge/artifact-collector.mjs';
@@ -31,7 +31,7 @@ function completedNativeFixture() {
 }
 
 test('completed native recovery uses persisted result.json without any response.txt and preserves every original byte', async () => {
- const f = completedNativeFixture(), root = await mkdtemp(path.join(tmpdir(), 'native-completed-result-'));
+ const f = completedNativeFixture(), root = await realpath(await mkdtemp(path.join(tmpdir(), 'native-completed-result-')));
  try {
    await writeFile(path.join(root, 'result.json'), JSON.stringify(f.result));
    const recovered = await readCompletedNativeResult(root, f.state, f.candidate, f.identity);
@@ -86,7 +86,7 @@ test('completed native recovery refuses a foreign run, an unfinished process or 
 });
 
 test('scope-plan collector CLI emits its typed result when invoked through a release symlink',async()=>{
- const root=await mkdtemp(path.join(tmpdir(),'scope-plan-cli-'));
+ const root=await realpath(await mkdtemp(path.join(tmpdir(),'scope-plan-cli-')));
  try{
   const alias=path.join(root,'current.mjs');
   await symlink(fileURLToPath(new URL('../bridge/recover-scope-plan.mjs',import.meta.url)),alias);
@@ -97,7 +97,7 @@ test('scope-plan collector CLI emits its typed result when invoked through a rel
 });
 
 async function planFixture(){
- const root=await mkdtemp(path.join(tmpdir(),'scope-plan-collection-')),id=randomUUID(),workspace='test/o-plan-'+id;
+ const root=await realpath(await mkdtemp(path.join(tmpdir(),'scope-plan-collection-'))),id=randomUUID(),workspace='test/o-plan-'+id;
  await mkdir(path.join(root,'runs',id),{recursive:true});await mkdir(path.join(root,'workspaces',workspace,'evidence'),{recursive:true});
  await writeFile(path.join(root,'runs',id,'state.json'),JSON.stringify({runId:id,runtime:'opencode',workspace,state:'failed',code:'RESULT_FORMAT'}));
  const bytes='{"version":1,"tasks":[],"blockers":[]}';
@@ -129,7 +129,7 @@ test('plan collection rejects a live worker, changed candidate and file outside 
 });
 
 test('incident: descriptive labels become real filenames and preserve exact bytes', async () => {
-  const root=await mkdtemp(path.join(tmpdir(),'artifact-labels-'));
+  const root=await realpath(await mkdtemp(path.join(tmpdir(),'artifact-labels-')));
   try {
     await mkdir(path.join(root,'evidence'));
     await writeFile(path.join(root,'evidence/change.diff'),'real patch');
@@ -156,7 +156,7 @@ test('incident: descriptive labels become real filenames and preserve exact byte
 });
 
 test('a hidden provenance file has a stable legal name without changing paths or bytes',async()=>{
- const root=await mkdtemp(path.join(tmpdir(),'artifact-hidden-'));
+ const root=await realpath(await mkdtemp(path.join(tmpdir(),'artifact-hidden-')));
  try {
   await mkdir(path.join(root,'data')); await writeFile(path.join(root,'data','.candidate-provenance.json'),'{"hashesVerified":115}');
   const result=await collectArtifacts({artifacts:[{name:'candidate materialization',path:'data/.candidate-provenance.json'}]},root);
@@ -188,7 +188,7 @@ test('Qwen delivery with surrounding prose recovers exact JSON and failed eviden
     'Here is the delivery:\n\n```json\n'+raw+'\n```\n\nFinal notes: passed=false.',
     'Delivery:\r\n```JSON\r\n'+raw+'\r\n```\r\nNo approval.'])
     assert.deepEqual(parseArtifactResult(answer),value);
-  const root=await mkdtemp(path.join(tmpdir(),'artifact-format-'));
+  const root=await realpath(await mkdtemp(path.join(tmpdir(),'artifact-format-')));
   try{
     await mkdir(path.join(root,'evidence'));
     await writeFile(path.join(root,'evidence/verification.json'),'{"passed":false}');
