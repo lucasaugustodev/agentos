@@ -121,7 +121,7 @@ it('advertises only eligible requirement IDs and supports a serial supervisor fa
  const schema=deliveryDecisionSchema(agents,['req-2'],true);
  expect(schema.safeParse({deliveries:[part('a')]}).success).toBe(false);
  expect(schema.safeParse(part('a')).success).toBe(false);
- expect(schema.safeParse({...part('a'),requirementId:'req-2'}).success).toBe(true);
+ expect(schema.safeParse({...part('a'),kind:'delivery',requirementId:'req-2'}).success).toBe(true);
 });
 it('preserves every accepted partial branch as input while keeping a join out of the accumulated source after a consumer failure',async()=>{
  const input=request();const {objectiveId}=await submitObjective(input);

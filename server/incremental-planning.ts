@@ -17,6 +17,10 @@ const writePathItemSchema = z
   .refine(p=>!p.includes('//')&&!p.split('/').includes('.'),'Use caminhos relativos sem aliases.');
 
 const singleDeliveryFields = {
+  // Optional only while parsing stored/legacy decisions. New model responses
+  // use deliveryDecisionSchema, which requires the semantic kind explicitly.
+  kind: z.enum(['delivery', 'validation']).optional(),
+  validationTargetKey: z.string().regex(/^[a-z][a-z0-9_-]{0,39}$/).optional(),
   key: z.string().regex(/^[a-z][a-z0-9_-]{0,39}$/).optional(),
   dependsOn: z.array(z.string().regex(/^[a-z][a-z0-9_-]{0,39}$/)).max(6).optional(),
   requirementId: z.string(),
@@ -30,6 +34,8 @@ const singleDeliveryFields = {
 export const nextDeliveryItemSchema = z.object(singleDeliveryFields).strict();
 
 export const nextDeliverySchema = z.object({
+  kind: singleDeliveryFields.kind,
+  validationTargetKey: singleDeliveryFields.validationTargetKey,
   key: singleDeliveryFields.key,
   dependsOn: singleDeliveryFields.dependsOn,
   requirementId: z.string().optional(),
@@ -46,13 +52,14 @@ export function deliveryDecisionSchema(agents: {id:string;runtime:string}[],elig
   if (!ids.length) throw new DomainError('SCOPE_MISSING','Nenhum agente de execução disponível.');
   const agentEnum = z.enum(ids as [string,...string[]]);
   const requirementId=eligible?.length?z.enum(eligible as [string,...string[]]):z.string();
-  const item=nextDeliveryItemSchema.extend({agentId:agentEnum,requirementId});
-  if(serial)return item;
-  return nextDeliverySchema.extend({
-    requirementId:requirementId.optional(),
-    agentId: agentEnum.optional(),
-    deliveries: z.array(item).min(1).max(6).optional(),
-  });
+  const delivery=nextDeliveryItemSchema.extend({kind:z.literal('delivery'),
+    validationTargetKey:z.never().optional(),agentId:agentEnum,requirementId});
+  if(serial)return delivery;
+  const validation=nextDeliveryItemSchema.extend({kind:z.literal('validation'),
+    validationTargetKey:singleDeliveryFields.validationTargetKey.unwrap(),
+    agentId:z.literal('qa.integration'),requirementId});
+  const item=z.discriminatedUnion('kind',[delivery,validation]);
+  return z.union([delivery,z.object({deliveries:z.array(item).min(1).max(6)}).strict()]);
 }
 
 function invalid(violation:string,message:string,detail:Record<string,unknown>={}):never{
@@ -86,14 +93,31 @@ export function compileDelivery(raw: unknown, request: ObjectiveInput, previous?
     invalid('AMBIGUOUS_DECISION','Use uma entrega única ou deliveries; não misture os dois formatos.');
   const items = parsed.deliveries?.length ? parsed.deliveries : [nextDeliveryItemSchema.parse(raw)];
   const { requirements, completed, eligible } = deliveryFrontier(request, previous, advance);
-  const selectedIds = [...new Set(items.map(i => i.requirementId))];
-  if (selectedIds.some(id => !eligible.includes(id)))
-    invalid('INELIGIBLE_REQUIREMENT','Selecione somente requisitos elegíveis.',{eligible,received:selectedIds});
-  if(items.some(i=>i.agentId==='qa.integration'))
+  const selectedIds = [...new Set(items.filter(i=>i.kind!=='validation').map(i => i.requirementId))];
+  if (items.some(i=>!eligible.includes(i.requirementId)))
+    invalid('INELIGIBLE_REQUIREMENT','Selecione somente requisitos elegíveis.',{eligible,received:items.map(i=>i.requirementId)});
+  if(items.some(i=>i.kind!=='validation'&&i.agentId==='qa.integration'))
     invalid('VALIDATOR_AS_WORKER','O QA independente é criado pelo controlador; selecione um implementador.');
-  const keyed=items.map((item,index)=>({...item,partKey:item.key??`part-${index+1}`,index}));
+  const keyed=items.map((item,index)=>({...item,kind:item.kind??'delivery',partKey:item.key??`part-${index+1}`,index}));
   const byKey=new Map(keyed.map(item=>[item.partKey,item]));
   if(byKey.size!==keyed.length)invalid('DUPLICATE_TASK_KEY','Cada subtarefa precisa de uma chave única.');
+  for(const item of keyed){
+    if(new Set(item.dependsOn??[]).size!==(item.dependsOn??[]).length)
+      invalid('DUPLICATE_DEPENDENCY','Não repita uma dependência.',{key:item.partKey});
+    if(item.kind==='delivery'){
+      if(item.validationTargetKey)invalid('UNEXPECTED_VALIDATION_TARGET','Somente uma validação pode declarar candidata alvo.',{key:item.partKey});
+      continue;
+    }
+    const target=item.validationTargetKey&&byKey.get(item.validationTargetKey);
+    if(!target||target.kind!=='delivery')
+      invalid('VALIDATION_TARGET_REQUIRED','A validação exige uma entrega produtora deste mesmo lote.',{key:item.partKey,target:item.validationTargetKey});
+    if(item.requirementId!==target.requirementId)
+      invalid('VALIDATION_REQUIREMENT_MISMATCH','A validação deve cobrir o requisito de sua candidata alvo.',{key:item.partKey,target:target.partKey});
+    if(item.writePaths?.some(path=>!isAttemptLocalWriteScope(path)))
+      invalid('VALIDATION_SOURCE_WRITE','A validação não pode escrever na fonte; use apenas evidence/ ou data/.',{key:item.partKey});
+    // The model may omit the dependency but may never omit candidate identity.
+    item.dependsOn=[...new Set([...(item.dependsOn??[]),target.partKey])];
+  }
   const visiting=new Set<string>(),ancestors=new Map<string,Set<string>>(),ordered:typeof keyed=[];
   function visit(key:string):Set<string>{
     if(ancestors.has(key))return ancestors.get(key)!;
@@ -101,8 +125,6 @@ export function compileDelivery(raw: unknown, request: ObjectiveInput, previous?
     const item=byKey.get(key);
     if(!item)invalid('UNKNOWN_DEPENDENCY','A dependência precisa nomear uma subtarefa deste lote.',{key});
     visiting.add(key);const all=new Set<string>();
-    if(new Set(item.dependsOn??[]).size!==(item.dependsOn??[]).length)
-      invalid('DUPLICATE_DEPENDENCY','Não repita uma dependência.',{key});
     for(const dependency of item.dependsOn??[]){all.add(dependency);for(const parent of visit(dependency))all.add(parent);}
     visiting.delete(key);ancestors.set(key,all);ordered.push(item);return all;
   }
@@ -135,10 +157,12 @@ export function compileDelivery(raw: unknown, request: ObjectiveInput, previous?
     return bindDeliveryFeedback(plan,reports);
   }
   const seenPaths: { idx: number; path: string }[] = [];
-  for (const [idx, item] of items.entries()) {
-    if (!item.writePaths?.length)
+  const deliveries=keyed.filter(item=>item.kind==='delivery');
+  for (const item of deliveries) {
+    const idx=item.index;
+    if (deliveries.length>1&&!item.writePaths?.length)
       invalid('WRITE_SCOPE_REQUIRED','Subtarefas no mesmo lote exigem writePaths explícitos.',{key:item.key??`part-${idx+1}`});
-    for (const rawPath of item.writePaths) {
+    for (const rawPath of item.writePaths??[]) {
       if(isAttemptLocalWriteScope(rawPath))continue;
       const norm = rawPath.replace(/\/+$/, '');
       if (seenPaths.some(other => other.idx !== idx && (other.path === norm || other.path.startsWith(norm + '/') || norm.startsWith(other.path + '/'))))
@@ -146,16 +170,40 @@ export function compileDelivery(raw: unknown, request: ObjectiveInput, previous?
       seenPaths.push({ idx, path: norm });
     }
   }
-  const taskKey=(key:string)=>`deliver-${byKey.get(key)!.index+1}`;
+  const taskKey=(key:string)=>`${byKey.get(key)!.kind==='validation'?'validate':'deliver'}-${byKey.get(key)!.index+1}`;
+  function sourceParents(item:typeof keyed[number]){
+    return [...new Set((item.dependsOn??[]).map(key=>{
+      const parent=byKey.get(key)!;return parent.kind==='validation'?parent.validationTargetKey!:key;
+    }))];
+  }
+  function sourceAncestors(item:typeof keyed[number]):Set<string>{
+    const found=new Set<string>();
+    for(const key of sourceParents(item)){
+      found.add(key);
+      for(const parent of sourceAncestors(byKey.get(key)!))found.add(parent);
+    }
+    return found;
+  }
   const joins:z.input<typeof planSchema>['tasks']=[];
-  const workTasks = ordered.map((item) => {
+  const validationTasks:z.input<typeof planSchema>['tasks']=ordered.filter(item=>item.kind==='validation').map(item=>({
+    key:taskKey(item.partKey),title:item.title,agentId:'qa.integration',agentRole:'validator',stage:'verify',
+    baseWorkspace:request.workspaces[0],sourceTask:taskKey(item.validationTargetKey!),
+    dependencies:item.dependsOn!.map(taskKey),covers:[item.requirementId],writePaths:item.writePaths??[],
+    description:`${item.action}\nValide somente a candidata aceita de ${taskKey(item.validationTargetKey!)}. Outras dependências fornecem evidências, não substituem a candidata alvo.\nExecute os controles: ${item.verification}\nA fonte é somente leitura. Grave relatórios e scripts em evidence/ e estado temporário em data/. Registre comandos, resultados e limitações em evidence/verification.json. passed deve ser false para qualquer falha, critério não verificado ou evidência ausente. Não repare a candidata. Este aceite não substitui a verificação final da entrega acumulada.`,
+    criteria:[{id:'verified',label:'Validação independente da candidata alvo',type:'json_field',name:'verification.json',field:'passed',equals:true}],
+  }));
+  const workTasks = ordered.filter(item=>item.kind==='delivery').map((item) => {
     const idx=item.index;
     const selected = requirements.find(r => r.id === item.requirementId)!;
-    const dependencies=(item.dependsOn??[]).map(taskKey);
+    const validationGates=(item.dependsOn??[]).filter(key=>byKey.get(key)!.kind==='validation').map(taskKey);
+    // Validation workspaces are not source producers. A delivery waiting for a
+    // validation inherits its original producer, never the validator's copy.
+    const dependencies=sourceParents(item).map(taskKey);
     let sourceTask=dependencies[0];
     if(dependencies.length>1){
       sourceTask=`join-${idx+1}`;
-      const parents=ordered.filter(p=>ancestors.get(item.partKey)!.has(p.partKey));
+      const sourceKeys=sourceAncestors(item);
+      const parents=ordered.filter(p=>p.kind==='delivery'&&sourceKeys.has(p.partKey));
       joins.push({key:sourceTask,title:`Preparar insumos de ${item.title}`.slice(0,200),
         agentId:'engineering.integration',stage:'integrate',baseWorkspace:request.workspaces[0],
         dependencies:parents.map(p=>taskKey(p.partKey)),covers:[...new Set(parents.map(p=>p.requirementId))],
@@ -163,22 +211,22 @@ export function compileDelivery(raw: unknown, request: ObjectiveInput, previous?
         description:`Integre os patches canônicos das dependências ${parents.map(p=>taskKey(p.partKey)).join(', ')} na ordem indicada sobre a base comum. Preserve todas as pré-imagens e os lotes anteriores. Esta preparação fornece insumos à subtarefa ${item.partKey}; não conclui nenhum requisito. Execute os controles das dependências: ${parents.map(p=>p.verification).join(' | ')}. Registre evidence/delivery.json, passed:true somente se todos passarem.`,
         criteria:[{id:'joined',label:'Insumos integrados e verificados',type:'json_field',name:'delivery.json',field:'passed',equals:true}]});
     }
-    const shared=items.filter(i=>i.requirementId===item.requirementId).length>1;
+    const shared=deliveries.filter(i=>i.requirementId===item.requirementId).length>1;
     return {
       key: `deliver-${idx + 1}`,
       title: item.title,
       agentId: item.agentId,
       stage: 'work' as const,
-      ...(sourceTask?{dependencies:[sourceTask],sourceTask}:{dependencies:[]}),
+      ...(sourceTask?{dependencies:[...new Set([sourceTask,...validationGates])],sourceTask}:{dependencies:[]}),
       baseWorkspace: request.workspaces[0],
       covers: [item.requirementId],
-      writePaths: item.writePaths!,
-      description: `${item.action}\n${shared?'Entregue a contribuição delimitada desta subtarefa; a integração e o QA deverão comprovar o requisito inteiro':'Entregue integralmente este requisito'}: ${selected.description}\nIdentidade da subtarefa: ${item.partKey}. Dependências: ${(item.dependsOn??[]).join(', ')||'nenhuma'}.\nEscopo exclusivo de escrita desta subtarefa: ${item.writePaths!.join(', ')}\nReproduza o defeito antes de corrigir quando aplicável; execute os controles: ${item.verification}\nPreserve funcionalidades e mudanças dos lotes anteriores. Trabalhe de forma incremental e verificavel: escreva primeiro um esqueleto minimo dos arquivos de entrega e sele evidencias a cada etapa concluida, em vez de auditar a arvore inteira antes da primeira escrita. Limite a exploracao aos arquivos do contrato e das dependencias diretas. Nao crie bancos, containers ou dados de runtime locais (nada de pgdata, docker ou DATABASE_URL inventada): validacao com PostgreSQL e somente pelo request_validation protegido; sem ele, registre a limitacao em evidence/. Registre comandos, resultados e limitações em evidence/delivery.json. O campo passed só pode ser true após verificar a entrega; não basta produzir um plano ou relatório.`,
+      writePaths: item.writePaths??[],
+      description: `${item.action}\n${shared?'Entregue a contribuição delimitada desta subtarefa; a integração e o QA deverão comprovar o requisito inteiro':'Entregue integralmente este requisito'}: ${selected.description}\nIdentidade da subtarefa: ${item.partKey}. Dependências: ${(item.dependsOn??[]).join(', ')||'nenhuma'}.\nEscopo exclusivo de escrita desta subtarefa: ${(item.writePaths??[]).join(', ')}\nReproduza o defeito antes de corrigir quando aplicável; execute os controles: ${item.verification}\nPreserve funcionalidades e mudanças dos lotes anteriores. Trabalhe de forma incremental e verificavel: escreva primeiro um esqueleto minimo dos arquivos de entrega e sele evidencias a cada etapa concluida, em vez de auditar a arvore inteira antes da primeira escrita. Limite a exploracao aos arquivos do contrato e das dependencias diretas. Nao crie bancos, containers ou dados de runtime locais (nada de pgdata, docker ou DATABASE_URL inventada): validacao com PostgreSQL e somente pelo request_validation protegido; sem ele, registre a limitacao em evidence/. Registre comandos, resultados e limitações em evidence/delivery.json. O campo passed só pode ser true após verificar a entrega; não basta produzir um plano ou relatório.`,
       criteria: [{id:'delivery',label:'Entrega implementada e controles executados',type:'json_field' as const,name:'delivery.json',field:'passed',equals:true}],
     };
   });
   const combinedVerification = items.map(i => `[${i.requirementId}] ${i.verification}`).join(' | ');
-  const combinedWritePaths = [...new Set(items.flatMap(i => i.writePaths ?? []))];
+  const combinedWritePaths = [...new Set(deliveries.flatMap(i => i.writePaths ?? []))];
   const plan = planSchema.parse({
     title: previous?.title ?? request.message.slice(0, 120),
     summary: `Janela paralela verificável (${items.length} entregas): ${items.map(i => i.title).join('; ')}. ${pending.length} requisito(s) ainda pendente(s).`,
@@ -193,7 +241,7 @@ export function compileDelivery(raw: unknown, request: ObjectiveInput, previous?
       pendingRequirementIds: pending,
     },
     tasks: [
-      ...joins,...workTasks,
+      ...joins,...workTasks,...validationTasks,
       {
         key: 'integrate',
         title: 'Integrar entregas paralelas do lote',
@@ -213,7 +261,7 @@ export function compileDelivery(raw: unknown, request: ObjectiveInput, previous?
         stage: 'verify',
         baseWorkspace: request.workspaces[0],
         sourceTask: 'integrate',
-        dependencies: ['integrate'],
+        dependencies: ['integrate',...validationTasks.map(task=>task.key)],
         covers,
         description: `Verifique independentemente a candidata integrada imutável e repita os controles combinados: ${combinedVerification}\nComprove os requisitos COMPLETOS: ${JSON.stringify(requirements.filter(r=>selectedIds.includes(r.id)))}. Aceites parciais das subtarefas não comprovam a entrega conjunta.\n${pending.length ? 'Este aceite cobre apenas a janela selecionada, não encerra o objetivo. Verifique também regressões das entregas anteriores.' : 'Esta é a verificação final: comprove TODOS os requisitos do objetivo na mesma candidata acumulada, incluindo os lotes anteriores.'}\nInspecione evidências reais, registre comandos e resultados em evidence/verification.json. passed deve ser false se houver falhas, critérios não verificados ou evidência ausente. Não repare a candidata.`,
         criteria: [{id:'verified',label:'Verificação independente da candidata',type:'json_field',name:'verification.json',field:'passed',equals:true}],
@@ -254,25 +302,46 @@ export async function verifiedBatch(db: DB, goalId: string, revision: number) {
     r.id run_id,r.state run_state,
     (SELECT passed FROM acceptances WHERE run_id=r.id ORDER BY created_at DESC,id DESC LIMIT 1) passed,
     (SELECT id FROM acceptances WHERE run_id=r.id ORDER BY created_at DESC,id DESC LIMIT 1) acceptance_id,
-    a.id candidate_artifact_id,a.digest candidate_digest
+    a.id candidate_artifact_id,a.digest candidate_digest,
+    ARRAY(SELECT d.depends_on FROM dependencies d WHERE d.task_id=t.id) dependency_ids
     FROM tasks t LEFT JOIN runs r ON r.task_id=t.id AND r.attempt=t.attempt_count
     LEFT JOIN LATERAL(SELECT id,digest FROM artifacts WHERE run_id=r.id AND name='candidate.json' ORDER BY created_at DESC,id DESC LIMIT 1)a ON true
     WHERE t.goal_id=$1 AND t.plan_revision=$2 AND t.stage IN('work','integrate','verify') AND t.state<>'superseded'`, [goalId,revision])).rows;
   const verifiers = tasks.filter(t => t.stage === 'verify');
-  const verifier = verifiers[0];
   const integrations = tasks.filter(t => t.stage === 'integrate');
-  const integrator = integrations.find(t=>t.execution?.workspace===verifier?.execution?.sourceWorkspace);
   const workers = tasks.filter(t => t.stage === 'work');
-  const expectedCount = integrations.length ? workers.length + integrations.length + 1 : 2;
-  if (!workers.length || verifiers.length!==1 || tasks.length !== expectedCount || !verifier ||
-      (integrations.length>0&&!integrator) ||
+  const byId=new Map(tasks.map(task=>[task.id,task]));
+  function ancestors(id:string){
+    const found=new Set<string>(),pending=[...(byId.get(id)?.dependency_ids??[])];
+    while(pending.length){
+      const parent=pending.pop()!;
+      if(found.has(parent))continue;
+      found.add(parent);pending.push(...(byId.get(parent)?.dependency_ids??[]));
+    }
+    return found;
+  }
+  if(tasks.some(task=>task.dependency_ids.some((id:string)=>!byId.has(id))||ancestors(task.id).has(task.id)))return null;
+  // A targeted intermediate check cannot advance the batch. The final check
+  // must follow every task, including every validation gate, and inspect the
+  // accumulated source producer rather than any validator's unchanged copy.
+  const finals=verifiers.filter(candidate=>{
+    const parents=ancestors(candidate.id);
+    const sources=tasks.filter(task=>task.execution?.workspace===candidate.execution?.sourceWorkspace&&task.stage!=='verify');
+    if(sources.length!==1||parents.has(candidate.id)||!parents.has(sources[0].id))return false;
+    const sourceParents=ancestors(sources[0].id);
+    return tasks.every(task=>task.id===candidate.id||parents.has(task.id))&&
+      [...workers,...integrations].every(task=>task.id===sources[0].id||sourceParents.has(task.id));
+  });
+  const verifier=finals[0];
+  const sourceProducer=tasks.find(task=>task.execution?.workspace===verifier?.execution?.sourceWorkspace&&task.stage!=='verify');
+  if (!workers.length || finals.length!==1 || !sourceProducer ||
       tasks.some(t => t.state !== 'accepted' || t.run_state !== 'submitted' || t.passed !== true) ||
       !verifier.execution?.sourceWorkspace || tasks.some(t => !t.candidate_artifact_id)) return null;
   if ((await db.query(`SELECT 1 FROM runs r JOIN tasks t ON t.id=r.task_id WHERE t.goal_id=$1
       AND (r.state IN('queued','running','cancelling','reconciling') OR EXISTS(SELECT 1 FROM leases l WHERE l.run_id=r.id)) LIMIT 1`,[goalId])).rowCount) return null;
   return { taskId:verifier.id, runId:verifier.run_id, sourceWorkspace:verifier.execution.sourceWorkspace,
     candidateArtifactId:verifier.candidate_artifact_id,candidateDigest:verifier.candidate_digest,
-    verificationAcceptanceId:verifier.acceptance_id,workRunId:(integrator ?? workers[0])?.run_id };
+    verificationAcceptanceId:verifier.acceptance_id,workRunId:sourceProducer.run_id };
 }
 
 export async function queueNextDelivery(db: DB, objective: any, previous: ProposedPlan) {

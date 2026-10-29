@@ -11,7 +11,7 @@ import { refreshGoal } from '../server/service.js';
 
 const request = () => objectiveSchema.parse({message:'Corrigir dois defeitos independentes e verificar a candidata acumulada.',project:'test',
   workspaces:['test/base'],mode:'execute',planningStrategy:'incremental',requirements:['O endpoint deve persistir a alteração correta.','A interface deve exibir o progresso correto.'],idempotencyKey:randomUUID()});
-const decision = (requirementId='req-1') => ({requirementId,title:'Corrigir persistência',action:'Reproduzir a falha de persistência e corrigir sua causa com teste discriminante.',
+const decision = (requirementId='req-1') => ({kind:'delivery' as const,requirementId,title:'Corrigir persistência',action:'Reproduzir a falha de persistência e corrigir sua causa com teste discriminante.',
   verification:'Executar regressão que falha na base e passa na candidata, preservando os demais controles.',agentId:'engineering.backend.node'});
 beforeAll(()=>migrate());
 beforeEach(async()=>{
@@ -286,8 +286,9 @@ it('repairs the first invalid agent after nineteen transport failures without co
     if(method==='worker.prepare')return {};
     if(method==='generate'){
       const schema=JSON.parse(p.messages[0].content).schema;
-      expect(schema.properties.agentId.enum).toContain('engineering.backend.node');
-      expect(schema.properties.agentId.enum).not.toContain('engineering.backend.nodejs');
+      const deliverySchema=schema.anyOf[0];
+      expect(deliverySchema.properties.agentId.enum).toContain('engineering.backend.node');
+      expect(deliverySchema.properties.agentId.enum).not.toContain('engineering.backend.nodejs');
       return {message:{content:[{type:'text',text:JSON.stringify({...decision(),agentId:++generated===1?'engineering.backend.nodejs':'engineering.backend.node'})}]}};
     }
     throw Error('ranking fallback');

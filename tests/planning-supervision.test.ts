@@ -12,7 +12,7 @@ import {planningContractVersion} from '../server/planning-supervision.js';
 vi.mock('../bridge/model-policy.mjs',async original=>({...await original<any>(),readModelPolicy:vi.fn()}));
 const policy={version:1,mode:'glm-only',accountId:'agentos-api-00000000-0000-4000-8000-000000000001',bridgeId:'agentos:api:00000000-0000-4000-8000-000000000001',model:'glm-5.3-flash',requestLimit:6,sessionLimit:12} as const;
 let f:any;
-const item=(id='req-1')=>({requirementId:id,title:'Implementar e comprovar entrega',agentId:'engineering.backend.node',action:'Implementar integralmente o requisito preservando os controles e a candidata aceita.',verification:'Executar os controles originais e todos os negativos na mesma candidata acumulada.'});
+const item=(id='req-1')=>({kind:'delivery' as const,requirementId:id,title:'Implementar e comprovar entrega',agentId:'engineering.backend.node',action:'Implementar integralmente o requisito preservando os controles e a candidata aceita.',verification:'Executar os controles originais e todos os negativos na mesma candidata acumulada.'});
 beforeAll(()=>migrate());
 beforeEach(async()=>{
  vi.mocked(readModelPolicy).mockReturnValue(policy);
