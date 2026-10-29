@@ -28,7 +28,7 @@ import { chatEngine, listChats, newChat, chatDetail } from './chat.js';
 import type { WorkerEngine } from './worker.js';
 import { submitObjective, objectiveDetail, feedbackObjective } from './planner.js';
 import {registerObjectiveInput} from './objective-inputs.js';
-import {configureObjectiveReview,objectiveReviews} from './objective-review.js';
+import {configureObjectiveReview,objectiveReviews,requestObjectiveReview} from './objective-review.js';
 import {reconcileInheritedCancellation} from './objective-state-repair.js';
 import { cycleRoutes } from './cycles/routes.js';
 import { trustedTailnet } from './tailnet.js';
@@ -48,6 +48,8 @@ export function makeApp(engine?: WorkerEngine) {
   cycleRoutes(app);
   const sessionKey = randomBytes(32).toString('hex');
   app.setErrorHandler((error: any, _req, reply) => {
+    if(error.code==='FST_ERR_CTP_BODY_TOO_LARGE')
+      return reply.status(413).send({error:'REQUEST_TOO_LARGE',message:'A solicitação excede o limite desta rota.'});
     if (error instanceof ZodError)
       return reply.status(400).send({
         error: 'VALIDATION',
@@ -152,6 +154,11 @@ export function makeApp(engine?: WorkerEngine) {
       {channel:bearer&&equal(bearer,config.apiToken)?'api-token':'operator-session'});
   });
   app.get('/api/objectives/:id/reviews',async req=>objectiveReviews(z.uuid().parse((req.params as any).id)));
+  app.post('/api/objectives/:id/reviews',{bodyLimit:8192},async req=>{
+    const bearer=(req.headers.authorization??'').replace(/^Bearer /,'');
+    return requestObjectiveReview(z.uuid().parse((req.params as any).id),req.body,
+      {channel:bearer&&equal(bearer,config.apiToken)?'api-token':'operator-session'});
+  });
   app.post('/api/objectives/:id/review-policy',async req=>configureObjectiveReview(z.uuid().parse((req.params as any).id),req.body));
   app.get('/api/objectives/:id', async (req) =>
     objectiveDetail(z.uuid().parse((req.params as any).id)),
