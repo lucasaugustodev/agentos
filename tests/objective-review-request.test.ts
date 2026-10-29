@@ -1,5 +1,6 @@
 import {afterAll,afterEach,beforeAll,beforeEach,expect,it,vi} from 'vitest';
 import {randomUUID} from 'node:crypto';
+import type {PoolClient} from 'pg';
 import {readModelPolicy} from '../bridge/model-policy.mjs';
 import {pool,migrate} from '../server/db.js';
 import {seedRegistry} from '../server/registry.js';
@@ -18,7 +19,7 @@ vi.mock('../server/objective-review-readiness.js',async original=>({...await ori
 const policy={version:1,mode:'glm-only',accountId:'agentos-api-00000000-0000-4000-8000-000000000001',
   bridgeId:'agentos:api:00000000-0000-4000-8000-000000000001',model:'glm-5.3-flash',requestLimit:6,sessionLimit:12} as const;
 const release={candidate:'/opt/agentos/releases/managed-00000000-0000-4000-8000-000000000001',digest:'a'.repeat(64)};
-let f:any,engine:ObjectiveReviewEngine|undefined,consumerOwner:Awaited<ReturnType<typeof pool.connect>>;
+let f:any,engine:ObjectiveReviewEngine|undefined,consumerOwner:PoolClient;
 const auth={channel:'api-token'} as const;
 beforeAll(async()=>{
   await migrate();await installObjectiveReview();consumerOwner=await pool.connect();
