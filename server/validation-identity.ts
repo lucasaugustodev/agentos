@@ -35,7 +35,7 @@ const inputsSql = (filter: string) => `
       ||CASE WHEN m.worker_validation IS NULL THEN '{}'::jsonb ELSE jsonb_build_object('workerValidation',
         jsonb_build_object('policy',m.worker_validation,'currentPolicy',p.value,'handoff',h.value,
           'state',j.value->'state','result',j.value->'result','code',j.value->'code',
-          'evidenceState',e.value->'state','evidenceDigest',encode(sha256(convert_to((e.value->'body')::text,'UTF8')),'hex')))
+          'evidenceState',e.value->'state','evidenceDigest',encode(sha256(convert_to((e.value#>'{body,authority}')::text,'UTF8')),'hex')))
         END validation_input
     FROM manifests m
     LEFT JOIN settings p ON m.worker_validation IS NOT NULL AND p.id='worker-validation:'||m.goal_id
