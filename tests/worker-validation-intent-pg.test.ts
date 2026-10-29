@@ -62,7 +62,7 @@ function exported(job:any,coverage:any={version:1,source:'registered_vitest_json
     resultDigest:job.result.resultDigest,receiptDigest:'d'.repeat(64),producer:{...Object.fromEntries([
       'goalId','taskId','runId','runFence','contextVersion','expectedAttempt','candidateDigest'].map(k=>[k,job[k]])),contractDigest:job.request.contractDigest},
     outcome:{passed:job.result.passed,code:job.result.code,state:'completed'},
-    registeredActionSha:'31e7aa59d7b11f3552cfd8499481c727e4a8b316fc5b952e45839ba3df2a9c72',
+    registeredActionSha:'640557b086101b38566fbb9dd1361015f9e22ac31e5526caa43d7b176c1a6abe',
     registeredCommand:['/usr/bin/python3','/opt/agentos-control/agentos-release-action.py','validate'],
     publishedBaselineDigest:job.result.publishedBaselineDigest,publicationProofDigest:'f'.repeat(64),validationProofDigest:'f'.repeat(64),
     registeredReceiptSha:job.result.registeredReceiptSha,validatedReleaseDigest:'b'.repeat(64),
@@ -201,8 +201,9 @@ it('keeps revoked CI readable as historical repair evidence without authorizing 
   expect((await run()).instruction_snapshot).toEqual(original);
   expect((await validateTask(f.task)).passed).toBe(false);
 });
-it('rejects an arbitrary executor SHA and unregistered settings without an authenticated receipt',async()=>{
-  await admit();const job=await completed();await publish(job,undefined,{registeredActionSha:'0'.repeat(64)});
+it.each(['0'.repeat(64),'31e7aa59d7b11f3552cfd8499481c727e4a8b316fc5b952e45839ba3df2a9c72'])(
+  'rejects an unregistered executor %s and settings without an authenticated receipt',async(registeredActionSha)=>{
+  await admit();const job=await completed();await publish(job,undefined,{registeredActionSha});
   expect((await workerValidationGate(pool,f.run)).state).toBe('pending');
   await pool.query("DELETE FROM events WHERE kind='WORKER_VALIDATION_POLICY_REGISTERED' AND entity_id=$1",[f.goal]);
   expect(await workerValidationGate(pool,f.run)).toMatchObject({state:'failed',detail:'VALIDATION_POLICY_UNREGISTERED'});

@@ -30,7 +30,7 @@ const canonical = (v: any): any =>
 const digest = (v: any) => sha(JSON.stringify(canonical(v)));
 const registeredShas = ['e66fcf513aaa513ff2216d87556fb5dba771597dc933ca4b4b38573d8842d5b5',
   '02a92158a4084a1aeb3b4c55998b6740d90428f80acb06a225730a1423ba9c26',
-  '31e7aa59d7b11f3552cfd8499481c727e4a8b316fc5b952e45839ba3df2a9c72'] as const;
+  '640557b086101b38566fbb9dd1361015f9e22ac31e5526caa43d7b176c1a6abe'] as const;
 const key = (id: string) => 'candidate-validation-evidence:' + id;
 const uuid = z.uuid(),
   hash = z.string().regex(/^[a-f0-9]{64}$/);

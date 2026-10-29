@@ -228,7 +228,7 @@ class ValidatorProvenanceTests(unittest.TestCase):
             p.complete_output(output,self.layout.builds/'foreign/.local-test/vitest-results.json')
 
     def test_reviewed_coverage_executor_requires_its_real_report_hash(self):
-        executor = '31e7aa59d7b11f3552cfd8499481c727e4a8b316fc5b952e45839ba3df2a9c72'
+        executor = '640557b086101b38566fbb9dd1361015f9e22ac31e5526caa43d7b176c1a6abe'
         output = copy.deepcopy(self.output)
         with self.assertRaisesRegex(ValueError,'EXECUTOR_CHANGED'): p.executor_artifacts(output,executor)
         raw = '{"testResults":[]}'
