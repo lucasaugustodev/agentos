@@ -60,3 +60,14 @@ source, documentation, scripts and built assets remain signed. The parity tests
 execute both digest implementations and verify that real file changes still stop
 publication before the swap. Python composition fixtures run with `-B` so test
 execution does not add bytecode to the source tree.
+
+## Structured occurrence input
+
+Each cycle attempt receives its complete external input as `cycle-input.json`
+through the existing hashed input transport. Its context manifest records the
+attempt/fence, occurrence, size, digest and sandbox path. The prompt references
+that file instead of truncating large JSON or requiring history reconstruction.
+Only complete inputs up to 4 KiB are also included inline. The existing 8 MiB
+per-file and 24 MiB combined transport limits still apply; excess is an explicit
+failure. Payloads are untrusted data: delivery of the file does not execute a
+command, apply a patch or grant any additional authority.

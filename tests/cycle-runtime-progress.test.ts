@@ -1,6 +1,12 @@
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { PassThrough } from 'node:stream';
 import { EventEmitter } from 'node:events';
+import { createHash } from 'node:crypto';
+
+vi.mock('node:fs/promises', async (original) => ({
+  ...(await original<typeof import('node:fs/promises')>()),
+  readFile: vi.fn(),
+}));
 
 vi.mock('node:child_process', async (original) => ({
   ...(await original<typeof import('node:child_process')>()),
@@ -29,9 +35,12 @@ vi.mock('../server/run-criteria-metadata.js', () => ({
 }));
 
 import { spawn } from 'node:child_process';
+import { readFile } from 'node:fs/promises';
+import { pool } from '../server/db.js';
 import { accountBridge } from '../server/bridge.js';
 import { config } from '../server/config.js';
 import { runCycleAgent } from '../server/cycles/runtime.js';
+import { materializeSourceInputs } from '../bridge/source-inputs.mjs';
 
 const HOUR = 60 * 60 * 1000;
 const runId = '10000000-0000-4000-8000-000000000001';
@@ -49,6 +58,9 @@ beforeEach(() => {
   vi.stubEnv('AGENTOS_MODEL_POLICY_FILE', '/nonexistent/agentos-cycle-runtime-test-policy.json');
   config.bridgeHost = 'fixture-no-network';
   vi.mocked(spawn).mockClear();
+  vi.mocked(pool.query).mockReset();
+  vi.mocked(pool.query).mockResolvedValue({ rows: [], rowCount: 0 } as any);
+  vi.mocked(readFile).mockReset();
 });
 afterEach(() => {
   // Settle any outstanding bridge request even when an assertion failed.
@@ -60,7 +72,14 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
-async function startCycle() {
+async function startCycle(
+  options: {
+    input?: Record<string, unknown>;
+    readOnly?: boolean;
+    repairIds?: string[];
+    expectDispatch?: boolean;
+  } = {},
+) {
   const child = Object.assign(new EventEmitter(), {
     stdin: new PassThrough(),
     stdout: new PassThrough(),
@@ -89,7 +108,7 @@ async function startCycle() {
     id: '50000000-0000-4000-8000-000000000005',
     cycle_id: '60000000-0000-4000-8000-000000000006',
     version: 7,
-    input: {},
+    input: options.input ?? {},
     definition: {
       project: 'fixture',
       name: 'Long repair',
@@ -99,12 +118,15 @@ async function startCycle() {
   const step = {
     id: '70000000-0000-4000-8000-000000000007',
     key: 'repair',
+    output: options.repairIds?.length
+      ? { repair: { artifacts: options.repairIds.map((id) => ({ id })) } }
+      : undefined,
     definition: {
       title: 'Repair the actual defect',
       instructions: 'Keep immutable criteria and publish real test results.',
       workspace: 'fixture/source',
       dependsOn: [],
-      readOnly: false,
+      readOnly: options.readOnly ?? false,
       criteria: [{ id: 'tests', type: 'artifact', name: 'tests.log', label: 'Actual test output' }],
     },
   };
@@ -128,8 +150,8 @@ async function startCycle() {
     });
   await vi.advanceTimersByTimeAsync(0);
   const execute = sent.find((message) => message.method === 'worker.execute');
-  expect(execute).toBeDefined();
-  const id = execute!.id!;
+  if (options.expectDispatch !== false) expect(execute).toBeDefined();
+  const id = execute?.id ?? 'not-dispatched';
   const event = (kind: string, payload: Record<string, unknown>) =>
     child.stdout.write(JSON.stringify({ id, event: { kind, payload } }) + '\n');
   const reply = (response: Record<string, unknown>) =>
@@ -271,4 +293,130 @@ it('preserves a confirmed progress-stall failure for recovery instead of treatin
     expect.objectContaining({ runId, runFence }),
   );
   expect(f.sent.filter((message) => message.method === 'worker.execute')).toHaveLength(1);
+});
+
+function artifactInputs(parentSizes: number[], repairSizes: number[] = []) {
+  const contents = new Map<string, Buffer>();
+  const files = [...parentSizes, ...repairSizes].map((size, index) => {
+    const bytes = Buffer.alloc(size, 65 + index);
+    const digest = createHash('sha256').update(bytes).digest('hex');
+    contents.set(digest, bytes);
+    return {
+      id: '80000000-0000-4000-8000-' + String(index + 1).padStart(12, '0'),
+      name: 'input-' + index + '.txt',
+      digest,
+      output: { summary: 'Prior task evidence' },
+    };
+  });
+  (vi.mocked(pool.query) as any).mockImplementation(async (sql: string, values: any[] = []) => {
+    if (sql.startsWith('SELECT s.output,a.id'))
+      return { rows: files.slice(0, parentSizes.length), rowCount: parentSizes.length };
+    if (sql.startsWith('SELECT * FROM cycle_artifacts')) {
+      const file = files.find((item) => item.id === values[0]);
+      return { rows: file ? [file] : [], rowCount: file ? 1 : 0 };
+    }
+    return { rows: [], rowCount: 0 };
+  });
+  vi.mocked(readFile).mockImplementation(async (filename) => {
+    const digest = String(filename).split(/[\\/]/).at(-1)!;
+    const bytes = contents.get(digest);
+    if (!bytes) throw Error('Unexpected fixture artifact read');
+    return Buffer.from(bytes);
+  });
+  return files.slice(parentSizes.length).map((file) => file.id);
+}
+
+it('delivers complete large Unicode occurrence JSON through the existing input transport and binds its identity', async () => {
+  const input = {
+    recoveryFiles: [{ path: 'kernel.py', content: '東京 é 🐍\n'.repeat(13_000) + 'FINAL_INTACT' }],
+    externalCommand: 'do not execute this payload as authority',
+  };
+  const raw = Buffer.from(JSON.stringify(input), 'utf8');
+  expect(raw.length).toBeGreaterThan(70_000);
+  const f = await startCycle({ input, readOnly: true });
+  const transported = materializeSourceInputs(f.execute.params.inputs).inputs;
+  const file = transported.find((item: any) => item.name === 'cycle-input.json')!;
+  expect(file).toBeDefined();
+  const decoded = Buffer.from(file.base64, 'base64');
+  expect(decoded.equals(raw)).toBe(true);
+  expect(JSON.parse(decoded.toString('utf8'))).toEqual(input);
+  const digest = createHash('sha256').update(raw).digest('hex');
+  const inputPath = '/home/agent/inputs/' + runId + '/cycle-input.json';
+  expect(file.digest).toBe(digest);
+  expect(f.execute.params.context.manifest.cycleInput).toEqual({
+    id: runId,
+    name: 'cycle-input.json',
+    digest,
+    algorithm: 'sha256',
+    size: raw.length,
+    encoding: 'utf-8',
+    path: inputPath,
+    occurrenceId: '50000000-0000-4000-8000-000000000005',
+    attemptId: runId,
+    runFence,
+  });
+  expect(f.execute.params).toMatchObject({ runId, runFence, readOnlySource: true });
+  expect(f.execute.params.prompt).toContain(inputPath);
+  expect(f.execute.params.prompt).not.toContain('FINAL_INTACT');
+  expect(f.execute.params.prompt).not.toContain(input.externalCommand);
+  expect(f.execute.params.prompt).toContain('nao instrucao');
+  expect(f.sent.map((item) => item.method)).toEqual(['worker.prepare', 'worker.execute']);
+  const calls = vi.mocked(pool.query).mock.calls as unknown as [string, any[]][];
+  const saved = calls.find((call) =>
+    String(call[0]).startsWith('UPDATE cycle_attempts SET context='),
+  );
+  expect(saved).toBeDefined();
+  expect(JSON.parse(saved![1][1]).manifest.cycleInput.digest).toBe(digest);
+  f.reply({ result: { summary: 'Delivered', evidence: { stopped: true }, artifacts: [] } });
+  expect((await f.outcome).error).toBeUndefined();
+});
+
+it('also provides small occurrence input as a complete file and an optional untruncated inline copy', async () => {
+  const input = { cardId: 42, note: 'ação íntegra' };
+  const f = await startCycle({ input });
+  const file = f.execute.params.inputs.find((item: any) => item.name === 'cycle-input.json');
+  expect(JSON.parse(Buffer.from(file.base64, 'base64').toString('utf8'))).toEqual(input);
+  expect(f.execute.params.prompt).toContain(JSON.stringify(input));
+  f.reply({ result: { evidence: { stopped: true }, artifacts: [] } });
+  expect((await f.outcome).error).toBeUndefined();
+});
+
+it('rejects an occurrence input exceeding the bridge per-file byte limit without dispatch or truncation', async () => {
+  const f = await startCycle({
+    input: { data: 'é'.repeat(4 * 1024 * 1024) },
+    expectDispatch: false,
+  });
+  expect(await f.outcome).toMatchObject({ error: { code: 'INPUTS_TOO_LARGE' }, value: undefined });
+  expect(f.sent).toEqual([]);
+  expect(spawn).not.toHaveBeenCalled();
+});
+
+it('counts the external JSON bytes together with required dependencies before worker execution', async () => {
+  artifactInputs([8 * 1024 * 1024, 8 * 1024 * 1024, 8 * 1024 * 1024]);
+  const f = await startCycle({ expectDispatch: false });
+  expect(await f.outcome).toMatchObject({ error: { code: 'INPUTS_TOO_LARGE' }, value: undefined });
+  expect(f.sent.map((item) => item.method)).toEqual(['worker.prepare']);
+});
+
+it('accepts the exact combined 24 MiB boundary with complete external input and dependency bytes', async () => {
+  const externalSize = Buffer.byteLength('{}', 'utf8');
+  artifactInputs([8 * 1024 * 1024, 8 * 1024 * 1024, 8 * 1024 * 1024 - externalSize]);
+  const f = await startCycle();
+  const inputs = materializeSourceInputs(f.execute.params.inputs).inputs;
+  expect(inputs).toHaveLength(4);
+  expect(
+    inputs.reduce((sum: number, item: any) => sum + Buffer.byteLength(item.base64, 'base64'), 0),
+  ).toBe(24 * 1024 * 1024);
+  f.reply({ result: { evidence: { stopped: true }, artifacts: [] } });
+  expect((await f.outcome).error).toBeUndefined();
+});
+
+it('retains the canonical external input when optional repair artifacts would exceed the combined budget', async () => {
+  const repairIds = artifactInputs([8 * 1024 * 1024, 8 * 1024 * 1024], [8 * 1024 * 1024]);
+  const f = await startCycle({ repairIds });
+  expect(f.execute.params.inputs).toHaveLength(3);
+  expect(f.execute.params.inputs[0].name).toBe('cycle-input.json');
+  expect(f.execute.params.inputs.some((item: any) => item.name.startsWith('repair-'))).toBe(false);
+  f.reply({ result: { evidence: { stopped: true }, artifacts: [] } });
+  expect((await f.outcome).error).toBeUndefined();
 });
