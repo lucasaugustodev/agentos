@@ -8,6 +8,9 @@ const indexes = [
   ['events_run_activity_idx', `CREATE INDEX CONCURRENTLY IF NOT EXISTS events_run_activity_idx
     ON public.events((payload->>'runId'),created_at DESC)
     WHERE kind IN('OPENCODE_TOOL_EVENT','HARNESS_TOOL_EVENT','ARTIFACT_CREATED','MODEL_RESPONSE')`],
+  ['events_confirmed_run_kind_idx', `CREATE INDEX CONCURRENTLY IF NOT EXISTS events_confirmed_run_kind_idx
+    ON public.events((payload->>'runId'),kind)
+    WHERE kind IN('HARNESS_STOPPED','HARNESS_NOT_STARTED') AND payload->>'confirmed'='true'`],
   ['events_kind_created_idx', 'CREATE INDEX CONCURRENTLY IF NOT EXISTS events_kind_created_idx ON public.events(kind,created_at DESC)'],
 ] as const;
 
