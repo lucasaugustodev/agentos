@@ -765,7 +765,7 @@ export class PlanningEngine {
             remaining: deliveryFrontier(run.request, previous, !!run.feedback?.incrementalAdvance).eligible.length,
             objectiveInputs: objectiveInputs.inputs.map(({id,digest,...input})=>({id,digest,
               included:'content' in input,omitted:'omitted' in input?input.omitted:undefined,
-              ...('summary' in input?{summaryIncluded:true,summaryDigest:input.summaryDigest}:{}),
+              ...('summary' in input&&'summaryDigest' in input?{summaryIncluded:true,summaryDigest:input.summaryDigest}:{}),
               ...('summaryOmitted' in input?{summaryOmitted:input.summaryOmitted}:{})})),
           });
         });
