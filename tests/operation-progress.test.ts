@@ -27,6 +27,7 @@ const integrated = (id = 'integration', scope = 'documentation/release') => ({
   last_run_id: 'run-' + id,
   last_run_state: 'submitted',
   acceptance_passed: true,
+  dependency_ids: [] as string[],
   execution: { baseWorkspace: scope },
   created_at: '2026-10-01T12:00:00Z',
   accepted_at: '2026-10-06T15:00:00Z',
@@ -81,7 +82,7 @@ it('matches the Python manifest encoding for non-ASCII source paths', () => {
 });
 
 it('counts integration and QA only from current real acceptances on the same candidate', () => {
-  const tasks = [integrated(), { ...integrated('qa'), stage: 'verify' }];
+  const tasks = [integrated(), { ...integrated('qa'), stage: 'verify',dependency_ids:['integration'] }];
   let p = observeOperationProgress(tasks, { integration: a, qa: a });
   expect(p.delivery).toEqual({ integrated: 1, verified: 1, total: 1 });
   expect(projectOperationProgress(p, null).nextTransition.kind).toBe('complete');
@@ -171,7 +172,7 @@ it('requires new input content, not a renamed ID, and removal/reintroduction is 
 it('clears delivery stagnation only on an accepted candidate milestone, preserving proof digests', () => {
   const before = stagnant();
   const observation = observeOperationProgress(
-    [integrated(), { ...integrated('qa'), stage: 'verify', state: 'ready' }],
+    [integrated(), { ...integrated('qa'), stage: 'verify', state: 'ready',dependency_ids:['integration'] }],
     { integration: a },
     [{ run_id: 'run-integration', digest: b }],
   );
@@ -220,6 +221,70 @@ it('requests a delivery plan when the objective has no integration or verificati
   expect(p!.nextTransition.kind).toBe('replan');
 });
 
+function targetedValidationFixture(finalAccepted=false){
+  const producer={...integrated('producer'),stage:'work',plan_revision:4};
+  const intermediate={...integrated('z-intermediate'),stage:'verify',plan_revision:4,
+    dependency_ids:[producer.id],accepted_at:'2026-10-06T18:00:00Z'};
+  const integration={...integrated('m-integration'),plan_revision:4,dependency_ids:[producer.id]};
+  const final={...integrated('a-final'),stage:'verify',plan_revision:4,dependency_ids:[integration.id,intermediate.id],
+    ...(finalAccepted?{}:{state:'blocked_dependencies',acceptance_passed:false})};
+  return {producer,intermediate,integration,final,tasks:[producer,intermediate,integration,final]};
+}
+
+it('does not promote a same-digest intermediate check over the pending final QA by UUID',()=>{
+  const f=targetedValidationFixture(),digests={[f.integration.id]:a,[f.intermediate.id]:a};
+  const observation=observeOperationProgress(f.tasks,digests);
+  expect(observation.milestones[0].verification).toMatchObject({taskId:f.final.id,state:'pending'});
+  expect(observation.delivery).toEqual({integrated:1,verified:0,total:1});
+  expect(projectOperationProgress(observation,null).nextTransition.kind).toBe('verify');
+  // The later intermediate acceptance is not the time of a final delivery.
+  expect(observation.lastDeliveryAt).toBe(new Date(f.integration.accepted_at).toISOString());
+});
+
+it.each([a,b])('selects the accepted final QA by ancestry regardless of intermediate digest %s',auxiliaryDigest=>{
+  const f=targetedValidationFixture(true),digests={[f.integration.id]:a,[f.intermediate.id]:auxiliaryDigest,[f.final.id]:a};
+  for(const tasks of [f.tasks,[...f.tasks].reverse()]){
+    const observation=observeOperationProgress(tasks,digests);
+    expect(observation.milestones[0].verification.taskId).toBe(f.final.id);
+    expect(observation.delivery.verified).toBe(1);
+    expect(projectOperationProgress(observation,null).nextTransition.kind).toBe('complete');
+  }
+});
+
+it('uses the final integration rather than a same-transaction join with a higher UUID',()=>{
+  const f=targetedValidationFixture(),join={...integrated('zz-join'),plan_revision:4,dependency_ids:[f.producer.id]},
+    consumer={...integrated('consumer'),stage:'work',plan_revision:4,dependency_ids:[join.id]};
+  f.integration.dependency_ids.push(consumer.id);
+  const observation=observeOperationProgress([...f.tasks,join,consumer],{[join.id]:b,[f.integration.id]:a});
+  expect(observation.milestones[0].integration).toMatchObject({taskId:f.integration.id,candidateDigest:a});
+});
+
+it('does not hide ambiguous terminal validations or invalid dependencies behind passing manifests',()=>{
+  const f=targetedValidationFixture(true),other={...f.final,id:'zz-other-final'},
+    digests={[f.integration.id]:a,[f.intermediate.id]:a,[f.final.id]:a,[other.id]:a};
+  const ambiguous=observeOperationProgress([...f.tasks,other],digests);
+  expect(ambiguous.milestones[0].verification).toMatchObject({state:'pending',selectionIssue:'ambiguous_dag'});
+  expect(ambiguous.delivery.verified).toBe(0);
+  expect(projectOperationProgress(ambiguous,null).nextTransition.kind).toBe('replan');
+  f.producer.dependency_ids=[f.intermediate.id];
+  const cyclic=observeOperationProgress(f.tasks,digests);
+  expect(cyclic.delivery.verified).toBe(0);
+  expect(cyclic.milestones[0].verification.selectionIssue).toBe('invalid_dag');
+  f.producer.dependency_ids=['missing-parent'];
+  expect(observeOperationProgress(f.tasks,digests).milestones[0].verification.selectionIssue).toBe('invalid_dag');
+  const live=observeOperationProgress([...f.tasks,{...other,has_live_run:true}],digests);
+  expect(projectOperationProgress(live,null).nextTransition.kind).toBe('wait_live');
+});
+
+it('uses the current plan revision before task timestamps and refuses an unversioned UUID tie',()=>{
+  const f=targetedValidationFixture(),historical={...integrated('old-accepted'),plan_revision:3,created_at:'2026-10-20T00:00:00Z'};
+  const observation=observeOperationProgress([...f.tasks,historical],{[historical.id]:b,[f.integration.id]:a});
+  expect(observation.milestones[0].integration.taskId).toBe(f.integration.id);
+  const tied=observeOperationProgress([integrated('a-candidate'),integrated('z-candidate')],{'a-candidate':a,'z-candidate':a});
+  expect(tied.milestones[0].integration.selectionIssue).toBe('ambiguous_dag');
+  expect(tied.delivery.integrated).toBe(0);
+});
+
 beforeAll(async () => {
   await migrate();
   await installBacklogPlanner();
@@ -250,6 +315,42 @@ async function databaseFixture() {
   );
   return { goal, task, agent };
 }
+
+it('projects persisted dependency edges and revision without promoting an intermediate acceptance',async()=>{
+  const f=await databaseFixture(),producer=randomUUID(),intermediate='f'+randomUUID().slice(1),final='0'+randomUUID().slice(1),
+    created='2026-10-06T12:00:00Z',scope='docs/'+f.goal,candidate=manifest(),artifacts=new Map<string,Buffer>();
+  await pool.query('UPDATE tasks SET plan_revision=4,created_at=$2 WHERE id=$1',[f.task,created]);
+  for(const [id,stage] of [[producer,'work'],[intermediate,'verify'],[final,'verify']]){
+    await pool.query(`INSERT INTO tasks(id,goal_id,key,title,description,agent_id,state,criteria,stage,execution,plan_revision,created_at)
+      VALUES($1,$2,$1::text,'Synthetic gate','Projection fixture',$3,'ready','[]',$4,$5,4,$6)`,
+      [id,f.goal,f.agent,stage,JSON.stringify({baseWorkspace:scope}),created]);
+  }
+  for(const [consumer,parent] of [[intermediate,producer],[f.task,producer],[final,f.task],[final,intermediate]])
+    await pool.query('INSERT INTO dependencies VALUES($1,$2)',[consumer,parent]);
+  const accept=async(taskId:string)=>{
+    const runId=randomUUID(),artifactId=randomUUID();
+    await pool.query("INSERT INTO runs(id,task_id,attempt,state,fence,runtime,agent_version) VALUES($1,$2,1,'submitted',$3,'test',1)",[runId,taskId,randomUUID()]);
+    await pool.query("UPDATE tasks SET state='accepted',attempt_count=1 WHERE id=$1",[taskId]);
+    await pool.query("INSERT INTO acceptances(id,task_id,run_id,passed,checks,reviewer) VALUES($1,$2,$3,true,'[]','synthetic-projection-test')",[randomUUID(),taskId,runId]);
+    await pool.query("INSERT INTO artifacts(id,run_id,name,mime,digest,size) VALUES($1,$2,'candidate.json','application/json',$3,$4)",[artifactId,runId,candidate.digest,candidate.bytes.length]);
+    artifacts.set(artifactId,candidate.bytes);
+  };
+  const read=async(id:string)=>({bytes:artifacts.get(id)!});
+  await accept(producer);await accept(f.task);await accept(intermediate);
+  const pending=await collectOperationProgress(pool,f.goal,read);
+  expect(pending.milestones[0].verification).toMatchObject({taskId:final,state:'pending'});
+  expect(pending.delivery).toEqual({integrated:1,verified:0,total:1});
+  await accept(final);
+  const complete=await collectOperationProgress(pool,f.goal,read);
+  expect(complete.milestones[0].verification.taskId).toBe(final);
+  expect(complete.delivery.verified).toBe(1);
+  await pool.query('DELETE FROM dependencies WHERE task_id=$1 AND depends_on=$2',[final,intermediate]);
+  const ambiguous=await collectOperationProgress(pool,f.goal,read);
+  expect(ambiguous.milestones[0].verification.selectionIssue).toBe('ambiguous_dag');
+  expect(ambiguous.delivery.verified).toBe(0);
+  expect((await pool.query('SELECT state,criteria FROM tasks WHERE goal_id=$1',[f.goal])).rows.every(row=>
+    row.state==='accepted'&&row.criteria.length===0)).toBe(true);
+});
 
 it('reads progress and input identity without transferring large embedded files or changing stored evidence',async()=>{
  const f=await databaseFixture(),bytes=Buffer.from('Relevant file contents\n'.repeat(50000));

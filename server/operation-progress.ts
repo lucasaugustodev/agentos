@@ -11,6 +11,7 @@ type ArtifactReader = (id: string) => Promise<{ bytes: Buffer }>;
 type MilestoneState = 'not_planned' | 'pending' | 'running' | 'accepted';
 export type DeliveryMilestone = {
   state: MilestoneState;
+  selectionIssue?: 'ambiguous_dag' | 'invalid_dag';
   taskId?: string;
   runId?: string;
   candidateDigest: string | null;
@@ -108,6 +109,63 @@ const currentAcceptance = (task: any) =>
   task.last_run_attempt === task.attempt_count &&
   task.acceptance_passed === true;
 
+/** Select a delivery boundary, never a lucky UUID among tasks created in the
+ * same planning transaction. Legacy unversioned graphs retain temporal
+ * replacement only between disconnected generations, not within a DAG. */
+function deliveryBoundary(tasks: any[], scope: string) {
+  const eligible=tasks.filter(task=>scopeOf(task)===scope && !['cancelled','superseded'].includes(task.state) &&
+    ['work','integrate','verify'].includes(task.stage) && !['diagnostic','repair','planning'].includes(task.execution?.workKind));
+  const revisions=eligible.map(task=>task.plan_revision).filter(Number.isInteger);
+  if(revisions.length)return eligible.filter(task=>task.plan_revision===Math.max(...revisions));
+  const byId=new Map(eligible.map(task=>[task.id,task]));
+  const adjacent=new Map(eligible.map(task=>[task.id,new Set<string>()]));
+  for(const task of eligible)for(const parent of task.dependency_ids??[]){
+    if(!byId.has(parent))continue;
+    adjacent.get(task.id)!.add(parent);adjacent.get(parent)!.add(task.id);
+  }
+  const visited=new Set<string>(),components:any[][]=[];
+  for(const task of eligible){
+    if(visited.has(task.id))continue;
+    const component:any[]=[],pending=[task.id];
+    while(pending.length){
+      const id=pending.pop()!;
+      if(visited.has(id))continue;
+      visited.add(id);component.push(byId.get(id));pending.push(...adjacent.get(id)!);
+    }
+    if(component.some(node=>['integrate','verify'].includes(node.stage)))components.push(component);
+  }
+  const created=(component:any[])=>Math.max(...component.filter(node=>['integrate','verify'].includes(node.stage))
+    .map(node=>Date.parse(node.created_at??'')||0));
+  const latest=Math.max(...components.map(created));
+  return components.filter(component=>created(component)===latest).flat();
+}
+
+function deliveryGates(tasks:any[],selected:any[]) {
+  const byId=new Map(tasks.map(task=>[task.id,task]));
+  const cache=new Map<string,Set<string>>(),visiting=new Set<string>();
+  const ancestors=(id:string):Set<string>=>{
+    if(cache.has(id))return cache.get(id)!;
+    if(visiting.has(id)||!byId.has(id))throw Error('INVALID_PROGRESS_DAG');
+    visiting.add(id);const found=new Set<string>();
+    for(const parent of byId.get(id).dependency_ids??[]){
+      found.add(parent);for(const ancestor of ancestors(parent))found.add(ancestor);
+    }
+    visiting.delete(id);cache.set(id,found);return found;
+  };
+  const integrations=selected.filter(task=>task.stage==='integrate');
+  const verifications=selected.filter(task=>task.stage==='verify');
+  const choose=(candidates:any[],required:any[])=>{
+    const finals=candidates.filter(task=>required.every(other=>other.id===task.id||ancestors(task.id).has(other.id)));
+    return finals.length===1?{task:finals[0]}:candidates.length?{selectionIssue:'ambiguous_dag' as const}:{};
+  };
+  try{
+    for(const task of selected)ancestors(task.id);
+    return {integration:choose(integrations,integrations),verification:choose(verifications,selected)};
+  }catch{
+    return {integration:{selectionIssue:'invalid_dag' as const},verification:{selectionIssue:'invalid_dag' as const}};
+  }
+}
+
 /** Attempts, fresh case IDs and diagnostic acceptance are deliberately absent from delivery identity. */
 export function observeOperationProgress(
   tasks: any[],
@@ -120,13 +178,9 @@ export function observeOperationProgress(
       ['integrate', 'verify'].includes(t.stage) && !['cancelled', 'superseded'].includes(t.state),
   );
   const scopes = [...new Set(deliveryTasks.map(scopeOf))].sort();
-  const milestone = (candidates: any[]): DeliveryMilestone => {
-    // The latest planned task owns its gate; an old accepted task cannot hide a new integration.
-    const task = [...candidates].sort(
-      (a, b) =>
-        (Date.parse(b.created_at ?? '') || 0) - (Date.parse(a.created_at ?? '') || 0) ||
-        String(b.id).localeCompare(String(a.id)),
-    )[0];
+  const milestone = (selection:{task?:any;selectionIssue?:'ambiguous_dag'|'invalid_dag'}): DeliveryMilestone => {
+    const {task,selectionIssue}=selection;
+    if(selectionIssue)return {state:'pending',selectionIssue,candidateDigest:null,artifactDigests:[]};
     if (!task) return { state: 'not_planned', candidateDigest: null, artifactDigests: [] };
     const accepted = currentAcceptance(task);
     return {
@@ -141,12 +195,9 @@ export function observeOperationProgress(
   };
   const milestones = scopes.map((scope) => {
     const scoped = tasks.filter((t) => scopeOf(t) === scope);
-    const integration = milestone(
-      deliveryTasks.filter((t) => scopeOf(t) === scope && t.stage === 'integrate'),
-    );
-    const verification = milestone(
-      deliveryTasks.filter((t) => scopeOf(t) === scope && t.stage === 'verify'),
-    );
+    const gates=deliveryGates(tasks,deliveryBoundary(tasks,scope));
+    const integration=milestone(gates.integration);
+    const verification=milestone(gates.verification);
     const diagnostics = scoped.filter(
       (t) =>
         t.execution?.workKind === 'diagnostic' && !['cancelled', 'superseded'].includes(t.state),
@@ -174,7 +225,11 @@ export function observeOperationProgress(
       ? [[m.scope, 'verify', m.verification.candidateDigest]]
       : []),
   ]);
-  const acceptedDelivery = deliveryTasks.filter((t) => currentAcceptance(t) && manifests[t.id]);
+  const acceptedGateIds=new Set(milestones.flatMap(m=>[
+    ...(m.integration.state==='accepted'&&m.integration.candidateDigest?[m.integration.taskId]:[]),
+    ...(m.verificationMatchesCandidate?[m.verification.taskId]:[]),
+  ]));
+  const acceptedDelivery = deliveryTasks.filter((t) => acceptedGateIds.has(t.id)&&currentAcceptance(t)&&manifests[t.id]);
   const dates = acceptedDelivery
     .map((t) => t.accepted_at)
     .filter(Boolean)
@@ -223,6 +278,7 @@ export function projectOperationProgress(
   const running = observation.milestones.find(
     (m) => m.integration.state === 'running' || m.verification.state === 'running',
   );
+  const selectionIssue=observation.milestones.find(m=>m.integration.selectionIssue||m.verification.selectionIssue);
   if (running)
     nextTransition = {
       kind: 'wait_live',
@@ -235,6 +291,9 @@ export function projectOperationProgress(
         ? 'Há execução viva; replaneje apenas trabalho independente com causa, hipótese e prova esperada.'
         : 'Aguarde a execução viva; atividade não comprova entrega.',
     };
+  else if(selectionIssue)
+    nextTransition={kind:observation.liveRuns?'wait_live':'replan',scope:selectionIssue.scope,
+      reason:'O DAG não identifica uma entrega final única ou contém dependências inválidas. Preserve execuções vivas e corrija o vínculo dos gates; aceites intermediários não concluem a entrega.'};
   else if (detected)
     nextTransition = {
       kind: 'replan',
@@ -297,7 +356,8 @@ export function projectOperationProgress(
 export async function collectOperationProgress(db: DB, goalId: string, readArtifact: ArtifactReader) {
   const tasks = checkedExecutionMetadata((
     await db.query(
-      `SELECT t.id,t.stage,t.state,t.attempt_count,t.created_at,t.covers,${executionMetadataColumns},
+      `SELECT t.id,t.stage,t.state,t.attempt_count,t.created_at,t.plan_revision,t.covers,${executionMetadataColumns},
+    ARRAY(SELECT d.depends_on FROM dependencies d WHERE d.task_id=t.id) dependency_ids,
     jsonb_build_object('baseWorkspace',control."baseWorkspace",'workspace',control.workspace,
       'workKind',control."workKind",'inputs',CASE WHEN t.state IN('accepted','cancelled','superseded')
         THEN '[]'::jsonb ELSE metadata.input_digests END) execution,
