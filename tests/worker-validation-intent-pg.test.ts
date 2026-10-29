@@ -179,9 +179,23 @@ it('registered technical CI does not override a failed original criterion',async
   expect(result.checks.find(c=>c.id==='proof')?.passed).toBe(false);
   const before=(await pool.query('SELECT id,digest FROM artifacts WHERE run_id=$1 ORDER BY id',[f.run])).rows;
   const inputs=await runtimeValidationRepairInputs(pool,f.goal,[f.task],['requirement-a']);
-  expect(inputs.map((i:any)=>i.name)).toEqual(['ci-receipt.json','validation.log']);
+  expect(inputs.map((i:any)=>i.name)).toEqual(['ci-receipt.json','validation.log','ci-diagnostic-scope.json']);
   expect((await pool.query('SELECT id,digest FROM artifacts WHERE run_id=$1 ORDER BY id',[f.run])).rows).toEqual(before);
   expect(await runtimeValidationRepairInputs(pool,f.goal,[f.task],['other-requirement'])).toEqual([]);
+});
+it('keeps revoked CI readable as historical repair evidence without authorizing execution or acceptance',async()=>{
+  await admit({passed:false});const original=(await run()).instruction_snapshot;
+  const job=await completed();await publish(job);await validateTask(f.task);
+  const before=await runtimeValidationRepairInputs(pool,f.goal,[f.task],['requirement-a']);
+  await registerWorkerValidationPolicy(f.goal,{...policy,enabled:false},{channel:'operator-session'});
+  expect(await workerValidationGate(pool,f.run)).toMatchObject({state:'failed',detail:'VALIDATION_POLICY_REVOKED'});
+  const inputs=await runtimeValidationRepairInputs(pool,f.goal,[f.task],['requirement-a']);
+  expect(inputs).toEqual(before);
+  const note=JSON.parse(Buffer.from(inputs[2].base64,'base64').toString());
+  expect(note).toMatchObject({diagnosticOnly:true,authorizesExecution:false,authorizesAcceptance:false,
+    originalPolicyRegistrationId:f.registration.registrationId});
+  expect((await run()).instruction_snapshot).toEqual(original);
+  expect((await validateTask(f.task)).passed).toBe(false);
 });
 it('rejects an arbitrary executor SHA and unregistered settings without an authenticated receipt',async()=>{
   await admit();const job=await completed();await publish(job,undefined,{registeredActionSha:'0'.repeat(64)});

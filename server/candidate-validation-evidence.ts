@@ -195,7 +195,7 @@ function scope(task: any) {
     allowedAccounts: task.allowed_accounts,
   });
 }
-async function source(db: DB, actionId: string) {
+async function source(db: DB, actionId: string,mode:'current'|'historical_runtime_evidence'='current') {
   uuid.parse(actionId);
   const v = (
     await db.query('SELECT value FROM settings WHERE id=$1', ['candidate-validation:' + actionId])
@@ -210,11 +210,14 @@ async function source(db: DB, actionId: string) {
     )
   )
     failure('CI_EVIDENCE_NOT_COMPLETED');
-  if(v.authority==='runtime_artifact') await verifyWorkerValidationAuthority(db,v);
+  if(v.authority==='runtime_artifact') await verifyWorkerValidationAuthority(db,v,
+    mode==='historical_runtime_evidence'?'historical_evidence':'current');
   else await verifyAcceptedManagementAction(db, v.goalId, v.managerRunId, v.index, proposal(v));
-  const authorization = await frameworkProjectAuthorization(db, v.goalId);
-  if (digest(authorization.authorization) !== digest(v.request.frameworkAuthorization))
-    failure('CI_EVIDENCE_AUTHORIZATION_CHANGED');
+  if(mode!=='historical_runtime_evidence' || v.authority!=='runtime_artifact') {
+    const authorization = await frameworkProjectAuthorization(db, v.goalId);
+    if (digest(authorization.authorization) !== digest(v.request.frameworkAuthorization))
+      failure('CI_EVIDENCE_AUTHORIZATION_CHANGED');
+  }
   const r = (
     await db.query(
       'SELECT r.*,t.goal_id FROM runs r JOIN tasks t ON t.id=r.task_id WHERE r.id=$1',
@@ -392,12 +395,21 @@ export async function runtimeValidationRepairInputs(db:DB,goalId:string,taskIds:
       AND EXISTS(SELECT 1 FROM acceptances a WHERE a.run_id::text=v.value->>'runId' AND NOT a.passed)
     ORDER BY e.value->>'updatedAt' DESC,e.id LIMIT 1`,[goalId,taskIds,covers])).rows;
   if(!rows.length) return [];
-  const job=rows[0].value,current=await source(db,job.actionId);
+  const job=rows[0].value,current=await source(db,job.actionId,'historical_runtime_evidence');
   const body=checkedExport({...job.body,inputs:job.body.inputs.map(({id,source,...input}:any)=>input)},current);
   if(job.requestDigest!==body.requestDigest || job.resultDigest!==body.resultDigest ||
     job.criteriaDigest!==current.criteriaDigest || job.scopeDigest!==current.scopeDigest)
     failure('CI_EVIDENCE_PUBLICATION_CHANGED');
-  return job.body.inputs;
+  // This small immutable-derived input keeps historical proof useful after
+  // revocation without representing it as authority for the next candidate.
+  const note=Buffer.from(JSON.stringify({version:1,kind:'historical_candidate_ci',diagnosticOnly:true,
+    authorizesExecution:false,authorizesAcceptance:false,actionId:job.actionId,producer:body.authority.producer,
+    originalPolicyRegistrationId:current.v.request.runtimeAuthority.policyRegistration.registrationId,
+    originalPolicyDigest:current.v.request.runtimeAuthority.policyRegistration.policyDigest,receiptDigest:body.receiptDigest}));
+  const noteHash=sha('ci-diagnostic-scope:'+job.actionId),id=noteHash.slice(0,8)+'-'+noteHash.slice(8,12)+
+    '-5'+noteHash.slice(13,16)+'-8'+noteHash.slice(17,20)+'-'+noteHash.slice(20,32);
+  return [...job.body.inputs,{id,name:'ci-diagnostic-scope.json',mime:'application/json',digest:sha(note),
+    size:note.length,base64:note.toString('base64'),source:'registered_external_ci_diagnostic'}];
 }
 
 /** Durable publication is retryable because the RPC is strictly read-only.

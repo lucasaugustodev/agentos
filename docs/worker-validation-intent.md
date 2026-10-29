@@ -113,15 +113,21 @@ and request digests bind the report to this exact stopped candidate and policy.
 The registered executor and broker must independently establish this coverage;
 TypeScript never derives it from worker text or a generic `N passed` log. An older
 valid CI receipt without coverage remains real historical evidence and yields
-`CI_REQUIRED_COVERAGE_MISSING`, not acceptance. This is an intermediate limitation
-until the registered profile produces and verifies the structured report.
+`CI_REQUIRED_COVERAGE_MISSING`, not acceptance. The corresponding registered
+profile upgrade produces the Vitest JSON and a bound coverage report; the broker
+verifies those real artifacts before exporting the coverage authority. Updating
+TypeScript alone does not upgrade or authorize an older executor.
 
 Passing registered CI adds one necessary check, never overrides other criteria.
 A negative gate preserves its receipt/log and feeds existing objective repair.
 The next plan receives the most recent matching CI receipt/log as immutable
 execution inputs for the affected requirement. No artifacts are appended to the
-old attempt and no manager revision is invented. The final independent verifier
-is preserved.
+old attempt and no manager revision is invented. After policy revocation the
+original authenticated registration, intent and receipt remain readable as
+historical evidence. A separate `ci-diagnostic-scope.json` input explicitly says
+that these bytes authorize neither execution nor acceptance of the new candidate.
+Current dispatch and acceptance still reject the revoked policy. The final
+independent verifier is preserved.
 
 ## Validation plan
 

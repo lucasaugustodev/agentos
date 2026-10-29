@@ -9,8 +9,8 @@ export const canonicalValidationValue = (v:any):any => Array.isArray(v) ? v.map(
   : v && typeof v==='object' ? Object.fromEntries(Object.keys(v).sort().map(k=>[k,canonicalValidationValue(v[k])])) : v;
 export const validationDigest = (v:any) => createHash('sha256').update(JSON.stringify(canonicalValidationValue(v))).digest('hex');
 const sha = (v:Buffer) => createHash('sha256').update(v).digest('hex');
-export const requiredDatabaseTestSchema=z.object({file:z.string().regex(/^tests\/(?:[a-zA-Z0-9_-]+\/)*[a-zA-Z0-9_-]+(?:\.[a-zA-Z0-9_-]+)*\.test\.[cm]?[jt]s$/),
-  name:z.string().min(1).max(500)}).strict();
+export const requiredDatabaseTestSchema=z.object({file:z.string().max(300).regex(/^tests\/(?:[a-zA-Z0-9_-]+\/)*[a-zA-Z0-9_-]+(?:\.[a-zA-Z0-9_-]+)*\.test\.[cm]?[jt]s$/),
+  name:z.string().min(1).max(500).refine(value=>!value.includes('\0'))}).strict();
 export const workerValidationPolicySchema=z.object({version:z.literal(1),enabled:z.boolean(),
   project:z.string().regex(/^[a-z0-9_-]+$/),profile:z.literal('agentos.validate'),
   stages:z.array(z.enum(['work','integrate','verify'])).min(1).max(3),required:z.literal(true),
@@ -56,7 +56,7 @@ async function assertWorkerValidationOwner(db:DB,goalId:string,acceptedRunId?:st
 
 /** Revalidation never adopts a newer policy for an existing run. Revocation or
  * replacement fails closed; old runs without an admission snapshot stay legacy. */
-export async function verifyWorkerValidationRegistration(db:DB,run:any) {
+export async function verifyWorkerValidationRegistration(db:DB,run:any,mode:'current'|'historical_evidence'='current') {
   const raw=run.instruction_snapshot?.workerValidation;
   const parsed=registrationSchema.safeParse(raw);
   if(!parsed.success) throw Error('VALIDATION_POLICY_UNBOUND');
@@ -65,19 +65,24 @@ export async function verifyWorkerValidationRegistration(db:DB,run:any) {
     !registration.policy.enabled || !registration.policy.stages.includes(task.stage) ||
     !['harness','opencode'].includes(task.execution?.kind) ||
     validationDigest(registration.policy)!==registration.policyDigest) throw Error('VALIDATION_POLICY_UNBOUND');
-  const current=(await db.query('SELECT value FROM settings WHERE id=$1',[registration.id])).rows[0]?.value;
-  if(validationDigest(current??null)!==validationDigest(registration)) throw Error('VALIDATION_POLICY_REVOKED');
+  if(mode==='current') {
+    const current=(await db.query('SELECT value FROM settings WHERE id=$1',[registration.id])).rows[0]?.value;
+    if(validationDigest(current??null)!==validationDigest(registration)) throw Error('VALIDATION_POLICY_REVOKED');
+  }
   if(!(await db.query(`SELECT 1 FROM events WHERE kind='WORKER_VALIDATION_POLICY_REGISTERED'
     AND entity_id=$1 AND payload=$2::jsonb LIMIT 1`,[task.goal_id,JSON.stringify(registration)])).rowCount)
     throw Error('VALIDATION_POLICY_UNREGISTERED');
-  await assertWorkerValidationOwner(db,task.goal_id,run.id);
-  const framework=await frameworkProjectAuthorization(db,task.goal_id);
-  if(framework.project!==registration.policy.project) throw Error('VALIDATION_POLICY_UNBOUND');
+  const project=(await db.query('SELECT project FROM goals WHERE id=$1',[task.goal_id])).rows[0]?.project;
+  if(project!==registration.policy.project) throw Error('VALIDATION_POLICY_UNBOUND');
+  if(mode==='current') {
+    await assertWorkerValidationOwner(db,task.goal_id,run.id);
+    await frameworkProjectAuthorization(db,task.goal_id);
+  }
   return registration;
 }
 
-export async function workerValidationAuthority(db:DB,run:any) {
-  const policyRegistration=await verifyWorkerValidationRegistration(db,run);
+export async function workerValidationAuthority(db:DB,run:any,mode:'current'|'historical_evidence'='current') {
+  const policyRegistration=await verifyWorkerValidationRegistration(db,run,mode);
   const refs=(await db.query(`SELECT id,digest,size FROM artifacts WHERE run_id=$1
     AND name='validation-intent.json' ORDER BY id LIMIT 2`,[run.id])).rows;
   if(refs.length!==1 || refs[0].size>4096 || refs[0].size<1) throw Error('VALIDATION_INTENT_REQUIRED');
@@ -90,14 +95,14 @@ export async function workerValidationAuthority(db:DB,run:any) {
     snapshotDigest:validationDigest(policyRegistration)},reason:parsed.data.reason};
 }
 
-export async function verifyWorkerValidationAuthority(db:DB,value:any) {
+export async function verifyWorkerValidationAuthority(db:DB,value:any,mode:'current'|'historical_evidence'='current') {
   if(value.authority!=='runtime_artifact' || value.request?.authority!=='runtime_artifact' ||
     value.managerRunId || value.request.managerRunId || value.request.decisionProof) throw Error('VALIDATION_AUTHORITY_UNBOUND');
   const run=(await db.query('SELECT * FROM runs WHERE id=$1',[value.runId])).rows[0];
   if(!run || run.task_id!==value.taskId || run.fence!==value.runFence || run.context_id!==value.contextVersion ||
     run.attempt!==value.expectedAttempt || !['submitted','failed'].includes(run.state) || !run.finished_at)
     throw Error('VALIDATION_BINDING_STALE');
-  const proof=await workerValidationAuthority(db,run);
+  const proof=await workerValidationAuthority(db,run,mode);
   if(validationDigest(proof.authority)!==validationDigest(value.request.runtimeAuthority)) throw Error('VALIDATION_AUTHORITY_UNBOUND');
   return run;
 }
