@@ -9,6 +9,7 @@ import { assertStopped, inspectStopped } from './continuation.js';
 import { readArtifact } from './service.js';
 import { runtimeCandidateDigest } from './operation-progress.js';
 import { readDeliverySourceIdentity, sourceIdentityFrozen } from './delivery-source-resolution.js';
+import {workerValidationAuthority,verifyWorkerValidationAuthority} from './worker-validation.js';
 
 const owned = ['proposed', 'freezing', 'frozen', 'running', 'uncertain'];
 const sha = (bytes: Buffer | string) => createHash('sha256').update(bytes).digest('hex');
@@ -158,7 +159,12 @@ export async function installCandidateValidation(db: DB = pool) {
       WHERE s.id LIKE 'candidate-validation:%' AND s.value->>'taskId'=target::text
         AND s.value->>'runId'=r.id::text AND s.value->>'runFence'=r.fence::text
         AND s.value->>'contextVersion'=r.context_id::text
-        AND s.value->>'state' IN('proposed','freezing','frozen','running','uncertain')) $$;
+        AND s.value->>'state' IN('proposed','freezing','frozen','running','uncertain'))
+      OR EXISTS(SELECT 1 FROM runs r JOIN tasks t ON t.id=r.task_id
+        LEFT JOIN settings h ON h.id='worker-validation-handoff:'||r.id
+        WHERE t.id=target AND r.attempt=t.attempt_count AND r.state='submitted'
+          AND NULLIF(r.instruction_snapshot->'workerValidation','null'::jsonb) IS NOT NULL
+          AND COALESCE(h.value->>'state','pending')='pending') $$;
     CREATE OR REPLACE FUNCTION agentos_candidate_validation_guard() RETURNS trigger LANGUAGE plpgsql AS $$
     BEGIN
       PERFORM pg_advisory_xact_lock(4280001);
@@ -200,6 +206,10 @@ async function binding(db: DB, goalId: string, managerRunId: string, value: Prop
     )
   ).rowCount;
   if (!manager) throw Error('VALIDATION_MANAGER_UNAUTHORIZED');
+  return candidateTargetBinding(db,goalId,value);
+}
+
+async function candidateTargetBinding(db:DB,goalId:string,value:Proposal) {
   const framework = await frameworkProjectAuthorization(db, goalId);
   const task = (
     await db.query('SELECT * FROM tasks WHERE id=$1 AND goal_id=$2', [value.taskId, goalId])
@@ -263,6 +273,97 @@ async function binding(db: DB, goalId: string, managerRunId: string, value: Prop
   if (!sourceIdentityFrozen(current) || current.live || current.leased || current.cancelled)
     throw Error('VALIDATION_BINDING_STALE');
   return { task, run, contractDigest: current.contract_digest, ...framework };
+}
+
+async function authorizedBinding(db:DB,value:any) {
+  if(value.authority==='runtime_artifact') {
+    await verifyWorkerValidationAuthority(db,value);
+    return candidateTargetBinding(db,value.goalId,proposal(value));
+  }
+  await verifyAcceptedManagementAction(db,value.goalId,value.managerRunId,value.index,proposal(value));
+  return binding(db,value.goalId,value.managerRunId,proposal(value));
+}
+
+/** A durable handoff receipt, not another execution queue. Only current stopped
+ * submitted attempts with an admission policy may reserve the existing owner. */
+export async function reconcileWorkerValidationIntents(inspect=inspectStopped) {
+  const rows=(await pool.query(`SELECT r.id FROM runs r JOIN tasks t ON t.id=r.task_id
+    LEFT JOIN settings h ON h.id='worker-validation-handoff:'||r.id
+    WHERE r.state='submitted' AND t.state='submitted' AND r.attempt=t.attempt_count
+      AND r.instruction_snapshot->'workerValidation' IS NOT NULL
+      AND r.instruction_snapshot->'workerValidation'<>'null'::jsonb
+      AND COALESCE(h.value->>'state','pending')='pending'
+      AND COALESCE((h.value->>'nextProbeAt')::timestamptz,'epoch')<now()
+    ORDER BY r.finished_at,r.id LIMIT 20`)).rows;
+  for(const row of rows) {
+    let proof:any,observationError:string|undefined;
+    try {
+      const raw=await runtimeProposal(pool,row.id);
+      const target=await candidateTargetBinding(pool,raw.goalId,raw.value);
+      try {
+        proof=await inspect(row.id,target.task.execution.kind==='opencode');
+        assertStopped(proof,target.run,target.task);
+      } catch {observationError='STOP_UNCONFIRMED';}
+    } catch(e:any){observationError=/^[A-Z_]+$/.test(e.message)?e.message:'VALIDATION_INTENT_FORMAT';}
+    await tx(async db=>{
+      await lock(db);
+      const key='worker-validation-handoff:'+row.id;
+      const previous=(await db.query('SELECT value FROM settings WHERE id=$1 FOR UPDATE',[key])).rows[0]?.value;
+      if(previous && previous.state!=='pending') return;
+      let receipt:any={version:1,runId:row.id,state:'pending'};
+      try {
+        const raw=await runtimeProposal(db,row.id),value=raw.value;
+        const target=await candidateTargetBinding(db,raw.goalId,value);
+        const existing=(await db.query(`SELECT value FROM settings WHERE id LIKE 'candidate-validation:%'
+          AND value->>'runId'=$1 ORDER BY id LIMIT 2`,[row.id])).rows;
+        if(existing.length) {
+          if(existing.length!==1 || existing[0].value.authority!=='runtime_artifact' ||
+            existing[0].value.candidateDigest!==value.candidateDigest) throw Error('VALIDATION_OWNER_CONFLICT');
+          await verifyWorkerValidationAuthority(db,existing[0].value);
+          receipt={...receipt,state:'reserved',actionId:existing[0].value.actionId};
+        } else {
+          if(observationError) throw Error(observationError);
+          assertStopped(proof,target.run,target.task);
+          const candidate=await canonicalCandidate(db,value,proof),actionId=randomUUID();
+          const request={actionId,authority:'runtime_artifact',runtimeAuthority:raw.authority,goalId:raw.goalId,
+            ...Object.fromEntries(Object.entries(value).filter(([k])=>!['kind','reason'].includes(k))),
+            workspace:target.task.execution.workspace,contractDigest:target.contractDigest,project:target.project,
+            frameworkAuthorization:target.authorization,...candidate};
+          const job={version:1,actionId,authority:'runtime_artifact',goalId:raw.goalId,...value,
+            state:'proposed',request,proposedAt:new Date().toISOString()};
+          await db.query('INSERT INTO settings(id,value) VALUES($1,$2)',
+            ['candidate-validation:'+actionId,JSON.stringify(job)]);
+          receipt={...receipt,state:'reserved',actionId};
+          await event(db,'CANDIDATE_VALIDATION_PROPOSED',value.taskId,{actionId,goalId:raw.goalId,
+            runId:row.id,authority:'runtime_artifact',candidateDigest:value.candidateDigest,acceptance:false});
+        }
+      } catch(e:any) {
+        const code=/^[A-Z_]+$/.test(e.message)?e.message:'VALIDATION_INTENT_FORMAT';
+        // Physical uncertainty does not free ownership or manufacture failure.
+        const pending=/STOP|LIVE|INSPECT|UNCONFIRMED|TRANSPORT|PROCESS/.test(code);
+        receipt={...receipt,state:pending?'pending':'rejected',code,
+          ...(pending?{nextProbeAt:new Date(Date.now()+15000).toISOString()}: {})};
+      }
+      await db.query('INSERT INTO settings(id,value) VALUES($1,$2) ON CONFLICT(id) DO UPDATE SET value=excluded.value',
+        [key,JSON.stringify(receipt)]);
+      await event(db,'WORKER_VALIDATION_HANDOFF',row.id,receipt);
+    });
+  }
+}
+
+async function runtimeProposal(db:DB,runId:string) {
+  const run=(await db.query(`SELECT r.*,t.goal_id,t.state task_state,t.attempt_count FROM runs r
+    JOIN tasks t ON t.id=r.task_id WHERE r.id=$1`,[runId])).rows[0];
+  if(!run || run.state!=='submitted' || run.task_state!=='submitted' || run.attempt!==run.attempt_count || !run.finished_at)
+    throw Error('VALIDATION_BINDING_STALE');
+  const {authority,reason}=await workerValidationAuthority(db,run);
+  const refs=(await db.query("SELECT id,digest FROM artifacts WHERE run_id=$1 AND name='candidate.json' ORDER BY id LIMIT 2",[runId])).rows;
+  if(refs.length!==1) throw Error('VALIDATION_ARTIFACT_CHANGED');
+  const candidate=await readArtifact(refs[0].id),candidateDigest=runtimeCandidateDigest(candidate.bytes,refs[0].digest);
+  if(!candidateDigest) throw Error('VALIDATION_CANDIDATE_CHANGED');
+  return {authority,goalId:run.goal_id,value:candidateValidationSchema.parse({kind:'request_validation',
+    taskId:run.task_id,expectedAttempt:run.attempt,runId:run.id,runFence:run.fence,contextVersion:run.context_id,
+    candidateArtifactId:refs[0].id,candidateArtifactDigest:refs[0].digest,candidateDigest,reason})};
 }
 
 async function canonicalCandidate(db: DB, value: Proposal, proof: any) {
@@ -523,14 +624,7 @@ export async function reconcileCandidateValidations(
         return { value: current, mode: 'receipt' as const };
       }
       try {
-        await verifyAcceptedManagementAction(
-          db,
-          current.goalId,
-          current.managerRunId,
-          current.index,
-          proposal(current),
-        );
-        const target = await binding(db, current.goalId, current.managerRunId, proposal(current));
+        const target = await authorizedBinding(db,current);
         if (target.contractDigest !== current.request.contractDigest)
           throw Error('VALIDATION_CONTRACT_CHANGED');
         if (
@@ -555,12 +649,7 @@ export async function reconcileCandidateValidations(
     let result: any;
     try {
       if (claim.mode === 'freeze') {
-        const target = await binding(
-          pool,
-          claim.value.goalId,
-          claim.value.managerRunId,
-          proposal(claim.value),
-        );
+        const target = await authorizedBinding(pool,claim.value);
         const proof = await inspect(target.run.id, target.task.execution.kind === 'opencode');
         assertStopped(proof, target.run, target.task);
         await canonicalCandidate(pool, claim.value, proof);

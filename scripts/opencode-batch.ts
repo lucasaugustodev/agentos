@@ -24,6 +24,7 @@ import { assembleContext, hash, saveMemory } from '../server/memory.js';
 import { acceptedDependencyArtifacts } from '../server/recovery.js';
 import { observeInputFailureBounded } from '../server/input-failure-observation.js';
 import { instructionTask } from '../server/task-instructions.js';
+import {workerValidationInstruction} from '../server/worker-validation.js';
 import { runtimeInputs } from '../server/execution-inputs.js';
 import { recordOpenCodeNotStarted } from '../server/not-started.js';
 import { recordWorkerReadiness } from '../server/worker-readiness.js';
@@ -429,6 +430,7 @@ async function execute(id: string, reservation: NativeReservation) {
             task.title +
             '\n\n' +
             task.description +
+            '\n\n'+workerValidationInstruction(run)+
             (task.execution.revisionFeedback ? '\n\nRECIBOS DA PROPOSTA ANTERIOR (corrija a proposta, não repita o JSON recusado): '+JSON.stringify(task.execution.revisionFeedback) : '') +
             '\n\nINSTRUCTION MANIFEST: ' +
             JSON.stringify((context.manifest as any).taskInstructions),

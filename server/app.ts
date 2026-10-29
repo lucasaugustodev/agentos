@@ -28,6 +28,7 @@ import { chatEngine, listChats, newChat, chatDetail } from './chat.js';
 import type { WorkerEngine } from './worker.js';
 import { submitObjective, objectiveDetail, feedbackObjective } from './planner.js';
 import {registerObjectiveInput} from './objective-inputs.js';
+import {registerWorkerValidationPolicy} from './worker-validation.js';
 import {configureObjectiveReview,objectiveReviews,requestObjectiveReview} from './objective-review.js';
 import {reconcileInheritedCancellation} from './objective-state-repair.js';
 import { cycleRoutes } from './cycles/routes.js';
@@ -151,6 +152,11 @@ export function makeApp(engine?: WorkerEngine) {
   app.post('/api/objectives/:id/inputs',async req=>{
     const bearer=(req.headers.authorization??'').replace(/^Bearer /,'');
     return registerObjectiveInput(z.uuid().parse((req.params as any).id),req.body,
+      {channel:bearer&&equal(bearer,config.apiToken)?'api-token':'operator-session'});
+  });
+  app.post('/api/objectives/:id/validation-policy',async req=>{
+    const bearer=(req.headers.authorization??'').replace(/^Bearer /,'');
+    return registerWorkerValidationPolicy(z.uuid().parse((req.params as any).id),req.body,
       {channel:bearer&&equal(bearer,config.apiToken)?'api-token':'operator-session'});
   });
   app.get('/api/objectives/:id/reviews',async req=>objectiveReviews(z.uuid().parse((req.params as any).id)));

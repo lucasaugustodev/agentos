@@ -20,6 +20,7 @@ import { generationTiming } from './generation-timing.js';
 import {stageArtifactInputBundle} from './artifact-input-bundle.js';
 import {inputFailureMetadata} from './input-failure.js';
 import {analyticalPrompt,analyticalPromptCharacterLimit,promptCheckpoint} from './analytical-prompt.js';
+import {workerValidationInstruction} from './worker-validation.js';
 export {promptCheckpoint} from './analytical-prompt.js';
 
 export type RuntimeResult = {
@@ -123,6 +124,7 @@ async function executeRemoteHarness(input: RuntimeInput): Promise<RuntimeResult>
         prompt: [
           input.task.title,
           input.task.description,
+          workerValidationInstruction(input.run),
           'INSTRUCTION MANIFEST: ' +
             JSON.stringify(input.context.manifest.taskInstructions ?? null),
           'Role: ' + input.task.agent_id,

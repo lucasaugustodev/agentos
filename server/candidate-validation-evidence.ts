@@ -13,6 +13,8 @@ import {
 import { assertStopped } from './continuation.js';
 import { mergeSupervisorInputs } from './execution-inputs.js';
 import { actionSchema } from './supervision-actions.js';
+import {verifyWorkerValidationAuthority,requiredDatabaseTestSchema} from './worker-validation.js';
+import {readDeliverySourceIdentity,sourceIdentityFrozen} from './delivery-source-resolution.js';
 
 const sha = (value: Buffer | string) => createHash('sha256').update(value).digest('hex');
 const canonical = (v: any): any =>
@@ -26,7 +28,8 @@ const canonical = (v: any): any =>
         )
       : v;
 const digest = (v: any) => sha(JSON.stringify(canonical(v)));
-const registeredSha = 'e66fcf513aaa513ff2216d87556fb5dba771597dc933ca4b4b38573d8842d5b5';
+const registeredShas = ['e66fcf513aaa513ff2216d87556fb5dba771597dc933ca4b4b38573d8842d5b5',
+  '02a92158a4084a1aeb3b4c55998b6740d90428f80acb06a225730a1423ba9c26'] as const;
 const key = (id: string) => 'candidate-validation-evidence:' + id;
 const uuid = z.uuid(),
   hash = z.string().regex(/^[a-f0-9]{64}$/);
@@ -81,7 +84,11 @@ const exportSchema = z
             state: z.literal('completed'),
           })
           .strict(),
-        registeredActionSha: z.literal(registeredSha),
+        registeredActionSha: z.enum(registeredShas),
+        coverage:z.object({version:z.literal(1),source:z.literal('registered_vitest_json'),
+          profile:z.literal('agentos.validate'),candidateDigest:hash,obligationsDigest:hash,
+          reportDigest:hash,requiredTests:z.array(requiredDatabaseTestSchema.extend({
+            status:z.enum(['passed','failed','skipped','missing'])}).strict()).min(1).max(128)}).strict().optional(),
         registeredCommand: z.tuple([
           z.literal('/usr/bin/python3'),
           z.literal('/opt/agentos-control/agentos-release-action.py'),
@@ -203,7 +210,8 @@ async function source(db: DB, actionId: string) {
     )
   )
     failure('CI_EVIDENCE_NOT_COMPLETED');
-  await verifyAcceptedManagementAction(db, v.goalId, v.managerRunId, v.index, proposal(v));
+  if(v.authority==='runtime_artifact') await verifyWorkerValidationAuthority(db,v);
+  else await verifyAcceptedManagementAction(db, v.goalId, v.managerRunId, v.index, proposal(v));
   const authorization = await frameworkProjectAuthorization(db, v.goalId);
   if (digest(authorization.authorization) !== digest(v.request.frameworkAuthorization))
     failure('CI_EVIDENCE_AUTHORIZATION_CHANGED');
@@ -352,6 +360,44 @@ function checkedExport(raw: any, current: Awaited<ReturnType<typeof source>>) {
   )
     failure('CI_EVIDENCE_BYTES_CHANGED');
   return value;
+}
+
+/** Controller-only evidence can gate this exact current attempt. Historical
+ * artifacts and acceptances remain untouched; exported receipts are not worker reports. */
+export async function readRuntimeCandidateValidationEvidence(db:DB,actionId:string) {
+  const job=(await db.query('SELECT value FROM settings WHERE id=$1',[key(actionId)])).rows[0]?.value;
+  if(job?.state!=='published') return null;
+  const current=await source(db,actionId),v=current.v;
+  if(v.authority!=='runtime_artifact' || v.result.stale===true) failure('CI_EVIDENCE_AUTHORIZATION_CHANGED');
+  const target=await readDeliverySourceIdentity(db,v.taskId);
+  if(!target || !sourceIdentityFrozen(target) || target.live || target.leased || target.cancelled ||
+    target.run_id!==v.runId || target.fence!==v.runFence || target.contract_digest!==v.request.contractDigest)
+    failure('CI_EVIDENCE_PRODUCER_CHANGED');
+  const body=checkedExport({...job.body,inputs:job.body.inputs.map(({id,source,...input}:any)=>input)},current);
+  if(job.requestDigest!==body.requestDigest || job.resultDigest!==body.resultDigest ||
+    job.scopeDigest!==current.scopeDigest || job.criteriaDigest!==current.criteriaDigest ||
+    job.contextDependencyDigest!==current.contextDependencyDigest) failure('CI_EVIDENCE_PUBLICATION_CHANGED');
+  return body;
+}
+
+/** Feed a future repair through existing immutable execution inputs. This never
+ * adds artifacts to the producer or impersonates a manager's revise action. */
+export async function runtimeValidationRepairInputs(db:DB,goalId:string,taskIds:string[],covers:string[]) {
+  if(!taskIds.length || !covers.length) return [];
+  const rows=(await db.query(`SELECT e.value FROM settings e JOIN tasks t ON t.id::text=e.value->>'taskId'
+    JOIN settings v ON v.id='candidate-validation:'||(e.value->>'actionId')
+    WHERE e.id LIKE 'candidate-validation-evidence:%' AND e.value->>'state'='published'
+      AND t.goal_id=$1 AND t.id=ANY($2::uuid[]) AND t.covers ?| $3::text[]
+      AND v.value->>'authority'='runtime_artifact'
+      AND EXISTS(SELECT 1 FROM acceptances a WHERE a.run_id::text=v.value->>'runId' AND NOT a.passed)
+    ORDER BY e.value->>'updatedAt' DESC,e.id LIMIT 1`,[goalId,taskIds,covers])).rows;
+  if(!rows.length) return [];
+  const job=rows[0].value,current=await source(db,job.actionId);
+  const body=checkedExport({...job.body,inputs:job.body.inputs.map(({id,source,...input}:any)=>input)},current);
+  if(job.requestDigest!==body.requestDigest || job.resultDigest!==body.resultDigest ||
+    job.criteriaDigest!==current.criteriaDigest || job.scopeDigest!==current.scopeDigest)
+    failure('CI_EVIDENCE_PUBLICATION_CHANGED');
+  return job.body.inputs;
 }
 
 /** Durable publication is retryable because the RPC is strictly read-only.

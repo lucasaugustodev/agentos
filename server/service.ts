@@ -738,6 +738,12 @@ export async function validateTask(taskId: string, reviewer?: string) {
   const task = await readValidationSnapshot(pool, taskId, reviewer);
   if (!task)
     throw new DomainError('NOT_SUBMITTED', 'A tarefa ainda não está pronta para validação.');
+  const {workerValidationGate}=await import('./worker-validation.js');
+  const ci=await workerValidationGate(pool,task.run_id);
+  if(ci.state==='pending') return {passed:false,pending:true,checks:[{id:'registered-ci',label:'CI registrado da candidata',
+    type:'registered_ci',passed:false,detail:ci.detail}],duplicate:false};
+  if(task.receipt_match && ci.required && ci.state!=='passed' && task.accepted_passed)
+    throw new DomainError('STATE_CHANGED','A prova de CI perdeu autoridade; o aceite histórico foi preservado.');
   if (task.receipt_match)
     return { passed: task.accepted_passed!, checks: task.accepted_checks!, duplicate: true };
   if (task.state !== 'submitted')
@@ -752,6 +758,8 @@ export async function validateTask(taskId: string, reviewer?: string) {
     detail: string;
     evidence?: ReturnType<typeof verifyRepairSourceProof> & { patchArtifactId: string; reportArtifactId: string };
   }> = [];
+  if(ci.required) checks.push({id:'registered-ci',label:'CI registrado da candidata',type:'registered_ci',
+    passed:ci.state==='passed',detail:ci.detail});
   for (const c of task.criteria as Criterion[]) {
     let passed = false,
       detail = '';
@@ -803,6 +811,9 @@ export async function validateTask(taskId: string, reviewer?: string) {
     const fresh = await readValidationSnapshot(db, taskId, reviewer);
     if (!fresh || fresh.validation_key !== task.validation_key)
       throw new DomainError('STATE_CHANGED', 'A tentativa, contrato ou evidência mudou durante a validação.');
+    const freshCi=await workerValidationGate(db,fresh.run_id);
+    if(JSON.stringify(freshCi)!==JSON.stringify(ci))
+      throw new DomainError('STATE_CHANGED','A autoridade ou evidência de CI mudou durante a validação.');
     // Another validator may have completed while this call was reading bytes.
     if (fresh.receipt_match)
       return { passed: fresh.accepted_passed!, checks: fresh.accepted_checks!, duplicate: true };
@@ -843,6 +854,14 @@ export async function validateTask(taskId: string, reviewer?: string) {
       validationKey: fresh.validation_key,
       acceptanceId,
     });
+    if(!passed && ci.required && ci.state==='failed' &&
+      (await db.query('SELECT 1 FROM objectives WHERE id=$1',[task.goal_id])).rowCount) {
+      const {queueFeedback}=await import('./planner.js');
+      await queueFeedback(db,task.goal_id,'registered-ci:'+task.run_id+':'+fresh.validation_key,
+        'Registered candidate CI did not satisfy acceptance: '+ci.detail+
+        '. Correct the specific failure and preserve the original criteria. '+
+        (ci.actionId?'Canonical CI action '+ci.actionId+' supplies immutable receipt/log inputs to the repair.':'No registered CI was dispatched; correct the declared intent/policy handoff.'),[taskId]);
+    }
     await refreshGoal(db, task.goal_id);
     if (passed) {
       await db.query(

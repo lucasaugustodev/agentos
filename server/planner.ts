@@ -573,7 +573,10 @@ export async function applyPlannedResult(run: any, plan: ProposedPlan) {
       const ids = new Map(plan.tasks.map((t) => [t.key, randomUUID()]));
       const operatorInputs=await readObjectiveInputs(db,run.objective_id);
       for (const t of plan.tasks) {
-        const inputs=inputsForRequirements(operatorInputs,t.covers);
+        const {runtimeValidationRepairInputs}=await import('./candidate-validation-evidence.js');
+        const {mergeSupervisorInputs}=await import('./execution-inputs.js');
+        const inputs=mergeSupervisorInputs(inputsForRequirements(operatorInputs,t.covers),
+          await runtimeValidationRepairInputs(db,run.objective_id,replace,t.covers));
         const execution = {
           ...executionSpec(run.objective_id, revision, t, plan),
           revisionFeedback: run.feedback,
