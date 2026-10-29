@@ -207,6 +207,20 @@ it('cannot complete with unconsumed feedback and reopens a completed objective w
   expect((await pool.query('SELECT state FROM goals WHERE id=$1',[objectiveId])).rows[0].state).toBe('active');
   expect((await pool.query('SELECT count(*) FROM acceptances WHERE passed=true')).rows[0].count).toBe('6');
 });
+it('completes when the only unconsumed feedback was superseded by a later completed plan',async()=>{
+  const {objectiveId,input,plan}=await start();
+  // Legacy zombie: old feedback referenced only by a terminally failed run,
+  // with completed plans created after it. This mirrors the deployed repair.
+  await feedbackObjective(objectiveId,'legacy-zombie','Old counterexample superseded by completed planning revisions.');
+  const zombie=(await pool.query("SELECT id FROM objective_feedback WHERE objective_id=$1 AND trigger_key='legacy-zombie'",[objectiveId])).rows[0];
+  await pool.query("UPDATE objective_feedback SET created_at=now()-interval '2 days' WHERE id=$1",[zombie.id]);
+  await pool.query("INSERT INTO planning_runs(id,objective_id,base_revision,trigger_key,state,fence,feedback,created_at) VALUES($1,$2,1,'feedback:legacy-zombie','failed',$3,$4,now()-interval '2 days')",[randomUUID(),objectiveId,randomUUID(),JSON.stringify({feedbackIds:[zombie.id],reports:['legacy'],acceptedCount:0})]);
+  await acceptBatch(objectiveId,1);await reconcilePlanning();
+  const run=await claimPlanning();await applyPlannedResult(run,compileDelivery(decision('req-2'),input,plan,true));
+  await acceptBatch(objectiveId,2);
+  await tx(async db=>{await lock(db);await refreshGoal(db,objectiveId);});
+  expect((await pool.query('SELECT state FROM goals WHERE id=$1',[objectiveId])).rows[0].state).toBe('completed');
+});
 it('fails visibly instead of silently truncating feedback beyond the existing task context limit',()=>{
   expect(()=>compileDelivery(decision(),request(),undefined,false,['x'.repeat(21000)])).toThrowError(expect.objectContaining({code:'REQUIRED_CONTEXT'}));
 });
