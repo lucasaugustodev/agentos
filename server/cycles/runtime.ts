@@ -176,6 +176,7 @@ export async function runCycleAgent(
       'worker.execute',
       {
         runId: a.id,
+        runFence: a.fence,
         workspace,
         profile: 'code',
         managed: true,
@@ -188,7 +189,10 @@ export async function runCycleAgent(
       },
       {
         signal,
-        timeout: 3600000,
+        // Match ordinary workers: real model/tool progress renews inactivity.
+        // Heartbeats and queue notifications do not count as progress, and a
+        // timeout still requires confirmed remote termination before recovery.
+        idleTimeout: 60 * 60 * 1000,
         onEvent: (k, p) => {
           events = events.then(() => onEvent(k, clean(p)));
         },
