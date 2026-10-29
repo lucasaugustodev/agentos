@@ -64,7 +64,9 @@ def verified_coverage(request, output, executor_sha):
             recorded.get('executorSha256') != executor_sha):
         fail('RECEIPT_UNBOUND')
     action = str(uuid.UUID(request['actionId']))
-    root = pathlib.PurePosixPath('/var/lib/agentos-build') / action
+    # Structured coverage is issued only by the hardened registered executor.
+    # Legacy releases did not attest required DB cases; no old path is upgraded.
+    root = pathlib.PurePosixPath('/var/lib/agentos-validation-builds') / action
     if (coverage.get('version') != 1 or coverage.get('profile') != 'agentos.validate' or
             coverage.get('source') != 'registered_vitest_json' or
             coverage.get('candidateDigest') != request['candidateDigest'] or

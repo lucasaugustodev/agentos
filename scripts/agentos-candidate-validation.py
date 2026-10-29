@@ -198,8 +198,8 @@ def execution_registration():
     layout = provenance.Layout()
     actual = sha(provenance.read(REGISTERED))
     if actual == REGISTERED_HASH and not layout.registry.exists():
-        return {'registeredActionSha': REGISTERED_HASH}
-    identity = provenance.active_registration(layout)
+        raise ValueError('VALIDATOR_EXECUTOR_HISTORICAL_ONLY')
+    identity = provenance.active_registration(layout, for_execution=True)
     record = provenance.registration_record(layout, identity)
     return {'registeredActionSha': record['executorSha256'], 'executionRegistration': identity}
 
@@ -323,20 +323,44 @@ def inspect_published_baseline():
     """Fixed, read-only baseline tuple consumed by the rebase inspector."""
     return published_source_manifest()
 
-def execute(request, directory, frozen_id, executor=None, baseline=None):
+def validation_stopped(request):
+    action = str(uuid.UUID(request['actionId']))
+    unit = 'agentos-validation-' + action + '.service'
+    group = '/system.slice/' + unit
+    try:
+        result = subprocess.run(['systemctl','show',unit,'--property=LoadState,ActiveState,MainPID,ControlGroup'],
+                                check=True,capture_output=True,text=True,timeout=5)
+        values = dict(line.split('=',1) for line in result.stdout.splitlines() if '=' in line)
+        if (values.get('LoadState') not in ['loaded','not-found'] or values.get('ActiveState') not in ['inactive','failed'] or
+                values.get('MainPID') != '0' or values.get('ControlGroup') not in ['',group]):
+            raise ValueError('VALIDATION_STOP_UNCONFIRMED')
+        events = pathlib.Path('/sys/fs/cgroup'+group+'/cgroup.events')
+        if events.exists():
+            if not re.search(r'^populated 0$',events.read_text(),re.M): raise ValueError('VALIDATION_STOP_UNCONFIRMED')
+        elif values.get('ControlGroup'):
+            raise ValueError('VALIDATION_STOP_UNCONFIRMED')
+        return {'unit':unit,'mainPID':0,'controlGroup':values.get('ControlGroup'),'populated':False,
+                'activeState':values['ActiveState'],'loadState':values['LoadState']}
+    except (OSError,subprocess.SubprocessError,ValueError):
+        raise ValueError('VALIDATION_STOP_UNCONFIRMED')
+
+
+def execute(request, directory, frozen_id, executor=None, baseline=None, stop_probe=None):
     if executor is not None:  # Isolated tests supply a process, never the CLI.
-        return execute_bound(request, directory, frozen_id, executor, baseline)
+        return execute_bound(request, directory, frozen_id, executor, baseline, stop_probe)
     with provenance.execution_lock(provenance.Layout()):
         profile = registered_profile()
         identity = execution_registration()
         return execute_bound(request, directory, frozen_id, profile, (baseline or {}) | identity)
 
-def execute_bound(request, directory, frozen_id, executor=None, baseline=None):
+def execute_bound(request, directory, frozen_id, executor=None, baseline=None, stop_probe=None):
     # This started marker is fsynced BEFORE crossing the command boundary.
     # A killed owner is uncertain and cannot authorize a second invocation.
     file = directory / 'receipt.json'
     started = {'version': 1, 'actionId': request['actionId'], 'requestDigest': sha(canonical(request)), 'state': 'running', 'candidateDigest': request['candidateDigest'], 'validatedCandidateDigest': request['candidateDigest'], 'frozenWorkspace': frozen_id, **(baseline or {})}
     atomic(file, started)
+    invoked = False
+    stop_proof = None
     try:
         profile = registered_profile() if executor is None else executor
         parameters = {'workspace': frozen_id}
@@ -346,10 +370,20 @@ def execute_bound(request, directory, frozen_id, executor=None, baseline=None):
                 'candidateDigest':request['candidateDigest'],
                 'requiredDatabaseTests':request['runtimeAuthority']['policyRegistration']['policy']['requiredDatabaseTests']}
         payload = {'occurrenceId': request['actionId'], 'attemptId': request['actionId'], 'parameters': parameters, 'results': []}
+        invoked = True
         completed = subprocess.run([profile['command'], *profile['args']], input=json.dumps(payload), capture_output=True, text=True, timeout=1900)
+        # A child guard's exit (including SIGKILL or malformed output) says
+        # nothing about the systemd CI unit. Probe that exact unit independently.
+        stop_proof = (stop_probe or validation_stopped)(request)
         if completed.returncode != 0:
             refusal = re.search(r'^ValueError: ([A-Z_]+)$', completed.stderr.strip())
-            result = {'state': 'failed', 'code': 'VALIDATION_COMMAND_FAILED', 'exitCode': completed.returncode, 'passed': False,
+            stop_unconfirmed = bool(refusal and refusal.group(1) == 'VALIDATION_STOP_UNCONFIRMED')
+            # An abruptly terminated guard may leave a systemd-run client
+            # that has not dispatched yet. A momentarily absent unit does not
+            # prove that launcher quiescence; never release this ownership.
+            result = {'state': 'uncertain',
+                      'code': 'VALIDATION_STOP_UNCONFIRMED' if stop_unconfirmed else 'VALIDATION_GUARD_INTERRUPTED',
+                      'exitCode': completed.returncode, 'passed': False,
                       **({'executorCode': refusal.group(1)} if refusal else {})}
         else:
             output = json.loads(completed.stdout)
@@ -364,9 +398,16 @@ def execute_bound(request, directory, frozen_id, executor=None, baseline=None):
         result = {'state': 'uncertain', 'code': 'VALIDATION_COMMAND_TIMEOUT', 'passed': False}
     except ValueError as error:
         safe_code = str(error) if re.fullmatch('[A-Z_]+',str(error)) else 'VALIDATION_RESULT_FORMAT'
-        result = {'state': 'failed', 'code': 'VALIDATION_EXECUTOR_FAILED', 'executorCode': safe_code, 'passed': False}
+        uncertain = invoked
+        result = {'state': 'uncertain' if uncertain else 'failed',
+                  'code': ('VALIDATION_STOP_UNCONFIRMED' if safe_code == 'VALIDATION_STOP_UNCONFIRMED' else 'VALIDATION_EXECUTOR_UNCERTAIN') if uncertain else 'VALIDATION_EXECUTOR_FAILED',
+                  'executorCode': safe_code, 'passed': False}
     except (KeyError, OSError):
-        result = {'state': 'failed', 'code': 'VALIDATION_EXECUTOR_FAILED', 'passed': False}
+        uncertain = invoked
+        result = {'state': 'uncertain' if uncertain else 'failed',
+                  'code': 'VALIDATION_STOP_UNCONFIRMED' if uncertain else 'VALIDATION_EXECUTOR_FAILED', 'passed': False}
+    if stop_proof is not None:
+        result['validationStopProof'] = stop_proof
     atomic(file, started | result)
     return started | result
 

@@ -22,11 +22,20 @@ REVIEWED_SHA = '02a92158a4084a1aeb3b4c55998b6740d90428f80acb06a225730a1423ba9c26
 REVIEWED_COMMIT = 'd52ef6b603e637bf301ac1ab0360a72dfd6912a6'
 # A later executor requires a reviewed code change adding its exact public
 # source identity here. Neither CLI input nor a writable registry can add one.
-REVIEWED_EXECUTORS = {
-    REVIEWED_SHA: REVIEWED_COMMIT,
-    '31e7aa59d7b11f3552cfd8499481c727e4a8b316fc5b952e45839ba3df2a9c72':
-        '708a0670c99bcd57f5d7353e8aabf02b276fca7e',
+HISTORICAL_EXECUTORS = {REVIEWED_SHA: REVIEWED_COMMIT}
+# Only complete reviewed bundles are admissible for new execution. Historical
+# scripts remain identifiable without becoming eligible for re-registration.
+REVIEWED_BUNDLES = {
+    '640557b086101b38566fbb9dd1361015f9e22ac31e5526caa43d7b176c1a6abe': {
+        'sourceCommit':'502d01c624cef75625bb1a935fa69173ca386869',
+        'files':{
+            'agentos-release-action.py':'640557b086101b38566fbb9dd1361015f9e22ac31e5526caa43d7b176c1a6abe',
+            'candidate_origin.py':'742212cdc76a1404418ad9fa0b57215d377eea4433f77bc2cd29eed9e2a27e6f',
+        },
+    },
 }
+REVIEWED_EXECUTORS = {**HISTORICAL_EXECUTORS,
+                      **{key:value['sourceCommit'] for key,value in REVIEWED_BUNDLES.items()}}
 # Exact legacy bytes with only __pycache__ excluded from digest. It is a
 # permitted migration preimage, never an executor authorized for new CI.
 PARTIAL_PREIMAGE = '783eee1dac521a54a351032c73f3335b7a322ab6419c50bd6ce4fc8fec69dbd3'
@@ -45,6 +54,8 @@ class Layout:
         self.releases = self.root / 'opt/agentos/releases'
         self.receipts = self.root / 'var/lib/agentos/releases'
         self.builds = self.root / 'var/lib/agentos-build'
+        self.validation_builds = self.root / 'var/lib/agentos-validation-builds'
+        self.operator_records = self.root / 'var/lib/agentos-operator-releases'
         self.broker = self.root / 'var/lib/agentos-bridge/candidate-validations'
         self.control = self.root / 'opt/agentos-control/agentos-release-action.py'
         self.registry = self.root / 'opt/agentos-control/validator-registrations'
@@ -218,13 +229,29 @@ def operator_proof(layout, current, directory):
     record, r = document(layout.receipts / (occurrence + '.json'))
     if published.get('ok') is not True or published.get('output') != record:
         fail('VALIDATOR_PUBLICATION_RECEIPT_MISMATCH')
-    complete_output(validated, layout.builds / attempt / '.local-test/vitest-results.json')
     base = record_matches(layout, current, record, validated.get('output', {}))
     if str(base) != vi.get('base'):
         fail('VALIDATOR_OPERATOR_INTENT_CHANGED')
-    executor = sha(read(base / 'scripts/agentos-release-action.py'))
-    if executor != LEGACY_SHA and executor not in REVIEWED_EXECUTORS:
-        fail('VALIDATOR_HISTORICAL_EXECUTOR_UNREVIEWED')
+    declared = vi.get('executor')
+    modern = 'executorSha256' in validated.get('output', {})
+    if modern or declared is not None or pi.get('executor') is not None:
+        if not isinstance(declared, dict) or set(declared) != {'path','sha256','sourceCommit','registration'} or pi.get('executor') != declared:
+            fail('VALIDATOR_OPERATOR_EXECUTOR_UNBOUND')
+        executor = declared['sha256']
+        if (executor not in REVIEWED_BUNDLES or declared.get('sourceCommit') != REVIEWED_EXECUTORS.get(executor) or
+                pathlib.Path(declared.get('path','')) != layout.control or
+                validated.get('output',{}).get('executorSha256') != executor):
+            fail('VALIDATOR_OPERATOR_EXECUTOR_UNBOUND')
+        registered = registration_record(layout, declared['registration'])
+        if (registered['executorSha256'] != executor or registered.get('version') != 2 or
+                registered.get('installedAt', float('inf')) > record['validatedAt']):
+            fail('VALIDATOR_OPERATOR_EXECUTOR_UNBOUND')
+    else:
+        # Only legacy receipts without modern identity use the historical base.
+        executor = sha(read(base / 'scripts/agentos-release-action.py'))
+        if executor != LEGACY_SHA and executor not in HISTORICAL_EXECUTORS:
+            fail('VALIDATOR_HISTORICAL_EXECUTOR_UNREVIEWED')
+    complete_output(validated, (layout.validation_builds if executor in REVIEWED_BUNDLES else layout.builds) / attempt / '.local-test/vitest-results.json')
     executor_artifacts(validated, executor)
     for action, timestamp in [('validate', record['validatedAt']), ('publish', record['publishedAt'])]:
         if (directory / (action + '.intent.json')).stat().st_mtime > timestamp + 2 or (directory / (action + '.receipt.json')).stat().st_mtime + 2 < timestamp:
@@ -241,30 +268,95 @@ def registration_record(layout, identity):
     record, ref = document(layout.registry / (rid + '.json'))
     if ref['sha256'] != identity['registrationDigest']:
         fail('VALIDATOR_REGISTRATION_CHANGED')
-    if (record.get('version') != 1 or record.get('kind') != 'reviewed_validator_transition' or
+    if (record.get('version') not in (1,2) or record.get('kind') != 'reviewed_validator_transition' or
             record.get('registrationId') != rid or record.get('executorSha256') not in REVIEWED_EXECUTORS or
             record.get('sourceCommit') != REVIEWED_EXECUTORS.get(record.get('executorSha256')) or record.get('state') != 'installed' or
             record.get('previousExecutorSha256') not in {LEGACY_SHA, PARTIAL_PREIMAGE, *REVIEWED_EXECUTORS}):
         fail('VALIDATOR_REGISTRATION_INVALID')
-    for evidence in record.get('publicationEvidence', {}).get('evidence', []):
-        if sha(read(evidence['path'])) != evidence['sha256']:
-            fail('VALIDATOR_REGISTRATION_EVIDENCE_CHANGED')
-    if not record.get('publicationEvidence', {}).get('evidence'):
+    evidence = record.get('publicationEvidence', {}).get('evidence', [])
+    if not evidence:
         fail('VALIDATOR_REGISTRATION_EVIDENCE_MISSING')
+    if record['version'] == 1:
+        if record['executorSha256'] not in HISTORICAL_EXECUTORS:
+            fail('VALIDATOR_REGISTRATION_INVALID')
+        for ref in evidence:
+            if sha(read(ref['path'])) != ref['sha256']:
+                fail('VALIDATOR_REGISTRATION_EVIDENCE_CHANGED')
+    else:
+        bundle = REVIEWED_BUNDLES.get(record['executorSha256'])
+        if (not bundle or record.get('bundleManifest') != bundle['files'] or
+                record.get('bundleDigest') != sha(canonical(bundle['files'])) or
+                record.get('sourceKind') not in ('published_runtime','reviewed_public_source')):
+            fail('VALIDATOR_REGISTRATION_BUNDLE_INVALID')
+        validate_archives(layout, rid, record.get('evidenceArchive'), evidence)
+        source_evidence = record.get('sourceEvidence', [])
+        if (len(source_evidence) != len(bundle['files']) or
+                {ref.get('name'):ref.get('sha256') for ref in source_evidence} != bundle['files']):
+            fail('VALIDATOR_REGISTRATION_SOURCE_CHANGED')
+        validate_archives(layout, rid, record.get('sourceArchive'), source_evidence)
     intent, intent_ref = document(layout.registry / (rid + '.intent.json'))
     if (intent_ref['sha256'] != record.get('intentSha256') or intent.get('registrationId') != rid or
             intent.get('expectedRegisteredSha256') != record['previousExecutorSha256'] or
             intent.get('expectedReleaseDigest') != record['publicationEvidence'].get('release', {}).get('digest') or
             intent.get('expectedPublicationProofDigest') != sha(canonical(record['publicationEvidence']))):
         fail('VALIDATOR_REGISTRATION_INTENT_CHANGED')
+    if record.get('sourceKind') == 'reviewed_public_source' and (
+            intent.get('executorSha256') != record['executorSha256'] or intent.get('sourceCommit') != record['sourceCommit']):
+        fail('VALIDATOR_REGISTRATION_INTENT_CHANGED')
     return record
 
 
-def active_registration(layout):
+def validate_archives(layout, rid, archives, originals):
+    if not isinstance(archives,list) or len(archives) != len(originals):
+        fail('VALIDATOR_REGISTRATION_ARCHIVE_MISSING')
+    expected = {(item['path'],item['sha256']) for item in originals}
+    actual = set()
+    for item in archives:
+        if set(item) != {'path','sha256','archivedPath'}:
+            fail('VALIDATOR_REGISTRATION_ARCHIVE_INVALID')
+        path = pathlib.Path(item['archivedPath'])
+        if path != layout.registry/(rid+'.evidence')/(item['sha256']+'.blob'):
+            fail('VALIDATOR_REGISTRATION_ARCHIVE_INVALID')
+        if sha(read(path)) != item['sha256']:
+            fail('VALIDATOR_REGISTRATION_EVIDENCE_CHANGED')
+        actual.add((item['path'],item['sha256']))
+    if actual != expected or len(actual) != len(archives):
+        fail('VALIDATOR_REGISTRATION_ARCHIVE_INVALID')
+
+
+def preserve_evidence(layout, rid, refs):
+    folder = layout.registry/(rid+'.evidence')
+    folder.mkdir(mode=0o700, exist_ok=True)
+    protected(folder, directory=True)
+    archived = []
+    for ref in refs:
+        raw = read(ref['path'])
+        if sha(raw) != ref['sha256']:
+            fail('VALIDATOR_REGISTRATION_EVIDENCE_CHANGED')
+        dest = folder/(ref['sha256']+'.blob')
+        if dest.exists():
+            if read(dest) != raw:
+                fail('VALIDATOR_REGISTRATION_EVIDENCE_CHANGED')
+        else:
+            atomic(dest, raw)
+        archived.append({'path':ref['path'],'sha256':ref['sha256'],'archivedPath':str(dest)})
+    return archived
+
+
+def verify_installed_bytes(layout, record):
+    manifest = record.get('bundleManifest', {'agentos-release-action.py':record['executorSha256']})
+    for name, expected in manifest.items():
+        if sha(read(layout.control.parent / name)) != expected:
+            fail('VALIDATION_EXECUTOR_CHANGED')
+
+
+def active_registration(layout, required_executor=None, for_execution=False):
     pointer, _ = document(layout.registry / 'current.json')
     record = registration_record(layout, pointer)
-    if sha(read(layout.control)) != record['executorSha256']:
-        fail('VALIDATION_EXECUTOR_CHANGED')
+    if ((required_executor is not None and record['executorSha256'] != required_executor) or
+            (for_execution and record['executorSha256'] not in REVIEWED_BUNDLES)):
+        fail('VALIDATOR_EXECUTOR_HISTORICAL_ONLY')
+    verify_installed_bytes(layout, record)
     return pointer
 
 
@@ -285,7 +377,7 @@ def broker_proof(layout, current, directory):
     registration = registration_record(layout, receipt.get('executionRegistration', {}))
     if registration['executorSha256'] != receipt['registeredActionSha']:
         fail('VALIDATOR_BROKER_RECEIPT_UNBOUND')
-    complete_output(result, layout.builds / action / '.local-test/vitest-results.json')
+    complete_output(result, (layout.validation_builds if receipt['registeredActionSha'] in REVIEWED_BUNDLES else layout.builds) / action / '.local-test/vitest-results.json')
     executor_artifacts(result, receipt['registeredActionSha'])
     record, rr = document(layout.receipts / (action + '.json'))
     record_matches(layout, current, record, result.get('output', {}))
@@ -300,8 +392,13 @@ def publication(layout):
     action_sha = sha(read(current / 'scripts/agentos-release-action.py'))
     if action_sha not in REVIEWED_EXECUTORS:
         return None  # Legacy publication parser retains its existing contract.
+    if action_sha in REVIEWED_BUNDLES:
+        for name, expected in REVIEWED_BUNDLES[action_sha]['files'].items():
+            if sha(read(current/'scripts'/name)) != expected:
+                fail('VALIDATOR_PUBLISHED_BUNDLE_CHANGED')
     found = []
-    for path in sorted(layout.builds.glob('*/publish.receipt.json')):
+    operator_paths = [*layout.builds.glob('*/publish.receipt.json'), *layout.operator_records.glob('*/publish.receipt.json')]
+    for path in sorted(operator_paths):
         try:
             advertised, _ = document(path)
         except (OSError, ValueError):
@@ -351,7 +448,7 @@ def atomic(path, raw):
 def locks(layout):
     with contextlib.ExitStack() as stack:
         for path in [layout.control.parent / 'validator-registration.lock',
-                     layout.receipts / 'publication.lock', layout.builds / 'validation.lock']:
+                     layout.receipts / 'publication.lock', layout.validation_builds / 'validation.lock']:
             protected(path.parent, directory=True)
             fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
             handle = stack.enter_context(os.fdopen(fd, 'a'))
@@ -382,26 +479,64 @@ def register(layout, request, after_replace=None):
     """
     if os.geteuid() != OWNER_UID:
         fail('VALIDATOR_REGISTRATION_PRIVILEGE_REQUIRED')
-    if set(request) != {'registrationId', 'expectedRegisteredSha256', 'expectedReleaseDigest', 'expectedPublicationProofDigest'}:
+    basic = {'registrationId', 'expectedRegisteredSha256', 'expectedReleaseDigest', 'expectedPublicationProofDigest'}
+    reviewed_source = set(request) == basic | {'executorSha256','sourceCommit'}
+    if not reviewed_source and set(request) != basic:
         fail('VALIDATOR_REGISTRATION_REQUEST_INVALID')
     rid = str(uuid.UUID(request['registrationId']))
     if request['expectedRegisteredSha256'] not in {LEGACY_SHA, PARTIAL_PREIMAGE, *REVIEWED_EXECUTORS}:
         fail('VALIDATOR_REGISTRATION_PREIMAGE_UNREVIEWED')
     protected(layout.control.parent, directory=True)
+    layout.validation_builds.mkdir(mode=0o711, exist_ok=True)
+    protected(layout.validation_builds, directory=True)
     with locks(layout):
         for path in layout.broker.glob('*/receipt.json'):
             prior, _ = document(path)
             if prior.get('state') in ('running', 'uncertain'):
                 fail('VALIDATOR_REGISTRATION_EXECUTION_UNCERTAIN')
+        intent_path = layout.registry / (rid + '.intent.json')
+        record_path = layout.registry / (rid + '.json')
+        if record_path.exists():
+            # Lost replies reconcile the installed transition, even after a
+            # later publication. They never roll a newer pointer backwards.
+            intent, _ = document(intent_path)
+            if intent != request:
+                fail('VALIDATOR_REGISTRATION_IDEMPOTENCY_CONFLICT')
+            record, ref = document(record_path)
+            pointer = {'version':1,'registrationId':rid,'registrationDigest':ref['sha256']}
+            registration_record(layout, pointer)
+            if (layout.registry/'current.json').exists():
+                current, _ = document(layout.registry/'current.json')
+                if current != pointer:
+                    fail('VALIDATOR_REGISTRATION_SUPERSEDED')
+            verify_installed_bytes(layout, record)
+            atomic(layout.registry/'current.json', canonical(pointer))
+            return pointer
         proof = publication(layout)
         if (not proof or proof['release']['digest'] != request['expectedReleaseDigest'] or
                 sha(canonical(proof)) != request['expectedPublicationProofDigest']):
             fail('VALIDATOR_REGISTRATION_PROOF_CHANGED')
-        target = read(pathlib.Path(proof['release']['candidate']) / 'scripts/agentos-release-action.py')
-        target_sha = sha(target)
-        if target_sha not in REVIEWED_EXECUTORS:
+        if reviewed_source:
+            target_sha = request.get('executorSha256')
+            bundle = REVIEWED_BUNDLES.get(target_sha)
+            if not bundle or request.get('sourceCommit') != bundle['sourceCommit']:
+                fail('VALIDATOR_REGISTRATION_SOURCE_UNREVIEWED')
+            source = layout.control.parent/'reviewed-validator-bundles'/target_sha
+            source_kind = 'reviewed_public_source'
+        else:
+            source = pathlib.Path(proof['release']['candidate'])/'scripts'
+            target_sha = sha(read(source/'agentos-release-action.py'))
+            bundle = REVIEWED_BUNDLES.get(target_sha)
+            source_kind = 'published_runtime'
+        if not bundle:
             fail('VALIDATOR_REGISTRATION_SOURCE_UNREVIEWED')
-        intent_path = layout.registry / (rid + '.intent.json')
+        if (set(bundle['files']) != {'agentos-release-action.py','candidate_origin.py'} or
+                bundle['files']['agentos-release-action.py'] != target_sha):
+            fail('VALIDATOR_REGISTRATION_BUNDLE_INVALID')
+        source_bytes = {name:read(source/name) for name in bundle['files']}
+        if {name:sha(raw) for name,raw in source_bytes.items()} != bundle['files']:
+            fail('VALIDATOR_REGISTRATION_SOURCE_CHANGED')
+        source_evidence = [{'name':name,'path':str(source/name),'sha256':bundle['files'][name]} for name in sorted(bundle['files'])]
         existing = intent_path.exists()
         if existing:
             intent, _ = document(intent_path)
@@ -418,23 +553,23 @@ def register(layout, request, after_replace=None):
         actual = sha(read(layout.control))
         if actual not in (request['expectedRegisteredSha256'], target_sha):
             fail('VALIDATOR_REGISTRATION_PREIMAGE_CHANGED')
-        record_path = layout.registry / (rid + '.json')
-        if record_path.exists():
-            record, ref = document(record_path)
-            pointer = {'version': 1, 'registrationId': rid, 'registrationDigest': ref['sha256']}
-            registration_record(layout, pointer)
-            if actual != target_sha:
-                fail('VALIDATION_EXECUTOR_CHANGED')
-            atomic(layout.registry / 'current.json', canonical(pointer))
-            return pointer
-        if actual != target_sha:
-            atomic(layout.control, target)
+        evidence_archive = preserve_evidence(layout, rid, proof['evidence'])
+        source_archive = preserve_evidence(layout, rid, source_evidence)
+        # Install dependency before the entrypoint. Incomplete installation
+        # fails the guard's literal module hash or its installed-bundle check.
+        for name in ['candidate_origin.py','agentos-release-action.py']:
+            destination = layout.control.parent/name
+            if not destination.exists() or read(destination) != source_bytes[name]:
+                atomic(destination, source_bytes[name])
         if after_replace:
             after_replace()  # Test-only interruption point, never CLI supplied.
-        record = {'version': 1, 'kind': 'reviewed_validator_transition', 'state': 'installed',
+        record = {'version': 2, 'kind': 'reviewed_validator_transition', 'state': 'installed',
                   'registrationId': rid, 'installedAt': time.time(), 'sourceCommit': REVIEWED_EXECUTORS[target_sha],
                   'previousExecutorSha256': request['expectedRegisteredSha256'],
                   'executorSha256': target_sha, 'publicationEvidence': proof,
+                  'sourceKind':source_kind,'sourceEvidence':source_evidence,
+                  'bundleManifest':bundle['files'],'bundleDigest':sha(canonical(bundle['files'])),
+                  'evidenceArchive':evidence_archive,'sourceArchive':source_archive,
                   'intentSha256': sha(canonical(request))}
         atomic(record_path, canonical(record))
         pointer = {'version': 1, 'registrationId': rid, 'registrationDigest': sha(canonical(record))}
@@ -449,7 +584,7 @@ def main():
         proof = publication(layout)
         print(json.dumps({'publication': proof, 'publicationProofDigest': sha(canonical(proof)),
                           'registeredExecutorSha256': sha(read(layout.control)),
-                          'reviewedExecutorSha256': REVIEWED_SHA, 'sourceCommit': REVIEWED_COMMIT}))
+                          'admissibleExecutors': {key:value['sourceCommit'] for key,value in REVIEWED_BUNDLES.items()}}))
     elif sys.argv[1:] == ['register']:
         print(json.dumps(register(layout, json.load(sys.stdin))))
     else:

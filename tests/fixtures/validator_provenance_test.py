@@ -5,6 +5,7 @@ import importlib.util
 import json
 import os
 import pathlib
+import shutil
 import tempfile
 import time
 import unittest
@@ -28,6 +29,11 @@ class ValidatorProvenanceTests(unittest.TestCase):
         self.protection = patch.object(p, 'PROTECTION_ROOT', self.root); self.protection.start()
         self.reviewed = (ROOT/'tests/fixtures/release-action-d52ef6b.txt').read_bytes()
         self.assertEqual(p.sha(self.reviewed), p.REVIEWED_SHA)
+        self.helper = (ROOT/'scripts/candidate_origin.py').read_bytes()
+        # Test-only reviewed fixture bundle; production never admits legacy02a.
+        self.bundles = patch.object(p,'REVIEWED_BUNDLES',{p.REVIEWED_SHA:{'sourceCommit':p.REVIEWED_COMMIT,
+            'files':{'agentos-release-action.py':p.REVIEWED_SHA,'candidate_origin.py':p.sha(self.helper)}}})
+        self.bundles.start()
         self.legacy = self.reviewed.replace(
             b'  # Keep this contract identical to workerSourceDigest: generated Python caches\n'
             b'  # are mutable runtime data; source, documentation and built assets are signed.\n', b'')
@@ -44,6 +50,7 @@ class ValidatorProvenanceTests(unittest.TestCase):
         self.occurrence = str(uuid.uuid4()); self.attempt = str(uuid.uuid4())
         self.current = self.layout.releases/('managed-'+self.attempt)
         self.put(self.current/'scripts/agentos-release-action.py', self.reviewed)
+        self.put(self.current/'scripts/candidate_origin.py', self.helper)
         self.put(self.current/'server/fixture.ts', b'export const checked = true;\n')
         self.put(self.current/'docs/contract.md', b'Preserve mandatory tests.\n')
         self.put(self.current/'dist/app.js', b'console.log("tested")\n')
@@ -61,7 +68,7 @@ class ValidatorProvenanceTests(unittest.TestCase):
         self.save_operator()
 
     def tearDown(self):
-        self.protection.stop(); self.owner.stop(); self.temp.cleanup()
+        self.bundles.stop(); self.protection.stop(); self.owner.stop(); self.temp.cleanup()
 
     def put(self, path, raw):
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -74,7 +81,8 @@ class ValidatorProvenanceTests(unittest.TestCase):
         self.js(self.directory/'release-input.json', self.input)
         for action in ['validate','publish']:
             file = self.directory/(action+'.intent.json')
-            self.js(file, {'action':action,'input':self.input,'base':str(self.base)})
+            self.js(file, {'action':action,'input':self.input,'base':str(self.base),
+                          **({'executor':self.executor_declaration} if hasattr(self,'executor_declaration') else {})})
             os.utime(file, (time.time()-20, time.time()-20))
         self.js(self.directory/'validate.receipt.json', self.output)
         self.js(self.directory/'publish.receipt.json', {'ok':True,'output':self.record})
@@ -89,7 +97,7 @@ class ValidatorProvenanceTests(unittest.TestCase):
         return p.register(self.layout, request or self.request(), after_replace)
 
     def test_operator_receipts_are_a_distinct_verified_format_not_fake_legacy_sidecars(self):
-        self.assertIn(p.sha((ROOT/'scripts/agentos-release-action.py').read_bytes()),p.REVIEWED_EXECUTORS)
+        self.assertIn(p.REVIEWED_SHA,p.HISTORICAL_EXECUTORS)
         before = {x.name:x.read_bytes() for x in self.directory.iterdir()}
         proof = p.publication(self.layout)
         self.assertEqual(proof['kind'], 'operator_guard_receipts')
@@ -177,6 +185,7 @@ class ValidatorProvenanceTests(unittest.TestCase):
         identity = self.register(); old_current = self.current
         action = str(uuid.uuid4()); next_release = self.layout.releases/('managed-'+action)
         self.put(next_release/'scripts/agentos-release-action.py',self.reviewed)
+        self.put(next_release/'scripts/candidate_origin.py',self.helper)
         self.put(next_release/'server/next.ts',b'new reviewed source')
         self.layout.active.unlink(); self.layout.active.symlink_to(next_release)
         validated = {'candidate':str(next_release),'digest':p.tree_digest(next_release),
@@ -274,7 +283,7 @@ class ValidatorProvenanceTests(unittest.TestCase):
 
     def coverage_output(self, request, status='passed', unrelated_status='skipped'):
         required = request['runtimeAuthority']['policyRegistration']['policy']['requiredDatabaseTests']
-        root = '/var/lib/agentos-build/'+request['actionId']
+        root = '/var/lib/agentos-validation-builds/'+request['actionId']
         report = {'testResults':[{'name':root+'/'+required[0]['file'],'assertionResults':[
             {'fullName':required[0]['name'],'status':status},
             {'fullName':'optional browser scenario','status':unrelated_status}]}]}
@@ -333,6 +342,93 @@ class ValidatorProvenanceTests(unittest.TestCase):
         request = self.runtime_request()
         self.assertIsNone(verified_coverage(request,{'artifacts':[]},p.REVIEWED_SHA))
         self.assertIsNone(verified_coverage({},self.coverage_output(request),p.REVIEWED_SHA))
+
+    def staged_request(self):
+        folder=self.layout.control.parent/'reviewed-validator-bundles'/p.REVIEWED_SHA
+        self.put(folder/'agentos-release-action.py',self.reviewed)
+        self.put(folder/'candidate_origin.py',self.helper)
+        return self.request() | {'executorSha256':p.REVIEWED_SHA,'sourceCommit':p.REVIEWED_COMMIT}
+
+    def test_reviewed_public_source_registration_precedes_its_publication_honestly(self):
+        request=self.staged_request()
+        before=self.layout.active.resolve()
+        pointer=self.register(request)
+        record=p.registration_record(self.layout,pointer)
+        self.assertEqual(record['sourceKind'],'reviewed_public_source')
+        self.assertEqual(record['publicationEvidence']['validationExecutorSha256'],p.LEGACY_SHA)
+        self.assertEqual(self.layout.active.resolve(),before)
+        self.assertEqual(record['bundleManifest'],p.REVIEWED_BUNDLES[p.REVIEWED_SHA]['files'])
+        self.assertEqual(p.active_registration(self.layout,for_execution=True),pointer)
+
+    def test_unreviewed_hash_wrong_commit_and_free_source_path_are_rejected(self):
+        for field,value in [('executorSha256','f'*64),('sourceCommit','f'*40),('sourcePath','/tmp/untrusted')]:
+            request=self.staged_request();request[field]=value
+            with self.assertRaises(ValueError):self.register(request)
+            self.assertEqual(self.layout.control.read_bytes(),self.partial)
+
+    def test_changed_staged_module_or_wrong_base_cannot_register(self):
+        request=self.staged_request()
+        helper=self.layout.control.parent/'reviewed-validator-bundles'/p.REVIEWED_SHA/'candidate_origin.py'
+        self.put(helper,self.helper+b'\n')
+        with self.assertRaisesRegex(ValueError,'SOURCE_CHANGED'):self.register(request)
+        request=self.staged_request();request['expectedReleaseDigest']='0'*64
+        with self.assertRaisesRegex(ValueError,'PROOF_CHANGED'):self.register(request)
+
+    def test_legacy_versions_are_historical_only_without_new_admissible_bundle(self):
+        request=self.request()
+        with patch.object(p,'REVIEWED_BUNDLES',{}):
+            with self.assertRaisesRegex(ValueError,'SOURCE_UNREVIEWED'):self.register(request)
+        self.assertEqual(self.layout.control.read_bytes(),self.partial)
+
+    def test_registered_module_tampering_is_rejected(self):
+        self.register(self.staged_request())
+        self.put(self.layout.control.parent/'candidate_origin.py',self.helper+b'\n')
+        with self.assertRaisesRegex(ValueError,'EXECUTOR_CHANGED'):
+            p.active_registration(self.layout,for_execution=True)
+
+    def test_archived_evidence_survives_source_cleanup_and_lost_reply(self):
+        request=self.staged_request();pointer=self.register(request)
+        for directory in [self.directory,self.layout.control.parent/'reviewed-validator-bundles'/p.REVIEWED_SHA]:
+            self.assertTrue(directory.resolve().is_relative_to(self.root))
+            shutil.rmtree(directory)
+        self.assertEqual(p.active_registration(self.layout),pointer)
+        self.assertEqual(self.register(request),pointer)
+        record=p.registration_record(self.layout,pointer)
+        archive=pathlib.Path(record['evidenceArchive'][0]['archivedPath'])
+        self.put(archive,archive.read_bytes()+b'changed')
+        with self.assertRaisesRegex(ValueError,'EVIDENCE_CHANGED'):p.active_registration(self.layout)
+
+    def test_wrong_executor_declaration_cannot_replace_historical_inference(self):
+        self.output['output']['executorSha256']=p.REVIEWED_SHA
+        self.record['executorSha256']=p.REVIEWED_SHA
+        self.save_operator()
+        with self.assertRaisesRegex(ValueError,'OPERATOR_EXECUTOR_UNBOUND'):p.publication(self.layout)
+
+    def test_modern_operator_receipt_binds_actual_registered_executor_not_old_base(self):
+        pointer=self.register(self.staged_request())
+        report='{"testResults":[]}'
+        metadata={'executorSha256':p.REVIEWED_SHA,'testReportDigest':p.sha(report.encode())}
+        self.output['artifacts'].append({'name':'vitest-results.json','content':report})
+        self.validated.update(metadata,validatedAt=time.time()+0.1)
+        self.record.update(metadata,validatedAt=self.validated['validatedAt'],publishedAt=time.time()+0.2)
+        self.executor_declaration={'path':str(self.layout.control),'sha256':p.REVIEWED_SHA,
+                                  'sourceCommit':p.REVIEWED_COMMIT,'registration':pointer}
+        self.save_operator()
+        proof=p.publication(self.layout)
+        self.assertEqual(proof['validationExecutorSha256'],p.REVIEWED_SHA)
+        self.assertEqual(p.sha((self.base/'scripts/agentos-release-action.py').read_bytes()),p.LEGACY_SHA)
+        self.executor_declaration['sha256']='f'*64;self.save_operator()
+        with self.assertRaisesRegex(ValueError,'OPERATOR_EXECUTOR_UNBOUND'):p.publication(self.layout)
+
+    def test_operator_records_can_be_preserved_exactly_under_protected_root(self):
+        destination=self.layout.operator_records/'preserved'
+        shutil.copytree(self.directory,destination,copy_function=shutil.copy2)
+        before={item.name:item.read_bytes() for item in self.directory.iterdir()}
+        self.assertTrue(self.directory.resolve().is_relative_to(self.root));shutil.rmtree(self.directory)
+        proof=p.publication(self.layout)
+        self.assertEqual(proof['kind'],'operator_guard_receipts')
+        self.assertEqual(before,{item.name:item.read_bytes() for item in destination.iterdir()})
+        self.assertTrue(proof['publicationRef']['path'].startswith(str(destination)))
 
 
 if __name__ == '__main__':

@@ -60,15 +60,39 @@ class CandidateValidationTests(unittest.TestCase):
   with self.assertRaisesRegex(ValueError,'STOP_UNCONFIRMED'):self.freeze(physical)
   self.assertFalse(self.manager.workspace('agentos/ocv'+self.request['actionId'].replace('-','')).exists())
  def test_actual_subprocess_failure_never_passes(self):
-  result=broker.execute(self.request,self.directory,'agentos/ocvtest',{'command':sys.executable,'args':['-c','import sys; sys.exit(7)']})
-  self.assertEqual(result['state'],'failed');self.assertFalse(result['passed']);self.assertEqual(result['exitCode'],7)
+  result=broker.execute(self.request,self.directory,'agentos/ocvtest',{'command':sys.executable,'args':['-c','import sys; sys.exit(7)']},stop_probe=lambda r:{'unit':'fixture','mainPID':0})
+  self.assertEqual(result['state'],'uncertain');self.assertFalse(result['passed']);self.assertEqual(result['exitCode'],7)
   self.assertEqual(json.loads((self.directory/'receipt.json').read_text())['exitCode'],7)
+ def test_unconfirmed_validation_stop_stays_uncertain_and_cannot_rerun(self):
+  self.directory=self.root/'states'/self.request['actionId'];self.directory.mkdir(parents=True)
+  command='import sys; print("ValueError: VALIDATION_STOP_UNCONFIRMED",file=sys.stderr); sys.exit(1)'
+  result=broker.execute(self.request,self.directory,'agentos/ocvtest',{'command':sys.executable,'args':['-c',command]},stop_probe=lambda r:{'unit':'fixture','mainPID':0,'loadState':'not-found'})
+  self.assertEqual(result['state'],'uncertain');self.assertEqual(result['code'],'VALIDATION_STOP_UNCONFIRMED')
+  self.assertFalse(result['passed'])
+  self.assertEqual(self.call('execute'),result)
  def test_registered_check_failure_keeps_discriminant_and_redacts_url(self):
   output={'ok':True,'output':{'passed':False},'artifacts':[{'name':'validation.log','content':'ERROR test.ts\npostgresql://user:secret@db/test'}]}
   command='import json; print('+repr(json.dumps(output))+')'
-  result=broker.execute(self.request,self.directory,'agentos/ocvtest',{'command':sys.executable,'args':['-c',command]})
+  result=broker.execute(self.request,self.directory,'agentos/ocvtest',{'command':sys.executable,'args':['-c',command]},stop_probe=lambda r:{'unit':'fixture','mainPID':0})
   self.assertEqual(result['code'],'VALIDATION_CHECKS_FAILED');self.assertFalse(result['passed'])
   self.assertIn('test.ts',result['diagnostic']);self.assertNotIn('secret',result['diagnostic'])
+ def test_guard_killed_after_effect_does_not_release_ci_ownership(self):
+  self.directory=self.root/'states'/self.request['actionId'];self.directory.mkdir(parents=True)
+  marker=self.root/'effect-count.txt'
+  command='import os,pathlib,signal; p=pathlib.Path('+repr(str(marker))+'); p.write_text("one effect"); os.kill(os.getpid(),signal.SIGKILL)'
+  result=broker.execute(self.request,self.directory,'agentos/ocvtest',{'command':sys.executable,'args':['-c',command]},stop_probe=lambda r:{'unit':'fixture','mainPID':0,'loadState':'not-found'})
+  self.assertEqual(result['state'],'uncertain');self.assertEqual(result['code'],'VALIDATION_GUARD_INTERRUPTED')
+  self.assertEqual(marker.read_text(),'one effect')
+  self.assertEqual(self.call('execute'),result)
+ def test_malformed_guard_output_does_not_prove_launcher_quiescence(self):
+  command='print("{truncated")'
+  result=broker.execute(self.request,self.directory,'agentos/ocvtest',{'command':sys.executable,'args':['-c',command]},stop_probe=lambda r:(_ for _ in ()).throw(ValueError('VALIDATION_STOP_UNCONFIRMED')))
+  self.assertEqual(result['state'],'uncertain')
+  second=self.root/'another-action';second.mkdir()
+  request=dict(self.request,actionId=str(uuid.uuid4()))
+  result=broker.execute(request,second,'agentos/ocvtest',{'command':sys.executable,'args':['-c',command]},stop_probe=lambda r:{'unit':'fixture','mainPID':0})
+  self.assertEqual(result['state'],'uncertain');self.assertFalse(result['passed'])
+  self.assertIn('validationStopProof',result)
  def test_real_systemd_stop_probe_refuses_wrong_remote_identity(self):
   state=self.manager.DATA/'worker-runs'/self.request['runId'];state.mkdir(parents=True)
   (state/'state.json').write_text(json.dumps({'runId':self.request['runId'],'workspace':'agentos/other','stopped':True}))
