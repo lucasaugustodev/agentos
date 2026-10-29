@@ -62,7 +62,7 @@ function exported(job:any,coverage:any={version:1,source:'registered_vitest_json
     resultDigest:job.result.resultDigest,receiptDigest:'d'.repeat(64),producer:{...Object.fromEntries([
       'goalId','taskId','runId','runFence','contextVersion','expectedAttempt','candidateDigest'].map(k=>[k,job[k]])),contractDigest:job.request.contractDigest},
     outcome:{passed:job.result.passed,code:job.result.code,state:'completed'},
-    registeredActionSha:'640557b086101b38566fbb9dd1361015f9e22ac31e5526caa43d7b176c1a6abe',
+    registeredActionSha:'39843bdbde81e84b5093ed6667484378d1f4444c66aa33424b52d28b45b0cc44',
     registeredCommand:['/usr/bin/python3','/opt/agentos-control/agentos-release-action.py','validate'],
     publishedBaselineDigest:job.result.publishedBaselineDigest,publicationProofDigest:'f'.repeat(64),validationProofDigest:'f'.repeat(64),
     registeredReceiptSha:job.result.registeredReceiptSha,validatedReleaseDigest:'b'.repeat(64),

@@ -10,8 +10,8 @@ It is historical evidence, not an admissible executor for new work. The
 intermediate `31e7…` executor was never activated and is not admissible either.
 `REVIEWED_BUNDLES` contains only the final reviewed guard plus its exact
 `candidate_origin.py`, with their source commit and byte hashes.
-The initial bundle is commit `502d01c624cef75625bb1a935fa69173ca386869`,
-guard SHA256 `640557b086101b38566fbb9dd1361015f9e22ac31e5526caa43d7b176c1a6abe`
+The initial bundle is commit `084e0459a7d045c45c22b8159c60dd5742df2acb`,
+guard SHA256 `39843bdbde81e84b5093ed6667484378d1f4444c66aa33424b52d28b45b0cc44`
 and origin-module SHA256
 `742212cdc76a1404418ad9fa0b57215d377eea4433f77bc2cd29eed9e2a27e6f`.
 
