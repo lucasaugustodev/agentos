@@ -16,6 +16,7 @@ export const objectiveInputSchema=z.object({
   requirementIds:z.array(requirement).min(1).max(30),
   sourceRef:z.string().trim().min(3).max(240),
   reason:z.string().trim().min(10).max(1000),
+  planningSummary:z.string().trim().min(20).max(3000).refine(value=>!value.includes('\0')).optional(),
   requestReplan:z.boolean().default(true),
 }).strict();
 type InputRequest=z.infer<typeof objectiveInputSchema>;
@@ -53,7 +54,7 @@ function checkedRequest(raw:unknown):InputRequest{
   const bytes=Buffer.from(input.base64,'base64');
   if(bytes.length>65536)throw failure('OBJECTIVE_INPUT_TOO_LARGE','Entrada de operador excede 64 KiB.',400);
   checkMemoryContent(bytes.toString('utf8'));
-  checkMemoryContent(request.sourceRef+'\n'+request.reason);
+  checkMemoryContent(request.sourceRef+'\n'+request.reason+'\n'+(request.planningSummary??''));
   return request;
 }
 function receipt(row:any,duplicate:boolean){
@@ -75,7 +76,8 @@ async function verifiedRow(db:DB,row:any){
   if(!(await db.query(`SELECT 1 FROM events WHERE kind='OBJECTIVE_INPUT_REGISTERED' AND entity_id=$1
     AND payload->>'inputId'=$2 AND payload->>'receiptDigest'=$3`,[row.goal_id,row.id,row.receipt_digest])).rowCount)
     throw failure('OBJECTIVE_INPUT_INTEGRITY','Proveniência da entrada ausente.');
-  return {id:row.id,name:p.name,digest:p.digest,base64:request.base64,requirementIds:p.requirementIds};
+  return {id:row.id,name:p.name,digest:p.digest,base64:request.base64,requirementIds:p.requirementIds,
+    ...(request.planningSummary!==undefined?{planningSummary:request.planningSummary}:{})};
 }
 
 /** Bytes come from the authenticated operator, never from a model-selected host
@@ -132,5 +134,5 @@ export async function readObjectiveInputs(db:DB,goalId:string){
 
 export function inputsForRequirements(inputs:{id:string;name:string;digest:string;base64:string;requirementIds:string[]}[],covers:string[]){
   return mergeSupervisorInputs([],inputs.filter(input=>input.requirementIds.some(id=>covers.includes(id)))
-    .map(({requirementIds,...input})=>input));
+    .map(({id,name,digest,base64})=>({id,name,digest,base64})));
 }

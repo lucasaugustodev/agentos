@@ -10,10 +10,11 @@ import {submitObjective,claimPlanning,applyPlannedResult,reconcilePlanning,Plann
 import {accountBridge} from '../server/bridge.js';
 import {installObjectiveInputs,registerObjectiveInput,readObjectiveInputs,inputsForRequirements} from '../server/objective-inputs.js';
 import {executionInputManifest,runtimeInputs} from '../server/execution-inputs.js';
+import {planningInputContext} from '../server/planning-input-context.js';
 
 const auth={channel:'api-token' as const};
 const digest=(bytes:Buffer)=>createHash('sha256').update(bytes).digest('hex');
-const decision={requirementId:'req-1',title:'Corrigir o consumidor de entrada',
+const decision={kind:'delivery',requirementId:'req-1',title:'Corrigir o consumidor de entrada',
   action:'Reproduzir o defeito e corrigir o consumidor preservando os controles originais.',
   verification:'Reexecutar o contrato original e os negativos na candidata imutável.',agentId:'engineering.backend.node'};
 beforeAll(async()=>{await migrate();await installObjectiveInputs();});
@@ -183,4 +184,53 @@ it('fails closed before model generation when operator provenance is missing',as
   expect(generated).toBe(0);
   const failure=(await pool.query('SELECT state,error FROM planning_runs WHERE id=$1',[run.id])).rows[0];
   expect(failure.state).toBe('failed');expect(failure.error).toContain('Proveniência da entrada ausente');
+});
+
+it('binds a compact summary to the original bytes without changing worker input transport',async()=>{
+  const f=await fixture(),bytes=Buffer.from('large diagnostic record\n'.repeat(1400));
+  const summary='The new profile identifies memory traffic as a hypothesis. Verify the original artifact on the exact candidate before accepting any gain.';
+  const body=request({name:'profile.txt',digest:digest(bytes),base64:bytes.toString('base64'),planningSummary:summary,requestReplan:false});
+  const registered=await registerObjectiveInput(f.objectiveId,body,auth);
+  const inputs=await readObjectiveInputs(pool,f.objectiveId);
+  expect(inputs[0]).toMatchObject({id:registered.inputId,digest:body.digest,planningSummary:summary});
+  expect(inputsForRequirements(inputs,['req-1'])).toEqual([{id:registered.inputId,name:body.name,digest:body.digest,base64:body.base64}]);
+  const projection=planningInputContext(inputs,['req-1']);
+  expect(projection.contentComplete).toBe(false);
+  expect(projection.inputs[0]).toMatchObject({digest:body.digest,omitted:'per-input-budget',summary,originalContentRead:false});
+  expect(projection.inputs[0]).not.toHaveProperty('content');
+  await expect(registerObjectiveInput(f.objectiveId,{...body,planningSummary:summary+' Changed claim.'},auth))
+    .rejects.toMatchObject({code:'IDEMPOTENCY_CONFLICT'});
+});
+
+it.each(['oversized','nul','secret'])('rejects %s summaries before registration',async kind=>{
+  const f=await fixture();
+  const planningSummary=kind==='oversized'?'x'.repeat(3001):kind==='nul'?'This summary contains\0unacceptable null bytes.':
+    ['-----BEGIN','PRIVATE KEY-----'].join(' ');
+  await expect(registerObjectiveInput(f.objectiveId,request({planningSummary}),auth)).rejects.toThrow();
+  expect((await pool.query('SELECT count(*)::int n FROM objective_inputs WHERE goal_id=$1',[f.objectiveId])).rows[0].n).toBe(0);
+});
+
+it('delivers a receipt-bound summary to the real planner and records summary-only consumption',async()=>{
+  const f=await fixture(),bytes=Buffer.from('full diagnostic data\n'.repeat(1000));
+  const summary='Compare the exact-source GPU receipt before repeating this experiment. The full profile is an input for the worker; this is only its operator summary.';
+  const body=request({name:'profile.txt',digest:digest(bytes),base64:bytes.toString('base64'),planningSummary:summary});
+  const registered=await registerObjectiveInput(f.objectiveId,body,auth);
+  await reconcilePlanning();const run=await claimPlanning();let generated=0;
+  vi.spyOn(accountBridge,'request').mockImplementation(async(method,p:any)=>{
+    if(method==='memory.search')return {items:[]};if(method==='worker.workspaces')return [{id:'test/base'}];if(method==='worker.prepare')return {};
+    if(method==='generate'){
+      generated++;
+      const entry=JSON.parse(p.messages[0].content).objectiveInputs.inputs[0];
+      expect(entry).toMatchObject({id:registered.inputId,digest:body.digest,summary,originalContentRead:false,omitted:'per-input-budget'});
+      expect(entry).not.toHaveProperty('content');expect(p.system).toContain('not as the full document');
+      return {message:{content:[{type:'text',text:JSON.stringify(decision)}]}};
+    }
+    throw Error('ranking fallback');
+  });
+  await new PlanningEngine().execute(run,new AbortController().signal);
+  expect(generated).toBe(1);
+  expect((await pool.query('SELECT state FROM planning_runs WHERE id=$1',[run.id])).rows[0].state).toBe('completed');
+  const event=(await pool.query("SELECT payload FROM events WHERE entity_id=$1 AND kind='PLANNING_DECISION_REQUESTED'",[f.objectiveId])).rows[0].payload;
+  expect(event.objectiveInputs).toEqual([{id:registered.inputId,digest:body.digest,included:false,omitted:'per-input-budget',summaryIncluded:true,summaryDigest:digest(Buffer.from(summary))}]);
+  expect(JSON.stringify(event)).not.toContain(summary);
 });
