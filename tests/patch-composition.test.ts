@@ -108,6 +108,6 @@ it('rejects an omitted accepted dependency patch and keeps it active when explic
 });
 
 it('checks real Git patch application, conflicts, idempotency and isolation using server-only temporary fixtures',async()=>{
-  const {stdout}=await promisify(execFile)('python3',[path.resolve('tests/fixtures/workspace_compose_test.py')],{timeout:20000});
+  const {stdout}=await promisify(execFile)('python3',['-B',path.resolve('tests/fixtures/workspace_compose_test.py')],{timeout:20000});
   expect(JSON.parse(stdout)).toMatchObject({passed:true,checks:15,productionTouched:false});
 });

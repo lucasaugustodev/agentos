@@ -21,7 +21,9 @@ NODE='/opt/deepseek-harness/node/bin'
 def digest(root):
  h=hashlib.sha256()
  for p in sorted(root.rglob('*')):
-  if p.is_file() and not p.is_symlink() and not any(x in p.relative_to(root).parts for x in ['node_modules','.local-test','.git']):
+  # Keep this contract identical to workerSourceDigest: generated Python caches
+  # are mutable runtime data; source, documentation and built assets are signed.
+  if p.is_file() and not p.is_symlink() and not any(x in p.relative_to(root).parts for x in ['node_modules','.local-test','.git','__pycache__']):
    h.update(str(p.relative_to(root)).encode());h.update(p.read_bytes())
  return h.hexdigest()
 def run(args,**kw):
@@ -31,7 +33,7 @@ def publish_source(candidate,record):
  workspace='agentos/src'+record['digest'][:16]
  source=pathlib.Path('/srv/agentos/workspaces')/workspace
  if not source.exists():
-  shutil.copytree(candidate,source,ignore=shutil.ignore_patterns('node_modules','.local-test','test-results','playwright-report','.git'))
+  shutil.copytree(candidate,source,ignore=shutil.ignore_patterns('node_modules','.local-test','test-results','playwright-report','.git','__pycache__'))
  value=json.dumps({'workspace':workspace,'release':str(candidate)})
  run(['runuser','-u','postgres','--','/usr/lib/postgresql/17/bin/psql','-p','15482','-d','agentos','-v','ON_ERROR_STOP=1','-c',"INSERT INTO settings(id,value) VALUES('agentos-source-workspace','"+value.replace("'","''")+"') ON CONFLICT(id) DO UPDATE SET value=excluded.value"])
 def main():
@@ -52,10 +54,10 @@ def main():
   if build.exists():raise ValueError('BUILD_ALREADY_EXISTS_RECONCILE')
   build.mkdir(parents=True)
   for base,dirs,files in os.walk(source,followlinks=False):
-   dirs[:]=[x for x in dirs if x not in ['node_modules','.git','.snapshot','evidence','data','dist','.local','.local-test','test-results','playwright-report']]
+   dirs[:]=[x for x in dirs if x not in ['node_modules','.git','.snapshot','evidence','data','dist','.local','.local-test','test-results','playwright-report','__pycache__']]
    for name in files:
     p=pathlib.Path(base)/name;rel=p.relative_to(source)
-    if name.startswith('.env') or p.is_symlink():continue
+    if name.startswith('.env') or name=='__pycache__' or p.is_symlink():continue
     target=build/rel;target.parent.mkdir(parents=True,exist_ok=True);shutil.copyfile(p,target)
   # Use exactly the reviewed dependency graph; dependency changes require a prepared dependency bundle.
   if (build/'package-lock.json').read_bytes()!=(ROOT/'current/package-lock.json').read_bytes():raise ValueError('DEPENDENCY_BUNDLE_REQUIRED')
@@ -80,7 +82,7 @@ def main():
   if not validation_complete(checked):raise ValueError('VALIDATION_INCOMPLETE')
   if str((ROOT/'current').resolve())!=validation_base:raise ValueError('BASE_CHANGED_REVALIDATE')
   candidate=ROOT/'releases'/('managed-'+attempt)
-  shutil.copytree(build,candidate,ignore=shutil.ignore_patterns('node_modules','.local-test','test-results','playwright-report'))
+  shutil.copytree(build,candidate,ignore=shutil.ignore_patterns('node_modules','.local-test','test-results','playwright-report','__pycache__'))
   os.symlink(str((ROOT/'current/node_modules').resolve()),candidate/'node_modules')
   record={'candidate':str(candidate),'digest':digest(candidate),'base':validation_base,'validatedAt':time.time()}
   receipt.write_text(json.dumps(record));os.chmod(receipt,0o600)

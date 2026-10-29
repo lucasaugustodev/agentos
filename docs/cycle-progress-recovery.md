@@ -51,3 +51,12 @@ use them to propose a scoped recovery. It must preserve the original failure,
 criteria and independent QA, and must not promote incomplete files through the
 completed-delivery collector. Unconfirmed termination must retain reconciliation
 and prevent a duplicate writer.
+
+## Release adoption
+
+Publication and worker readiness must hash the same immutable file set. Generated
+Python caches are excluded from both digests and from source/release copies;
+source, documentation, scripts and built assets remain signed. The parity tests
+execute both digest implementations and verify that real file changes still stop
+publication before the swap. Python composition fixtures run with `-B` so test
+execution does not add bytecode to the source tree.
