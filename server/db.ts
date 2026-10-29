@@ -9,7 +9,7 @@ import { installTaskInstructions } from './task-instructions.js';
 import { installRuntimeLookupIndexes } from './runtime-lookup-indexes.js';
 export const pool = new pg.Pool({
   connectionString: config.databaseUrl,
-  max: 15,
+  max: config.pgPoolMax,
   connectionTimeoutMillis: 10000,
 });
 export type DB = Pick<PoolClient, 'query'>;
@@ -47,7 +47,7 @@ export async function migrate() {
     await lock(db);
     await db.query(`
 CREATE TABLE IF NOT EXISTS settings (id text PRIMARY KEY, value jsonb NOT NULL);
-INSERT INTO settings VALUES('capacity','{"maxRuns":4,"browserSlots":2}') ON CONFLICT DO NOTHING;
+INSERT INTO settings VALUES('capacity','{"maxRuns":${config.capacityMaxRuns},"browserSlots":${config.browserSlots}}') ON CONFLICT DO NOTHING;
 CREATE TABLE IF NOT EXISTS agents (
  id text PRIMARY KEY, name text NOT NULL, department text NOT NULL, reports_to text,
  capabilities jsonb NOT NULL, runtime text NOT NULL, version int NOT NULL DEFAULT 1,

@@ -29,6 +29,7 @@ import {
 } from 'lucide-react';
 import './execution-tree.css';
 import { taskAttention, latestObservation } from './task-attention';
+import { actionSummary } from './execution-status';
 
 type Row = Record<string, any>;
 
@@ -36,6 +37,9 @@ interface ExecutionTreeViewProps {
   detail: Row;
   data: Row;
   inspect: (taskId: string) => void;
+  // The goal read model omits task instructions and accepted attempts; the
+  // drawer reads the per-task panel model for those.
+  loadTask: (taskId: string, signal: AbortSignal) => Promise<Row>;
 }
 
 interface TreeNode {
@@ -114,13 +118,17 @@ function resolveWritePaths(task: Row): string[] {
   if (Array.isArray(execution.paths) && execution.paths.length > 0) {
     return execution.paths;
   }
-  if (execution.workspace) {
-    return [execution.workspace.split('/').pop() || execution.workspace];
-  }
   return [];
 }
 
-export function ExecutionTreeView({ detail, data, inspect }: ExecutionTreeViewProps) {
+function runTokens(run: Row): number {
+  const u = run.usage;
+  if (!u) return 0;
+  return u.totalTokens ?? u.total_tokens ??
+    ((u.input ?? u.prompt_tokens ?? 0) + (u.output ?? u.completion_tokens ?? 0) + (u.cacheRead ?? 0));
+}
+
+export function ExecutionTreeView({ detail, data, inspect, loadTask }: ExecutionTreeViewProps) {
   const { tasks: history = [], dependencies = [], runs = [], acceptances = [], goal } = detail;
   const tasks = useMemo(() => history.filter((task: Row) => !['cancelled', 'superseded'].includes(task.state)), [history]);
   const [filterRole, setFilterRole] = useState<string>('all');
@@ -164,12 +172,7 @@ export function ExecutionTreeView({ detail, data, inspect }: ExecutionTreeViewPr
       const alert = taskAttention(task, data);
 
       let nodeTokens = 0;
-      for (const r of taskRuns) {
-        if (r.usage) {
-          nodeTokens += r.usage.totalTokens ?? r.usage.total_tokens ??
-            ((r.usage.input ?? r.usage.prompt_tokens ?? 0) + (r.usage.output ?? r.usage.completion_tokens ?? 0) + (r.usage.cacheRead ?? 0));
-        }
-      }
+      for (const r of taskRuns) nodeTokens += runTokens(r);
       globalTokens += nodeTokens;
 
       if (task.state === 'running') runningCount++;
@@ -252,6 +255,25 @@ export function ExecutionTreeView({ detail, data, inspect }: ExecutionTreeViewPr
   const inspectedNode = inspectedId ? nodes.get(inspectedId) ?? null : null;
   const setInspectedNode = (node: TreeNode | null) => setInspectedId(node?.id ?? null);
 
+  const [taskEvidence, setTaskEvidence] = useState<Row | null>(null);
+  const [taskEvidenceError, setTaskEvidenceError] = useState('');
+  useEffect(() => {
+    setTaskEvidence(null);
+    setTaskEvidenceError('');
+    if (!inspectedId) return;
+    let current = true, timer: ReturnType<typeof setTimeout> | undefined;
+    const controller = new AbortController();
+    const load = async () => {
+      try {
+        const value = await loadTask(inspectedId, controller.signal);
+        if (current) { setTaskEvidence(value); setTaskEvidenceError(''); }
+      } catch (e: any) { if (current) setTaskEvidenceError(e.message); }
+      finally { if (current) timer = setTimeout(() => void load(), 6000); }
+    };
+    void load();
+    return () => { current = false; controller.abort(); clearTimeout(timer); };
+  }, [inspectedId]);
+
   // Expand all by default on first load
   useEffect(() => {
     if (allNodeIds.size > 0 && expandedGoal.current !== (goal?.id ?? 'current')) {
@@ -290,7 +312,8 @@ export function ExecutionTreeView({ detail, data, inspect }: ExecutionTreeViewPr
       const matchTitle = (node.task.title || '').toLowerCase().includes(q);
       const matchKey = (node.task.key || '').toLowerCase().includes(q);
       const matchRole = node.role.toLowerCase().includes(q);
-      const matchScope = node.writePaths.some((p) => p.toLowerCase().includes(q));
+      const matchScope = node.writePaths.some((p) => p.toLowerCase().includes(q)) ||
+        (node.task.execution?.workspace || '').toLowerCase().includes(q);
       const matchModel = ((node.latestRun?.model || node.task.model || '')).toLowerCase().includes(q);
       return matchTitle || matchKey || matchRole || matchScope || matchModel;
     }
@@ -490,18 +513,29 @@ export function ExecutionTreeView({ detail, data, inspect }: ExecutionTreeViewPr
     ? Math.round((metrics.accepted / metrics.total) * 100)
     : 0;
 
-  // Observation and files for lateral drawer
-  const drawerObservation = inspectedNode?.latestRun
-    ? latestObservation(inspectedNode.latestRun, data.events)
-    : null;
+  // Lateral drawer: the per-task read model (newest attempt first) supersedes
+  // the goal summary, which has no description and skips accepted tasks' runs.
+  const evidence = inspectedNode && taskEvidence?.task?.id === inspectedNode.id ? taskEvidence : null;
+  const drawerTask: Row = evidence ? { ...inspectedNode!.task, ...evidence.task } : inspectedNode?.task ?? {};
+  const drawerRuns: Row[] = evidence?.runs?.length
+    ? evidence.runs
+    : inspectedNode?.latestRun ? [inspectedNode.latestRun] : [];
+  const drawerRun: Row | undefined = drawerRuns[0];
+  const drawerTokens = drawerRuns.reduce((sum, r) => sum + runTokens(r), 0);
+  const drawerObservation = drawerRun ? latestObservation(drawerRun, data.events) : null;
   const drawerFiles = drawerObservation?.files || [];
   const drawerActions = drawerObservation?.actions || [];
-  const drawerAcceptance = inspectedNode?.latestRun
-    ? acceptances.find((a: Row) => a.run_id === inspectedNode.latestRun?.id)
+  const drawerAcceptance = drawerRun
+    ? (evidence?.acceptances ?? acceptances).find((a: Row) => a.run_id === drawerRun.id)
     : null;
-  const drawerArtifacts = inspectedNode?.latestRun
-    ? data.artifacts?.filter((a: Row) => a.run_id === inspectedNode.latestRun?.id) || []
+  const drawerArtifacts = drawerRun
+    ? (evidence?.artifacts ?? data.artifacts ?? []).filter((a: Row) => a.run_id === drawerRun.id)
     : [];
+  const drawerAccountId = drawerRun?.account_id ?? drawerTask.account_id;
+  const drawerAccount = drawerAccountId
+    ? data.accounts?.find((a: Row) => a.id === drawerAccountId)?.label ?? drawerAccountId
+    : 'Automática';
+  const drawerLoading = !evidence && !taskEvidenceError;
 
   return (
     <div className="execution-tree-container">
@@ -699,9 +733,9 @@ export function ExecutionTreeView({ detail, data, inspect }: ExecutionTreeViewPr
               {[
                 ['overview', 'Visão Geral'],
                 ['prompt', 'Prompt & Contrato'],
-                ['files', `Arquivos & Diffs (${inspectedNode.writePaths.length})`],
+                ['files', `Arquivos & Diffs (${drawerFiles.length + drawerArtifacts.length})`],
                 ['logs', `Logs ao Vivo (${drawerActions.length})`],
-                ['criteria', `Critérios (${inspectedNode.task.criteria?.length || 0})`],
+                ['criteria', `Critérios (${drawerTask.criteria?.length || 0})`],
               ].map(([k, l]) => (
                 <button
                   key={k}
@@ -726,52 +760,79 @@ export function ExecutionTreeView({ detail, data, inspect }: ExecutionTreeViewPr
                       <div>
                         <dt>Modelo & Provedor</dt>
                         <dd>
-                          {inspectedNode.latestRun?.model ?? inspectedNode.task.model ?? 'Ainda não selecionado'}
+                          {drawerRun?.model ?? drawerTask.model ?? 'Ainda não selecionado'}
                         </dd>
                       </div>
                       <div>
                         <dt>Conta Vinculada</dt>
-                        <dd>
-                          {data.accounts?.find(
-                            (a: Row) =>
-                              a.id ===
-                              (inspectedNode.latestRun?.account_id ?? inspectedNode.task.account_id)
-                          )?.label || 'Automática'}
-                        </dd>
+                        <dd>{drawerAccount}</dd>
                       </div>
                       <div>
                         <dt>Tokens Consumidos</dt>
-                        <dd>{formatTokens(inspectedNode.totalTokens)} tokens</dd>
-                      </div>
-                      <div>
-                        <dt>Tempo Decorrido</dt>
                         <dd>
-                          {formatDuration(
-                            inspectedNode.latestRun?.started_at,
-                            inspectedNode.latestRun?.finished_at
-                          )}
+                          {formatTokens(drawerTokens)} tokens
+                          {drawerRuns.length > 1 && ` · ${drawerRuns.length} tentativas`}
                         </dd>
                       </div>
                       <div>
+                        <dt>Tempo Decorrido</dt>
+                        <dd>{formatDuration(drawerRun?.started_at, drawerRun?.finished_at)}</dd>
+                      </div>
+                      <div>
                         <dt>Tentativa Atual</dt>
-                        <dd>{inspectedNode.latestRun?.attempt || 1}ª tentativa</dd>
+                        <dd>
+                          {drawerRun
+                            ? `${drawerRun.attempt}ª tentativa · ${stateLabels[drawerRun.state] || drawerRun.state}`
+                            : drawerLoading ? 'Carregando…' : 'Nenhuma tentativa ainda'}
+                        </dd>
                       </div>
                       <div>
                         <dt>Executor / Runtime</dt>
-                        <dd>{inspectedNode.task.execution?.kind || 'OpenCode'}</dd>
+                        <dd>{drawerRun?.runtime ?? drawerTask.execution?.kind ?? 'Não registrado'}</dd>
                       </div>
                     </dl>
                   </div>
 
+                  {drawerTask.reason && !['accepted'].includes(drawerTask.state) && (
+                    <div className="drawer-section">
+                      <h4>
+                        <AlertTriangle size={15} color="#f59e0b" />
+                        Situação Registrada
+                      </h4>
+                      <p style={{ margin: 0, fontSize: '0.82rem', color: '#cbd5e1', lineHeight: 1.55 }}>
+                        {drawerTask.reason}
+                      </p>
+                    </div>
+                  )}
+
                   <div className="drawer-section">
                     <h4>
                       <FileCode size={15} color="#3bd6a4" />
-                      Workspace & Bounded Scope
+                      Workspace & Escopo
                     </h4>
-                    <p style={{ margin: 0, fontSize: '0.8rem', color: '#94a3b8' }}>
-                      Workspace Base: <code>{inspectedNode.task.execution?.workspace || './'}</code>
-                    </p>
-                    {inspectedNode.writePaths.length > 0 ? (
+                    <dl className="drawer-dl">
+                      <div>
+                        <dt>Workspace</dt>
+                        <dd><code>{drawerTask.execution?.workspace || 'Não registrado'}</code></dd>
+                      </div>
+                      {drawerTask.execution?.baseWorkspace && (
+                        <div>
+                          <dt>Base</dt>
+                          <dd><code>{drawerTask.execution.baseWorkspace}</code></dd>
+                        </div>
+                      )}
+                      {drawerTask.execution?.workKind && (
+                        <div>
+                          <dt>Tipo de trabalho</dt>
+                          <dd>{drawerTask.execution.workKind}</dd>
+                        </div>
+                      )}
+                      <div>
+                        <dt>Fonte</dt>
+                        <dd>{drawerTask.execution?.readOnlySource ? 'Somente leitura' : 'Gravável'}</dd>
+                      </div>
+                    </dl>
+                    {inspectedNode.writePaths.length > 0 && (
                       <div className="diff-files-list">
                         {inspectedNode.writePaths.map((path, idx) => (
                           <div className="diff-file-row" key={idx}>
@@ -780,21 +841,17 @@ export function ExecutionTreeView({ detail, data, inspect }: ExecutionTreeViewPr
                           </div>
                         ))}
                       </div>
-                    ) : (
-                      <p style={{ margin: 0, fontSize: '0.78rem', color: '#8190a7' }}>
-                        Nenhum escopo restrito declarado; permissão para o diretório local do módulo.
-                      </p>
                     )}
                   </div>
 
-                  {inspectedNode.latestRun?.summary && (
+                  {drawerRun?.summary && (
                     <div className="drawer-section">
                       <h4>
                         <FileText size={15} color="#c084fc" />
                         Sumário da Tentativa
                       </h4>
-                      <p style={{ margin: 0, fontSize: '0.82rem', color: '#cbd5e1', lineHeight: 1.55 }}>
-                        {inspectedNode.latestRun.summary}
+                      <p style={{ margin: 0, fontSize: '0.82rem', color: '#cbd5e1', lineHeight: 1.55, whiteSpace: 'pre-wrap' }}>
+                        {drawerRun.summary}
                       </p>
                     </div>
                   )}
@@ -810,7 +867,19 @@ export function ExecutionTreeView({ detail, data, inspect }: ExecutionTreeViewPr
                   <p style={{ margin: 0, fontSize: '0.78rem', color: '#94a3b8' }}>
                     Instruções e escopo registrados para esta tarefa.
                   </p>
-                  <pre className="code-pre-box">{inspectedNode.task.description}</pre>
+                  {evidence ? (
+                    drawerTask.description ? (
+                      <pre className="code-pre-box">{drawerTask.description}</pre>
+                    ) : (
+                      <p className="drawer-note">Nenhuma instrução registrada para esta tarefa.</p>
+                    )
+                  ) : taskEvidenceError ? (
+                    <p className="drawer-note" role="alert">
+                      Não foi possível carregar as instruções: {taskEvidenceError}
+                    </p>
+                  ) : (
+                    <p className="drawer-note">Carregando instruções…</p>
+                  )}
                 </div>
               )}
 
@@ -823,18 +892,28 @@ export function ExecutionTreeView({ detail, data, inspect }: ExecutionTreeViewPr
                   {drawerFiles.length > 0 ? (
                     <div className="diff-files-list">
                       {drawerFiles.map((f: Row, i: number) => (
-                        <div className="diff-file-row" key={i}>
+                        <div className="diff-file-row" key={f.path ?? i}>
                           <span className="diff-file-path">{f.path}</span>
                           <div>
-                            {f.added > 0 && <span className="diff-stat-add">+{f.added} </span>}
-                            {f.removed > 0 && <span className="diff-stat-remove">−{f.removed}</span>}
+                            {f.status === 'new' ? (
+                              <span className="diff-stat-add">Novo arquivo</span>
+                            ) : (
+                              <>
+                                {f.added > 0 && <span className="diff-stat-add">+{f.added} </span>}
+                                {f.removed > 0 && <span className="diff-stat-remove">−{f.removed}</span>}
+                              </>
+                            )}
                           </div>
                         </div>
                       ))}
                     </div>
                   ) : (
-                    <p style={{ margin: 0, fontSize: '0.8rem', color: '#8190a7' }}>
-                      Nenhum arquivo modificado registrado ainda nesta tentativa.
+                    <p className="drawer-note">
+                      {drawerObservation
+                        ? 'A última observação desta tentativa não registrou arquivos alterados.'
+                        : drawerRun
+                          ? 'Sem observação recente do workspace desta tentativa no painel.'
+                          : 'Nenhuma tentativa iniciada ainda.'}
                     </p>
                   )}
 
@@ -871,21 +950,36 @@ export function ExecutionTreeView({ detail, data, inspect }: ExecutionTreeViewPr
                   </h4>
                   {drawerActions.length > 0 ? (
                     <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
+                      {drawerObservation?.toolCalls > drawerActions.length && (
+                        <p className="drawer-note">
+                          {drawerObservation.toolCalls} chamadas no registro
+                          {drawerObservation.traceTruncated ? ' parcial' : ''}; exibindo as últimas {drawerActions.length}.
+                        </p>
+                      )}
                       {drawerActions.slice().reverse().map((act: Row, i: number) => (
                         <details key={act.id || i} open={i === 0}>
                           <summary style={{ cursor: 'pointer', fontSize: '0.8rem', color: '#cbd5e1' }}>
-                            <strong>{act.tool || 'Comando'}</strong> ·{' '}
-                            {act.finishedAt ? 'Concluído' : 'Em execução'}
+                            <strong>{actionSummary(act)}</strong> ·{' '}
+                            {act.state === 'running'
+                              ? 'Em execução'
+                              : act.state === 'error'
+                                ? 'Erro'
+                                : `Concluído${act.exitCode != null ? ` · saída ${act.exitCode}` : ''}`}
                           </summary>
-                          <pre className="code-pre-box" style={{ marginTop: '0.5rem' }}>
-                            {act.output || act.command || 'Sem saída de texto'}
+                          <h5 className="drawer-subheading">Comando</h5>
+                          <pre className="code-pre-box">{act.command || 'Não registrado'}</pre>
+                          <h5 className="drawer-subheading">Resultado</h5>
+                          <pre className="code-pre-box">
+                            {act.output || (act.state === 'running' ? 'Ainda sem resultado.' : 'Saída não incluída nesta observação.')}
                           </pre>
                         </details>
                       ))}
                     </div>
                   ) : (
-                    <p style={{ margin: 0, fontSize: '0.8rem', color: '#8190a7' }}>
-                      Ainda sem comandos ou chamadas de ferramentas registradas nesta tentativa.
+                    <p className="drawer-note">
+                      {drawerRun
+                        ? 'Ainda sem comandos ou chamadas de ferramentas registradas nesta tentativa.'
+                        : 'Nenhuma tentativa iniciada ainda.'}
                     </p>
                   )}
                 </div>
@@ -901,19 +995,21 @@ export function ExecutionTreeView({ detail, data, inspect }: ExecutionTreeViewPr
                     Resultado dos critérios registrados. O aceite final do objetivo é verificado separadamente.
                   </p>
                   <ul className="criteria-list-check">
-                    {(inspectedNode.task.criteria || []).map((c: Row) => {
+                    {(drawerTask.criteria || []).map((c: Row) => {
                       const check = drawerAcceptance?.checks?.find((chk: Row) => chk.id === c.id);
-                      const isPassed = check?.passed === true;
+                      const status = check?.passed === true ? 'passed' : check?.passed === false ? 'failed' : 'pending';
                       return (
-                        <li
-                          className={`criteria-item-check ${isPassed ? 'passed' : 'pending'}`}
-                          key={c.id}
-                        >
-                          {isPassed ? <Check size={16} /> : <Clock size={16} />}
+                        <li className={`criteria-item-check ${status}`} key={c.id}>
+                          {status === 'passed' ? <Check size={16} /> : status === 'failed' ? <X size={16} /> : <Clock size={16} />}
                           <div className="criteria-item-info">
                             <strong>{c.label}</strong>
                             <small>
-                              {check?.detail || 'Aguardando verificação empírica antes do aceite.'}
+                              {check?.detail ||
+                                (status === 'pending'
+                                  ? drawerLoading
+                                    ? 'Carregando resultado…'
+                                    : 'Ainda não verificado nesta tentativa.'
+                                  : status === 'passed' ? 'Aprovado.' : 'Reprovado.')}
                             </small>
                           </div>
                         </li>

@@ -1,3 +1,5 @@
+import { duration, MODEL_REQUEST_BUDGET_MS } from './duration.js';
+
 type Row = Record<string, any>;
 export function modelActivity(run: Row, events: Row[] = []) {
   const relevant = events
@@ -59,6 +61,7 @@ export function executionStatus(
   run: Row,
   now = Date.now(),
   model?: ReturnType<typeof modelActivity>,
+  budgetMs = MODEL_REQUEST_BUDGET_MS,
 ) {
   if (!['running', 'cancelling', 'reconciling'].includes(run.state))
     return {
@@ -93,16 +96,21 @@ export function executionStatus(
     };
   const current = observation.actions?.findLast((a: Row) => a.state === 'running');
   const last = observation.actions?.at(-1);
-  if (!current && model?.pending && model.latestKind !== 'MUSE_TOOL_EVENT')
+  if (!current && model?.pending && model.latestKind !== 'MUSE_TOOL_EVENT') {
+    // Named against the request's own budget, and always with the elapsed time:
+    // a fixed "over 5 minutes" hides both how long it really waited and how
+    // close it is to being abandoned, which is the whole question while it hangs.
+    const waited = now - Date.parse(model.requestedAt);
+    const spent = waited / budgetMs;
     return {
-      level: now - Date.parse(model.requestedAt) > 300000 ? 'warning' : 'active',
+      level: spent >= 0.5 ? 'warning' : 'active',
       title:
-        now - Date.parse(model.requestedAt) > 300000
-          ? 'Modelo sem resposta há mais de 5 minutos'
-          : 'Aguardando resposta do modelo',
-      detail:
-        'A chamada ao modelo ainda não terminou. Nenhuma ferramenta está executando neste intervalo.',
+        spent >= 0.5
+          ? `Modelo sem resposta há ${duration(waited)} de ${duration(budgetMs)}`
+          : `Aguardando o modelo há ${duration(waited)}`,
+      detail: `A chamada ao modelo começou há ${duration(waited)} e esta requisição é abandonada em ${duration(budgetMs)}. Nenhuma ferramenta está executando neste intervalo.`,
     };
+  }
   const lastAt =
     current?.startedAt ??
     [last?.finishedAt, model?.lastActivityAt, run.started_at]

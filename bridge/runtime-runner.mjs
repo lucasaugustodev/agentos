@@ -1,18 +1,25 @@
 import { assertModelRoute } from './model-policy.mjs';
+import os from 'node:os';
 import { createRuntimeGuidanceServer } from './runtime-guidance.mjs';
 import { prepareSandboxLocalhost } from './sandbox-localhost.mjs';
+import { prepareSandboxIdentity } from './sandbox-identity.mjs';
 import { prepareRepairFinalization, finalizeRepairArtifacts, repairFinalizationInstruction } from './repair-finalizer.mjs';
 import { spawn } from 'node:child_process';
 import { createServer } from 'node:http';
 import { createInterface } from 'node:readline';
 import { mkdir, readFile, writeFile, realpath, stat, readdir } from 'node:fs/promises';
+import { existsSync, mkdirSync, realpathSync } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
-import { GLM_ACCOUNT, GLM_REQUEST_ADMITTED, withAccountRequestGate } from './gated-generation.mjs';
+import { GLM_REQUEST_ADMITTED, glmRequestBudgetMs, inGlmRequestLane, withAccountRequestGate } from './gated-generation.mjs';
+import { glmModelProfile } from './glm-model-profile.mjs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
-import { toGeneration, completion } from './runtime-gateway.mjs';
+import { toGeneration, completion, fromMessages, messagesEvents } from './runtime-gateway.mjs';
 import { bufferedModelChannel, WORKER_MODEL_TIMEOUT_MS } from './runtime-model-channel.mjs';
+import { modelRequestTiming } from './model-request-timing.mjs';
+import { failedCallDiagnostic, harnessCallBudgetMs, isCompactionRequest, modelRetryDelay, providerContentBlock } from './model-retry.mjs';
+import { sourcePatchInstruction } from './source-patch-contract.mjs';
 import { workspaceOperation } from './workspaces.mjs';
 import { materializeSourceInputs } from './source-inputs.mjs';
 import {hydrateArtifactInputBundle,referencedInputLimitBytes} from './artifact-input-bundle.mjs';
@@ -29,9 +36,22 @@ import {inspectUnitExit} from './unit-exit.mjs';
 import {harnessFailureCode,harnessTurnFailureCode} from './harness-termination.mjs';
 import {projectHarnessToolFailure,rememberHarnessToolCall,forgetHarnessToolCall} from './runtime-tool-failure.mjs';
 
-const DATA = '/var/lib/agentos-bridge/worker-runs';
-const ROOT = '/srv/agentos/workspaces';
-const NODE = '/opt/deepseek-harness/node/bin/node';
+// Path guards across the bridge require canonical roots. Resolve the platform's
+// own symlinks (macOS maps /var to /private/var) once, here, so every guard
+// keeps comparing realpath to the path it was given.
+function canonicalRoot(value) {
+  const target = path.resolve(value);
+  try {
+    mkdirSync(target, { recursive: true, mode: 0o700 });
+    return realpathSync(target);
+  } catch {
+    return target;
+  }
+}
+const DATA_BASE = canonicalRoot(process.env.AGENTOS_BRIDGE_DATA || (existsSync('/var/lib/agentos-bridge') ? '/var/lib/agentos-bridge' : '.local/bridge'));
+const DATA = path.join(DATA_BASE, 'worker-runs');
+const ROOT = canonicalRoot(process.env.AGENTOS_WORKSPACES_ROOT || (existsSync('/srv/agentos/workspaces') ? '/srv/agentos/workspaces' : '.local/workspaces'));
+const NODE = process.env.AGENTOS_NODE_BIN || process.execPath;
 const uuid = /^[0-9a-f-]{36}$/;
 const key = /^[a-z0-9_-]+\/[a-z0-9_-]+$/;
 const digest = (b) => createHash('sha256').update(b).digest('hex');
@@ -56,7 +76,8 @@ export async function runHarness(params, signal, generate, emit = () => {}) {
   try{params=await hydrateArtifactInputBundle(params,signal);}
   catch(e){emit('HARNESS_NOT_STARTED',{confirmed:true,phase:'input_bundle',code:e.code??'INPUT_BUNDLE_INVALID'});throw e;}
   if (params.accountId?.startsWith('agentos:muse:')) {
-    const accounts = JSON.parse(await readFile('/var/lib/agentos-bridge/accounts.json', 'utf8'));
+    const accountsFile = existsSync(path.join(DATA_BASE, 'accounts.json')) ? path.join(DATA_BASE, 'accounts.json') : '/var/lib/agentos-bridge/accounts.json';
+    const accounts = existsSync(accountsFile) ? JSON.parse(await readFile(accountsFile, 'utf8')) : [];
     const account = accounts.find(a => a.id === params.accountId && a.family === 'muse');
     if (!account) throw error('ACCOUNT_MISSING');
     const { museCredential } = await import('./muse-accounts.mjs');
@@ -83,8 +104,14 @@ export async function runHarness(params, signal, generate, emit = () => {}) {
       () => false,
     ));
   // Admission includes host activity outside AgentOS; the slot runner also checks before exec.
-  const mem = await readFile('/proc/meminfo', 'utf8');
-  if (Number(mem.match(/MemAvailable:\s+(\d+)/)?.[1] ?? 0) < memory.minAvailableKiB) throw error('HOST_CAPACITY');
+  let availableKiB = 0;
+  try {
+    const mem = await readFile('/proc/meminfo', 'utf8');
+    availableKiB = Number(mem.match(/MemAvailable:\s+(\d+)/)?.[1] ?? 0);
+  } catch {
+    availableKiB = Math.floor(os.freemem() / 1024);
+  }
+  if (availableKiB < memory.minAvailableKiB) throw error('HOST_CAPACITY');
   await mkdir(DATA, { recursive: true, mode: 0o700 });
   const dir = `${DATA}/${params.runId}`,
     home = `${dir}/home`,
@@ -96,6 +123,7 @@ export async function runHarness(params, signal, generate, emit = () => {}) {
     throw e;
   }
   const loopbackHosts = await prepareSandboxLocalhost(home);
+  const sandboxIdentity = await prepareSandboxIdentity(dir);
   const outputContract = deliveryContract(params.runId, params.deliveryContract?.artifacts?.map(a => a.name) ?? [], extractPromptJsonFields(params.prompt));
   const repairSnapshot = await prepareRepairFinalization(params,
     () => workspaceOperation({action: 'inspect', workspace: params.workspace}), home);
@@ -159,16 +187,29 @@ export async function runHarness(params, signal, generate, emit = () => {}) {
     if(handoff && handoff.digest!==handoffDigest){handoffDigest=handoff.digest;emit('RUNTIME_HANDOFF',handoff);}
   };
   const gateway = createServer(async (req, res) => {
-    const channel = bufferedModelChannel(res, signal);
-    const requestId = randomUUID();
+    // The pinned runtime speaks Messages; older adapters speak completions.
+    const wire =
+      req.url === '/v1/messages'
+        ? 'messages'
+        : req.url === '/v1/chat/completions'
+          ? 'completions'
+          : null;
+    const channel = bufferedModelChannel(res, signal, { wire: wire ?? 'completions' });
+    let requestId = randomUUID();
     let requestSequence;
-    // GLM uses a semantic-idle watchdog in its actual provider transport,
-    // after admission. Queuing and a progressing stream do not spend a fixed
-    // wall-clock generation deadline; caller cancellation still owns the run.
-    const gatedRequest = params.accountId === GLM_ACCOUNT;
+    // GLM waits for a host-wide permit before its provider timeout starts.
+    // The same lane the gate itself recognizes, by account or by GLM model:
+    // deciding it differently here spent a permit while a fixed deadline ran
+    // over the queue wait, which is the one thing a permit must cover.
+    const gatedRequest = inGlmRequestLane({ accountId: params.accountId, model: params.model });
+    // The verified GLM route streams through the semantic-idle watchdog after
+    // admission, so a progressing generation spends no fixed wall-clock budget.
+    // Any other GLM route keeps the per-call budget as its only backstop.
+    const watchedRequest = gatedRequest && glmModelProfile(params.accountId, params.model).reasoning === true;
     const requestTimeout = gatedRequest ? null : AbortSignal.timeout(WORKER_MODEL_TIMEOUT_MS);
+    let timing = modelRequestTiming({ gated: gatedRequest });
     try {
-      if (req.method !== 'POST' || req.url !== '/v1/chat/completions') {
+      if (req.method !== 'POST' || !wire) {
         res.writeHead(404);
         res.end();
         return;
@@ -199,39 +240,116 @@ export async function runHarness(params, signal, generate, emit = () => {}) {
         }
       }
       if(Date.now()-handoffAt>60000)await checkpointHandoff();
-      const input = toGeneration(JSON.parse(body), {
+      const request = JSON.parse(body);
+      const compaction = isCompactionRequest(request);
+      const input = (wire === 'messages' ? fromMessages : toGeneration)(request, {
         accountId: params.accountId,
         model: params.model,
         reasoning: params.model === 'glm-5.3-flash' ? 'low' : 'high',
       });
       input.requestId = requestId;
       requestSequence = ++requests;
+      timing.start();
       emit('MODEL_REQUEST', {
         requestId, requests: requestSequence,
         contextBytes: body.length,
         accountId: params.accountId,
         model: params.model,
+        ...(compaction ? { compaction: true } : {}),
       });
-      // Own admission here as well: an older long-lived bridge can load this
-      // runtime while retaining its original ungated generate callback. Newer
-      // bridges recognize the private symbol and do not acquire twice.
-      const result = await withAccountRequestGate(
-        gatedRequest ? { ...input, runId: params.runId } : input,
-        requestTimeout ? AbortSignal.any([channel.signal, requestTimeout]) : channel.signal,
-        (requestSignal) => generate(input, requestSignal, GLM_REQUEST_ADMITTED),
-        emit,
-      );
+      const gateEmit = (kind, payload) => {
+        timing.observe(kind);
+        emit(kind, payload);
+      };
+      let result;
+      for (let retry = 0; ; retry++) {
+        try {
+          // Own admission here as well: an older long-lived bridge can load this
+          // runtime while retaining its original ungated generate callback. Newer
+          // bridges recognize the private symbol and do not acquire twice.
+          // Every repeat queues for a fresh permit, so the GLM limit still holds.
+          result = await withAccountRequestGate(
+            gatedRequest
+              ? {
+                  ...input,
+                  runId: params.runId,
+                  ...(watchedRequest ? {} : { requestTimeoutMs: harnessCallBudgetMs(glmRequestBudgetMs(), compaction) }),
+                }
+              : input,
+            requestTimeout ? AbortSignal.any([channel.signal, requestTimeout]) : channel.signal,
+            (requestSignal) => generate(input, requestSignal, GLM_REQUEST_ADMITTED),
+            gateEmit,
+          );
+          break;
+        } catch (e) {
+          const wait = modelRetryDelay(e, retry, {
+            aborted: channel.signal.aborted || Boolean(requestTimeout?.aborted),
+            compaction,
+            messages: input.messages,
+          });
+          if (wait === null) {
+            // A content refusal is final for this session; say so in the record.
+            if (!channel.signal.aborted && providerContentBlock(e, input.messages))
+              emit('MODEL_ERROR', { code: 'MODEL_REQUEST_FAILED', accountId: params.accountId, model: params.model, retry: retry + 1, ...failedCallDiagnostic(e, input.messages) });
+            throw e;
+          }
+          // Health still sees the failed call; the attempt keeps its work.
+          // This retires the failed call's identity: its progress counters
+          // must not be continued by the repeat, which starts from zero.
+          emit('MODEL_ERROR', {
+            requestId, requests: requestSequence,
+            code: channel.failureCode(e),
+            accountId: params.accountId,
+            model: params.model,
+            retrying: true,
+            retry: retry + 1,
+            delayMs: wait,
+            ...failedCallDiagnostic(e, input.messages),
+            ...timing.sample(),
+          });
+          await delay(wait, undefined, { signal: channel.signal });
+          // Each repeat is its own provider call, with its own identity, queue
+          // and admission, announced before it can report progress.
+          requestId = input.requestId = randomUUID();
+          requestSequence = ++requests;
+          emit('MODEL_REQUEST', {
+            requestId, requests: requestSequence,
+            contextBytes: body.length,
+            accountId: params.accountId,
+            model: params.model,
+            retry: retry + 1,
+            ...(compaction ? { compaction: true } : {}),
+          });
+          timing = modelRequestTiming({ gated: gatedRequest });
+          timing.start();
+        }
+      }
       for (const k of ['input', 'output', 'cacheRead', 'cacheWrite', 'totalTokens'])
         usage[k] += result.message.usage?.[k] ?? 0;
       emit('MODEL_RESPONSE', {
         requestId, requests: requestSequence,
         stopReason: result.message.stopReason,
         tokens: result.message.usage?.totalTokens ?? null,
+        // Self-describing: provider health is read per account, and a response
+        // that only carries a runId forces a join to learn who answered.
+        accountId: params.accountId,
+        model: params.model,
+        ...timing.sample(),
       });
-      channel.finish(completion(result.message, params.model));
+      channel.finish(
+        wire === 'messages'
+          ? messagesEvents(result.message, params.model)
+          : completion(result.message, params.model),
+      );
     } catch (e) {
       gatewayError = channel.failureCode(requestTimeout?.aborted ? requestTimeout.reason : e);
-      emit('MODEL_ERROR', { requestId, requests: requestSequence, code: gatewayError });
+      emit('MODEL_ERROR', {
+        requestId, requests: requestSequence,
+        code: gatewayError,
+        accountId: params.accountId,
+        model: params.model,
+        ...timing.sample(),
+      });
       channel.fail(gatewayError);
       // A broken provider call must not leave an apparently running, idle agent loop.
       fail(error(gatewayError));
@@ -289,6 +407,7 @@ export async function runHarness(params, signal, generate, emit = () => {}) {
     '/etc/ld.so.cache',
     '/etc/ld.so.cache',
     ...loopbackHosts.mount,
+    ...sandboxIdentity,
     '--ro-bind',
     '/opt/deepseek-harness/node',
     '/opt/deepseek-harness/node',
@@ -538,7 +657,7 @@ export async function runHarness(params, signal, generate, emit = () => {}) {
     const prompt = `${params.prompt}${roleClosure}${sourceInputs.instruction}\n\nContext manifest and shared memory: /home/agent/context.json\nInputs: /home/agent/inputs/\nRoutine code errors, failing tests and missing references that can be fixed in this workspace are implementation work, not external blockers. When assigned implementation, edit and test until the scoped task is done; do not return only a diagnosis of a fixable error. Do not expand scope or claim success without evidence. Output: respond with JSON {"summary":"...","artifacts":${JSON.stringify(exampleArtifacts)}}. Artifacts must be real files under this workspace, not claimed executions. Return a limitation only for an actual unmet external dependency or unresolved verified defect. Never claim independent acceptance.`;
     const receipt = await rpc('session/prompt', {
       sessionId: params.runId,
-      contentBlocks: [{ type: 'text', text: prompt + museTaskDeliveryInstruction(params.deliveryContract) + runtimeHandoffInstruction + runtimeArtifactInstruction + deliveryManifestInstructionFor(outputContract) + (repairSnapshot ? repairFinalizationInstruction : '') }],
+      contentBlocks: [{ type: 'text', text: prompt + museTaskDeliveryInstruction(params.deliveryContract) + runtimeHandoffInstruction + runtimeArtifactInstruction + sourcePatchInstruction + deliveryManifestInstructionFor(outputContract) + (repairSnapshot ? repairFinalizationInstruction : '') }],
     });
     receiptId = receipt.messageId;
     if (guidanceIdentity) {

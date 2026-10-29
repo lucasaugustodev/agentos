@@ -34,6 +34,7 @@ const familyLabels: Row = {
   qwen: 'Qwen Cloud',
   openai: 'API compatível',
 };
+import { ProviderHealthBadge } from './ProviderHealth.js';
 function useConnections() {
   const [data, setData] = useState<Row>({ accounts: [] }),
     [error, setError] = useState('');
@@ -415,6 +416,12 @@ export function SimpleChat({ onConnect, onGoals }: { onConnect: () => void; onGo
 export function ConnectionsPanel({ onConnect }: { onConnect: () => void }) {
   const { data, error, refresh } = useConnections();
   const [busy, setBusy] = useState(false);
+  // "last answer 12s ago" has to keep counting, or a dead provider reads as fresh.
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, []);
   return (
     <>
       <div className="connections-intro">
@@ -462,6 +469,11 @@ export function ConnectionsPanel({ onConnect }: { onConnect: () => void }) {
             </div>
             <h3>{a.label}</h3>
             <p className="account-identity">{a.identity?.email ?? familyLabels[a.provider]}</p>
+            <ProviderHealthBadge
+              health={data.health?.[a.id]}
+              windowMinutes={data.healthWindowMinutes ?? 30}
+              now={now}
+            />
             <span
               className={
                 'connection-state ' +

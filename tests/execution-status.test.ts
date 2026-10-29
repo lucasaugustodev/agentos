@@ -90,18 +90,27 @@ it('distinguishes a pending model response from tool execution and warns on a lo
     actions: [],
   };
   const model = modelActivity(r, events);
+  // The request started 60s before `now`, and the elapsed time is always named:
+  // a fixed "over 5 minutes" hid both how long it waited and how close it was
+  // to being abandoned, which is the whole question while it hangs.
   expect(executionStatus(observation, r, now, model)).toMatchObject({
     level: 'active',
-    title: 'Aguardando resposta do modelo',
+    title: 'Aguardando o modelo há 1 min',
   });
-  expect(
-    executionStatus(
-      { ...observation, observedAt: new Date(now + 300000).toISOString() },
-      r,
-      now + 300000,
-      model,
-    ).title,
-  ).toBe('Modelo sem resposta há mais de 5 minutos');
+  // Half the request budget is where an ordinary wait becomes a warning.
+  const halfBudget = executionStatus(
+    { ...observation, observedAt: new Date(now + 300000).toISOString() },
+    r,
+    now + 300000,
+    model,
+  );
+  expect(halfBudget.level).toBe('warning');
+  expect(halfBudget.title).toBe('Modelo sem resposta há 6 min de 12 min');
+  // A shorter budget moves the warning earlier, without touching the wording.
+  expect(executionStatus(observation, r, now, model, 60_000)).toMatchObject({
+    level: 'warning',
+    title: 'Modelo sem resposta há 1 min de 1 min',
+  });
   expect(
     modelActivity(r, [
       ...events,
@@ -163,5 +172,5 @@ it('uses real Muse tool events for activity freshness without treating them as m
   ]);
   expect(next.pending).toBe(true);
   expect(next.latestKind).toBe('MODEL_REQUEST');
-  expect(executionStatus(observation, r, now, next).title).toBe('Aguardando resposta do modelo');
+  expect(executionStatus(observation, r, now, next).title).toBe('Aguardando o modelo há 0ms');
 });

@@ -40,11 +40,14 @@ import {
   Download,
   RefreshCw,
   MessageSquare,
+  Cpu,
 } from 'lucide-react';
 import './style.css';
 import './chat.css';
+import './live-routes.css';
 import { SimpleChat, ConnectionsPanel, ConnectAccountDialog } from './Chat';
 import { Cycles } from './Cycles';
+import { runRoute, elapsed } from './run-route';
 import { GoalDirectory, GoalOverview, TaskInspection } from './GoalProgress';
 import { ExecutionTreeView } from './ExecutionTreeView';
 import { retainExecutionEvents } from './task-attention';
@@ -377,7 +380,13 @@ function App() {
     agents = data?.agents ?? [],
     goals = data?.goals ?? [];
   const activeRuns = runs.filter((r) => r.state === 'running'),
-    accepted = tasks.filter((t) => t.state === 'accepted'),
+    // panelState omits accepted tasks; the per-goal count comes from the server.
+    acceptedCount = goals
+      .filter((g) => !g.is_demo)
+      .reduce((n, g) => n + (g.accepted_count ?? 0), 0),
+    inMotion = goals.filter(
+      (g) => !g.is_demo && !g.merged_into && !['completed', 'cancelled', 'failed'].includes(g.state),
+    ),
     waiting = tasks.filter(
       (t) => t.state.startsWith('waiting') || t.state.startsWith('blocked') || t.state === 'queued',
     );
@@ -584,7 +593,7 @@ function App() {
                       [
                         CheckCircle2,
                         'Entregas aceitas',
-                        accepted.length,
+                        acceptedCount,
                         'Critérios realmente verificados',
                         'green',
                       ],
@@ -614,8 +623,10 @@ function App() {
                       }
                     >
                       <GoalsList
-                        goals={goals.filter(search).slice(-4).reverse()}
+                        goals={inMotion.filter(search).slice(0, 4)}
                         tasks={tasks}
+                        runs={runs}
+                        accounts={data.accounts}
                         open={openGoal}
                         emptyAction={
                           <button className="button primary" disabled={busy} onClick={demo}>
@@ -813,6 +824,59 @@ function App() {
                     <h3>Operador</h3>
                     <p>Objetivos, prioridades e decisões</p>
                   </div>
+                  <div className="org-accounts">
+                    {data.accounts
+                      .filter((a) => a.enabled && a.provider !== 'local')
+                      .map((a) => {
+                        const live = runs.filter(
+                          (r) =>
+                            r.account_id === a.id &&
+                            ['queued', 'running', 'cancelling', 'reconciling'].includes(r.state),
+                        );
+                        return (
+                          <Panel
+                            key={a.id}
+                            title={a.label}
+                            subtitle={`${a.model} · ${live.length}/${a.max_concurrency} vagas em uso`}
+                          >
+                            <div className="org-load">
+                              <i
+                                style={{
+                                  width:
+                                    Math.min(100, (live.length / Math.max(1, a.max_concurrency)) * 100) +
+                                    '%',
+                                }}
+                              />
+                            </div>
+                            {live.map((r) => {
+                              const task = tasks.find((t) => t.id === r.task_id);
+                              const goal = goals.find((g) => g.id === task?.goal_id);
+                              return (
+                                <button
+                                  className="org-live-run"
+                                  key={r.id}
+                                  onClick={() => goal && openGoal(goal.id)}
+                                >
+                                  <Cpu size={15} />
+                                  <span>
+                                    <strong>{task?.title ?? r.task_id}</strong>
+                                    <small>
+                                      {goal?.project ?? 'objetivo'} · {runRoute(r, data.accounts)}
+                                    </small>
+                                  </span>
+                                  <small>
+                                    {r.state === 'running' ? 'há ' + elapsed(r.started_at) : 'na fila'}
+                                    {r.heartbeat_at ? ' · sinal há ' + elapsed(r.heartbeat_at) : ''}
+                                  </small>
+                                </button>
+                              );
+                            })}
+                            {!live.length && <p className="org-idle">Nenhuma tarefa nesta conta agora.</p>}
+                          </Panel>
+                        );
+                      })}
+                  </div>
+                  <h3 className="org-section-title">Especializações disponíveis</h3>
                   <div className="department-grid">
                     {Object.entries(departmentLabels).map(([d, label]) => (
                       <Panel key={d} title={String(label)} subtitle="Supervisor sob demanda">
@@ -1411,11 +1475,15 @@ function App() {
 function GoalsList({
   goals,
   tasks,
+  runs,
+  accounts,
   open,
   emptyAction,
 }: {
   goals: Row[];
   tasks: Row[];
+  runs: Row[];
+  accounts: Row[];
   open: (id: string) => void;
   emptyAction?: React.ReactNode;
 }) {
@@ -1423,8 +1491,12 @@ function GoalsList({
     <div className="goals-list">
       {goals.map((g) => {
         const list = tasks.filter((t) => t.goal_id === g.id),
-          done = list.filter((t) => t.state === 'accepted').length,
-          progress = Math.round((done / Math.max(1, list.length)) * 100);
+          done = g.accepted_count ?? 0,
+          total = g.task_count ?? list.length,
+          progress = Math.round((done / Math.max(1, total)) * 100),
+          live = runs.filter(
+            (r) => r.state === 'running' && list.some((t) => t.id === r.task_id),
+          );
         return (
           <button key={g.id} className="goal-row" onClick={() => open(g.id)}>
             <span className="goal-symbol">
@@ -1436,14 +1508,20 @@ function GoalsList({
                 {g.is_demo && <span className="demo-tag">Exemplo técnico</span>}
               </div>
               <p>
-                {g.project} · {list.length} tarefas · criado há {relative(g.created_at)}
+                {g.project} · {total} tarefas · criado há {relative(g.created_at)}
               </p>
+              {live.map((r) => (
+                <p className="goal-live-route" key={r.id}>
+                  <Cpu size={13} />
+                  {runRoute(r, accounts)} · {list.find((t) => t.id === r.task_id)?.title}
+                </p>
+              ))}
               <div className="goal-progress">
                 <div className="progress-track">
                   <i style={{ width: progress + '%' }} />
                 </div>
                 <span>
-                  {done}/{list.length} aceitas
+                  {done}/{total} aceitas
                 </span>
               </div>
             </div>
@@ -1795,7 +1873,14 @@ function GoalDetail({
       {tab === 'overview' && (
         <GoalOverview detail={detail} data={data} inspect={setSelectedTaskId} />
       )}
-      {tab === 'tree' && <ExecutionTreeView detail={detail} data={data} inspect={setSelectedTaskId} />}
+      {tab === 'tree' && (
+        <ExecutionTreeView
+          detail={detail}
+          data={data}
+          inspect={setSelectedTaskId}
+          loadTask={(id, signal) => api('/panel/tasks/' + id, 'GET', undefined, signal)}
+        />
+      )}
       {tab === 'plan' && (
         <>
           <Panel title="Plano de execução" subtitle="As dependências são liberadas após aceite">

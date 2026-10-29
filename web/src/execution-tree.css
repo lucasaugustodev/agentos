@@ -943,6 +943,30 @@
   color: #f59e0b;
 }
 
+.criteria-item-check.failed {
+  border-color: rgba(248, 113, 113, 0.3);
+  background: rgba(248, 113, 113, 0.05);
+}
+
+.criteria-item-check.failed svg {
+  color: #f87171;
+}
+
+.drawer-note {
+  margin: 0;
+  font-size: 0.8rem;
+  color: #8190a7;
+}
+
+.drawer-subheading {
+  margin: 0.6rem 0 0.25rem;
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: #94a3b8;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
 .criteria-item-info strong {
   display: block;
   font-size: 0.82rem;

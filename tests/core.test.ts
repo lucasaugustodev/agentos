@@ -411,6 +411,16 @@ describe('Durable control plane', () => {
     expect(await service.schedule()).toHaveLength(1);
     expect((await pool.query("SELECT * FROM memories WHERE kind='evidence'")).rowCount).toBe(1);
   });
+  it('names the missing field when a delivered manifest misses its contract', async () => {
+    await service.createGoal(goal(), true);
+    const [id] = await service.schedule(),
+      run = await service.startRun(id, 'test');
+    await service.writeArtifact(id, run.fence, 'result.json', JSON.stringify({ summary: 'done', artifacts: [] }));
+    await service.completeRun(id, run.fence, 'Delivered');
+    const result = await service.validateTask(run.task_id);
+    expect(result.passed).toBe(false);
+    expect(result.checks[0].detail).toBe('Conteúdo não atende ao contrato: result.json precisa do campo "validated" igual a true.');
+  });
   it('preserves binary artifacts through storage and authenticated download', async () => {
     await service.createGoal(goal(), true);
     const [id] = await service.schedule(),

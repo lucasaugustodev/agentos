@@ -4,6 +4,8 @@ import { spawn } from 'node:child_process';
 import { createServer } from 'node:http';
 import { createInterface } from 'node:readline';
 import { mkdir, readFile, writeFile, appendFile, rename, realpath, stat, cp, lstat } from 'node:fs/promises';
+import { existsSync, mkdirSync, realpathSync } from 'node:fs';
+import os from 'node:os';
 import { createHash } from 'node:crypto';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 import path from 'node:path';
@@ -25,12 +27,31 @@ import { prepareOpenCodeWorkspace } from './opencode-preflight.mjs';
 import { prepareRepairFinalization, finalizeRepairArtifacts, repairFinalizationInstruction } from './repair-finalizer.mjs';
 export { collectArtifacts } from './artifact-collector.mjs';
 
-const DATA = '/var/lib/agentos-bridge/worker-runs';
-const ROOT = '/srv/agentos/workspaces';
-const NODE = '/opt/deepseek-harness/node/bin/node';
-const PROFILE = '/var/lib/agentos-bridge/opencode';
-const ACCOUNT = 'agentos:api:00000000-0000-4000-8000-000000000001';
-const MODEL = 'glm-5.3-flash';
+// Path guards across the bridge require canonical roots. Resolve the platform's
+// own symlinks (macOS maps /var to /private/var) once, here, so every guard
+// keeps comparing realpath to the path it was given.
+function canonicalRoot(value) {
+  const target = path.resolve(value);
+  try {
+    mkdirSync(target, { recursive: true, mode: 0o700 });
+    return realpathSync(target);
+  } catch {
+    return target;
+  }
+}
+const DATA_BASE = canonicalRoot(process.env.AGENTOS_BRIDGE_DATA || (existsSync('/var/lib/agentos-bridge') ? '/var/lib/agentos-bridge' : '.local/bridge'));
+const DATA = path.join(DATA_BASE, 'worker-runs');
+const ROOT = canonicalRoot(process.env.AGENTOS_WORKSPACES_ROOT || (existsSync('/srv/agentos/workspaces') ? '/srv/agentos/workspaces' : '.local/workspaces'));
+const NODE = process.execPath;
+const PROFILE = process.env.AGENTOS_OPENCODE_PROFILE || path.join(DATA_BASE, 'opencode');
+const DEFAULT_ACCOUNT = 'agentos:api:00000000-0000-4000-8000-000000000001';
+const DEFAULT_MODEL = 'glm-5.3-flash';
+// Namespaces, cgroup limits and the read-only mount tree are what makes a
+// worker isolated. Running without them is a different kind of execution, not
+// a degraded one, so it never happens implicitly and is never recorded as
+// isolated.
+const ISOLATION_AVAILABLE = existsSync('/usr/bin/systemd-run') && existsSync('/usr/bin/bwrap');
+const UNSANDBOXED_ALLOWED = process.env.AGENTOS_UNSANDBOXED_RUNTIME === '1';
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const workspaceKey = /^[a-z0-9_-]+\/[a-z0-9_-]+$/;
 const digest = (bytes) => createHash('sha256').update(bytes).digest('hex');
@@ -77,15 +98,34 @@ async function executeOpenCode(params, signal, emit) {
   if (!Array.isArray(writePaths) || !writePaths.length ||
       new Set(writePaths).size !== writePaths.length ||
       writePaths.some((item) => !['qa-protocol/', 'evidence/'].includes(item))) throw failure('INVALID_WRITE_SCOPE');
-  if ((params.accountId && params.accountId !== ACCOUNT && params.accountId !== ACCOUNT.replaceAll(':', '-')) ||
-      (params.model && params.model !== MODEL)) throw failure('INVALID_ROUTE');
+  const accountsFile = existsSync(path.join(DATA_BASE, 'accounts.json'))
+    ? path.join(DATA_BASE, 'accounts.json')
+    : existsSync('/var/lib/agentos-bridge/accounts.json')
+      ? '/var/lib/agentos-bridge/accounts.json'
+      : null;
+  let accounts = [];
+  if (accountsFile) {
+    try { accounts = JSON.parse(await readFile(accountsFile, 'utf8')); } catch {}
+  }
+  const account = accounts.find((item) => item.id === params.accountId || item.id === params.accountId?.replaceAll('-', ':')) ||
+    accounts.find((item) => item.id === DEFAULT_ACCOUNT) ||
+    accounts[0];
+  if (!ISOLATION_AVAILABLE && !UNSANDBOXED_ALLOWED) throw failure('RUNTIME_NOT_ISOLATED');
+  if (!account?.credential?.key) throw failure('ACCOUNT_CONFIGURATION');
+  let providerEndpoint;
+  try { providerEndpoint = new URL(account.baseUrl); } catch { throw failure('ACCOUNT_CONFIGURATION'); }
+  if (providerEndpoint.protocol !== 'https:' &&
+      !['127.0.0.1', 'localhost', '::1'].includes(providerEndpoint.hostname)) throw failure('ACCOUNT_CONFIGURATION');
+  const effectiveModel = params.model || account.model || DEFAULT_MODEL;
   const memory = openCodeMemory(params);
-  const account = JSON.parse(await readFile('/var/lib/agentos-bridge/accounts.json', 'utf8'))
-    .find((item) => item.id === ACCOUNT);
-  if (account?.baseUrl !== 'https://code.verboo.ai/router/v1' || account?.model !== MODEL ||
-      typeof account?.credential?.key !== 'string' || !account.credential.key) throw failure('ACCOUNT_CONFIGURATION');
-  const mem = await readFile('/proc/meminfo', 'utf8');
-  if (Number(mem.match(/MemAvailable:\s+(\d+)/)?.[1] ?? 0) < memory.minAvailableKiB) throw failure('HOST_CAPACITY');
+  let availableKiB = 0;
+  try {
+    const mem = await readFile('/proc/meminfo', 'utf8');
+    availableKiB = Number(mem.match(/MemAvailable:\s+(\d+)/)?.[1] ?? 0);
+  } catch {
+    availableKiB = Math.floor(os.freemem() / 1024);
+  }
+  if (availableKiB < memory.minAvailableKiB) throw failure('HOST_CAPACITY');
   await mkdir(DATA, { recursive: true, mode: 0o700 });
   const dir = `${DATA}/${params.runId}`;
   try { await mkdir(dir, { mode: 0o700 }); }
@@ -111,7 +151,8 @@ async function executeOpenCode(params, signal, emit) {
     // Serialize immutable snapshots: model calls and physical stop may overlap.
     const bytes = JSON.stringify({
       runId: params.runId, workspace: params.workspace, state, at: new Date().toISOString(),
-      unit, runtime: 'opencode', model: MODEL, requests, toolCalls, usage,
+      unit, runtime: 'opencode', model: effectiveModel, requests, toolCalls, usage,
+      isolation: ISOLATION_AVAILABLE ? 'namespace' : 'none',
       deliveryContract: outputContract, providerBackoff: providerWait, ...extra,
     });
     const pending = savePending.then(async () => {
@@ -170,7 +211,7 @@ async function executeOpenCode(params, signal, emit) {
     }
     await writeFile(`${home}/context.json`, JSON.stringify({ ...(params.context ?? {}), recovery: params.recoveryContext ?? null }));
     await writeFile(`${home}/opencode.json`, JSON.stringify({
-      $schema: 'https://opencode.ai/config.json', model: `agentos/${MODEL}`, small_model: `agentos/${MODEL}`,
+      $schema: 'https://opencode.ai/config.json', model: `agentos/${effectiveModel}`, small_model: `agentos/${effectiveModel}`,
       enabled_providers: ['agentos'], autoupdate: false, share: 'disabled', snapshot: false,
       plugin: [], mcp: {}, lsp: false,
       permission: { '*': 'allow', task: 'deny', question: 'deny', webfetch: 'deny', websearch: 'deny', skill: 'deny' },
@@ -179,7 +220,7 @@ async function executeOpenCode(params, signal, emit) {
         permission: { task: 'deny', question: 'deny', webfetch: 'deny', websearch: 'deny', skill: 'deny' } } },
       provider: { agentos: { npm: '@ai-sdk/openai-compatible', name: 'AgentOS scoped gateway',
         options: { baseURL: 'http://127.0.0.1:17820/v1', apiKey: 'no-provider-secret' },
-        models: { [MODEL]: { name: 'GLM 5.3 Flash', tool_call: true, reasoning: true, attachment: true,
+        models: { [effectiveModel]: { name: effectiveModel, tool_call: true, reasoning: true, attachment: true,
           modalities: { input: ['text', 'image'], output: ['text'] },
           interleaved: { field: 'reasoning_content' }, limit: { context: 1048576, output: 32768 },
           options: { reasoningEffort: 'low' }, variants: {
@@ -206,8 +247,8 @@ async function executeOpenCode(params, signal, emit) {
           if (body.length > 4 * 1024 * 1024) throw failure('CONTEXT_TOO_LARGE');
         }
         const payload = JSON.parse(body);
-        if (payload.model !== MODEL) throw failure('INVALID_ROUTE');
-        const identity = { runId: params.runId, workspace: params.workspace, model: MODEL };
+        if (payload.model !== effectiveModel && payload.model !== DEFAULT_MODEL) throw failure('INVALID_ROUTE');
+        const identity = { runId: params.runId, workspace: params.workspace, model: effectiveModel };
         const upstreamFailure = await requestWithProviderBackoff(
           { ...identity, providerBackoff: providerWait }, identity, () => requestGatedModel(
           {
@@ -221,12 +262,12 @@ async function executeOpenCode(params, signal, emit) {
               emit('MODEL_REQUEST', {
                 requests,
                 contextBytes: Buffer.byteLength(body),
-                accountId: ACCOUNT,
-                model: MODEL,
+                accountId: account.id,
+                model: effectiveModel,
               });
             },
           },
-          account.baseUrl + '/chat/completions',
+          account.baseUrl.replace(/\/+$/, '') + '/chat/completions',
           {
             method: 'POST',
             redirect: 'error',
@@ -356,12 +397,26 @@ async function executeOpenCode(params, signal, emit) {
       '--setenv', 'PLAYWRIGHT_BROWSERS_PATH', '/opt/browsers', '--setenv', 'LANG', 'C.UTF-8',
       '--', NODE, '/opt/agentos-bridge/opencode-sandbox.mjs',
     ];
-    child = spawn('systemd-run', [
-      '--quiet', '--wait', '--pipe', '--collect', `--unit=${unit}`, '-p', memory.memoryMax,
-      '-p', 'CPUQuota=150%', '-p', 'TasksMax=256', '-p', 'KillMode=control-group',
-      '-p', 'TimeoutStopSec=4', '--', '/usr/bin/python3', fileURLToPath(new URL('./slot-runner.py', import.meta.url)),
-      params.workspace, memory.slotMemory, '/usr/bin/bwrap', ...mounts,
-    ], { stdio: ['ignore', 'pipe', 'pipe'] });
+    if (ISOLATION_AVAILABLE) {
+      child = spawn('systemd-run', [
+        '--quiet', '--wait', '--pipe', '--collect', `--unit=${unit}`, '-p', memory.memoryMax,
+        '-p', 'CPUQuota=150%', '-p', 'TasksMax=256', '-p', 'KillMode=control-group',
+        '-p', 'TimeoutStopSec=4', '--', '/usr/bin/python3', fileURLToPath(new URL('./slot-runner.py', import.meta.url)),
+        params.workspace, memory.slotMemory, '/usr/bin/bwrap', ...mounts,
+      ], { stdio: ['ignore', 'pipe', 'pipe'] });
+    } else {
+      emit('RUNTIME_NOT_ISOLATED', { confirmed: true, reason: 'sandbox_unavailable', optIn: true });
+      child = spawn(NODE, [fileURLToPath(new URL('./opencode-sandbox.mjs', import.meta.url))], {
+        cwd: workspace,
+        env: {
+          ...process.env,
+          HOME: home,
+          PATH: process.env.PATH,
+          LANG: 'C.UTF-8',
+        },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+    }
     exitPromise = new Promise((resolve) => {
       child.once('error', () => { terminalError ??= failure('RUNTIME_START_FAILED'); ended = true; resolve(); });
       child.once('close', (code) => { exitCode = code; ended = true; resolve(); });

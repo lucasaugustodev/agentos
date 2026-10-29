@@ -1,4 +1,5 @@
 import { readModelPolicy, modelRouteAllowed } from '../bridge/model-policy.mjs';
+import { PLAN_STALL_REASON } from '../shared/recovery.js';
 import { generationTiming } from './generation-timing.js';
 import { planningRecovery } from './planning-recovery.js';
 import { randomUUID } from 'node:crypto';
@@ -21,6 +22,17 @@ import {readObjectiveInputs,inputsForRequirements} from './objective-inputs.js';
 import {planningInputContext,planningInputInstruction} from './planning-input-context.js';
 import {reconcileInheritedCancellation} from './objective-state-repair.js';
 import {reconcilePlanningFailures,verifyPlanningReviewEffects,planningReviewFallback,assertPlanningFeedbackCurrent} from './planning-supervision.js';
+
+// A prompt pasted whole is not a name. Prefer an explicit title, then the first
+// meaningful line, stripped of Markdown heading and label noise.
+function objectiveTitle(request: { title?: string; message: string }) {
+  if (request.title) return request.title;
+  const line = request.message
+    .split('\n')
+    .map((text) => text.replace(/^#+\s*/, '').replace(/^PROMPT:\s*/i, '').trim())
+    .find((text) => text.length >= 3);
+  return (line ?? request.message).slice(0, 120);
+}
 
 export async function submitObjective(raw: unknown) {
   const request = objectiveSchema.parse(raw);
@@ -52,7 +64,7 @@ export async function submitObjective(raw: unknown) {
     const id = randomUUID();
     await db.query(
       "INSERT INTO goals(id,title,description,project,state,idempotency_key) VALUES($1,$2,$3,$4,'planning',$5)",
-      [id, request.message.slice(0, 120), request.message, request.project, request.idempotencyKey],
+      [id, objectiveTitle(request), request.message, request.project, request.idempotencyKey],
     );
     await db.query(
       'INSERT INTO objectives(id,request,request_hash,mode,chat_id) VALUES($1,$2,$3,$4,$5)',
@@ -113,6 +125,12 @@ export async function objectiveDetail(id: string) {
   };
 }
 
+// A run failure stops being evidence once every task it named was accepted
+// afterwards: replanning on it superseded the independent QA of a lot that
+// had just passed (thefacebook r7, 2026-10-27).
+export const SETTLED_RUN_FEEDBACK = `(f.trigger_key LIKE 'run:%' AND jsonb_array_length(f.task_ids)>0
+  AND NOT EXISTS(SELECT 1 FROM jsonb_array_elements_text(f.task_ids) settled(id)
+    WHERE NOT EXISTS(SELECT 1 FROM tasks st WHERE st.id::text=settled.id AND st.state='accepted')))`;
 export async function queueFeedback(
   db: DB,
   id: string,
@@ -192,7 +210,7 @@ export async function reconcilePlanning() {
       // feedback attached solely to a terminally failed planning run would
       // block every future advance forever while never triggering a replan.
       const hasPendingFeedback = (await db.query(`SELECT 1 FROM objective_feedback f
-        WHERE f.objective_id=$1 AND NOT EXISTS(SELECT 1 FROM planning_runs p
+        WHERE f.objective_id=$1 AND NOT ${SETTLED_RUN_FEEDBACK} AND NOT EXISTS(SELECT 1 FROM planning_runs p
           WHERE p.objective_id=f.objective_id AND p.state='completed'
             AND p.feedback->'feedbackIds' ? f.id::text)
           AND NOT EXISTS(SELECT 1 FROM planning_runs c
@@ -217,7 +235,7 @@ export async function reconcilePlanning() {
         ]);
       const pending = (
         await db.query(
-          "SELECT f.* FROM objective_feedback f WHERE objective_id=$1 AND NOT EXISTS(SELECT 1 FROM planning_runs p WHERE p.objective_id=f.objective_id AND p.feedback->'feedbackIds' ? f.id::text) ORDER BY created_at",
+          `SELECT f.* FROM objective_feedback f WHERE objective_id=$1 AND NOT ${SETTLED_RUN_FEEDBACK} AND NOT EXISTS(SELECT 1 FROM planning_runs p WHERE p.objective_id=f.objective_id AND p.feedback->'feedbackIds' ? f.id::text) ORDER BY created_at`,
           [o.id],
         )
       ).rows;
@@ -243,7 +261,7 @@ export async function reconcilePlanning() {
         continue;
       // Fresh information can supersede a failed proposal, not erase the older
       // counterexamples attached to it. Carry those inputs into the new request.
-      const stranded=(await db.query(`SELECT f.* FROM objective_feedback f WHERE f.objective_id=$1
+      const stranded=(await db.query(`SELECT f.* FROM objective_feedback f WHERE f.objective_id=$1 AND NOT ${SETTLED_RUN_FEEDBACK}
         AND NOT(f.id=ANY($2::uuid[])) AND NOT EXISTS(SELECT 1 FROM planning_runs consumed
           WHERE consumed.objective_id=f.objective_id AND consumed.state='completed'
             AND (consumed.feedback->'feedbackIds' ? f.id::text OR consumed.created_at>f.created_at))
@@ -275,8 +293,8 @@ export async function reconcilePlanning() {
         recent.every((r) => (r.feedback.acceptedCount ?? 0) === acceptedCount)
       ) {
         await db.query(
-          "UPDATE objectives SET status='waiting_external',reason='Três revisões sem avanço validado; é necessária uma hipótese ou informação nova.' WHERE id=$1",
-          [o.id],
+          "UPDATE objectives SET status='waiting_external',reason=$2 WHERE id=$1",
+          [o.id, PLAN_STALL_REASON],
         );
         continue;
       }

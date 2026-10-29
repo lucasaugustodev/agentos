@@ -1,3 +1,6 @@
+/** Set by the planner when three revisions bring no newly validated work. */
+export const PLAN_STALL_REASON = 'Três revisões sem avanço validado; é necessária uma hipótese ou informação nova.';
+
 /** Provider availability is not evidence that an implementation failed. */
 export function providerAvailabilityFailure(code?: string | null) {
   return /^(AUTH_REQUIRED|QUOTA_EXCEEDED|RATE_LIMIT|RATE_LIMITED)$/.test(code ?? '');

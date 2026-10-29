@@ -218,6 +218,10 @@ export function backoffDelay(attempt, retryAfterSeconds, random = Math.random) {
 export function openAICompletionsFallback({ fetch: fetchImpl = fetch, random = Math.random,
   idleTimeoutMs = MODEL_IDLE_TIMEOUT_MS, now = () => Date.now(), timers } = {}) {
   return {
+    // This transport reads the prompt and the tools off the Context itself. The
+    // caller must not fold them into the transcript first: the SDK's shape and
+    // this one are alternatives, and folding here would drop both silently.
+    acceptsRawContext: true,
     streamSimple(model, { systemPrompt, messages, tools }, options = {}) {
       const resultPromise = (async () => {
         // The base URL is operator input and this request carries the credential.

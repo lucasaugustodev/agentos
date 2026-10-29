@@ -6,7 +6,7 @@ import { config } from '../server/config.js';
 import { accountBridge } from '../server/bridge.js';
 import { objectiveSchema,validatePlan } from '../server/objective-contracts.js';
 import { compileDelivery,bindDeliveryFeedback,incrementalEligible,verifiedBatch } from '../server/incremental-planning.js';
-import { submitObjective,feedbackObjective,claimPlanning,applyPlannedResult,reconcilePlanning,PlanningEngine } from '../server/planner.js';
+import { submitObjective,feedbackObjective,claimPlanning,applyPlannedResult,reconcilePlanning,PlanningEngine,queueFeedback } from '../server/planner.js';
 import { refreshGoal } from '../server/service.js';
 
 const request = () => objectiveSchema.parse({message:'Corrigir dois defeitos independentes e verificar a candidata acumulada.',project:'test',
@@ -136,6 +136,16 @@ it('carries immutable artifacts from a rejected submitted delivery without certi
   expect(queued[0].feedback.sourceOverrides['test/base']).not.toContain('r2');
   expect((await pool.query('SELECT state FROM tasks WHERE id=$1',[task.id])).rows[0].state).toBe('submitted');
   expect((await pool.query('SELECT passed FROM acceptances WHERE run_id=$1',[runId])).rows[0].passed).toBe(false);
+});
+it('advances instead of replanning on a run failure whose task was accepted afterwards',async()=>{
+  const {objectiveId}=await start();
+  const deliver=(await pool.query("SELECT id FROM tasks WHERE goal_id=$1 AND key='r1-deliver'",[objectiveId])).rows[0].id;
+  await queueFeedback(pool,objectiveId,'run:'+randomUUID(),'Entrega: tentativa anterior reprovada antes da correção.',[deliver]);
+  await acceptBatch(objectiveId,1);
+  await reconcilePlanning();
+  const queued=(await pool.query("SELECT * FROM planning_runs WHERE objective_id=$1 AND state='queued'",[objectiveId])).rows;
+  expect(queued).toHaveLength(1);
+  expect(queued[0].trigger_key).toMatch(/^incremental:/);
 });
 it('queues exactly one successor across repeated/concurrent reconciliation and carries its verified source',async()=>{
   const {objectiveId}=await start();await acceptBatch(objectiveId,1);

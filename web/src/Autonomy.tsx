@@ -1,28 +1,129 @@
 import React, { useEffect, useState } from 'react';
+import { elapsed } from './run-route';
+import './live-routes.css';
+
+const duration = (s?: number | null) =>
+  s == null ? '—' : s < 3600 ? Math.round(s / 60) + ' min' : (s / 3600).toFixed(1).replace('.', ',') + ' h';
+const statusLabel: Record<string, string> = {
+  active: 'Em andamento',
+  planned: 'Planejado',
+  replanning: 'Replanejando',
+  paused: 'Pausado',
+  completed: 'Concluído',
+  failed: 'Falhou',
+};
 
 export function Autonomy({ api }: { api: (url: string) => Promise<any> }) {
-  const [data,setData]=useState<any>(null), [error,setError]=useState('');
-  useEffect(()=>{let stopped=false; const refresh=async()=>{try{const d=await api('/autonomy');if(!stopped){setData(d);setError('');}}catch{if(!stopped)setError('Não foi possível consultar o observador.');}};
-    void refresh();const timer=setInterval(refresh,15000);return()=>{stopped=true;clearInterval(timer);};},[api]);
-  if(error)return <section role="alert">{error}</section>;
-  if(!data)return <p>Consultando observador independente…</p>;
-  const q=data.qualification, stale=Date.now()-Date.parse(data.observedAt)>90000;
-  return <section className="autonomy-panel">
-    <h2>Autonomia do AgentOS</h2>
-    <p><strong>{stale?'Observação desatualizada':data.qualified?'Meta comprovada':'Em validação'}</strong> · GLM exclusivo · até 12 sessões / 6 chamadas simultâneas</p>
-    <div className="autonomy-cards">
-      <article><strong>{data.finalDeliveries?.length??0}</strong><span>Entregas finais aceitas do objetivo</span></article>
-      <article><strong>{q.autonomousPassed} / {q.total}</strong><span>Ensaios autônomos · meta 54 / 60</span></article>
-      <article><strong>{data.gate?.effectiveActive??'?' } / 6</strong><span>Chamadas GLM · {data.gate?.queued??'?'} na fila</span></article>
-      <article><strong>{data.active?.length??0}</strong><span>Sessões ativas no sistema</span></article>
-    </div>
-    <p>{data.status==='schema_pending'?'Atualização de banco pendente.':data.status==='no_verified_delivery'?'Ainda não há entrega final aceita neste objetivo.':data.status==='model_policy_pending'?'Há execuções anteriores à política GLM para reconciliar.':data.status==='observation_failed'?'A leitura falhou; atividade atual não confirmada.':'Observação em andamento.'}</p>
-    <p>{q.reason} {q.pending} ensaios pendentes.</p>
-    <p>Observador: {new Date(data.observedAt).toLocaleString('pt-BR')} · Janela observada: {Number(q.observedHours??0).toFixed(2)} h. Isso não comprova 24 h de autonomia.</p>
-    <details><summary>Ver execuções e evidências</summary>
-      <ul>{(data.active??[]).map((r:any)=><li key={r.id}>{r.title} · {r.stage} · {r.model} · {r.state}</li>)}</ul>
-      <p>Aceites de supervisão ficam fora da contagem de entregas finais.</p>
-      <pre>{JSON.stringify({status:data.status,schema:data.schema,acceptances24h:data.acceptances24h,errors:data.errors},null,2)}</pre>
-    </details>
-  </section>;
+  const [data, setData] = useState<any>(null),
+    [error, setError] = useState('');
+  useEffect(() => {
+    let stopped = false;
+    const refresh = async () => {
+      try {
+        const d = await api('/autonomy');
+        if (!stopped) {
+          setData(d);
+          setError('');
+        }
+      } catch {
+        if (!stopped) setError('Não foi possível consultar os indicadores de autonomia.');
+      }
+    };
+    void refresh();
+    const timer = setInterval(refresh, 15000);
+    return () => {
+      stopped = true;
+      clearInterval(timer);
+    };
+  }, [api]);
+  if (error && !data) return <section role="alert">{error}</section>;
+  if (!data) return <p>Consultando indicadores…</p>;
+  const t = data.totals,
+    rate = t.attempts ? Math.round((t.succeeded / t.attempts) * 100) : null;
+  return (
+    <section className="autonomy-panel">
+      <h2>Autonomia da operação</h2>
+      <p>
+        Últimas {data.windowHours} h · atualizado {new Date(data.observedAt).toLocaleTimeString('pt-BR')}
+        {error && ' · última atualização falhou'}
+      </p>
+      <div className="autonomy-cards">
+        <article>
+          <strong>{data.active.length}</strong>
+          <span>Tarefas executando agora</span>
+        </article>
+        <article>
+          <strong>
+            {t.succeeded} / {t.attempts}
+          </strong>
+          <span>Tentativas concluídas{rate !== null ? ` · ${rate}%` : ''}</span>
+        </article>
+        <article>
+          <strong>{t.failed}</strong>
+          <span>Tentativas com falha (recuperação automática)</span>
+        </article>
+        <article>
+          <strong>{t.interventions}</strong>
+          <span>Intervenções suas · {t.attention} itens pedindo atenção</span>
+        </article>
+      </div>
+      <h3>Objetivos</h3>
+      <ul className="autonomy-list">
+        {data.objectives.map((o: any) => (
+          <li key={o.id}>
+            <strong>{o.title}</strong>
+            <span>
+              {statusLabel[o.state] ?? o.state} · {o.accepted_count}/{o.task_count} etapas aceitas ·{' '}
+              {o.running} executando · {o.failures}/{o.attempts} falhas
+              {o.last_accepted_at ? ` · último aceite há ${elapsed(o.last_accepted_at)}` : ''}
+              {o.attention_count ? ` · ${o.attention_count} pedem atenção` : ''}
+            </span>
+          </li>
+        ))}
+      </ul>
+      <h3>Contas</h3>
+      <ul className="autonomy-list">
+        {data.accounts.map((a: any) => (
+          <li key={a.id}>
+            <strong>
+              {a.label} · {a.model}
+            </strong>
+            <span>
+              {a.running}/{a.max_concurrency} vagas em uso · {a.succeeded} concluídas · {a.failed} falhas
+              {a.timeouts ? ` (${a.timeouts} por tempo esgotado)` : ''} · média de {duration(a.avg_success_seconds)} por
+              tentativa concluída
+            </span>
+          </li>
+        ))}
+      </ul>
+      {!!data.errors.length && (
+        <>
+          <h3>Falhas mais comuns</h3>
+          <ul className="autonomy-list">
+            {data.errors.map((e: any) => (
+              <li key={e.code}>
+                <strong>{e.code}</strong>
+                <span>{e.n} tentativas</span>
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
+      <details>
+        <summary>Ver execuções ativas</summary>
+        <ul className="autonomy-list">
+          {data.active.map((r: any) => (
+            <li key={r.id}>
+              <strong>{r.title}</strong>
+              <span>
+                {r.stage} · {r.model} · {r.account_label ?? 'conta automática'} ·{' '}
+                {r.state === 'running' ? 'há ' + elapsed(r.started_at) : r.state}
+                {r.heartbeat_at ? ' · sinal há ' + elapsed(r.heartbeat_at) : ''}
+              </span>
+            </li>
+          ))}
+        </ul>
+      </details>
+    </section>
+  );
 }

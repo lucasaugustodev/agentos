@@ -745,3 +745,48 @@
   color: #a4bad0;
   line-height: 1.5;
 }
+
+/* Provider health reads next to the connection state on purpose: the two
+   disagree exactly when the bridge still believes it is connected. */
+.provider-health {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  margin-top: 11px;
+  padding: 8px 9px;
+  border: 1px solid #2b405c;
+  border-radius: 7px;
+  background: #16233a;
+  color: #839dbf;
+}
+.provider-health strong {
+  display: block;
+  font-size: 10px;
+  color: #c6d8ef;
+  font-weight: 600;
+}
+.provider-health small {
+  display: block;
+  font-size: 9px;
+  margin-top: 3px;
+  overflow-wrap: anywhere;
+}
+.provider-health-queue {
+  color: #6e8aaf;
+}
+.provider-health-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  margin-top: 3px;
+  flex: none;
+  background: currentColor;
+}
+.provider-health.healthy { color: #7acdaf; }
+.provider-health.slow { color: #dfb375; }
+.provider-health.failing { color: #e2956d; }
+.provider-health.down {
+  color: #e07a7a;
+  border-color: #5a3340;
+}
+.provider-health.idle { color: #6e8aaf; }

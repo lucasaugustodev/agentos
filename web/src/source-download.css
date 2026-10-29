@@ -1,0 +1,48 @@
+.source-download {
+  display: flex;
+  gap: 14px;
+  align-items: center;
+  margin-top: 12px;
+  padding: 16px 20px;
+  border: 1px solid #2c4a7a;
+  border-radius: 12px;
+  background: #13213a;
+}
+.source-download > svg {
+  flex: none;
+  color: var(--blue);
+}
+.source-download > div {
+  flex: 1;
+  min-width: 0;
+}
+.source-download h3 {
+  margin: 0 0 4px;
+  font-size: 16px;
+}
+.source-download p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+.source-download code {
+  margin-left: 8px;
+  font-size: 12px;
+}
+.source-download .button {
+  display: inline-flex;
+  gap: 8px;
+  align-items: center;
+  white-space: nowrap;
+  text-decoration: none;
+}
+@media (max-width: 640px) {
+  .source-download {
+    flex-wrap: wrap;
+    padding: 15px;
+  }
+  .source-download .button {
+    width: 100%;
+    justify-content: center;
+  }
+}

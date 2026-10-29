@@ -805,3 +805,20 @@
 @media (prefers-reduced-motion: reduce) {
   .planning-activity strong::before { animation: none; }
 }
+
+/* The standing is the first thing read on a card, so the tone carries meaning:
+   parked and idle are not failures, and neither should look like progress. */
+.operation-standing {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-weight: 600;
+}
+.operation-standing.running { color: #7acdaf; }
+.operation-standing.planning { color: #8ab4e8; }
+.operation-standing.blocked { color: #dfb375; }
+.operation-standing.idle { color: #839dbf; }
+.operation-standing.paused { color: #c3a06a; }
+.operation-standing.done { color: #7acdaf; }
+.operation-standing.cancelled { color: #8295ad; }
+.operation-standing.merged { color: #8295ad; }

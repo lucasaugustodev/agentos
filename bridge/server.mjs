@@ -10,6 +10,7 @@ import {
   existsSync,
   chmodSync,
   statSync,
+  realpathSync,
 } from 'node:fs';
 import { createRequire } from 'node:module';
 import { createInterface } from 'node:readline';
@@ -19,25 +20,78 @@ import path from 'node:path';
 import { sendRuntimeGuidance,readRuntimeGuidanceReceipt } from './runtime-guidance.mjs';
 import { runState, workerWorkspaces } from './runtime-runner.mjs';
 import { agyPrintRequest, parseAgyPrintResult } from './agy-print.mjs';
-import { withAccountRequestGate } from './gated-generation.mjs';
+import { GLM_REQUEST_ADMITTED, inGlmRequestLane, withAccountRequestGate } from './gated-generation.mjs';
+import { modelRequestTiming } from './model-request-timing.mjs';
 import { museLogin, museSnapshot } from './muse-accounts.mjs';
 import { resolveGenerationAccount } from './generation-account.mjs';
 import { openAICompletionsFallback } from './openai-completions-fallback.mjs';
+import { createGlmRequestGate, DEFAULT_GLM_GATE_SOCKET } from './glm-request-gate.mjs';
+import net from 'node:net';
+import { unlink } from 'node:fs/promises';
 
 const DSH = '/opt/deepseek-harness/app/node_modules';
-const DATA = process.env.AGENTOS_BRIDGE_DATA || '/var/lib/agentos-bridge';
-mkdirSync(DATA, { recursive: true, mode: 0o700 });
-const yaml = createRequire(DSH + '/@deepseek-ai/dsh-credentials-local/lib/index.js')('yaml');
-const pi = DSH + '/@earendil-works/pi-ai/dist/';
-const { openaiCodexProvider } = await import(pi + 'providers/openai-codex.js');
-const { anthropicProvider } = await import(pi + 'providers/anthropic.js');
-const { kimiCodingProvider } = await import(pi + 'providers/kimi-coding.js');
-const { openAICompletionsApi } = await import(pi + 'api/openai-completions.lazy.js');
-const providers = {
-  codex: openaiCodexProvider(),
-  claude: anthropicProvider(),
-  kimi: kimiCodingProvider(),
-};
+const DATA = (() => {
+  // Canonical root: the path guards downstream compare realpath to this value.
+  const target = path.resolve(process.env.AGENTOS_BRIDGE_DATA || (existsSync('/var/lib/agentos-bridge') ? '/var/lib/agentos-bridge' : '.local/bridge'));
+  mkdirSync(target, { recursive: true, mode: 0o700 });
+  return realpathSync(target);
+})();
+
+let providers = {};
+let openAICompletionsApi = null;
+// The SDK's api-level entry points accept a TranscriptContext, which carries
+// the prompt and the tool declarations inside a leading system message. Only
+// normalizeContext() folds Context.systemPrompt and Context.tools into one, so
+// an api-level call made without it silently drops both: the model then never
+// sees a tool and answers in prose, which the delivery contract rejects.
+// The fallback implements the Context shape itself, so it must not be folded.
+let normalizeContext = null;
+let yaml = { parse: () => ({}) };
+
+if (existsSync(DSH)) {
+  try {
+    yaml = createRequire(DSH + '/@deepseek-ai/dsh-credentials-local/lib/index.js')('yaml');
+    const pi = DSH + '/@earendil-works/pi-ai/dist/';
+    const { openaiCodexProvider } = await import(pi + 'providers/openai-codex.js');
+    const { anthropicProvider } = await import(pi + 'providers/anthropic.js');
+    const { kimiCodingProvider } = await import(pi + 'providers/kimi-coding.js');
+    const { openAICompletionsApi: oai } = await import(pi + 'api/openai-completions.lazy.js');
+    const { normalizeContext: fold } = await import(pi + 'utils/transcript.js');
+    if (typeof fold !== 'function') throw Error('TRANSCRIPT_NORMALIZER_MISSING');
+    openAICompletionsApi = oai;
+    normalizeContext = fold;
+    providers = {
+      codex: openaiCodexProvider(),
+      claude: anthropicProvider(),
+      kimi: kimiCodingProvider(),
+    };
+  } catch {}
+}
+
+if (!openAICompletionsApi) openAICompletionsApi = () => openAICompletionsFallback();
+
+// Six simultaneous provider requests are enforced by a gate process. A
+// provisioned host runs it under systemd and this bridge only joins it; a
+// bridge the controller started on this same host owns one, so the limit is
+// real in development instead of silently absent. Never start one next to a
+// provisioned gate that is merely down: that would double the real ceiling.
+if (process.env.AGENTOS_LOCAL_GLM_GATE === '1' && !process.env.AGENTOS_GLM_GATE_SOCKET) {
+  const socketPath = path.join(DATA, 'glm-gate.sock');
+  const listening = existsSync(socketPath) && await new Promise((resolve) => {
+    const probe = net.createConnection(socketPath);
+    probe.once('connect', () => { probe.destroy(); resolve(true); });
+    probe.once('error', () => resolve(false));
+  });
+  if (!listening) {
+    if (existsSync(socketPath)) await unlink(socketPath).catch(() => {});
+    const gate = await createGlmRequestGate({ socketPath });
+    process.once('exit', () => { void gate.close(); });
+  }
+  process.env.AGENTOS_GLM_GATE_SOCKET = socketPath;
+} else if (!process.env.AGENTOS_GLM_GATE_SOCKET && existsSync(DEFAULT_GLM_GATE_SOCKET)) {
+  process.env.AGENTOS_GLM_GATE_SOCKET = DEFAULT_GLM_GATE_SOCKET;
+}
+
 const controllers = new Map(),
   attempts = new Map(),
   refreshes = new Map();
@@ -50,11 +104,20 @@ function saveAccount(account) {
   writeFileSync(credentialFile + '.tmp', JSON.stringify(rows), { mode: 0o600 });
   renameSync(credentialFile + '.tmp', credentialFile);
 }
-const settings = () =>
-  yaml.parse(readFileSync('/var/lib/deepseek-harness/.dsh/settings.yaml', 'utf8'))?.['llm-pi-ai']
-    ?.providers ?? {};
-const credentials = () =>
-  yaml.parse(readFileSync('/var/lib/deepseek-harness/.dsh/.credentials.yaml', 'utf8')) ?? {};
+const settings = () => {
+  try {
+    return yaml.parse(readFileSync('/var/lib/deepseek-harness/.dsh/settings.yaml', 'utf8'))?.['llm-pi-ai']?.providers ?? {};
+  } catch {
+    return {};
+  }
+};
+const credentials = () => {
+  try {
+    return yaml.parse(readFileSync('/var/lib/deepseek-harness/.dsh/.credentials.yaml', 'utf8')) ?? {};
+  } catch {
+    return {};
+  }
+};
 function modelSettings(route) {
   const inherited = settings()[route]?.models ?? [];
   const file = DATA + '/provider-models.json';
@@ -120,9 +183,18 @@ async function inheritedState() {
   if (inheritedCache && Date.now() - inheritedAt < 5000) return inheritedCache;
   if (!inheritedPending)
     inheritedPending = (async () => {
-      const response = await fetch('http://127.0.0.1:3084/state', {
-        signal: AbortSignal.timeout(20000),
-      });
+      let response;
+      try {
+        response = await fetch('http://127.0.0.1:3084/state', {
+          signal: AbortSignal.timeout(20000),
+        });
+      } catch (error) {
+        // A refused connection proves no harness is installed here. A timeout
+        // or transport error is uncertainty: reporting zero accounts would
+        // disconnect live accounts that may still exist.
+        if ((error?.cause?.code ?? error?.code) !== 'ECONNREFUSED') throw Error('INHERITANCE_UNAVAILABLE');
+        return { accounts: [], quotas: {} };
+      }
       if (!response.ok) throw Error('INHERITANCE_UNAVAILABLE');
       const result = await response.json();
       inheritedCache = result;
@@ -275,12 +347,23 @@ function safeError(error) {
     MUSE_LOGIN_START_FAILED: 'Não foi possível iniciar o login do Muse.',
     MUSE_DISCOVERY_FAILED: 'Não foi possível consultar o catálogo do Muse.',
     NATIVE_RUNTIME_ONLY: 'Use esta conta do Muse em uma tarefa com executor nativo.',
+    RUNTIME_NOT_ISOLATED:
+      'Este host não tem bubblewrap e systemd; execução isolada indisponível. Use um host de execução provisionado.',
+    INSECURE_PROVIDER_URL: 'O endpoint da conta precisa ser HTTPS; a credencial não trafega em claro.',
   };
+  // Structural transport diagnosis only: the error class and the socket-level
+  // cause, which distinguish a reset from a refusal without naming anything
+  // internal. Never the upstream body, URL or message text, and never an
+  // unreviewed error code: the allowlist above is where a code becomes public.
+  const transport = [error?.name, error?.cause?.code]
+    .filter((v) => /^[A-Za-z_]{3,40}$/.test(v ?? '') && v !== 'Error')
+    .join(' ');
   return {
     code: 'PROVIDER_ERROR',
     message:
       known[text] ??
-      'O provedor não concluiu a solicitação. Confira a conta e o modelo selecionados.',
+      'O provedor não concluiu a solicitação. Confira a conta e o modelo selecionados.' +
+        (transport ? ` [${transport}]` : ''),
   };
 }
 async function getCredential(account, signal) {
@@ -399,6 +482,22 @@ async function generate(params, signal, emit, admission) {
     if (glmModelProfile(account.id,params.model).reasoning)
       provider = openAICompletionsFallback();
   }
+  // The worker path instruments itself in runtime-runner and passes the
+  // admission symbol; anything else reaching here is a controller call, such as
+  // planning, whose provider latency was otherwise never recorded at all.
+  const instrumented = admission !== GLM_REQUEST_ADMITTED;
+  const timing = modelRequestTiming({ gated: inGlmRequestLane(params) });
+  const report = (kind, extra) =>
+    instrumented &&
+    emit?.(kind, { accountId: account.id, model: params.model, ...extra, ...timing.sample() });
+  const gateEmit = (kind, payload) => {
+    timing.observe(kind);
+    emit?.(kind, payload);
+  };
+  if (instrumented) {
+    timing.start();
+    emit?.('MODEL_REQUEST', { accountId: account.id, model: params.model });
+  }
   return withAccountRequestGate(
     params,
     signal,
@@ -408,9 +507,19 @@ async function generate(params, signal, emit, admission) {
       const requestId = typeof params.requestId === 'string' &&
         /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(params.requestId)
         ? params.requestId : randomUUID();
+      // Every SDK entry point, provider- and api-level alike, is typed for a
+      // TranscriptContext and reads the prompt and tools from the transcript.
+      // The bundled transport is the sole consumer of the raw Context shape and
+      // declares itself, because the GLM reasoning route selects it while the
+      // SDK is installed: folding is decided by the target, not by the SDK.
+      const context = {
+        systemPrompt: params.system ?? '',
+        messages: params.messages,
+        tools: params.tools ?? [],
+      };
       const stream = provider.streamSimple(
         model,
-        { systemPrompt: params.system ?? '', messages: params.messages, tools: params.tools ?? [] },
+        normalizeContext && !provider.acceptsRawContext ? normalizeContext(context) : context,
         {
           ...auth,
           signal: requestSignal,
@@ -439,9 +548,22 @@ async function generate(params, signal, emit, admission) {
         throw Error(result.errorMessage ?? result.stopReason);
       return { message: result, accountId: account.id, model: params.model };
     },
-    emit,
+    gateEmit,
     undefined,
     admission,
+  ).then(
+    (result) => {
+      report('MODEL_RESPONSE', {
+        stopReason: result.message.stopReason,
+        tokens: result.message.usage?.totalTokens ?? null,
+      });
+      return result;
+    },
+    (error) => {
+      // The code only; provider bodies and messages never leave this boundary.
+      report('MODEL_ERROR', { code: error?.code ?? 'MODEL_REQUEST_FAILED' });
+      throw error;
+    },
   );
 }
 async function agyGenerate(account, params, signal) {

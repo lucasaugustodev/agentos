@@ -1,9 +1,13 @@
 // Buffer provider output until validated, while keeping the SDK's SSE idle
 // watchdog alive. Comments carry transport liveness only, never model progress.
+import { messagesError } from './runtime-gateway.mjs';
 export const WORKER_MODEL_TIMEOUT_MS = 720_000;
 const failure = (code) => Object.assign(new Error(code), { code });
 
-export function bufferedModelChannel(res, callerSignal, { heartbeatMs = 15_000 } = {}) {
+// The pinned runtime speaks Messages; older adapters speak completions. Both
+// wires share this buffering and liveness; only the terminal framing differs.
+export function bufferedModelChannel(res, callerSignal, { heartbeatMs = 15_000, wire = 'completions' } = {}) {
+  const messages = wire === 'messages';
   const controller = new AbortController();
   let timer;
   const clear = () => { clearInterval(timer); timer = undefined; };
@@ -33,6 +37,13 @@ export function bufferedModelChannel(res, callerSignal, { heartbeatMs = 15_000 }
     finish(frames) {
       controller.signal.throwIfAborted();
       clear();
+      if (messages) {
+        // Messages has no [DONE] sentinel: message_stop terminates the stream.
+        for (const event of frames)
+          res.write('event: ' + event.type + '\ndata: ' + JSON.stringify(event) + '\n\n');
+        res.end();
+        return;
+      }
       for (const frame of frames) res.write('data: ' + JSON.stringify(frame) + '\n\n');
       res.end('data: [DONE]\n\n');
     },
@@ -49,6 +60,15 @@ export function bufferedModelChannel(res, callerSignal, { heartbeatMs = 15_000 }
     fail(code) {
       clear();
       if (!writable()) return;
+      if (messages) {
+        const body = JSON.stringify(messagesError(code));
+        if (res.headersSent) res.end('event: error\ndata: ' + body + '\n\n');
+        else {
+          res.writeHead(400, { 'content-type': 'application/json' });
+          res.end(body);
+        }
+        return;
+      }
       const payload = JSON.stringify({ error: { message: code, type: 'agentos_gateway' } });
       // Headers may already be sent for keepalives. A protocol error frame is
       // terminal; no [DONE] or completion may follow this failed response.

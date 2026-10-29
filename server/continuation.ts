@@ -26,7 +26,7 @@ import { reconcileWorkforces } from './workforce.js';
 import { assertSupervisedResume, continuationSignature } from './supervision-handoff.js';
 import { requestProgressReplan } from './retry-progress.js';
 import {reconcileVerificationRevisions} from './verification-revision-recovery.js';
-import {providerAvailabilityFailure} from '../shared/recovery.js';
+import {providerAvailabilityFailure,PLAN_STALL_REASON} from '../shared/recovery.js';
 import {requestRecoveryReview,appliedSupervisionOwnsContinuation,pendingSupervisionOwnsContinuation} from './recovery-supervision.js';
 import {verificationRoutingCode} from './verification-routing-failure.js';
 import {interruptedVerification,interruptedVerificationReason} from './verification-interruption.js';
@@ -35,6 +35,7 @@ import { runtimeProgressCode } from './runtime-progress-contract.js';
 import {operatorRecoveryCode} from './operator-recovery-contract.js';
 import { preservedAcceptedAuxiliaryIds } from './accepted-auxiliary.js';
 import { protocolReportRepairInstruction } from '../bridge/protocol-report-contract.mjs';
+import { SOURCE_BINARY_CHECK } from '../bridge/source-patch-contract.mjs';
 import {
   requestSemanticReplan,
   semanticRetryCode,
@@ -53,6 +54,10 @@ export function repairInstruction(code: string, expectedTestFile?: string) {
       protocolReportRepairInstruction(code, expectedTestFile) +
       ' Confira o contrato de saída, liste arquivos existentes e entregue somente JSON válido com summary e artifacts. Cada path deve ser relativo a /workspace, por exemplo evidence/protocol-report.json. Não use /workspace no path. Inclua todos os arquivos exigidos, logs reais e relatório de limitações; não transforme testes que falham em aprovados.'
     );
+  if (code === 'PATCH_BINARY_SOURCE')
+    return 'A entrega anterior foi rejeitada só porque o patch de fonte inclui um arquivo não-texto (imagem, banco, upload ou saída de teste) adicionado, alterado ou APAGADO fora de data/, evidence/ e assets/; o código em si não foi julgado. Não refaça a implementação. Rode ' +
+      SOURCE_BINARY_CHECK +
+      ' e siga cada linha: RESTORE devolve o arquivo da base intacto (binário que já estava na base não pode ser apagado nem alterado), MOVE leva um binário novo para data/ (por exemplo data/uploads/), ajustando o código que o grava. Repita até imprimir OK, rode os testes e entregue.';
   if (/AUTH|QUOTA|RATE_LIMIT/.test(code))
     return 'A conta anterior não conseguiu continuar. Retome os arquivos existentes usando esta nova rota. Execute somente o trabalho restante e preserve os critérios e evidências reais.';
   return 'Inspecione o checkpoint e o workspace preservado. Reproduza primeiro o menor caso que falha; escolha uma hipótese diferente da tentativa anterior, corrija dentro do escopo e execute os testes relevantes. Registre comandos e resultados reais. Entregue os artefatos exigidos, inclusive falhas e limitações. Não reinicie o trabalho do zero e não marque sucesso para apenas liberar a fila. Trabalhe de forma incremental e verificavel: escreva primeiro um esqueleto minimo dos arquivos de entrega e sele evidencias a cada etapa concluida, em vez de auditar a arvore inteira antes da primeira escrita. Limite a exploracao aos arquivos do contrato e das dependencias diretas. Nao crie bancos, containers ou dados de runtime locais (nada de pgdata, docker ou DATABASE_URL inventada): validacao com PostgreSQL e somente pelo request_validation protegido; sem ele, registre a limitacao em evidence/.';
@@ -248,7 +253,7 @@ export function chooseRepairRoute(task: any, run: any, accounts: any[], now = Da
       (r: any) => r.accountId === id && r.model === model && Date.parse(r.until) > now,
     );
   const switching = /AUTH|QUOTA|RATE_LIMIT/.test(run.error_code ?? '') || task.attempt_count >= 3;
-  const routes = candidates.flatMap((a) => {
+  const buildRoutes = (keepFailedRoute: boolean) => candidates.flatMap((a) => {
     const desired =
       task.execution?.profile === 'browser' || ['verify', 'integrate'].includes(task.stage)
         ? 'gpt-6-sol'
@@ -267,7 +272,7 @@ export function chooseRepairRoute(task: any, run: any, accounts: any[], now = Da
         (m) =>
           a.models.includes(m) &&
           !blocked(a.id, m) &&
-          !(switching && a.id === run.account_id && m === run.model),
+          !(switching && !keepFailedRoute && a.id === run.account_id && m === run.model),
       )
       .map((m) => ({
         accountId: a.id,
@@ -278,7 +283,15 @@ export function chooseRepairRoute(task: any, run: any, accounts: any[], now = Da
           (a.id === run.account_id ? 1 : 0),
       }));
   });
-  return routes.sort((a, b) => a.score - b.score)[0] ?? null;
+  // Switching away from the route that just failed is a preference, not a
+  // precondition. An installation with one account and one model has no other
+  // route to move to, so insisting on one leaves the repair with no candidate
+  // at all and the task waits for an account that is already connected. The
+  // cooldown in blocked() still applies, so a route that keeps failing is held
+  // back by time rather than by the absence of an alternative.
+  const routes = buildRoutes(false);
+  const usable = routes.length ? routes : buildRoutes(true);
+  return usable.sort((a, b) => a.score - b.score)[0] ?? null;
 }
 
 export async function routeVerificationRepair(sourceId: string) {
@@ -807,6 +820,13 @@ export async function resumeFailedHarness(id: string, fence: string, proof: any)
       [branch.map((c) => c.id), t.id, preserved],
     );
     await db.query("UPDATE goals SET state='active' WHERE id=$1 AND state='failed'", [t.goal_id]);
+    // The planner can declare a stall in the instant between this failure and
+    // this admission. A queued continuation is work in progress, and a parked
+    // objective is what the panel shows as having no active step.
+    await db.query(
+      "UPDATE objectives SET status='executing',reason=NULL,updated_at=now() WHERE id=$1 AND status='waiting_external' AND reason=$2",
+      [t.goal_id, PLAN_STALL_REASON],
+    );
     await db.query("UPDATE recoveries SET status='superseded' WHERE source_run_id=$1", [id]);
     await event(db, 'CONTINUATION_QUEUED', t.id, {
       runId: id,

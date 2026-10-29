@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Activity, CheckCircle2, ChevronRight, Clock, AlertCircle } from 'lucide-react';
+import { Activity, CheckCircle2, ChevronRight, Clock, AlertCircle, Cpu } from 'lucide-react';
 import {
   operationGames,
   operationProductivityLine,
@@ -10,6 +10,8 @@ import {
 import { latestObservation } from './task-attention';
 import { ScopedPlanners } from './ScopedPlanners';
 import {deliveryStatus} from './delivery-status';
+import { SourceDownload } from './SourceDownload';
+import { runRoute, elapsed } from './run-route';
 import './operation-board.css';
 type Row = Record<string, any>;
 const shortAge = (at?: string) => {
@@ -77,6 +79,10 @@ export function OperationBoard({
     }),
     healthy = supervisionHealthy(data),
     workforce = operationWorkforce(detail.goal.id, detail.tasks, data);
+  const liveRuns = (detail.runs ?? [])
+    .filter((run: Row) => ['queued', 'running', 'cancelling', 'reconciling'].includes(run.state))
+    .map((run: Row) => ({ run, task: detail.tasks.find((t: Row) => t.id === run.task_id) }))
+    .filter((entry: Row) => entry.task);
   const done = games.filter((g) => g.complete).length,
     working = games.filter((g) => g.focus.kind === 'running').length;
   const repairing = games.filter((g) => g.flows.some((f) => f.kind === 'repair')).length;
@@ -144,6 +150,7 @@ export function OperationBoard({
               {healthy ? 'Supervisão ativa' : 'Supervisão indisponível'}
             </span>
           </header>
+          <SourceDownload goal={detail.goal} />
           <div className="operation-productivity-line" aria-label="Métrica de produtividade">
             {operationProductivityLine(detail, data).line}
           </div>
@@ -204,6 +211,28 @@ export function OperationBoard({
               <span>Precisam de você</span>
             </div>
           </div>
+          {!!liveRuns.length && (
+            <section className="operation-live" aria-label="Executando agora">
+              <header>
+                <strong>Executando agora</strong>
+                <span>{liveRuns.length} {liveRuns.length === 1 ? 'tarefa' : 'tarefas'}</span>
+              </header>
+              {liveRuns.map(({ run, task }: Row) => (
+                <button key={run.id} onClick={() => inspect(task.id)}>
+                  <Cpu size={15} />
+                  <span>
+                    <strong>{task.title}</strong>
+                    <small>{runRoute(run, data.accounts ?? [])}</small>
+                  </span>
+                  <small>
+                    {run.state === 'running' ? 'há ' + elapsed(run.started_at) : 'na fila'}
+                    {run.heartbeat_at ? ' · sinal há ' + elapsed(run.heartbeat_at) : ''}
+                  </small>
+                  <ChevronRight size={14} />
+                </button>
+              ))}
+            </section>
+          )}
           {workforce && (
             <section className="operation-workforce" aria-label="Equipe da operação">
               <header>

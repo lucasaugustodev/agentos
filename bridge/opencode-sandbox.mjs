@@ -1,7 +1,12 @@
-// This entrypoint runs only inside the private mount, PID and network namespaces.
+// This entrypoint runs inside private namespace or direct local dev sandbox.
 import http from 'node:http';
 import { readFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import path from 'node:path';
 import { spawn } from 'node:child_process';
+
+const homeDir = process.env.HOME || '/home/agent';
+const sockPath = process.env.AGENTOS_MODEL_SOCK || (existsSync('/run/model.sock') ? '/run/model.sock' : path.join(path.dirname(homeDir), 'model.sock'));
 
 const proxy = http.createServer((req, res) => {
   if (req.method !== 'POST' || req.url !== '/v1/chat/completions') {
@@ -9,7 +14,7 @@ const proxy = http.createServer((req, res) => {
     return;
   }
   const upstream = http.request({
-    socketPath: '/run/model.sock', path: req.url, method: req.method,
+    socketPath: sockPath, path: req.url, method: req.method,
     headers: { 'content-type': 'application/json' },
   }, (reply) => {
     // The trusted gateway supplies canonical integer seconds only. Forward no
@@ -34,13 +39,16 @@ await new Promise((resolve, reject) => {
   proxy.once('error', reject);
   proxy.listen(17820, '127.0.0.1', resolve);
 });
-const config = await readFile('/home/agent/opencode.json', 'utf8');
-const prompt = await readFile('/home/agent/prompt.txt', 'utf8');
-const child = spawn('/opt/agentos-opencode/opencode', [
-  'run', '--pure', '--format', 'json', '--model', 'agentos/glm-5.3-flash',
+const config = await readFile(path.join(homeDir, 'opencode.json'), 'utf8');
+const prompt = await readFile(path.join(homeDir, 'prompt.txt'), 'utf8');
+let targetModel = 'agentos/glm-5.3-flash';
+try { targetModel = JSON.parse(config).model || targetModel; } catch {}
+const opencodeBin = process.env.OPENCODE_BIN || (existsSync('/opt/agentos-opencode/opencode') ? '/opt/agentos-opencode/opencode' : 'opencode');
+const child = spawn(opencodeBin, [
+  'run', '--pure', '--format', 'json', '--model', targetModel,
   '--agent', 'agentos-worker', '--title', 'AgentOS isolated task',
 ], {
-  cwd: '/workspace',
+  cwd: process.cwd(),
   env: {
     ...process.env,
     XDG_CONFIG_HOME: '/home/agent/.config',

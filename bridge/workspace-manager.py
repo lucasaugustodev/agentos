@@ -3,8 +3,15 @@ import contextlib, datetime, difflib, fcntl, hashlib, json, os, pathlib, re, shu
 import importlib.util
 _storage_spec=importlib.util.spec_from_file_location('agentos_storage_capacity',pathlib.Path(__file__).with_name('storage-capacity.py'))
 storage_capacity=importlib.util.module_from_spec(_storage_spec);_storage_spec.loader.exec_module(storage_capacity)
-ROOT=pathlib.Path('/srv/agentos/workspaces')
-DATA=pathlib.Path('/var/lib/agentos-bridge')
+# Same roots the Node side of the bridge resolves, canonicalized once so the
+# path guards below compare resolve() against the value they were given.
+def _root(variable,provisioned,fallback):
+    value=os.environ.get(variable) or (provisioned if pathlib.Path(provisioned).exists() else fallback)
+    target=pathlib.Path(value).absolute()
+    target.mkdir(parents=True,exist_ok=True)
+    return target.resolve()
+ROOT=_root('AGENTOS_WORKSPACES_ROOT','/srv/agentos/workspaces','.local/workspaces')
+DATA=_root('AGENTOS_BRIDGE_DATA','/var/lib/agentos-bridge','.local/bridge')
 SKIP={'.git','node_modules','evidence','data','.agentos-snapshot.json','.local-test','test-results','playwright-report','__pycache__'}
 def digest_key(value): return hashlib.sha256(value.encode()).hexdigest()
 def workspace(value):
@@ -60,7 +67,7 @@ def copy_reservation(source):
         dirs[:]=[d for d in dirs if d not in excluded]
         for name in files:
             if name in excluded: continue
-            p=pathlib.Path(folder)/name;info=p.stat(follow_symlinks=False)
+            p=pathlib.Path(folder)/name;info=p.lstat()
             if not stat.S_ISREG(info.st_mode): raise ValueError('SOURCE_NOT_REGULAR')
             amount=max(4096,info.st_size);copied+=amount
             if 'assets' not in p.relative_to(source).parts and not name.endswith('.log'): baseline+=amount

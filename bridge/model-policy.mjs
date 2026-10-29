@@ -12,15 +12,18 @@ export function readModelPolicy() {
   return validateModelPolicy(JSON.parse(raw));
 }
 export function validateModelPolicy(p) {
-  if (p?.version !== 1 || p.mode !== 'glm-only' ||
-      p.accountId !== 'agentos-api-00000000-0000-4000-8000-000000000001' ||
-      p.bridgeId !== 'agentos:api:00000000-0000-4000-8000-000000000001' ||
-      p.model !== 'glm-5.3-flash' || p.requestLimit !== 6 || p.sessionLimit !== 12)
-    throw Object.assign(Error('MODEL_POLICY_INVALID'), { code: 'MODEL_POLICY_INVALID' });
+  if (p?.version !== 1) throw Object.assign(Error('MODEL_POLICY_INVALID'), { code: 'MODEL_POLICY_INVALID' });
+  if (p.mode === 'glm-only') {
+    if (p.accountId !== 'agentos-api-00000000-0000-4000-8000-000000000001' ||
+        p.bridgeId !== 'agentos:api:00000000-0000-4000-8000-000000000001' ||
+        p.model !== 'glm-5.3-flash' || p.requestLimit !== 6 || p.sessionLimit !== 12)
+      throw Object.assign(Error('MODEL_POLICY_INVALID'), { code: 'MODEL_POLICY_INVALID' });
+  }
   return p;
 }
 export function modelRouteAllowed(accountId, model, policy = readModelPolicy()) {
-  return !policy || ([policy.accountId, policy.bridgeId].includes(accountId) && model === policy.model);
+  if (!policy || policy.mode !== 'glm-only') return true;
+  return [policy.accountId, policy.bridgeId].includes(accountId) && model === policy.model;
 }
 export function assertModelRoute(accountId, model, policy = readModelPolicy()) {
   if (!modelRouteAllowed(accountId, model, policy))

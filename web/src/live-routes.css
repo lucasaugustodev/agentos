@@ -1,0 +1,142 @@
+/* Which model and account is working right now, wherever tasks are listed. */
+.goal-live-route,
+.operation-live-route {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 4px;
+  color: #8db5e6;
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+.goal-live-route svg,
+.operation-live-route svg {
+  flex: none;
+}
+.operation-live {
+  margin-top: 12px;
+  padding: 14px 16px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--panel);
+}
+.operation-live > header {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 6px;
+  color: #a6b8ce;
+  font-size: 12px;
+}
+.operation-live > button,
+.org-live-run {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  padding: 10px 0;
+  text-align: left;
+  color: #c6d2e4;
+  background: transparent;
+  font-size: 12px;
+  cursor: pointer;
+}
+.operation-live > button:last-child,
+.org-live-run:last-of-type {
+  border-bottom: 0;
+}
+.operation-live > button:hover,
+.org-live-run:hover {
+  background: #20334c;
+}
+.operation-live > button > span,
+.org-live-run > span {
+  display: grid;
+  gap: 4px;
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.operation-live small,
+.org-live-run small {
+  font-size: 11px;
+  font-weight: normal;
+  color: #92a5c0;
+}
+.operation-live > button > svg,
+.org-live-run > svg {
+  flex: none;
+  color: var(--cyan);
+}
+.org-accounts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 14px;
+  margin-bottom: 28px;
+}
+.org-accounts .panel > :not(.panel-heading) {
+  margin-left: 16px;
+  margin-right: 16px;
+}
+.org-load {
+  height: 5px;
+  margin-bottom: 8px;
+  border-radius: 3px;
+  background: #1c2b40;
+  overflow: hidden;
+}
+.org-load i {
+  display: block;
+  height: 100%;
+  background: var(--cyan);
+}
+.org-idle {
+  padding: 8px 0 14px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.org-section-title {
+  margin: 0 0 12px;
+  color: #a6b8ce;
+  font-size: 13px;
+}
+@media (max-width: 640px) {
+  .org-accounts {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .operation-live > button,
+  .org-live-run {
+    flex-wrap: wrap;
+  }
+}
+.autonomy-panel h3 {
+  margin: 22px 0 10px;
+  color: #a6b8ce;
+  font-size: 14px;
+}
+.autonomy-list {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.autonomy-list li {
+  display: grid;
+  gap: 4px;
+  padding: 10px 14px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  overflow-wrap: anywhere;
+}
+.autonomy-list span {
+  color: #92a5c0;
+  font-size: 12px;
+}
+@media (max-width: 640px) {
+  .autonomy-panel {
+    padding: 16px 0;
+  }
+}

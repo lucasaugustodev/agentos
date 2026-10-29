@@ -13,6 +13,9 @@ export const workspaceId = z
 export const objectiveSchema = z
   .object({
     message: z.string().trim().min(5).max(30000),
+    // A long prompt makes a useless name. Callers that have one send it; the
+    // fallback stays the opening of the message, as before.
+    title: z.string().trim().min(3).max(120).optional(),
     project: z.string().regex(/^[a-z0-9_-]{1,80}$/),
     mode: z.enum(['plan', 'execute']),
     workspaces: z.array(workspaceId).min(1).max(10),
@@ -183,7 +186,14 @@ export function validatePlan(
       workers.length > 1 &&
       !integrations.some((i) => workers.every((w) => ancestry.get(i.key)!.has(w.key)))
     )
-      fail('Frentes paralelas precisam de integração comum.');
+      fail('Frentes paralelas precisam de integração comum.', {
+        workspace,
+        workers: workers.map((w) => w.key),
+        integrations: integrations.map((i) => ({
+          key: i.key,
+          cobre: workers.filter((w) => ancestry.get(i.key)!.has(w.key)).map((w) => w.key),
+        })),
+      });
     const finals = validators.filter((v) =>
       tasks
         .filter((t) => t.stage !== 'verify')
@@ -194,7 +204,18 @@ export function validatePlan(
         ),
     );
     for (const v of finals) finalValidators.add(v.key);
-    if (!finals.length) fail('Falta validação final da candidata integrada.');
+    if (!finals.length)
+      fail('Falta validação final da candidata integrada.', {
+        workspace,
+        aVerificar: tasks.filter((t) => t.stage !== 'verify').map((t) => t.key),
+        validadores: validators.map((v) => ({
+          key: v.key,
+          sourceTask: v.sourceTask ?? null,
+          alcanca: tasks
+            .filter((t) => t.stage !== 'verify' && ancestry.get(v.key)!.has(t.key))
+            .map((t) => t.key),
+        })),
+      });
   }
   const incremental = plan.incremental;
   if (incremental) {

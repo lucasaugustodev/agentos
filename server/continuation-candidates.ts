@@ -43,7 +43,16 @@ export async function readContinuationCandidates(db: DB, now: string): Promise<a
   ), due AS MATERIALIZED (
     SELECT eligible.* FROM eligible JOIN tasks t ON t.id=eligible.id
     WHERE (t.execution->'continuation'->>'runId' IS DISTINCT FROM eligible.run_id::text
-      OR COALESCE(t.execution->'continuation'->>'nextAt','') <= $1)
+      -- Scoped to REPEATED_NO_PROGRESS only: that escalation says the same
+      -- failure recurred with no file change, so re-inspecting the same
+      -- finished run cannot change the answer, yet the two-minute rescan kept
+      -- alternating checking/needs_action and emitted a status event every
+      -- pass. Other needs_action reasons (quota, disconnected accounts) must
+      -- stay re-checkable, because the world around them does change. A new
+      -- attempt carries a different runId, re-selected by the clause above.
+      OR (COALESCE(t.execution->'continuation'->>'nextAt','') <= $1
+        AND NOT (COALESCE(t.execution->'continuation'->>'state','') = 'needs_action'
+          AND COALESCE(t.execution->'continuation'->>'reasonCode','') = 'REPEATED_NO_PROGRESS')))
     ORDER BY eligible.updated_at LIMIT 30
   )
   SELECT guard.selection_error continuation_selection_error,selected.* FROM guard

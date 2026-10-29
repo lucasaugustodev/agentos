@@ -35,7 +35,8 @@ def read(root, name, missing=False):
     with os.fdopen(fd, 'rb') as handle:
         before = os.fstat(handle.fileno())
         if not stat.S_ISREG(before.st_mode) or before.st_size > MAX: fail('FILE_TYPE_SIZE')
-        if pathlib.Path('/proc/self/fd/' + str(handle.fileno())).resolve() != current: fail('PATH_CHANGED')
+        if sys.platform.startswith('linux') and \
+           pathlib.Path('/proc/self/fd/' + str(handle.fileno())).resolve() != current: fail('PATH_CHANGED')
         data = handle.read(MAX + 1)
         after = os.fstat(handle.fileno())
         actual = current.lstat()

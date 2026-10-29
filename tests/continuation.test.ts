@@ -6,7 +6,7 @@ import { pool, migrate, lock, tx } from '../server/db.js';
 import { schedule,failRun } from '../server/service.js';
 import {quotaFor} from '../server/accounts.js';
 import {assertRetryProgress} from '../server/retry-progress.js';
-import {providerAvailabilityFailure} from '../shared/recovery.js';
+import {providerAvailabilityFailure,PLAN_STALL_REASON} from '../shared/recovery.js';
 import {requestRecoveryReview} from '../server/recovery-supervision.js';
 import { hash } from '../server/memory.js';
 import { config } from '../server/config.js';
@@ -286,6 +286,24 @@ it('rejects stale stop proof and deduplicates simultaneous recovery', async () =
   expect(r.filter((x) => x.status === 'fulfilled')).toHaveLength(1);
   expect((await pool.query('SELECT * FROM artifacts WHERE run_id=$1', [f.run])).rowCount).toBe(2);
 });
+it('returns an objective parked as stalled to executing when its attempt is readmitted', async () => {
+  const f = await fixture();
+  await pool.query(
+    "INSERT INTO objectives(id,request,request_hash,mode,status,reason) VALUES($1::uuid,'{}'::jsonb,'h-'||$1::text,'execute','waiting_external',$2)",
+    [f.goal, PLAN_STALL_REASON]);
+  await resumeFailedHarness(f.run, f.fence, f.proof);
+  expect((await pool.query('SELECT status,reason FROM objectives WHERE id=$1', [f.goal])).rows[0])
+    .toEqual({ status: 'executing', reason: null });
+});
+it('keeps other external waits when an attempt is readmitted', async () => {
+  const f = await fixture();
+  await pool.query(
+    "INSERT INTO objectives(id,request,request_hash,mode,status,reason) VALUES($1::uuid,'{}'::jsonb,'h-'||$1::text,'execute','waiting_external','Revisão supervisionada desabilitada.')",
+    [f.goal]);
+  await resumeFailedHarness(f.run, f.fence, f.proof);
+  expect((await pool.query('SELECT status FROM objectives WHERE id=$1', [f.goal])).rows[0].status)
+    .toBe('waiting_external');
+});
 it('leaves uncertain live processes untouched when stop cannot be confirmed', async () => {
   const f = await fixture();
   const supervisor = new ContinuationSupervisor(async () => {
@@ -328,6 +346,57 @@ it('never routes to unauthorized or exhausted accounts', () => {
   expect(
     chooseRepairRoute({ execution: {} }, {}, [{ ...a, quota: { ordinaryUsageAllowed: false } }]),
   ).toBeNull();
+});
+it('repairs on the only route when there is nothing to switch to', () => {
+  // One connected account exposing one model is a whole installation, not a
+  // misconfiguration. Requiring a different route after the third attempt left
+  // such a host with no candidate, so the task waited on an account that was
+  // connected the entire time.
+  const only = {
+    id: 'solo',
+    provider: 'openai',
+    enabled: true,
+    bridge_id: 'solo',
+    model: 'glm-5.3-flash',
+    models: ['glm-5.3-flash'],
+    allow_unknown: true,
+  };
+  const task = { attempt_count: 3, stage: 'work', execution: { profile: 'code' } };
+  const run = { account_id: 'solo', model: 'glm-5.3-flash', error_code: 'RESULT_FORMAT' };
+  expect(chooseRepairRoute(task, run, [only])).toMatchObject({
+    accountId: 'solo',
+    model: 'glm-5.3-flash',
+  });
+});
+it('still prefers a different route when one exists', () => {
+  const base = { provider: 'openai', enabled: true, allow_unknown: true };
+  const used = { ...base, id: 'used', bridge_id: 'used', model: 'glm-5.3-flash', models: ['glm-5.3-flash'] };
+  const spare = { ...base, id: 'spare', bridge_id: 'spare', model: 'gpt-6-luna', models: ['gpt-6-luna'] };
+  const task = { attempt_count: 3, stage: 'work', execution: { profile: 'code' } };
+  const run = { account_id: 'used', model: 'glm-5.3-flash', error_code: 'RESULT_FORMAT' };
+  expect(chooseRepairRoute(task, run, [used, spare])).toMatchObject({ accountId: 'spare' });
+});
+it('honours a route cooldown before falling back to the only route', () => {
+  const only = {
+    id: 'solo',
+    provider: 'openai',
+    enabled: true,
+    bridge_id: 'solo',
+    model: 'glm-5.3-flash',
+    models: ['glm-5.3-flash'],
+    allow_unknown: true,
+  };
+  const until = new Date(Date.now() + 600000).toISOString();
+  const task = {
+    attempt_count: 3,
+    stage: 'work',
+    execution: {
+      profile: 'code',
+      continuationRoutes: [{ accountId: 'solo', model: 'glm-5.3-flash', until }],
+    },
+  };
+  const run = { account_id: 'solo', model: 'glm-5.3-flash', error_code: 'RESULT_FORMAT' };
+  expect(chooseRepairRoute(task, run, [only])).toBeNull();
 });
 
 async function candidateArtifact(

@@ -413,8 +413,10 @@ export async function schedule(service?:'agentos-opencode',inspect=inspectPrepar
           ).rows[0].count,
         );
         const exclusive = readModelPolicy();
-        const sessionCeiling = exclusive
-          ? Math.min(a.max_concurrency, exclusive.sessionLimit - (t.stage === 'coordinate' ? 0 : 1)) : a.max_concurrency;
+        // A policy without a session limit must not turn the ceiling into NaN
+        // and silently drop the per-account session cap.
+        const sessionCeiling = Number.isSafeInteger(exclusive?.sessionLimit)
+          ? Math.min(a.max_concurrency, exclusive!.sessionLimit - (t.stage === 'coordinate' ? 0 : 1)) : a.max_concurrency;
         if (n >= sessionCeiling) {
           why = 'Vagas desta conta ocupadas.';
           continue;
@@ -786,9 +788,13 @@ export async function validateTask(taskId: string, reviewer?: string) {
             c.type === 'artifact' ||
             (Object.hasOwn(JSON.parse(bytes.toString()), c.field) &&
               JSON.parse(bytes.toString())[c.field] === c.equals);
+          // Name the missing field: a bare refusal sends the next attempt to
+          // redo work that already passed, instead of fixing the manifest.
           detail = passed
             ? 'Artefato íntegro; contrato atendido.'
-            : 'Conteúdo não atende ao contrato.';
+            : c.type === 'json_field'
+              ? `Conteúdo não atende ao contrato: ${c.name} precisa do campo "${c.field}" igual a ${JSON.stringify(c.equals)}.`
+              : 'Conteúdo não atende ao contrato.';
         } catch {
           detail = 'Artefato inválido ou corrompido.';
         }
@@ -1112,15 +1118,22 @@ export async function snapshot() {
         'settings',
       ].map((table) =>
         pool.query(
-          (table === 'runs'
-            ? 'SELECT id,task_id,attempt,state,worker_id,account_id,runtime,agent_version,created_at,started_at,finished_at,heartbeat_at,context_id,summary,error_code,usage,checkpoint,model FROM '
-            : 'SELECT * FROM ') +
-            table +
-            (table === 'events'
-              ? ' ORDER BY id DESC LIMIT 100'
-              : table === 'contexts'
-                ? ' ORDER BY created_at DESC LIMIT 100'
-                : ''),
+          // A goal stays 'active' while its objective waits for a person, so the
+          // panel cannot tell "being worked on" from "parked" without the
+          // objective's own status. Carry it alongside instead of guessing.
+          table === 'goals'
+            ? `SELECT g.*, o.status objective_status, o.reason objective_reason,
+                 o.revision objective_revision, o.mode objective_mode
+               FROM goals g LEFT JOIN objectives o ON o.id=g.id`
+            : (table === 'runs'
+                ? 'SELECT id,task_id,attempt,state,worker_id,account_id,runtime,agent_version,created_at,started_at,finished_at,heartbeat_at,context_id,summary,error_code,usage,checkpoint,model FROM '
+                : 'SELECT * FROM ') +
+              table +
+              (table === 'events'
+                ? ' ORDER BY id DESC LIMIT 100'
+                : table === 'contexts'
+                  ? ' ORDER BY created_at DESC LIMIT 100'
+                  : ''),
         ),
       ),
     );

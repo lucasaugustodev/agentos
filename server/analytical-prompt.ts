@@ -15,13 +15,23 @@ export function promptCheckpoint(checkpoint: any) {
 
 /** Shared by assembly and execution: JSON escaping is part of the budget. */
 export function analyticalPrompt(run: any, task: any, context: {content: string; manifest: any}, dependencies: any[]) {
-  return JSON.stringify({
-    role: task.agent_id, task: task.title, description: task.description,
+  const payload: any = {
+    role: task.agent_id,
+    task: task.title,
+    description: task.description,
     instructionManifest: context.manifest.taskInstructions ?? null,
     executionInputs: context.manifest.executionInputs ?? [],
-    criteria: task.criteria, checkpoint: promptCheckpoint(run.checkpoint),
-    context: context.content, dependencies,
-  });
+    criteria: task.criteria,
+    checkpoint: promptCheckpoint(run.checkpoint),
+    context: context.content,
+    dependencies,
+  };
+  const agentRole = task.agent_role ?? run?.agent_role ?? null;
+  const agentLevel = task.agent_level ?? run?.agent_level ?? null;
+  if (agentRole !== null) payload.agentRole = agentRole;
+  if (agentLevel !== null) payload.level = agentLevel;
+  if (task.execution?.writePaths?.length) payload.writePaths = task.execution.writePaths;
+  return JSON.stringify(payload);
 }
 
 /** Only optional memory can be excluded. All non-memory inputs are immutable. */

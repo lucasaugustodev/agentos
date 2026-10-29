@@ -8,7 +8,9 @@ import {assertStopped} from './continuation.js';
 
 /** These executor codes describe provider transport, not a refuted solution. */
 export function retryAvailabilityFailure(code?:string|null) {
-  return providerAvailabilityFailure(code) || ['MODEL_TRANSPORT_ERROR','MODEL_REQUEST_TIMEOUT'].includes(code??'');
+  // The harness gateway reports a provider call that never answered as
+  // MODEL_TIMEOUT; OpenCode and model-request.mjs spell it MODEL_REQUEST_TIMEOUT.
+  return providerAvailabilityFailure(code) || ['MODEL_TRANSPORT_ERROR','MODEL_REQUEST_TIMEOUT','MODEL_TIMEOUT'].includes(code??'');
 }
 
 export async function retryProgressSignature(db: DB, task: any, run: any, candidateDigest: string) {

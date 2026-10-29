@@ -16,7 +16,9 @@ const legacy = `SELECT t.*,r.id run_id,r.fence,r.state run_state,r.error_code,r.
       AND t.execution->>'workKind' IS DISTINCT FROM 'planning'
       AND (t.recovery->>'mode' IS DISTINCT FROM 'manual' OR s.value->>'enabled'='true')
       AND (t.execution->'continuation'->>'runId' IS DISTINCT FROM r.id::text
-        OR COALESCE(t.execution->'continuation'->>'nextAt','') <= $1)
+        OR (COALESCE(t.execution->'continuation'->>'nextAt','') <= $1
+          AND NOT (COALESCE(t.execution->'continuation'->>'state','') = 'needs_action'
+            AND COALESCE(t.execution->'continuation'->>'reasonCode','') = 'REPEATED_NO_PROGRESS')))
       AND t.execution->>'kind' IN ('harness','opencode') ORDER BY t.updated_at LIMIT 30`;
 let ordinal = 0;
 
@@ -218,4 +220,34 @@ it('does not mutate tasks, runs, settings or events during selection', async () 
     expect(actual.map(row => row.id)).toEqual([t.id]);
     await db.query('ROLLBACK');
   } finally { await db.query('ROLLBACK'); db.release(); }
+});
+
+it('stops re-selecting a run already escalated to a person, but keeps a new attempt', async () => {
+  const g = await goal();
+  // Due by time, but already escalated: re-inspecting the same finished run
+  // cannot change the answer, and the rescan was emitting a status event every
+  // pass, burying the escalation it had already made.
+  const parked = await task(g, (run: string) => ({ kind: 'harness',
+    continuation: { runId: run, state: 'needs_action', reasonCode: 'REPEATED_NO_PROGRESS',
+      nextAt: '2026-10-11T19:00:00.000Z' } }));
+  const waiting = await task(g, (run: string) => ({ kind: 'harness',
+    continuation: { runId: run, state: 'checking', nextAt: '2026-10-11T19:00:00.000Z' } }));
+  // Quota and disconnected accounts recover on their own, so their escalations
+  // stay re-checkable; only repeated-no-progress is terminal for this run.
+  const quota = await task(g, (run: string) => ({ kind: 'harness',
+    continuation: { runId: run, state: 'needs_action', nextAt: '2026-10-11T19:00:00.000Z' } }));
+  const ids = (await equivalent()).map((row: any) => row.id);
+  expect(ids).not.toContain(parked.id);
+  expect(ids).toContain(waiting.id);
+  expect(ids).toContain(quota.id);
+});
+
+it('re-selects an escalated task once a newer attempt replaces the run', async () => {
+  const g = await goal();
+  // A person acting queues another attempt; its different runId re-opens the
+  // task through the clause that compares runId, with no time involved.
+  const t = await task(g, { kind: 'harness',
+    continuation: { runId: randomUUID(), state: 'needs_action', reasonCode: 'REPEATED_NO_PROGRESS',
+      nextAt: '2099-01-01T00:00:00.000Z' } });
+  expect((await equivalent()).map((row: any) => row.id)).toContain(t.id);
 });

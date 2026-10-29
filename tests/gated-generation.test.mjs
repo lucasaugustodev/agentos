@@ -9,10 +9,13 @@ import { acquireGlmRequestSlot } from '../bridge/glm-request-slot.mjs';
 import {
   GLM_ACCOUNT,
   GLM_REQUEST_ADMITTED,
+  glmRequestBudgetMs,
+  inGlmRequestLane,
   requestGatedModel,
   withAccountRequestGate,
   withGlmRequestSlot,
 } from '../bridge/gated-generation.mjs';
+import { glmModelProfile } from '../bridge/glm-model-profile.mjs';
 
 const deferred = () => {
   let resolve;
@@ -355,4 +358,33 @@ test('an admitted provider timeout retains its reason and releases the permit', 
     { name: 'TimeoutError' },
   );
   await until(async () => (await gate.status()).active === 0);
+});
+
+test('an installation account running the verified model keeps the GLM lane and its contract', () => {
+  const own = 'agentos:api:cb017dea-b631-49ae-bd6b-36655265c9d6';
+  assert.equal(inGlmRequestLane({ accountId: own, model: 'glm-5.3-flash' }), true);
+  // The profile carries the endpoint's thinking contract, not generic defaults.
+  const profile = glmModelProfile(own, 'glm-5.3-flash');
+  assert.equal(profile.reasoning, true);
+  assert.equal(profile.compat.thinkingFormat, 'zai');
+  // Another model on the same account is not the verified GLM endpoint.
+  assert.deepEqual(glmModelProfile(own, 'deepseek-v4.1-flash'), {});
+  assert.deepEqual(glmModelProfile('harness:qwen-cloud', 'qwen-max'), {});
+});
+
+test('the provider budget is configured within bounds, never silently shortened', () => {
+  const original = process.env.AGENTOS_GLM_REQUEST_TIMEOUT_MS;
+  try {
+    delete process.env.AGENTOS_GLM_REQUEST_TIMEOUT_MS;
+    assert.equal(glmRequestBudgetMs(), 720000);
+    process.env.AGENTOS_GLM_REQUEST_TIMEOUT_MS = '1500000';
+    assert.equal(glmRequestBudgetMs(), 1500000);
+    for (const refused of ['30000', '7200000', 'soon', '']) {
+      process.env.AGENTOS_GLM_REQUEST_TIMEOUT_MS = refused;
+      assert.equal(glmRequestBudgetMs(), 720000);
+    }
+  } finally {
+    if (original === undefined) delete process.env.AGENTOS_GLM_REQUEST_TIMEOUT_MS;
+    else process.env.AGENTOS_GLM_REQUEST_TIMEOUT_MS = original;
+  }
 });
