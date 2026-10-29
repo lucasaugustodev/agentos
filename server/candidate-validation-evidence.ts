@@ -29,7 +29,8 @@ const canonical = (v: any): any =>
       : v;
 const digest = (v: any) => sha(JSON.stringify(canonical(v)));
 const registeredShas = ['e66fcf513aaa513ff2216d87556fb5dba771597dc933ca4b4b38573d8842d5b5',
-  '02a92158a4084a1aeb3b4c55998b6740d90428f80acb06a225730a1423ba9c26'] as const;
+  '02a92158a4084a1aeb3b4c55998b6740d90428f80acb06a225730a1423ba9c26',
+  '31e7aa59d7b11f3552cfd8499481c727e4a8b316fc5b952e45839ba3df2a9c72'] as const;
 const key = (id: string) => 'candidate-validation-evidence:' + id;
 const uuid = z.uuid(),
   hash = z.string().regex(/^[a-f0-9]{64}$/);
@@ -163,9 +164,7 @@ export async function installCandidateValidationEvidence(db: DB = pool) {
     CREATE TRIGGER agentos_ci_evidence_immutable BEFORE UPDATE OR DELETE ON settings FOR EACH ROW EXECUTE FUNCTION agentos_ci_evidence_immutable();`);
 }
 
-function scope(task: any) {
-  const execution = { ...task.execution };
-  for (const name of [
+const scopeExecutionOmissions=[
     'workspace',
     'sourceWorkspace',
     'snapshot',
@@ -180,7 +179,11 @@ function scope(task: any) {
     'verificationRecheck',
     'candidateValidationEvidence',
     'workforceLane',
-  ])
+  ];
+const scopeTaskFields=['id','goal_id','stage','criteria','covers','agent_id','resources','required_memories','allowed_accounts'];
+function scope(task: any) {
+  const execution = { ...task.execution };
+  for (const name of scopeExecutionOmissions)
     delete execution[name];
   return digest({
     id: task.id,
@@ -220,8 +223,14 @@ async function source(db: DB, actionId: string,mode:'current'|'historical_runtim
   }
   const r = (
     await db.query(
-      'SELECT r.*,t.goal_id FROM runs r JOIN tasks t ON t.id=r.task_id WHERE r.id=$1',
-      [v.runId],
+      `SELECT r.id,r.task_id,r.fence,r.context_id,r.attempt,r.state,r.finished_at,t.goal_id,
+        jsonb_typeof(r.instruction_snapshot->'task')='object' frozen_task_present,
+        (SELECT COALESCE(jsonb_object_agg(k,val),'{}'::jsonb)
+          FROM jsonb_each(r.instruction_snapshot->'task') e(k,val) WHERE k=ANY($3::text[]))
+        ||CASE WHEN (r.instruction_snapshot->'task') ? 'execution' THEN jsonb_build_object('execution',
+          (r.instruction_snapshot#>'{task,execution}')-$2::text[]) ELSE '{}'::jsonb END scope_task
+        FROM runs r JOIN tasks t ON t.id=r.task_id WHERE r.id=$1`,
+      [v.runId,scopeExecutionOmissions,scopeTaskFields],
     )
   ).rows[0];
   if (
@@ -230,7 +239,7 @@ async function source(db: DB, actionId: string,mode:'current'|'historical_runtim
     r.task_id !== v.taskId ||
     r.fence !== v.runFence ||
     r.context_id !== v.contextVersion ||
-    !r.instruction_snapshot?.task ||
+    !r.frozen_task_present ||
     r.attempt !== v.expectedAttempt ||
     !['submitted', 'failed'].includes(r.state) ||
     !r.finished_at
@@ -246,15 +255,15 @@ async function source(db: DB, actionId: string,mode:'current'|'historical_runtim
   )
     failure('CI_EVIDENCE_CANDIDATE_CHANGED');
   const context = (
-    await db.query('SELECT manifest FROM contexts WHERE id=$1 AND run_id=$2', [r.context_id, r.id])
+    await db.query("SELECT manifest->'dependencyArtifacts' dependencies FROM contexts WHERE id=$1 AND run_id=$2", [r.context_id, r.id])
   ).rows[0];
   if (!context) failure('CI_EVIDENCE_PRODUCER_CHANGED');
   return {
     v,
     run: r,
-    scopeDigest: scope(r.instruction_snapshot.task),
-    criteriaDigest: digest(r.instruction_snapshot.task.criteria),
-    contextDependencyDigest: digest(context.manifest.dependencyArtifacts ?? []),
+    scopeDigest: scope(r.scope_task),
+    criteriaDigest: digest(r.scope_task.criteria),
+    contextDependencyDigest: digest(context.dependencies ?? []),
   };
 }
 

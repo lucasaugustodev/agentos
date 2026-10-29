@@ -9,7 +9,7 @@ import { assertStopped, inspectStopped } from './continuation.js';
 import { readArtifact } from './service.js';
 import { runtimeCandidateDigest } from './operation-progress.js';
 import { readDeliverySourceIdentity, sourceIdentityFrozen } from './delivery-source-resolution.js';
-import {workerValidationAuthority,verifyWorkerValidationAuthority} from './worker-validation.js';
+import {workerValidationAuthority,verifyWorkerValidationAuthority,readWorkerValidationIdentity} from './worker-validation.js';
 
 const owned = ['proposed', 'freezing', 'frozen', 'running', 'uncertain'];
 const sha = (bytes: Buffer | string) => createHash('sha256').update(bytes).digest('hex');
@@ -352,8 +352,7 @@ export async function reconcileWorkerValidationIntents(inspect=inspectStopped) {
 }
 
 async function runtimeProposal(db:DB,runId:string) {
-  const run=(await db.query(`SELECT r.*,t.goal_id,t.state task_state,t.attempt_count FROM runs r
-    JOIN tasks t ON t.id=r.task_id WHERE r.id=$1`,[runId])).rows[0];
+  const run=await readWorkerValidationIdentity(db,runId);
   if(!run || run.state!=='submitted' || run.task_state!=='submitted' || run.attempt!==run.attempt_count || !run.finished_at)
     throw Error('VALIDATION_BINDING_STALE');
   const {authority,reason}=await workerValidationAuthority(db,run);

@@ -89,7 +89,14 @@ dispatch/acceptance. Neither command exit nor a worker's `passed: true` is proof
 
 The deterministic validator includes current CI state in its input identity.
 Polling excludes pending CI; direct validation returns pending without writing an
-acceptance. The final transaction rechecks the gate under the admission lock.
+acceptance. The complete proof and artifact bytes are read outside admission
+locks, bracketed by small database identities. The final transaction rechecks
+those identities under the admission lock: policy/event/ownership, current
+run/fence/context, candidate and intent metadata, frozen contract, request and
+receipt digests. It performs no artifact or log I/O. Policy revocation or any
+bound identity change between these phases refuses the commit. Admission policy
+queries project only needed fields, and input/contract hashes are computed inside
+PostgreSQL instead of transporting large execution inputs through gate evaluation.
 Only the existing authenticated evidence exporter supplies the controller gate.
 
 Its optional coverage authority is:
@@ -143,6 +150,9 @@ The counterexamples cover old admissions, stage selection, absent/forged intent,
 no early acceptance, concurrent duplicate validation, no fake manager identity,
 uncertain stop/outcome, revoked policy, stale fence/context/candidate, mandatory
 case omissions/skips, arbitrary executor SHA, original criteria and evidence
-handoff without historical writes. Full reviewed validation and a real registered
+handoff without historical writes. A megabyte input fixture verifies narrow gate
+projections, and a delayed artifact read plus a real advisory-lock barrier verifies
+that the commit does not reread files and refuses a concurrent policy change.
+Full reviewed validation and a real registered
 CI run on a newly admitted final stage remain required before claiming end to end
 autonomy.

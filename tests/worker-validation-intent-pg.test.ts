@@ -1,5 +1,6 @@
 import {afterAll,beforeAll,beforeEach,expect,it,vi} from 'vitest';
 import {createHash,randomUUID} from 'node:crypto';
+import {setTimeout as delay} from 'node:timers/promises';
 import {pool,migrate} from '../server/db.js';
 import {seedRegistry} from '../server/registry.js';
 import {installManagement} from '../server/management.js';
@@ -7,7 +8,7 @@ import {writeArtifact,completeRun,validateTask} from '../server/service.js';
 import {reconcileWorkerValidationIntents,reconcileCandidateValidations} from '../server/candidate-validation.js';
 import {reconcileCandidateValidationEvidence,runtimeValidationRepairInputs} from '../server/candidate-validation-evidence.js';
 import {registerWorkerValidationPolicy,validationDigest,canonicalValidationValue,workerValidationInstruction,
-  workerValidationGate} from '../server/worker-validation.js';
+  workerValidationGate,readWorkerValidationIdentity,verifiedWorkerValidationGate} from '../server/worker-validation.js';
 import {readPendingValidations} from '../server/validation-identity.js';
 
 const sha=(bytes:Buffer|string)=>createHash('sha256').update(bytes).digest('hex');
@@ -22,12 +23,15 @@ beforeEach(async()=>{
   await pool.query("INSERT INTO goals(id,title,description,project,idempotency_key) VALUES($1::uuid,'Framework CI','No manager','agentos',$1::text)",[f.goal]);
 });
 afterAll(async()=>{await pool.end();});
-async function admit(options:{registered?:boolean,stage?:string,intent?:unknown,omitIntent?:boolean,submit?:boolean,passed?:boolean}={}) {
+async function admit(options:{registered?:boolean,stage?:string,intent?:unknown,omitIntent?:boolean,submit?:boolean,passed?:boolean,inputBytes?:number}={}) {
   if(options.registered!==false)f.registration=await registerWorkerValidationPolicy(f.goal,policy,{channel:'api-token'});
+  const bytes=options.inputBytes?Buffer.from('large-input-sentinel-'.repeat(Math.ceil(options.inputBytes/21)).slice(0,options.inputBytes)):null;
+  f.largeInput=bytes?.toString('base64');
   await pool.query(`INSERT INTO tasks(id,goal_id,key,title,description,agent_id,state,stage,criteria,execution,attempt_count,covers,recovery)
     VALUES($1,$2,'candidate','Candidate verification','Frozen worker contract','qa.integration','running',$3,$4,$5,1,'["requirement-a"]','{"mode":"automatic"}')`,
     [f.task,f.goal,options.stage??'verify',JSON.stringify([{id:'proof',label:'Original criterion',type:'json_field',name:'verification.json',field:'passed',equals:true}]),
-      JSON.stringify({kind:'harness',workspace:'agentos/oworkerfixture',baseWorkspace:'agentos/base',readOnlySource:true})]);
+      JSON.stringify({kind:'harness',workspace:'agentos/oworkerfixture',baseWorkspace:'agentos/base',readOnlySource:true,
+        ...(bytes?{inputs:[{id:randomUUID(),name:'large-context.txt',digest:sha(bytes),base64:bytes.toString('base64')}]}:{})})]);
   await pool.query("INSERT INTO runs(id,task_id,attempt,fence,runtime,agent_version,state,context_id) VALUES($1,$2,1,$3,'harness',1,'running',$4)",
     [f.run,f.task,f.fence,f.context]);
   await pool.query("INSERT INTO contexts(id,run_id,manifest,content) VALUES($1,$2,'{}','Context')",[f.context,f.run]);
@@ -58,7 +62,7 @@ function exported(job:any,coverage:any={version:1,source:'registered_vitest_json
     resultDigest:job.result.resultDigest,receiptDigest:'d'.repeat(64),producer:{...Object.fromEntries([
       'goalId','taskId','runId','runFence','contextVersion','expectedAttempt','candidateDigest'].map(k=>[k,job[k]])),contractDigest:job.request.contractDigest},
     outcome:{passed:job.result.passed,code:job.result.code,state:'completed'},
-    registeredActionSha:'02a92158a4084a1aeb3b4c55998b6740d90428f80acb06a225730a1423ba9c26',
+    registeredActionSha:'31e7aa59d7b11f3552cfd8499481c727e4a8b316fc5b952e45839ba3df2a9c72',
     registeredCommand:['/usr/bin/python3','/opt/agentos-control/agentos-release-action.py','validate'],
     publishedBaselineDigest:job.result.publishedBaselineDigest,publicationProofDigest:'f'.repeat(64),validationProofDigest:'f'.repeat(64),
     registeredReceiptSha:job.result.registeredReceiptSha,validatedReleaseDigest:'b'.repeat(64),
@@ -202,4 +206,53 @@ it('rejects an arbitrary executor SHA and unregistered settings without an authe
   expect((await workerValidationGate(pool,f.run)).state).toBe('pending');
   await pool.query("DELETE FROM events WHERE kind='WORKER_VALIDATION_POLICY_REGISTERED' AND entity_id=$1",[f.goal]);
   expect(await workerValidationGate(pool,f.run)).toMatchObject({state:'failed',detail:'VALIDATION_POLICY_UNREGISTERED'});
+});
+it('does not transfer a megabyte of execution inputs through CI gate or identity projections',async()=>{
+  await admit({inputBytes:1024*1024});const job=await completed();await publish(job);
+  const original=pool.query.bind(pool);let leaked=false,maxRowBytes=0;
+  const spy=vi.spyOn(pool,'query').mockImplementation((async(...args:any[])=>{
+    const result=await (original as any)(...args);
+    for(const row of result.rows??[]){const encoded=JSON.stringify(row);maxRowBytes=Math.max(maxRowBytes,Buffer.byteLength(encoded));
+      if(encoded.includes(f.largeInput.slice(0,256)))leaked=true;}
+    return result;
+  }) as any);
+  try {
+    const identity=await readWorkerValidationIdentity(pool,f.run);
+    expect(identity.instruction_snapshot).toBeUndefined();expect(identity.admitted_kind).toBe('harness');
+    const result=await verifiedWorkerValidationGate(pool,f.run);
+    expect(result.gate.state).toBe('passed');expect(Buffer.byteLength(JSON.stringify(result))).toBeLessThan(32000);
+    expect(leaked).toBe(false);expect(maxRowBytes).toBeLessThan(64000);
+  } finally {spy.mockRestore();}
+});
+it.each([false,true])('reads CI artifacts before the admission lock and fences a policy race=%s',async(revoke)=>{
+  await admit();const job=await completed();await publish(job);
+  const service=await import('../server/service.js'),original=service.readArtifact;
+  let observed!:()=>void,release!:()=>void;
+  const reached=new Promise<void>(resolve=>{observed=resolve;}),barrier=new Promise<void>(resolve=>{release=resolve;});
+  let reads=0;
+  const spy=vi.spyOn(service,'readArtifact').mockImplementation(async(id:string)=>{
+    reads++;if(reads===1){observed();await barrier;}return original(id);
+  });
+  const owner=await pool.connect();let pending:Promise<any>|undefined;
+  try {
+    pending=validateTask(f.task).then(value=>({value}),error=>({error}));
+    expect(await Promise.race([reached.then(()=>true),pending.then(()=>false)])).toBe(true);
+    await owner.query('BEGIN');
+    expect((await owner.query('SELECT pg_try_advisory_xact_lock(4280001) acquired')).rows[0].acquired).toBe(true);
+    const pid=(await owner.query('SELECT pg_backend_pid() pid')).rows[0].pid;
+    release();let blocked=false;
+    for(let n=0;n<200;n++){
+      blocked=!!(await owner.query(`SELECT 1 FROM pg_locks w WHERE w.locktype='advisory' AND w.classid=0
+        AND w.objid=4280001 AND w.objsubid=1 AND NOT w.granted
+        AND w.database=(SELECT oid FROM pg_database WHERE datname=current_database())
+        AND $1::int=ANY(pg_blocking_pids(w.pid)) LIMIT 1`,[pid])).rowCount;
+      if(blocked)break;await delay(10);
+    }
+    expect(blocked).toBe(true);const beforeCommitReads=reads;expect(beforeCommitReads).toBeGreaterThan(0);
+    if(revoke)await owner.query("UPDATE settings SET value=jsonb_set(value,'{policy,enabled}','false'::jsonb) WHERE id=$1",['worker-validation:'+f.goal]);
+    await owner.query('COMMIT');const result=await pending;
+    if(revoke)expect(result.error).toMatchObject({code:'STATE_CHANGED'});
+    else expect(result.value.passed).toBe(true);
+    expect(reads).toBe(beforeCommitReads);
+  } finally {release();await owner.query('ROLLBACK');owner.release();spy.mockRestore();await pending;}
 });

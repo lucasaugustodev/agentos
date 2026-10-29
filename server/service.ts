@@ -738,8 +738,9 @@ export async function validateTask(taskId: string, reviewer?: string) {
   const task = await readValidationSnapshot(pool, taskId, reviewer);
   if (!task)
     throw new DomainError('NOT_SUBMITTED', 'A tarefa ainda não está pronta para validação.');
-  const {workerValidationGate}=await import('./worker-validation.js');
-  const ci=await workerValidationGate(pool,task.run_id);
+  const {verifiedWorkerValidationGate,workerValidationCommitIdentity,validationDigest}=await import('./worker-validation.js');
+  const proof=task.validation_input.workerValidation?await verifiedWorkerValidationGate(pool,task.run_id):null;
+  const ci:import('./worker-validation.js').WorkerValidationGate=proof?.gate??{required:false,state:'legacy',detail:''};
   if(ci.state==='pending') return {passed:false,pending:true,checks:[{id:'registered-ci',label:'CI registrado da candidata',
     type:'registered_ci',passed:false,detail:ci.detail}],duplicate:false};
   if(task.receipt_match && ci.required && ci.state!=='passed' && task.accepted_passed)
@@ -811,8 +812,7 @@ export async function validateTask(taskId: string, reviewer?: string) {
     const fresh = await readValidationSnapshot(db, taskId, reviewer);
     if (!fresh || fresh.validation_key !== task.validation_key)
       throw new DomainError('STATE_CHANGED', 'A tentativa, contrato ou evidência mudou durante a validação.');
-    const freshCi=await workerValidationGate(db,fresh.run_id);
-    if(JSON.stringify(freshCi)!==JSON.stringify(ci))
+    if(proof && validationDigest(await workerValidationCommitIdentity(db,fresh.run_id))!==validationDigest(proof.identity))
       throw new DomainError('STATE_CHANGED','A autoridade ou evidência de CI mudou durante a validação.');
     // Another validator may have completed while this call was reading bytes.
     if (fresh.receipt_match)
