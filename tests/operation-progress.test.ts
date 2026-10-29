@@ -322,7 +322,7 @@ it('projects persisted dependency edges and revision without promoting an interm
   await pool.query('UPDATE tasks SET plan_revision=4,created_at=$2 WHERE id=$1',[f.task,created]);
   for(const [id,stage] of [[producer,'work'],[intermediate,'verify'],[final,'verify']]){
     await pool.query(`INSERT INTO tasks(id,goal_id,key,title,description,agent_id,state,criteria,stage,execution,plan_revision,created_at)
-      VALUES($1,$2,$1::text,'Synthetic gate','Projection fixture',$3,'ready','[]',$4,$5,4,$6)`,
+      VALUES($1::uuid,$2,$1::text,'Synthetic gate','Projection fixture',$3,'ready','[]',$4,$5,4,$6)`,
       [id,f.goal,f.agent,stage,JSON.stringify({baseWorkspace:scope}),created]);
   }
   for(const [consumer,parent] of [[intermediate,producer],[f.task,producer],[final,f.task],[final,intermediate]])
