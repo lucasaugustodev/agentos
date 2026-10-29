@@ -78,6 +78,25 @@ def source_snapshot_identity(source_id,source):
         raise ValueError('SOURCE_SNAPSHOT_INVALID')
     return hashlib.sha256(raw).hexdigest()
 
+def make_new_clone_editable(staging):
+    """Normalize only the newly copied tree, before protected metadata exists.
+
+    copytree preserves immutable release modes. Workers must be able to edit
+    their clone without DAC_OVERRIDE; executable and private-file modes remain
+    intact. Source, existing workspaces, baselines and markers are never passed
+    here. Dependencies and protected metadata are installed after this step.
+    """
+    for folder,dirs,files in os.walk(staging,followlinks=False):
+        directory=pathlib.Path(folder);info=directory.lstat()
+        if not stat.S_ISDIR(info.st_mode): raise ValueError('SOURCE_NOT_REGULAR')
+        directory.chmod(stat.S_IMODE(info.st_mode)|0o700)
+        for name in dirs:
+            if not stat.S_ISDIR((directory/name).lstat().st_mode): raise ValueError('SOURCE_SYMLINK')
+        for name in files:
+            path=directory/name;info=path.lstat()
+            if not stat.S_ISREG(info.st_mode): raise ValueError('SOURCE_NOT_REGULAR')
+            path.chmod(stat.S_IMODE(info.st_mode)|0o600)
+
 def prepare(params):
     target_id,source_id=params['workspace'],params['sourceWorkspace']
     target,source=workspace(target_id),workspace(source_id)
@@ -95,6 +114,7 @@ def prepare(params):
             baseline_staging=DATA/'workspace-baselines'/('.prepare-'+uuid.uuid4().hex)
             try:
                 shutil.copytree(source,staging,ignore=ignored)
+                make_new_clone_editable(staging)
                 project_deps=pathlib.Path('/opt/agentos-project-deps')/target_id.split('/')[0]/'node_modules'
                 (staging/'node_modules').symlink_to(str(project_deps) if project_deps.is_dir() else '/opt/agentos-runtime/node_modules',target_is_directory=True)
                 (staging/'evidence').mkdir(exist_ok=True); (staging/'data').mkdir(exist_ok=True)
