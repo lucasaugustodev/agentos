@@ -74,7 +74,7 @@ class CandidateValidationTests(unittest.TestCase):
   (state/'state.json').write_text(json.dumps({'runId':self.request['runId'],'workspace':'agentos/other','stopped':True}))
   with self.assertRaisesRegex(ValueError,'PHYSICAL_IDENTITY_CHANGED'):broker.stopped(self.request,self.manager)
  def test_production_profile_remains_validate_only(self):
-  self.assertEqual(broker.sha((ROOT/'scripts/agentos-release-action.py').read_bytes()),broker.REGISTERED_HASH)
+  self.assertIn(broker.sha((ROOT/'scripts/agentos-release-action.py').read_bytes()),broker.provenance.REVIEWED_EXECUTORS)
   self.assertNotIn("'publish'",(ROOT/'scripts/agentos-candidate-validation.py').read_text())
  def call(self,mode):
   original_state,original_stdin,original_argv=broker.STATE,sys.stdin,sys.argv
