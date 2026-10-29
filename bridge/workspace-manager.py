@@ -65,6 +65,19 @@ def copy_reservation(source):
             amount=max(4096,info.st_size);copied+=amount
             if 'assets' not in p.relative_to(source).parts and not name.endswith('.log'): baseline+=amount
     return copied+2*baseline+16*1024*1024
+def source_snapshot_identity(source_id,source):
+    marker=source/'.agentos-snapshot.json'
+    try: info=marker.lstat()
+    except FileNotFoundError: return None
+    if not stat.S_ISREG(info.st_mode) or info.st_uid!=os.geteuid() or info.st_mode&0o022:
+        raise ValueError('SOURCE_SNAPSHOT_UNPROTECTED')
+    fd=os.open(marker,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+    with os.fdopen(fd,'rb') as handle:
+        raw=handle.read(128*1024+1)
+    if len(raw)>128*1024 or json.loads(raw).get('workspace')!=source_id:
+        raise ValueError('SOURCE_SNAPSHOT_INVALID')
+    return hashlib.sha256(raw).hexdigest()
+
 def prepare(params):
     target_id,source_id=params['workspace'],params['sourceWorkspace']
     target,source=workspace(target_id),workspace(source_id)
@@ -76,6 +89,7 @@ def prepare(params):
             if state['sourceWorkspace']!=source_id or state.get('workspace')!=target_id: raise ValueError('SNAPSHOT_CONFLICT')
             return state
         if not source.is_dir(): raise ValueError('SOURCE_MISSING')
+        parent_snapshot=source_snapshot_identity(source_id,source)
         with storage_capacity.reserve(ROOT,DATA,copy_reservation(source)):
             staging=target.parent/('.prepare-'+uuid.uuid4().hex)
             baseline_staging=DATA/'workspace-baselines'/('.prepare-'+uuid.uuid4().hex)
@@ -96,6 +110,8 @@ def prepare(params):
                 for args in [['init','-q'],['-c','core.hooksPath=/dev/null','add','.'],['-c','core.hooksPath=/dev/null','commit','-qm','Isolated objective baseline','--allow-empty']]:
                     subprocess.run(['git',*args],cwd=staging,env=env,check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
                 state={'workspace':target_id,'sourceWorkspace':source_id,'baseDigest':source_hash(files),'createdAt':datetime.datetime.now(datetime.timezone.utc).isoformat()}
+                if source_snapshot_identity(source_id,source)!=parent_snapshot: raise ValueError('SOURCE_SNAPSHOT_CHANGED')
+                if parent_snapshot is not None: state['sourceSnapshotDigest']=parent_snapshot
                 (staging/'.agentos-snapshot.json').write_text(json.dumps(state))
                 # Preserve a previous failed preparation's baseline separately;
                 # stale files must never silently join the new source manifest.
