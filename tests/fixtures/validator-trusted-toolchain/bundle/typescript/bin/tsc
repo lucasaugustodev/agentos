@@ -1,0 +1,2 @@
+# Benign Python fake tool; invoked using /usr/bin/python3 only in the isolated jail.
+print('TRUSTED_FAKE_TSC')
