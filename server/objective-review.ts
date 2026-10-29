@@ -23,8 +23,18 @@ type Dispatch=(method:string,params?:any,options?:any)=>Promise<any>;
 const fail=(code:string)=>new DomainError(code,code,409);
 const liveStates="'queued','generating','guiding','uncertain','queued_next_step','consumed'";
 
+let objectiveReviewInstallation:Promise<void>|undefined;
+/** All callers in this process share the same committed installation. Repeating
+ * ALTER/DROP TRIGGER for each request can deadlock against normal review writes.
+ * A failed atomic installation is retryable; a new release gets a fresh module. */
+export function installObjectiveReview():Promise<void>{
+  if(!objectiveReviewInstallation)objectiveReviewInstallation=applyObjectiveReviewSchema().catch(error=>{
+    objectiveReviewInstallation=undefined;throw error;
+  });
+  return objectiveReviewInstallation;
+}
 /** Separate additive schema; does not rewrite the existing guarded backlog migration. */
-export async function installObjectiveReview(){
+async function applyObjectiveReviewSchema(){
   const db=await pool.connect();
   try{
     await db.query('BEGIN');await db.query('SELECT pg_advisory_xact_lock(4280,2601)');

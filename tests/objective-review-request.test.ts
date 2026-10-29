@@ -47,10 +47,13 @@ beforeEach(async()=>{
   await pool.query("UPDATE goals SET state='active' WHERE id=$1",[goal]);
   const taskId=randomUUID(),runId=randomUUID(),fence=randomUUID(),context=randomUUID();
   await pool.query(`INSERT INTO tasks(id,goal_id,key,title,description,agent_id,state,stage,criteria,execution,attempt_count,covers)
-    VALUES($1,$2,'target','Input consumer','Immutable task','qa.backend','running','work','[]','{"kind":"harness"}',1,'["req-1"]')`,[taskId,goal]);
-  await pool.query(`INSERT INTO runs(id,task_id,attempt,fence,runtime,agent_version,state,context_id,instruction_snapshot)
-    VALUES($1,$2,1,$3,'harness',1,'running',$4,$5)`,[runId,taskId,fence,context,JSON.stringify({
-      task:{description:'Immutable scope: fix only the consumer and its original tests.',criteria:[{id:'original',type:'test',description:'Preserve the original input.'}]}})]);
+    VALUES($1,$2,'target','Input consumer',$3,'qa.backend','running','work',$4,'{"kind":"harness"}',1,'["req-1"]')`,
+    [taskId,goal,'Immutable scope: fix only the consumer and its original tests.',
+      JSON.stringify([{id:'original',type:'test',description:'Preserve the original input.'}])]);
+  // The production trigger freezes the task's real description and criteria.
+  // Never overwrite its snapshot to make a reviewer-context assertion pass.
+  await pool.query(`INSERT INTO runs(id,task_id,attempt,fence,runtime,agent_version,state,context_id)
+    VALUES($1,$2,1,$3,'harness',1,'running',$4)`,[runId,taskId,fence,context]);
   await pool.query("INSERT INTO contexts(id,run_id,manifest,content,created_at) VALUES($1,$2,'{}','Immutable scope',now()-interval '1 minute')",[context,runId]);
   f={goal,taskId,runId,fence,context};
   await observe();
