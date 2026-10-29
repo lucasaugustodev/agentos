@@ -8,20 +8,36 @@ import {objectiveSchema} from '../server/objective-contracts.js';
 import {config} from '../server/config.js';
 import {makeApp} from '../server/app.js';
 import {operationHash} from '../server/operations-contract.js';
+import {objectiveReviewControllerRelease} from '../server/objective-review-readiness.js';
 import {installObjectiveReview,configureObjectiveReview,requestObjectiveReview,ObjectiveReviewEngine} from '../server/objective-review.js';
 vi.mock('../bridge/model-policy.mjs',async original=>({...await original<any>(),readModelPolicy:vi.fn()}));
+vi.mock('../server/objective-review-readiness.js',async original=>({...await original<any>(),objectiveReviewControllerRelease:vi.fn()}));
 
 // Real transactions and HTTP auth in the isolated PostgreSQL test database;
 // synthetic transport only. These are not provider/autonomy qualification.
 const policy={version:1,mode:'glm-only',accountId:'agentos-api-00000000-0000-4000-8000-000000000001',
   bridgeId:'agentos:api:00000000-0000-4000-8000-000000000001',model:'glm-5.3-flash',requestLimit:6,sessionLimit:12} as const;
-let f:any,engine:ObjectiveReviewEngine|undefined;
+const release={candidate:'/opt/agentos/releases/managed-00000000-0000-4000-8000-000000000001',digest:'a'.repeat(64)};
+let f:any,engine:ObjectiveReviewEngine|undefined,consumerOwner:Awaited<ReturnType<typeof pool.connect>>;
 const auth={channel:'api-token'} as const;
-beforeAll(async()=>{await migrate();await installObjectiveReview();});
+beforeAll(async()=>{
+  await migrate();await installObjectiveReview();consumerOwner=await pool.connect();
+  await consumerOwner.query('SELECT pg_advisory_lock(4280027),pg_advisory_lock(4280050)');
+});
 beforeEach(async()=>{
   vi.mocked(readModelPolicy).mockReturnValue(policy);
+  vi.mocked(objectiveReviewControllerRelease).mockResolvedValue(release);
   await pool.query('TRUNCATE goals,agents,accounts,memories,events CASCADE');
   await pool.query("DELETE FROM settings WHERE id LIKE 'workforce:%' OR id LIKE 'objective-review:%'");
+  await pool.query("DELETE FROM settings WHERE id='maintenance' OR id LIKE 'worker-readiness:%'");
+  const backendPid=(await consumerOwner.query('SELECT pg_backend_pid() pid')).rows[0].pid;
+  const readiness={service:'agentos-workers',pid:123,candidate:release.candidate,digest:release.digest,
+    startupId:randomUUID(),readyAt:new Date().toISOString(),locks:[{key:4280027,backendPid},{key:4280050,backendPid}]};
+  await pool.query('INSERT INTO settings VALUES($1,$2)',['worker-readiness:agentos-workers',JSON.stringify(readiness)]);
+  await pool.query("INSERT INTO events(kind,payload) VALUES('WORKER_SERVICE_UPDATED',$1)",[JSON.stringify({
+    service:'agentos-workers',candidate:release.candidate,pid:readiness.pid,readiness,
+    stopped:{unit:'agentos-workers',previousPid:122,activeState:'inactive',mainPid:0,oldPidGone:true,cgroupEmpty:true,
+      checkedAt:readiness.readyAt}})]);
   await seedRegistry();
   await pool.query(`INSERT INTO accounts(id,label,provider,model,models,bridge_id,enabled,allow_unknown,max_concurrency)
     VALUES($1,'Synthetic GLM','openai',$2,$3,$4,true,true,12)`,[policy.accountId,policy.model,JSON.stringify([policy.model]),policy.bridgeId]);
@@ -39,13 +55,16 @@ beforeEach(async()=>{
   await observe();
 });
 afterEach(async()=>{await engine?.close();engine=undefined;vi.unstubAllEnvs();vi.restoreAllMocks();});
-afterAll(()=>pool.end());
+afterAll(async()=>{
+  await consumerOwner?.query('SELECT pg_advisory_unlock(4280027),pg_advisory_unlock(4280050)');
+  consumerOwner?.release();await pool.end();
+});
 function snapshot(){return {runId:f.runId,observedAt:new Date().toISOString(),workspace:'test/base',runtimeState:'running',traceTruncated:true,
   actions:[{id:'redacted',sequence:1,tool:'bash',command:'[Comando envolvendo credenciais omitido]',
     output:'[Saida omitida]',state:'returned',exitCode:0},
     {id:'test',sequence:2,tool:'bash',command:'run original test',output:'DomainError: receipt mismatch',state:'error',exitCode:1}],
   files:[{path:'consumer.ts',status:'modified',added:'2',removed:'1'}],evidence:[]};}
-async function observe(value=snapshot()){
+async function observe(value:any=snapshot()){
   f.observation=value;
   f.eventId=String((await pool.query("INSERT INTO events(kind,entity_id,payload) VALUES('EXECUTION_OBSERVED',$1,$2) RETURNING id",
     [f.taskId,JSON.stringify({runId:f.runId,observation:value})])).rows[0].id);
@@ -103,6 +122,25 @@ it('rejects oversized/unknown/instruction-shaped packets without recording a req
     expect((await app.inject({method:'POST',url,headers,payload:{...packet(),reason:'x'.repeat(10000)}})).statusCode).toBe(413);
     expect((await pool.query('SELECT 1 FROM objective_review_signals')).rowCount).toBe(0);
   }finally{await app.close();}
+});
+it('refuses new HTTP requests until the actual review consumer has adopted this release',async()=>{
+  await pool.query("DELETE FROM settings WHERE id='worker-readiness:agentos-workers'");
+  const app=makeApp();
+  try{
+    const response=await app.inject({method:'POST',url:'/api/objectives/'+f.goal+'/reviews',payload:packet(),
+      headers:{authorization:'Bearer '+config.apiToken}});
+    expect(response.statusCode).toBe(503);expect(response.json().error).toBe('REVIEW_CONSUMER_NOT_READY');
+    expect((await pool.query('SELECT 1 FROM objective_review_signals')).rowCount).toBe(0);
+    expect((await pool.query("SELECT 1 FROM events WHERE kind='OBJECTIVE_REVIEW_REQUESTED'")).rowCount).toBe(0);
+  }finally{await app.close();}
+});
+it('replays a recorded request even when the consumer and release identity are no longer available',async()=>{
+  const input=packet(),created=await request(input);
+  await pool.query("DELETE FROM settings WHERE id='worker-readiness:agentos-workers'");
+  vi.mocked(objectiveReviewControllerRelease).mockClear().mockRejectedValue(Error('must not read release for replay'));
+  expect(await request(input)).toMatchObject({id:created.id,duplicate:true,state:'observed'});
+  expect(objectiveReviewControllerRelease).not.toHaveBeenCalled();
+  expect((await pool.query("SELECT 1 FROM events WHERE kind='OBJECTIVE_REVIEW_REQUESTED'")).rowCount).toBe(1);
 });
 it('observes by default; off rejects; enabling supervision uses the real operator signal without inventing a loop',async()=>{
   await configureObjectiveReview(f.goal,{mode:'off'});

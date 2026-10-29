@@ -12,6 +12,7 @@ import {toolLoopObservation,type LoopSignal} from './tool-loop-observation.js';
 import {queueFeedback} from './planner.js';
 import {operatorReviewRequestSchema,operatorReviewRequestDigest,operatorReviewSignalSchema,operatorReviewMaterial,
   type OperatorReviewAuth} from './objective-review-contract.js';
+import {objectiveReviewControllerRelease,assertObjectiveReviewConsumerReady} from './objective-review-readiness.js';
 
 const policySchema=z.object({mode:z.enum(['off','observe','supervised'])}).strict();
 const decisionSchema=z.object({kind:z.enum(['continue','guide','request_input','replan_after_boundary']),
@@ -164,6 +165,9 @@ export async function requestObjectiveReview(goalId:string,raw:unknown,auth:Oper
     if(!material)throw fail('OBJECTIVE_REVIEW_EVIDENCE_STALE');
     if((await db.query(`SELECT 1 FROM objective_review_signals WHERE run_id=$1 AND state IN(${liveStates})`,[request.runId])).rowCount)
       throw fail('OBJECTIVE_REVIEW_ALREADY_PENDING');
+    // An old WorkerEngine cannot safely consume an operator signal. Historical
+    // replay above remains readable even while rollout/readiness is unavailable.
+    await assertObjectiveReviewConsumerReady(db,await objectiveReviewControllerRelease());
     const id=randomUUID(),state=target.review_mode==='supervised'?'queued':'observed';
     const signal=operatorReviewSignalSchema.parse({version:1,source:'operator',pattern:'operator_review',
       requestKey:request.requestKey,requestDigest,expectedRevision:request.expectedRevision,reason,

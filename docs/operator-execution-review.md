@@ -4,6 +4,8 @@
 
 Use the existing administrative API token or authenticated operator session. Read-only credentials for `/api/operations/v1` cannot use this mutation. The operations capabilities endpoint therefore continues to advertise `request_intervention: false`.
 
+New requests also require the actual consumer, `agentos-workers`, to have adopted the same published release as the API. Admission checks the module's current release identity, the existing rollout adoption event, matching worker readiness, and live observer/continuation ownership locks. A maintenance drain must permit that adopted worker lane. The separate backlog service is not this engine's consumer. Until those proofs match, the route returns `503 REVIEW_CONSUMER_NOT_READY` without registering a signal. Schema installation by the API never counts as consumer readiness. Replaying an existing request remains possible even when the consumer is unavailable.
+
 Example with synthetic identities:
 
 ```json
@@ -40,6 +42,8 @@ Guidance still requires a committed action intent followed by the existing fence
 ## Limits of this first increment
 
 This does not automatically detect every stalled task, add an autonomous planner, change task decomposition or prove productivity. A snapshot's file metadata cannot prove unchanged file bytes. The prompt is bounded to the last four visible tool actions with explicit snippet limits; the reviewer should abstain when evidence is insufficient. Material comparison is conservative and may invalidate a request as an observation window changes.
+
+The readiness gate does not restart an old consumer or interrupt its live execution to force adoption. If a guarded rollout is waiting for that actor, the manual review feature waits too. Development checkouts do not claim production release readiness; isolated tests inject synthetic release identity and exercise real database ownership/proof checks.
 
 The existing one-review-owner rule includes `uncertain`, `queued_next_step` and `consumed`. A distinct request in those states is rejected with `OBJECTIVE_REVIEW_ALREADY_PENDING`; this increment does not invent a second owner or a post-consumption retry protocol. Replaying the original key remains a read of that review's identity. Automatic follow-up and safely replacing an already-consumed advisory require a separately validated transition.
 
