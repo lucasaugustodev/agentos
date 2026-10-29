@@ -471,6 +471,23 @@ def execution_lock(layout):
         yield
 
 
+def ensure_validation_build_root(layout):
+    path = layout.validation_builds
+    protected(path.parent, directory=True)
+    path.mkdir(mode=0o711, exist_ok=True)
+    protected(path, directory=True)
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != OWNER_UID or info.st_mode & 0o022:
+            fail('VALIDATOR_PROVENANCE_UNPROTECTED')
+        # mkdir's mode is masked by the launching operator's umask. Only this
+        # fixed, protected CI root gains traversal; no ancestor is chmodded.
+        os.fchmod(fd, 0o711)
+    finally:
+        os.close(fd)
+
+
 def register(layout, request, after_replace=None):
     """Explicit reviewed transition; no automatic trust-on-first-use or reload.
 
@@ -487,8 +504,7 @@ def register(layout, request, after_replace=None):
     if request['expectedRegisteredSha256'] not in {LEGACY_SHA, PARTIAL_PREIMAGE, *REVIEWED_EXECUTORS}:
         fail('VALIDATOR_REGISTRATION_PREIMAGE_UNREVIEWED')
     protected(layout.control.parent, directory=True)
-    layout.validation_builds.mkdir(mode=0o711, exist_ok=True)
-    protected(layout.validation_builds, directory=True)
+    ensure_validation_build_root(layout)
     with locks(layout):
         for path in layout.broker.glob('*/receipt.json'):
             prior, _ = document(path)

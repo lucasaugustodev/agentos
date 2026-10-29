@@ -430,6 +430,28 @@ class ValidatorProvenanceTests(unittest.TestCase):
         self.assertEqual(before,{item.name:item.read_bytes() for item in destination.iterdir()})
         self.assertTrue(proof['publicationRef']['path'].startswith(str(destination)))
 
+    def test_validation_root_is_traversable_under_restrictive_umask(self):
+        request=self.staged_request();before=self.layout.validation_builds.parent.stat().st_mode
+        old=os.umask(0o077)
+        try:self.register(request)
+        finally:os.umask(old)
+        self.assertEqual(self.layout.validation_builds.stat().st_mode & 0o777,0o711)
+        self.assertEqual(self.layout.validation_builds.parent.stat().st_mode,before)
+
+    def test_unprotected_validation_root_is_not_chmodded_into_trust(self):
+        request=self.staged_request();self.layout.validation_builds.mkdir(mode=0o777)
+        self.layout.validation_builds.chmod(0o777)
+        with self.assertRaisesRegex(ValueError,'UNPROTECTED'):self.register(request)
+        self.assertEqual(self.layout.validation_builds.stat().st_mode & 0o777,0o777)
+        self.assertEqual(self.layout.control.read_bytes(),self.partial)
+
+    def test_validation_root_symlink_never_changes_target_permissions(self):
+        request=self.staged_request();target=self.root/'unrelated';target.mkdir(mode=0o700)
+        self.layout.validation_builds.symlink_to(target,target_is_directory=True)
+        before=target.stat().st_mode
+        with self.assertRaisesRegex(ValueError,'UNPROTECTED'):self.register(request)
+        self.assertEqual(target.stat().st_mode,before)
+
 
 if __name__ == '__main__':
     unittest.main()
