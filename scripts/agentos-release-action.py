@@ -115,16 +115,24 @@ def write_regular_files(destination,files):
   target=destination.joinpath(*name.parts)
   target.parent.mkdir(parents=True,exist_ok=True)
   fd=os.open(target,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o444)
-  with os.fdopen(fd,'wb') as handle:handle.write(raw)
+  with os.fdopen(fd,'wb') as handle:
+   handle.write(raw)
+   os.fchmod(handle.fileno(),0o444)
  for folder,dirs,_ in os.walk(destination,followlinks=False):
   pathlib.Path(folder).chmod(0o555)
 
 
 def ensure_build_root():
+ for path in BUILD_ROOT.parents:
+  info=path.lstat()
+  if not stat.S_ISDIR(info.st_mode) or info.st_uid!=0 or info.st_mode&0o022:raise ValueError('VALIDATION_BUILD_ROOT_UNPROTECTED')
  BUILD_ROOT.mkdir(mode=0o711,exist_ok=True)
  for path in [BUILD_ROOT,*BUILD_ROOT.parents]:
   info=path.lstat()
   if not stat.S_ISDIR(info.st_mode) or info.st_uid!=0 or info.st_mode&0o022:raise ValueError('VALIDATION_BUILD_ROOT_UNPROTECTED')
+ # mkdir's mode is filtered by the launching operator's umask. Change only the
+ # fixed, now-verified protected directory; no existing writable root is trusted.
+ BUILD_ROOT.chmod(0o711)
  return BUILD_ROOT
 
 

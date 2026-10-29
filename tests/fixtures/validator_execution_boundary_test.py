@@ -172,6 +172,17 @@ class BoundaryTests(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o555)
         self.assertEqual(stat.S_IMODE((target / 'code.py').stat().st_mode), 0o444)
 
+    def test_restrictive_operator_umask_preserves_readable_immutable_files(self):
+        target = self.root / 'umask-copy'
+        previous = os.umask(0o077)
+        try:
+            guard.write_regular_files(target, {'nested/source.py': b'code'})
+        finally:
+            os.umask(previous)
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o555)
+        self.assertEqual(stat.S_IMODE((target / 'nested').stat().st_mode), 0o555)
+        self.assertEqual(stat.S_IMODE((target / 'nested/source.py').stat().st_mode), 0o444)
+
     def test_safe_copy_refuses_existing_destination(self):
         target = self.root / 'copy'
         target.symlink_to('/usr')
