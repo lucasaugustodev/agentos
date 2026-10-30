@@ -33,7 +33,7 @@ async function fixture(){
   plannerAccountId:'legacy',plannerModel:'glm-5.3-flash',allowedAccounts:['legacy'],idempotencyKey:id});
  await pool.query("INSERT INTO goals(id,title,description,project,state,idempotency_key) VALUES($1::uuid,'Route','Fixture','test','failed',$1::text)",[id]);
  await pool.query("INSERT INTO objectives(id,request,request_hash,mode,status,revision) VALUES($1,$2,$3,'execute','executing',2)",[id,JSON.stringify(request),hash(request)]);
- const old=randomUUID();await pool.query("INSERT INTO planning_runs(id,objective_id,base_revision,trigger_key,state,attempt,model) VALUES($1,$2,1,'old','failed',2,'glm-5.3-flash')",[old,id]);
+ const old=randomUUID();await pool.query("INSERT INTO planning_runs(id,objective_id,base_revision,trigger_key,state,attempt,model,fence) VALUES($1,$2,1,'old','failed',2,'glm-5.3-flash',$3)",[old,id,randomUUID()]);
  const snapshot=await objectiveModelRoute(id);
  const {expectedGoalId,expectedRevision,expectedRequestDigest,expectedPolicyDigest,expectedGenerationId}=snapshot;
  const body={idempotencyKey:randomUUID(),expectedGoalId,expectedRevision,expectedRequestDigest,expectedPolicyDigest,expectedGenerationId,
@@ -42,7 +42,7 @@ async function fixture(){
  return {id,request,old,body,register};
 }
 async function newRun(id:string){
- const run=randomUUID();await pool.query("INSERT INTO planning_runs(id,objective_id,base_revision,trigger_key,state) VALUES($1::uuid,$2,2,$1::text,'queued')",[run,id]);
+ const run=randomUUID();await pool.query("INSERT INTO planning_runs(id,objective_id,base_revision,trigger_key,state,fence) VALUES($1::uuid,$2,2,$1::text,'queued',$3)",[run,id,randomUUID()]);
  return (await pool.query('SELECT * FROM planning_runs WHERE id=$1',[run])).rows[0];
 }
 it('records one immutable generation under concurrent replay; only new runs receive all three routing fields',async()=>{
@@ -76,8 +76,8 @@ it('never binds an old retry, including null-to-current, and rejects a foreign g
  expect(await claimPlanning()).toBeNull();
  expect((await pool.query('SELECT route_generation_id,model,error FROM planning_runs WHERE id=$1',[f.old])).rows[0])
   .toEqual({route_generation_id:null,model:'glm-5.3-flash',error:'OBJECTIVE_MODEL_ROUTE_RUN_STALE'});
- await expect(pool.query("INSERT INTO planning_runs(id,objective_id,base_revision,trigger_key,route_generation_id) VALUES($1,$2,2,'forged',$3)",
-  [randomUUID(),f.id,randomUUID()])).rejects.toThrow('PLANNING_ROUTE_GENERATION_STALE');
+ await expect(pool.query("INSERT INTO planning_runs(id,objective_id,base_revision,trigger_key,route_generation_id,fence) VALUES($1,$2,2,'forged',$3,$4)",
+  [randomUUID(),f.id,randomUUID(),randomUUID()])).rejects.toThrow('PLANNING_ROUTE_GENERATION_STALE');
 });
 it.each(['paused','cancelled','completed','revision','request','policy','file-policy','generation','goal','workforce','planner','maintenance','uncertain','live','native','lease','disabled-account'] as const)
  ('refuses %s without granting a route',async kind=>{
