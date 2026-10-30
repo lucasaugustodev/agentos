@@ -40,6 +40,7 @@ async function fixture(limit=12){
   };
   const install=()=>pool.query("INSERT INTO settings(id,value) VALUES('model-policy',$1) ON CONFLICT(id) DO UPDATE SET value=excluded.value",[JSON.stringify(policy)]);
   return {goal,workforce,task,run,install};
+}
 it('routes every new role to exact v2 policy while keeping explicit restrictions and low planner profile',()=>{
   const account={id:policy.accountId,bridge_id:policy.bridgeId,models:[policy.model],enabled:true,allow_unknown:true,provider:'openai'};
   const workforce:any={enabled:true,glmAccountId:'old-account',glmTarget:12,workerAccounts:[],coordinatorAccountId:'old-account',coordinatorModel:'glm-5.3-flash'};
@@ -53,7 +54,7 @@ it('routes every new role to exact v2 policy while keeping explicit restrictions
   expect(workforceCapacityReason({account_id:policy.accountId,model:policy.model},active,workforce)).toBe('WORKFORCE_GLM_CAPACITY');
 });
 it('SQL rejects malformed v2 authority and a model rename never grants manager authority',async()=>{
-  for(const change of [{version:3},{mode:'glm-only'},{model:'renamed-privileged'},{requestLimit:7},{sessionLimit:13},
+  for(const change of [{version:3},{version:'2'},{mode:'glm-only'},{model:'renamed-privileged'},{requestLimit:7},{sessionLimit:13},{requestLimit:'6'},
     {bridgeId:'agentos:api:other'},{accountId:'agentos:muse:other'},{extra:true}]){
     const result=await pool.query(`SELECT COALESCE(${exclusiveModelPolicySql('$1::jsonb')},false) allowed`,[JSON.stringify({...policy,...change})]);
     expect(result.rows[0].allowed).toBe(false);
