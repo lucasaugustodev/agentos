@@ -504,6 +504,7 @@ export async function claimPlanning() {
       planningRunId: run.id,
       model: selected.model,
       accountId: selected.account.id,
+      ...(run.route_generation_id?{routeGenerationId:run.route_generation_id}:{}),
     });
     return { ...run, request, fence, attempt: run.attempt + 1, ...selected };
   });
@@ -548,6 +549,7 @@ export async function applyPlannedResult(run: any, plan: ProposedPlan, preparedS
       fresh.state !== 'running' ||
       ['paused','cancelled'].includes(fresh.goal_state) ||
       fresh.fence !== run.fence ||
+      (fresh.route_generation_id??null)!==(run.route_generation_id??null) ||
       fresh.revision !== run.base_revision
     )
       throw new DomainError('STALE_PLAN', 'Resultado de uma revisão antiga ignorado.');
@@ -814,6 +816,8 @@ export class PlanningEngine {
         const lastRejected=recovery?(await pool.query('SELECT output,error FROM planning_attempts WHERE planning_run_id=$1 AND attempt<$2 AND output IS NOT NULL ORDER BY attempt DESC LIMIT 1',[run.id,run.attempt])).rows[0]:undefined;
         const compactMessage = incremental ? {
           objective: run.request.message, constraints: run.request.constraints,
+          ...(run.route_generation_id?{operatorModelRoute:{generationId:run.route_generation_id,
+            plannerAccountId:run.request.plannerAccountId,plannerModel:run.request.plannerModel,allowedAccounts:run.request.allowedAccounts}}:{}),
           ...(run.request.sourceContractVersion?{sourceContractVersion:run.request.sourceContractVersion}:{}),
           ...frontier,
           agents: context.agents.map((a: any) => ({ id: a.id, capabilities: a.capabilities })),

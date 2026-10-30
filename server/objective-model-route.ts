@@ -39,7 +39,7 @@ async function latest(db:DB,id:string){
 }
 async function verify(db:DB,row:any):Promise<Payload>{
  const p=row?.payload as Payload;
- if(!p||p.version!==1||p.id!==row.id||p.goalId!==row.objective_id||p.generation!==row.generation||
+ if(!p||!p.request||!p.originalRequest||!p.effectiveRequest||p.version!==1||p.id!==row.id||p.goalId!==row.objective_id||p.generation!==row.generation||
    p.request.expectedGoalId!==p.goalId||p.request.idempotencyKey!==row.idempotency_key||hash(p)!==row.receipt_digest||hash(p.request)!==p.requestDigest||
    !objectiveModelRouteSchema.safeParse(p.request).success||!['api-token','operator-session'].includes(p.authChannel)||
    p.policy?.version!==2||hash(p.policy)!==p.policyDigest||p.originalRequestDigest!==p.request.expectedRequestDigest||
