@@ -48,6 +48,11 @@ class RollbackTests(unittest.TestCase):
    with self.assertRaisesRegex(RuntimeError,'health'):self.publish()
   self.assertEqual(order,[str(self.after),'readonly',str(self.before)])
   self.assertEqual((self.root/'current').resolve(),self.before)
+  observation=self.receipt.with_name(self.id+'.rollback.json').read_bytes()
+  with patch.object(g,'run') as run:
+   with self.assertRaisesRegex(ValueError,'ROLLBACK_RECONCILE'):self.publish()
+   run.assert_not_called()
+  self.assertEqual(self.receipt.with_name(self.id+'.rollback.json').read_bytes(),observation)
  def test_observation_write_failure_never_changes_pointer_back(self):
   with patch.object(g,'run',side_effect=RuntimeError()),patch.object(g,'require_rollback_readiness',return_value={'ok':True}),\
        patch.object(g,'persist_rollback_observation',side_effect=OSError('disk')):
