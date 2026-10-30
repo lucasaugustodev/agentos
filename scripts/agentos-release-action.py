@@ -396,6 +396,80 @@ def publish_source(candidate,record):
  elif build_snapshot(source,include_outputs=True)!=files:raise ValueError('PUBLISHED_SOURCE_CHANGED')
  value=json.dumps({'workspace':workspace,'release':str(candidate)})
  run(['runuser','-u','postgres','--','/usr/lib/postgresql/17/bin/psql','-p','15482','-d','agentos','-v','ON_ERROR_STOP=1','-c',"INSERT INTO settings(id,value) VALUES('agentos-source-workspace','"+value.replace("'","''")+"') ON CONFLICT(id) DO UPDATE SET value=excluded.value"])
+
+def publication_executor(origin):
+ # Registration remains locked for this entire process. Preserve the validator
+ # identity in the old receipt; this is the independently registered publisher.
+ bound=origin.require_registered_bundle(pathlib.Path(__file__).resolve(),_EXECUTOR_SHA,ORIGIN_MODULE_SHA)
+ pointer={key:bound[key] for key in ('version','registrationId','registrationDigest')}
+ record,ref=origin.document(origin.Layout().control/'validator-registrations'/(pointer['registrationId']+'.json'))
+ if ref['sha256']!=pointer['registrationDigest'] or not re.fullmatch('[a-f0-9]{40}',record.get('sourceCommit','')):
+  raise ValueError('PUBLICATION_EXECUTOR_UNBOUND')
+ return {'path':str(pathlib.Path(__file__).resolve()),'sha256':_EXECUTOR_SHA,
+         'sourceCommit':record['sourceCommit'],'registration':pointer}
+
+ROLLBACK_READINESS_JS = r'''
+// Imported source is the exact previously published release, never a CLI that
+// might silently ignore --check. No installer or application runtime is called.
+const {pool}=await import('./server/db.ts');
+let db;
+try {
+ db=await pool.connect();
+ await db.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');
+ await db.query("SET LOCAL statement_timeout='5s'");
+ await db.query("SET LOCAL lock_timeout='1s'");
+ const gates=[['base','schema-readiness','requireSchemaReady'],
+  ['backlog','backlog-schema-readiness','requireBacklogSchemaReady'],
+  ['taskExecution','task-execution-metadata','requireTaskExecutionMetadataReady'],
+  ['runCriteria','run-criteria-metadata','requireRunCriteriaMetadataReady'],
+  ['panel','task-panel-metadata','requireTaskPanelMetadataReady']];
+ for (const [,file,name] of gates) await (await import('./server/'+file+'.ts'))[name](db);
+ await db.query('ROLLBACK');
+ console.log(JSON.stringify({version:1,ok:true,readOnly:true,gates:gates.map(x=>x[0])}));
+} catch {
+ if(db) await db.query('ROLLBACK').catch(()=>{});
+ console.error('ROLLBACK_SCHEMA_NOT_READY');process.exitCode=1;
+} finally {db?.release();await pool.end();}
+'''
+
+def require_rollback_readiness(previous,record):
+ previous=pathlib.Path(previous)
+ origin=record.get('candidateOrigin',{}).get('published',{})
+ expected=origin.get('releaseDigest')
+ if (previous.parent!=ROOT/'releases' or previous.is_symlink() or
+     str(previous)!=record.get('base') or origin.get('release')!=str(previous) or
+     not isinstance(expected,str) or not re.fullmatch('[a-f0-9]{64}',expected) or digest(previous)!=expected):
+  raise ValueError('ROLLBACK_SOURCE_UNBOUND')
+ bundle=(previous/'node_modules').resolve(strict=True)
+ node=protected_tool(pathlib.Path(NODE)/'node',root_owned=False,forbidden_uid=pwd.getpwnam('agentos-build').pw_uid)
+ loader=protected_tool(bundle/'tsx/dist/loader.mjs')
+ environment=protected_tool(pathlib.Path('/etc/agentos/server.env'))
+ if not loader.is_relative_to(bundle):raise ValueError('ROLLBACK_LOADER_UNBOUND')
+ # PGOPTIONS also makes transactions opened by imports read-only. The only
+ # child is Node; bounded queries and finally/pool.end close its connections.
+ result=subprocess.run([str(node),'--env-file='+str(environment),'--import',str(loader),
+  '--input-type=module','-e',ROLLBACK_READINESS_JS],cwd=previous,
+  env={'PATH':NODE+':/usr/bin:/bin','HOME':'/nonexistent','NODE_OPTIONS':'','NODE_PATH':'',
+       'PGAPPNAME':'agentos-rollback-readiness','PGOPTIONS':'-c default_transaction_read_only=on -c statement_timeout=5000 -c lock_timeout=1000 -c idle_in_transaction_session_timeout=10000'},
+  stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,timeout=40)
+ expected_result={'version':1,'ok':True,'readOnly':True,'gates':['base','backlog','taskExecution','runCriteria','panel']}
+ if result.returncode or result.stderr or json.loads(result.stdout)!=expected_result:raise ValueError('ROLLBACK_SCHEMA_NOT_READY')
+ if digest(previous)!=expected or (ROOT/'current').resolve()!=pathlib.Path(record['candidate']):raise ValueError('ROLLBACK_SOURCE_CHANGED')
+ return {**expected_result,'source':str(previous),'digest':expected,'checkedAt':time.time()}
+
+def persist_rollback_observation(receipt,record,value):
+ path=receipt.with_name(receipt.stem+'.rollback.json')
+ value={'version':1,'candidate':record['candidate'],'digest':record['digest'],'base':record['base'],
+        'validationReceiptSha256':hashlib.sha256(receipt.read_bytes()).hexdigest(),
+        'publisher':record['publicationExecutor'],'observedAt':time.time(),**value}
+ temporary=path.with_name(path.name+'.'+uuid.uuid4().hex+'.tmp')
+ fd=os.open(temporary,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+ with os.fdopen(fd,'w') as stream:
+  json.dump(value,stream,sort_keys=True,separators=(',',':'));stream.flush();os.fsync(stream.fileno())
+ os.replace(temporary,path)
+ fd=os.open(path.parent,os.O_RDONLY|os.O_DIRECTORY)
+ try:os.fsync(fd)
+ finally:os.close(fd)
 def main():
  data=json.load(sys.stdin); action=sys.argv[1]
  if action not in {'validate','publish'}:raise ValueError('INVALID_ACTION')
@@ -477,6 +551,7 @@ def main():
    print(json.dumps({'ok':True,'summary':'Versão já publicada.','output':record}));return
   if str(previous)!=record['base']:raise ValueError('BASE_CHANGED_REVALIDATE')
   origin_module.require_publish_origin(record)
+  record['publicationExecutor']=publication_executor(origin_module)
   swap=ROOT/('current-'+occurrence);os.symlink(candidate,swap);os.replace(swap,ROOT/'current')
   try:
    run(['systemctl','restart','agentos-api'])
@@ -488,6 +563,11 @@ def main():
      if attempt==29:raise
      time.sleep(1)
   except Exception:
+   try:readiness=require_rollback_readiness(previous,record)
+   except Exception:
+    persist_rollback_observation(receipt,record,{'state':'blocked','code':'ROLLBACK_READINESS_UNPROVEN'})
+    raise ValueError('PUBLICATION_FAILED_ROLLBACK_BLOCKED_RECONCILE') from None
+   persist_rollback_observation(receipt,record,{'state':'ready','readiness':readiness})
    os.symlink(previous,swap);os.replace(swap,ROOT/'current');run(['systemctl','restart','agentos-api']);raise
   publish_source(candidate,record)
   record.update(publishedAt=time.time(),previous=str(previous),workersPendingRestart=True);receipt.write_text(json.dumps(record))

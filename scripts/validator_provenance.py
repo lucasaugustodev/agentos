@@ -212,6 +212,36 @@ def record_matches(layout, current, record, validated):
     return release_path(layout, record['base'])
 
 
+def registered_executor_at(layout, declared, timestamp):
+    if not isinstance(declared, dict) or set(declared) != {'path','sha256','sourceCommit','registration'}:
+        fail('VALIDATOR_OPERATOR_EXECUTOR_UNBOUND')
+    executor = declared['sha256']
+    if (executor not in REVIEWED_BUNDLES or declared['sourceCommit'] != REVIEWED_EXECUTORS.get(executor) or
+            pathlib.Path(declared['path']) != layout.control):
+        fail('VALIDATOR_OPERATOR_EXECUTOR_UNBOUND')
+    registered = registration_record(layout, declared['registration'])
+    installed = registered.get('installedAt')
+    if (registered['executorSha256'] != executor or registered.get('version') != 2 or
+            type(installed) not in (int,float) or not math.isfinite(installed) or installed <= 0 or installed > timestamp):
+        fail('VALIDATOR_OPERATOR_EXECUTOR_UNBOUND')
+    # A historically superseded registration is valid only before its successor
+    # was installed. Inspect immutable records, not today's mutable pointer.
+    rid = declared['registration']['registrationId']
+    for path in layout.registry.glob('*.json'):
+        if path.name == 'current.json' or path.name.endswith('.intent.json') or path.stem == rid:
+            continue
+        other, ref = document(path)
+        if other.get('state') != 'installed' or other.get('kind') != 'reviewed_validator_transition':
+            continue
+        installed_after = other.get('installedAt')
+        if (type(installed_after) in (int,float) and math.isfinite(installed_after) and
+                installed < installed_after <= timestamp):
+            registration_record(layout, {'version':1,'registrationId':other.get('registrationId'),
+                                         'registrationDigest':ref['sha256']})
+            fail('VALIDATOR_OPERATOR_EXECUTOR_SUPERSEDED')
+    return executor
+
+
 def operator_proof(layout, current, directory):
     published, p = document(directory / 'publish.receipt.json')
     if published.get('output', {}).get('candidate') != str(current):
@@ -233,18 +263,20 @@ def operator_proof(layout, current, directory):
     if str(base) != vi.get('base'):
         fail('VALIDATOR_OPERATOR_INTENT_CHANGED')
     declared = vi.get('executor')
+    publisher = pi.get('executor')
     modern = 'executorSha256' in validated.get('output', {})
     if modern or declared is not None or pi.get('executor') is not None:
-        if not isinstance(declared, dict) or set(declared) != {'path','sha256','sourceCommit','registration'} or pi.get('executor') != declared:
+        executor = registered_executor_at(layout, declared, record['validatedAt'])
+        registered_executor_at(layout, publisher, record['publishedAt'])
+        if validated.get('output',{}).get('executorSha256') != executor:
             fail('VALIDATOR_OPERATOR_EXECUTOR_UNBOUND')
-        executor = declared['sha256']
-        if (executor not in REVIEWED_BUNDLES or declared.get('sourceCommit') != REVIEWED_EXECUTORS.get(executor) or
-                pathlib.Path(declared.get('path','')) != layout.control or
-                validated.get('output',{}).get('executorSha256') != executor):
-            fail('VALIDATOR_OPERATOR_EXECUTOR_UNBOUND')
-        registered = registration_record(layout, declared['registration'])
-        if (registered['executorSha256'] != executor or registered.get('version') != 2 or
-                registered.get('installedAt', float('inf')) > record['validatedAt']):
+        # Old equal-executor receipts remain byte-for-byte historical evidence.
+        # A transition requires the publisher's own captured active authority;
+        # neither validation output nor its executor field is rewritten.
+        captured = record.get('publicationExecutor')
+        if ((publisher != declared and captured != publisher) or
+                (captured is not None and captured != publisher) or
+                'publicationExecutor' in validated.get('output',{})):
             fail('VALIDATOR_OPERATOR_EXECUTOR_UNBOUND')
     else:
         # Only legacy receipts without modern identity use the historical base.
@@ -381,6 +413,8 @@ def broker_proof(layout, current, directory):
     executor_artifacts(result, receipt['registeredActionSha'])
     record, rr = document(layout.receipts / (action + '.json'))
     record_matches(layout, current, record, result.get('output', {}))
+    if 'publicationExecutor' in record:
+        registered_executor_at(layout, record['publicationExecutor'], record['publishedAt'])
     return {'version': 2, 'kind': 'registered_broker_receipts', 'release': record,
             'validationExecutorSha256': receipt['registeredActionSha'], 'publicationRef': rr,
             'validationRef': result_ref, 'registeredReceipt': rr,

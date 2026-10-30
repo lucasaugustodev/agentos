@@ -61,6 +61,7 @@ def publisher(root, state, occurrence, ready, complete, result, layout, invalid=
                  'hashlib': hashlib, 'shutil': shutil, 'urllib': FakeUrllib,
                  'run': lambda *_args, **_kwargs: '', 'publish_source': fake_source,
                  'trusted_origin_module': lambda: IsolatedOrigin}
+    namespace['publication_executor'] = lambda _origin: {'fixture': 'registered publisher'}
     exec(compile(selected, 'sandboxed-release-action.py', 'exec'), namespace)
     sys.argv = ['sandboxed-release-action.py', 'publish']
     sys.stdin = io.StringIO(json.dumps({'occurrenceId': occurrence}))
