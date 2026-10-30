@@ -2,19 +2,21 @@ import {beforeAll,beforeEach,afterAll,afterEach,it,expect,vi} from 'vitest';
 import {randomUUID} from 'node:crypto';
 import {mkdir,writeFile} from 'node:fs/promises';
 import path from 'node:path';
-import {pool,migrate,tx,event} from '../server/db.js';
+import {pool,tx,event} from '../server/db.js';
 import {config} from '../server/config.js';
 import {seedRegistry} from '../server/registry.js';
 import {hash} from '../server/memory.js';
-import {installBacklogPlanner} from '../server/backlog.js';
-import {installManagement} from '../server/management.js';
-import {installSupervision,recordSupervisionDecisions,applySupervisionDecisions,resumeSupervisedWork} from '../server/supervision.js';
+import {prepareSchema} from '../server/schema-readiness.js';
+import {prepareBacklogSchema} from '../server/backlog-schema-readiness.js';
+import {recordSupervisionDecisions,applySupervisionDecisions,resumeSupervisedWork} from '../server/supervision.js';
 import {writeArtifact,completeRun,validateTask,schedule} from '../server/service.js';
 import {reconcileDisabledWorkforceLanes,applyDisabledLaneRevision} from '../server/workforce-disabled-lane.js';
 
 beforeAll(async()=>{
   expect(new URL(config.databaseUrl).pathname).toBe('/agentos_test');
-  await migrate();await installBacklogPlanner();await installSupervision();await installManagement();
+  // Nested installers use NOWAIT relation locks. Keep their bounded conflict
+  // recovery and readiness receipts in the canonical outer preparer.
+  await prepareSchema();await prepareBacklogSchema();
 });
 beforeEach(async()=>{
   await pool.query('TRUNCATE goals,agents,accounts,events CASCADE');await seedRegistry();

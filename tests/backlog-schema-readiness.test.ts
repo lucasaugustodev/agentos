@@ -7,6 +7,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { pool, migrate } from '../server/db.js';
 import { config } from '../server/config.js';
+import { installVerificationSourceBinding } from '../server/verification-source-binding.js';
 import { migrationModules, migrationReceiptKey, migrationAdvisoryLock, prepareSchema, requireSchemaReady } from '../server/schema-readiness.js';
 import {
   backlogMigrationModules, backlogMigrationReceiptKey, backlogMigrationSource,
@@ -207,4 +208,48 @@ it.each(['40P01', '55P03', '23514'])('bounds and classifies preparation retries 
     expect((await owner.query('SELECT pg_try_advisory_lock($1) owned', [migrationAdvisoryLock])).rows[0].owned).toBe(true);
     await owner.query('SELECT pg_advisory_unlock($1)', [migrationAdvisoryLock]);
   } finally { owner.release(); }
+});
+
+it('recovers a real acceptances NOWAIT conflict through canonical backlog preparation after the reader releases', async () => {
+  const reader = await pool.connect();
+  let attempts = 0;
+  const observed: string[] = [];
+  try {
+    await reader.query('BEGIN');
+    await reader.query('LOCK TABLE public.acceptances IN ACCESS SHARE MODE');
+    const receipt = await prepareBacklogSchema({ retryDelaysMs: [25], apply: async () => {
+      attempts++;
+      try { await installVerificationSourceBinding(); }
+      catch (error: any) {
+        observed.push(error.code);
+        // Release only after PostgreSQL has actually rejected the first DDL.
+        // The preparer, not this observer, must decide whether to retry it.
+        await reader.query('ROLLBACK');
+        throw error;
+      }
+    } });
+    expect(observed).toEqual(['55P03']);
+    expect(attempts).toBe(2);
+    expect(receipt).toMatchObject({ state: 'complete', alreadyApplied: false });
+    await expect(requireBacklogSchemaReady()).resolves.toMatchObject({ version: 1 });
+  } finally { await reader.query('ROLLBACK'); reader.release(); }
+});
+
+it('bounds a persistent real acceptances conflict without publishing completion and recovers only after release', async () => {
+  const reader = await pool.connect();
+  let attempts = 0;
+  try {
+    await reader.query('BEGIN');
+    await reader.query('LOCK TABLE public.acceptances IN ACCESS SHARE MODE');
+    await expect(prepareBacklogSchema({ retryDelaysMs: [25], apply: async () => {
+      attempts++;
+      await installVerificationSourceBinding();
+    } })).rejects.toMatchObject({ code: '55P03' });
+    expect(attempts).toBe(2);
+    expect((await stored()).state).toBe('applying');
+    await expect(requireBacklogSchemaReady()).rejects.toMatchObject({ code: 'BACKLOG_MIGRATION_REQUIRED' });
+    expect((await reader.query('SELECT pg_try_advisory_lock($1) owned', [migrationAdvisoryLock])).rows[0].owned).toBe(true);
+    await reader.query('SELECT pg_advisory_unlock($1)', [migrationAdvisoryLock]);
+  } finally { await reader.query('ROLLBACK'); reader.release(); }
+  await expect(prepareBacklogSchema()).resolves.toMatchObject({ state: 'complete', alreadyApplied: false });
 });
