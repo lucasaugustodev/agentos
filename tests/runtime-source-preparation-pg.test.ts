@@ -37,7 +37,7 @@ function inspection(request:SourcePreparationRequest,changed=false){
     candidate:{baseDigest:request.expectedSourceDigest,candidateDigest:changed?sha('preserved edits'):request.expectedSourceDigest},
     destinationChanged:changed,checkedAt:Date.now()};
 }
-async function fixture(prior=0,knownNotStarted=false){
+async function fixture(prior=0,knownNotStarted=false,inputBytes=0){
   const goalId=randomUUID(),taskId=randomUUID(),planningRunId=randomUUID(),planFence=randomUUID(),identity=randomUUID();
   const base='sample/o'+goalId.replaceAll('-','').slice(0,12)+'r2-base-0-p'+identity.replaceAll('-','');
   const baseRequest={workspace:base,sourceWorkspace:'sample/accepted',preparationIdentity:identity,
@@ -54,8 +54,10 @@ async function fixture(prior=0,knownNotStarted=false){
   const intentKey=`planning-source-preparation:${planningRunId}:0`;
   const sourceReuse={version:1,planningRunId,proofDigest:proof.proofDigest,preparationIdentity:identity,
     receiptDigest:basePrepared.receipt.receiptDigest,baselineWorkspace:base,incorporatedArtifacts:artifacts,acceptance:false,finalVerificationRequired:true};
+  const payload=Buffer.alloc(inputBytes,97);
   const execution={kind:'harness',workspace:request.workspace,sourceWorkspace:base,baseWorkspace:'sample/logical',
-    profile:'code',sourcePreparation:request,sourceReuse};
+    profile:'code',sourcePreparation:request,sourceReuse,...(inputBytes?{inputs:[{id:randomUUID(),name:'context.txt',
+      digest:sha(payload),base64:payload.toString('base64')}]}:{})};
   const resources=['remote-slot','workspace:'+request.workspace];
   await pool.query("INSERT INTO goals(id,title,description,project,idempotency_key) VALUES($1::uuid,'Bound clone','Fixture','sample',$1::text)",[goalId]);
   await pool.query("INSERT INTO objectives(id,request,request_hash,mode,status,revision) VALUES($1,'{}','fixture','execute','executing',2)",[goalId]);
@@ -106,6 +108,18 @@ it('checks the first unchanged clone and applied intent without preparing it aga
   await assertBoundRuntimePreparationCurrent(f.input);
   expect(f.rpc.mock.calls.map(x=>x[0])).toEqual(['worker.inspectPreparation']);expect(f.inspectStop).not.toHaveBeenCalled();
   expect((await pool.query('SELECT count(*)::int n FROM acceptances')).rows[0].n).toBe(0);
+});
+
+it('keeps large frozen execution inputs out of runtime authority projections',async()=>{
+  const f=await fixture(0,false,1024*1024),queries=vi.spyOn(pool,'query');
+  expect(await prepareBoundRuntimeWorkspace(f.input)).toBe(true);
+  const captures=queries.mock.calls.map((args,index)=>({sql:String(args[0]),result:queries.mock.results[index].value}))
+    .filter(x=>x.sql.startsWith('SELECT r.id,r.task_id'));
+  expect(captures).toHaveLength(1);
+  const returned=JSON.stringify((await captures[0].result).rows);
+  expect(returned.length).toBeLessThan(20000);
+  expect(returned).not.toContain(f.input.task.execution.inputs[0].base64.slice(0,100));
+  expect(returned).not.toContain('context.txt');
 });
 
 it('prepares confirmed absence using exactly the frozen UUID and checks the resulting clone',async()=>{
