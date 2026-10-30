@@ -97,7 +97,8 @@ it.each(['paused','cancelled','completed','revision','request','policy','file-po
   if(['live','native','lease'].includes(kind)){
    const task=randomUUID(),run=randomUUID();
    await pool.query("INSERT INTO tasks(id,goal_id,key,title,description,agent_id,state,criteria,execution,attempt_count) VALUES($1,$2,'old-worker','Old worker','Fixture','engineering.backend.node','failed','[]','{\"kind\":\"harness\",\"workspace\":\"test/base\"}',1)",[task,f.id]);
-   await pool.query("INSERT INTO runs(id,task_id,attempt,state,fence,runtime,agent_version) VALUES($1,$2,1,$3,$4,'harness',1)",[run,task,kind==='live'?'running':'failed',randomUUID()]);
+   await pool.query("INSERT INTO runs(id,task_id,attempt,state,fence,runtime,agent_version,account_id,model) VALUES($1,$2,1,$3,$4,'harness',1,$5,$6)",
+    [run,task,kind==='live'?'running':'failed',randomUUID(),accountId,target.model]);
    if(kind==='native')await pool.query("INSERT INTO opencode_jobs(run_id,state) VALUES($1,'running')",[run]);
    if(kind==='lease')await pool.query("INSERT INTO leases(resource,run_id) VALUES('workspace:test/base',$1)",[run]);
   }
