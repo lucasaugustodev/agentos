@@ -10,6 +10,7 @@ import {exclusiveModelPolicySql} from '../server/model-policy-sql.js';
 import {managerAuthoritySql} from '../server/manager-authority.js';
 import {generationTiming} from '../server/generation-timing.js';
 import {managementRoutes} from '../server/management.js';
+import {resolveSupervisedRoute} from '../server/supervised-route.js';
 
 const policy={version:2,mode:'exclusive-model',accountId:'agentos-api-11111111-2222-4333-8444-555555555555',
   bridgeId:'agentos:api:11111111-2222-4333-8444-555555555555',model:'deepseek-v4-pro-0813',requestLimit:6,sessionLimit:12};
@@ -80,6 +81,12 @@ it('maintenance, manager wake and route suggestions cannot rewrite an existing l
   }
   const current={id:randomUUID(),account_id:policy.accountId,model:policy.model,execution:{kind:'harness'}};
   expect(chooseWorkforceRoute(current,[account],workforce)).toEqual({accountId:policy.accountId,model:policy.model});
+  const task={...current,stage:'work',allowed_accounts:[policy.accountId]};
+  const route={accountId:policy.accountId,model:policy.model};
+  expect(resolveSupervisedRoute(task,route,workforce,[account],[])).toEqual({ok:true,route,lane:'glm'});
+  expect(resolveSupervisedRoute({...task,model:'glm-5.3-flash'},route,workforce,[account],[]))
+    .toMatchObject({ok:false,code:'SUPERVISION_ROUTE_UNAVAILABLE'});
+  expect(resolveSupervisedRoute(task,route,workforce,[{...account,bridge_id:'unverified'}],[])).ok.toBe(false);
 });
 it('twelve analytical/harness sessions share one SQL lane and concurrent thirteenth admission is refused',async()=>{
   const f=await fixture();await f.install();
