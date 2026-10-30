@@ -5,6 +5,9 @@ _storage_spec=importlib.util.spec_from_file_location('agentos_storage_capacity',
 storage_capacity=importlib.util.module_from_spec(_storage_spec);_storage_spec.loader.exec_module(storage_capacity)
 ROOT=pathlib.Path('/srv/agentos/workspaces')
 DATA=pathlib.Path('/var/lib/agentos-bridge')
+# Production requires protected ancestors through the filesystem root. Isolated
+# fixtures replace this anchor with their own temporary, owned directory.
+PROTECTION_ROOT=pathlib.Path('/')
 SKIP={'.git','node_modules','evidence','data','.agentos-snapshot.json','.local-test','test-results','playwright-report','__pycache__'}
 def digest_key(value): return hashlib.sha256(value.encode()).hexdigest()
 def workspace(value):
@@ -97,7 +100,240 @@ def make_new_clone_editable(staging):
             if not stat.S_ISREG(info.st_mode): raise ValueError('SOURCE_NOT_REGULAR')
             path.chmod(stat.S_IMODE(info.st_mode)|0o600)
 
+def preparation_binding(params):
+    keys=('expectedSourceDigest','expectedSourceSnapshotDigest','preparationIdentity')
+    if not any(key in params for key in keys): return None
+    if not all(isinstance(params.get(key),str) for key in keys):
+        raise ValueError('PREPARATION_BINDING_INVALID')
+    if not all(re.fullmatch(r'[0-9a-f]{64}',params[key]) for key in keys[:2]):
+        raise ValueError('PREPARATION_BINDING_INVALID')
+    try: valid=str(uuid.UUID(params['preparationIdentity']))==params['preparationIdentity']
+    except ValueError: valid=False
+    if not valid: raise ValueError('PREPARATION_BINDING_INVALID')
+    return {'version':1,'preparationIdentity':params['preparationIdentity'],
+            'sourceWorkspace':params['sourceWorkspace'],'targetWorkspace':params['workspace'],
+            'expectedSourceDigest':params['expectedSourceDigest'],
+            'expectedSourceSnapshotDigest':params['expectedSourceSnapshotDigest']}
+
+def preparation_digest(value):
+    return digest_key(json.dumps(value,sort_keys=True,separators=(',',':'),ensure_ascii=False))
+
+def protected_preparation_directory(path,create=False):
+    path=pathlib.Path(path)
+    if path!=path.absolute() or path.resolve()!=path or not path.is_relative_to(PROTECTION_ROOT):
+        raise ValueError('PREPARATION_DIRECTORY_UNPROTECTED')
+    if create and not path.exists():
+        protected_preparation_directory(path.parent)
+        path.mkdir(mode=0o700)
+    current=path
+    while True:
+        info=current.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid!=os.geteuid() or info.st_mode&0o022:
+            raise ValueError('PREPARATION_DIRECTORY_UNPROTECTED')
+        if current==PROTECTION_ROOT: break
+        current=current.parent
+    return path
+
+def read_preparation_json(path,immutable=False):
+    try: fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+    except FileNotFoundError: raise ValueError('PREPARATION_RECEIPT_MISSING')
+    except OSError: raise ValueError('PREPARATION_RECEIPT_UNPROTECTED')
+    with os.fdopen(fd,'rb') as handle:
+        before=os.fstat(handle.fileno())
+        if (not stat.S_ISREG(before.st_mode) or before.st_uid!=os.geteuid() or before.st_nlink!=1
+                or before.st_mode&(0o222 if immutable else 0o022)):
+            raise ValueError('PREPARATION_RECEIPT_UNPROTECTED')
+        raw=handle.read(128*1024+1)
+        after=os.fstat(handle.fileno())
+    identity=lambda info:(info.st_dev,info.st_ino,info.st_mode,info.st_uid,info.st_gid,
+                          info.st_nlink,info.st_size,info.st_mtime_ns,info.st_ctime_ns)
+    if identity(before)!=identity(after) or len(raw)>128*1024:
+        raise ValueError('PREPARATION_RECEIPT_CHANGED')
+    try: value=json.loads(raw)
+    except (ValueError,UnicodeError): raise ValueError('PREPARATION_RECEIPT_INVALID')
+    if not isinstance(value,dict): raise ValueError('PREPARATION_RECEIPT_INVALID')
+    return value,hashlib.sha256(raw).hexdigest()
+
+def write_preparation_json(path,value):
+    raw=json.dumps(value,sort_keys=True,separators=(',',':'),ensure_ascii=False).encode()
+    fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o444)
+    with os.fdopen(fd,'wb') as handle:
+        os.fchmod(handle.fileno(),0o444) # Explicit despite a restrictive umask.
+        handle.write(raw);handle.flush();os.fsync(handle.fileno())
+
+@contextlib.contextmanager
+def preparation_locks(names,shared=()):
+    directory=protected_preparation_directory(DATA/'locks',create=True)
+    handles=[]
+    try:
+        requests=[(DATA/'worker.lock',True)]+[(directory/('workspace-'+digest_key(name)),name in shared)
+                                             for name in sorted(set(names))]
+        for path,is_shared in requests:
+            try: fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_NOFOLLOW|os.O_NONBLOCK,0o600)
+            except OSError: raise ValueError('PREPARATION_LOCK_UNPROTECTED')
+            handle=os.fdopen(fd,'a');handles.append(handle);info=os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_uid!=os.geteuid() or info.st_nlink!=1 or info.st_mode&0o022:
+                raise ValueError('PREPARATION_LOCK_UNPROTECTED')
+            fcntl.flock(handle,(fcntl.LOCK_SH if is_shared else fcntl.LOCK_EX)|fcntl.LOCK_NB)
+        yield
+    except BlockingIOError: raise ValueError('SOURCE_BUSY')
+    finally:
+        for handle in handles: handle.close()
+
+def flush_preparation_tree(root,names):
+    directories={root}
+    for name in names:
+        path=root/name
+        fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode): raise ValueError('SOURCE_NOT_REGULAR')
+            os.fsync(fd)
+        finally: os.close(fd)
+        current=path.parent
+        while current!=root:
+            directories.add(current);current=current.parent
+    for directory in sorted(directories,key=lambda path:len(path.parts),reverse=True):
+        fd=os.open(directory,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+        try: os.fsync(fd)
+        finally: os.close(fd)
+
+def preparation_source_matches(source,binding):
+    marker,generation=read_preparation_json(source/'.agentos-snapshot.json')
+    if marker.get('workspace')!=binding['sourceWorkspace'] or generation!=binding['expectedSourceSnapshotDigest']:
+        raise ValueError('PREPARATION_SOURCE_GENERATION_CHANGED')
+    if source_hash(sources(source))!=binding['expectedSourceDigest']:
+        raise ValueError('PREPARATION_SOURCE_DIGEST_CHANGED')
+
+def preparation_baseline_matches(baseline,expected):
+    protected_preparation_directory(baseline)
+    for folder,dirs,files in os.walk(baseline,followlinks=False):
+        protected_preparation_directory(pathlib.Path(folder))
+        for name in dirs:
+            protected_preparation_directory(pathlib.Path(folder)/name)
+        for name in files:
+            info=(pathlib.Path(folder)/name).lstat()
+            if not stat.S_ISREG(info.st_mode) or info.st_uid!=os.geteuid() or info.st_mode&0o022 or info.st_nlink!=1:
+                raise ValueError('PREPARATION_BASELINE_UNPROTECTED')
+    if source_hash(sources(baseline))!=expected:
+        raise ValueError('PREPARATION_BASELINE_CHANGED')
+
+def replay_bound_preparation(target,baseline,receipt_path,binding):
+    state,_=read_preparation_json(target/'.agentos-snapshot.json',immutable=True)
+    receipt,_=read_preparation_json(receipt_path,immutable=True)
+    body={key:value for key,value in receipt.items() if key!='receiptDigest'}
+    expected_keys=set(binding)|{'bindingDigest','observedSourceDigest','sourceSnapshotDigest',
+                               'cloneBaseDigest','baselineDigest','createdAt','receiptDigest'}
+    expected=binding['expectedSourceDigest'];generation=binding['expectedSourceSnapshotDigest']
+    if (type(receipt.get('version')) is not int or set(receipt)!=expected_keys or any(receipt.get(key)!=value for key,value in binding.items())
+            or receipt.get('bindingDigest')!=preparation_digest(binding)
+            or receipt.get('receiptDigest')!=preparation_digest(body)
+            or any(receipt.get(key)!=expected for key in ['observedSourceDigest','cloneBaseDigest','baselineDigest'])
+            or receipt.get('sourceSnapshotDigest')!=generation
+            or not isinstance(receipt.get('createdAt'),str)
+            or state!={'workspace':binding['targetWorkspace'],'sourceWorkspace':binding['sourceWorkspace'],
+                       'baseDigest':expected,'sourceSnapshotDigest':generation,'createdAt':receipt['createdAt'],
+                       'preparation':{'version':1,'preparationIdentity':binding['preparationIdentity'],
+                                      'bindingDigest':receipt['bindingDigest'],'receiptDigest':receipt['receiptDigest']}}):
+        raise ValueError('PREPARATION_BINDING_MISMATCH')
+    preparation_baseline_matches(baseline,expected)
+    if source_hash(sources(target))!=expected:
+        raise ValueError('PREPARATION_TARGET_CHANGED')
+    return {**state,'preparationReceipt':receipt}
+
+def prepare_bound(params,binding):
+    target_id,source_id=params['workspace'],params['sourceWorkspace']
+    target,source=workspace(target_id),workspace(source_id)
+    if target==source or target.is_symlink() or target.parent!=source.parent or not target.name.startswith('o'):
+        raise ValueError('INVALID_TARGET')
+    protected_preparation_directory(DATA)
+    receipts=protected_preparation_directory(DATA/'workspace-preparations',create=True)
+    baselines=protected_preparation_directory(DATA/'workspace-baselines',create=True)
+    receipt_path=receipts/(binding['preparationIdentity']+'.json')
+    baseline=baselines/digest_key(target_id)
+    with preparation_locks([target_id,source_id,'preparation:'+binding['preparationIdentity']],shared=[source_id]):
+        if not source.is_dir(): raise ValueError('SOURCE_MISSING')
+        preparation_source_matches(source,binding)
+        if target.exists():
+            result=replay_bound_preparation(target,baseline,receipt_path,binding)
+            preparation_source_matches(source,binding)
+            return result
+        if receipt_path.exists():
+            previous,_=read_preparation_json(receipt_path,immutable=True)
+            if any(previous.get(key)!=value for key,value in binding.items()):
+                raise ValueError('PREPARATION_BINDING_MISMATCH')
+        if baseline.exists() or baseline.is_symlink() or receipt_path.exists() or receipt_path.is_symlink():
+            raise ValueError('PREPARATION_PARTIAL_STATE')
+        with storage_capacity.reserve(ROOT,DATA,copy_reservation(source)):
+            staging=target.parent/('.prepare-'+uuid.uuid4().hex)
+            baseline_staging=baselines/('.prepare-'+uuid.uuid4().hex)
+            published=False
+            try:
+                shutil.copytree(source,staging,ignore=ignored)
+                make_new_clone_editable(staging)
+                ignore=staging/'.gitignore'
+                existing=ignore.read_text() if ignore.exists() else ''
+                if any(name not in existing.splitlines() for name in ['assets/','evidence/','data/','node_modules/','.agentos-snapshot.json']):
+                    raise ValueError('PREPARATION_SOURCE_NORMALIZATION')
+                project_deps=pathlib.Path('/opt/agentos-project-deps')/target_id.split('/')[0]/'node_modules'
+                (staging/'node_modules').symlink_to(str(project_deps) if project_deps.is_dir() else '/opt/agentos-runtime/node_modules',target_is_directory=True)
+                (staging/'evidence').mkdir(exist_ok=True);(staging/'data').mkdir(exist_ok=True)
+                files=sources(staging);expected=binding['expectedSourceDigest']
+                if source_hash(files)!=expected: raise ValueError('PREPARATION_CLONE_CHANGED')
+                preparation_source_matches(source,binding)
+                baseline_staging.mkdir(mode=0o700)
+                for name,raw in files.items():
+                    dest=baseline_staging/name;parent=baseline_staging
+                    for part in pathlib.Path(name).parts[:-1]:
+                        parent=parent/part;parent.mkdir(mode=0o700,exist_ok=True)
+                    fd=os.open(dest,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o444)
+                    with os.fdopen(fd,'wb') as handle:
+                        os.fchmod(handle.fileno(),0o444);handle.write(raw)
+                env={**os.environ,'GIT_CONFIG_NOSYSTEM':'1','GIT_CONFIG_GLOBAL':'/dev/null','GIT_AUTHOR_NAME':'AgentOS','GIT_AUTHOR_EMAIL':'agentos@localhost','GIT_COMMITTER_NAME':'AgentOS','GIT_COMMITTER_EMAIL':'agentos@localhost'}
+                for args in [['init','-q'],['-c','core.hooksPath=/dev/null','add','.'],['-c','core.hooksPath=/dev/null','commit','-qm','Isolated objective baseline','--allow-empty']]:
+                    subprocess.run(['git',*args],cwd=staging,env=env,check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                if source_hash(sources(staging))!=expected: raise ValueError('PREPARATION_CLONE_CHANGED')
+                preparation_source_matches(source,binding)
+                created=datetime.datetime.now(datetime.timezone.utc).isoformat()
+                receipt={**binding,'bindingDigest':preparation_digest(binding),'observedSourceDigest':expected,
+                         'sourceSnapshotDigest':binding['expectedSourceSnapshotDigest'],
+                         'cloneBaseDigest':expected,'baselineDigest':expected,'createdAt':created}
+                receipt['receiptDigest']=preparation_digest(receipt)
+                state={'workspace':target_id,'sourceWorkspace':source_id,'baseDigest':expected,
+                       'sourceSnapshotDigest':binding['expectedSourceSnapshotDigest'],'createdAt':created,
+                       'preparation':{'version':1,'preparationIdentity':binding['preparationIdentity'],
+                                      'bindingDigest':receipt['bindingDigest'],'receiptDigest':receipt['receiptDigest']}}
+                write_preparation_json(staging/'.agentos-snapshot.json',state)
+                preparation_baseline_matches(baseline_staging,expected)
+                flush_preparation_tree(staging,[*files,'.agentos-snapshot.json'])
+                flush_preparation_tree(baseline_staging,files)
+                if source_hash(sources(staging))!=expected: raise ValueError('PREPARATION_CLONE_CHANGED')
+                preparation_source_matches(source,binding)
+                # Reserve the identity durably before either destination rename.
+                # A receipt alone is not completion: replay also requires the
+                # exact protected marker, baseline and destination bytes.
+                published=True
+                write_preparation_json(receipt_path,receipt)
+                flush_preparation_tree(receipts,[])
+                baseline_staging.rename(baseline)
+                flush_preparation_tree(baselines,[])
+                staging.rename(target)
+                flush_preparation_tree(target.parent,[])
+                return {**state,'preparationReceipt':receipt}
+            except Exception:
+                if published: raise ValueError('PREPARATION_EFFECT_UNCONFIRMED')
+                raise
+            finally:
+                # Only unpublished staging paths created by this invocation.
+                # Published partial state is never deleted or silently replaced.
+                for path,parent in [(staging,target.parent),(baseline_staging,baselines)]:
+                    if path.exists():
+                        if path.is_symlink() or path.resolve().parent!=parent.resolve() or not re.fullmatch(r'\.prepare-[0-9a-f]{32}',path.name):
+                            raise ValueError('INVALID_STAGING')
+                        shutil.rmtree(path)
+
 def prepare(params):
+    binding=preparation_binding(params)
+    if binding is not None: return prepare_bound(params,binding)
     target_id,source_id=params['workspace'],params['sourceWorkspace']
     target,source=workspace(target_id),workspace(source_id)
     if target==source or target.parent!=source.parent or not target.name.startswith('o'): raise ValueError('INVALID_TARGET')
