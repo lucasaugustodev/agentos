@@ -65,7 +65,10 @@ class RollbackTests(unittest.TestCase):
        patch.object(g.subprocess,'run',return_value=result) as run:
    value=g.require_rollback_readiness(self.before,self.record)
    args,kw=run.call_args
-   self.assertNotIn('prepare-schema',str(args));self.assertNotIn('--check',str(args))
+   command=args[0]
+   self.assertNotIn('--check',command)
+   self.assertFalse(any('prepare-schema' in value for value in command[:-1]))
+   self.assertEqual(command[-1],g.ROLLBACK_READINESS_JS)
    self.assertIn('default_transaction_read_only=on',kw['env']['PGOPTIONS'])
    self.assertNotIn('DATABASE_URL',kw['env']);self.assertEqual(kw['cwd'],self.before)
    return value
