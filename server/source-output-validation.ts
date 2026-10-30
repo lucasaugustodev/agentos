@@ -5,7 +5,23 @@ import {normalizeSourceContract,type SourceContractEntry} from './source-contrac
 const hash=(value:string|Buffer)=>createHash('sha256').update(value).digest('hex');
 type File={path:string;sha256:string};
 export type SourceOutputCheck={path:string;kind:'required'|'preserve';passed:boolean;code:string};
-export type SourceOutputProof={passed:boolean;code:string;checks:SourceOutputCheck[];candidateDigest?:string;contractDigest?:string};
+export type SourceOutputProof={passed:boolean;code:string;checks:SourceOutputCheck[];baseDigest?:string;candidateDigest?:string;contractDigest?:string};
+/** Only canonical validation writes this evidence, after checking the run-bound
+ * artifact and complete before/after inventories. Worker prose is never a cause. */
+export function sourceContractPlanningFailure(checks:unknown,runId:string) {
+  if(!Array.isArray(checks))return null;
+  const check=checks.find(c=>c?.id==='source-output'&&c.type==='source_contract'&&c.passed===false);
+  const proof=check?.sourceOutput;
+  if(proof?.schema!==1||proof.runId!==runId||proof.passed!==false||
+    proof.code!=='SOURCE_OUTPUT_REQUIREMENTS_FAILED'||typeof proof.artifactId!=='string'||
+    !/^[0-9a-f-]{36}$/i.test(proof.artifactId)||
+    ![proof.artifactDigest,proof.baseDigest,proof.candidateDigest,proof.contractDigest].every(d=>typeof d==='string'&&/^[0-9a-f]{64}$/.test(d))||
+    !Array.isArray(proof.checks))return null;
+  const failures=proof.checks.filter((c:any)=>c.kind==='preserve'&&c.passed===false&&typeof c.path==='string'&&
+    ['SOURCE_OUTPUT_PRESERVATION_BASE_MISSING','SOURCE_OUTPUT_PRESERVATION_BASE_HASH_MISMATCH'].includes(c.code));
+  return failures.length?{schema:1,runId,artifactId:proof.artifactId,artifactDigest:proof.artifactDigest,
+    baseDigest:proof.baseDigest,candidateDigest:proof.candidateDigest,contractDigest:proof.contractDigest,failures}:null;
+}
 const invalid=(code:string):SourceOutputProof=>({passed:false,code,checks:[]});
 
 /** Inspect canonical runtime inventories, never the worker's passed flag or a
@@ -39,7 +55,7 @@ export function verifySourceOutputCandidate(rawContract:unknown,bytes:Buffer,art
     checks.push({path:entry.path,kind:'preserve',passed:code==='SOURCE_OUTPUT_PRESERVED',code});
   }
   return {passed:checks.every(c=>c.passed),code:checks.every(c=>c.passed)?'SOURCE_OUTPUT_VERIFIED':'SOURCE_OUTPUT_REQUIREMENTS_FAILED',
-    checks,candidateDigest,contractDigest:hash(JSON.stringify(contract))};
+    checks,baseDigest:candidate.baseDigest,candidateDigest,contractDigest:hash(JSON.stringify(contract))};
 }
 
 type Snapshot={run_id:string;artifacts:any[];validation_input:any};
@@ -47,7 +63,8 @@ type Reader=(id:string)=>Promise<{id?:string;run_id:string;name:string;digest:st
 export async function sourceOutputValidation(snapshot:Snapshot,read:Reader){
   const authority=snapshot.validation_input.sourceOutput;
   if(authority===undefined)return null;
-  const result=(proof:SourceOutputProof)=>({id:'source-output',label:'Arquivos e preservação da candidata',type:'source_contract',
+  const result=(proof:SourceOutputProof,artifact?:{id:string;digest:string})=>({id:'source-output',label:'Arquivos e preservação da candidata',type:'source_contract',
+    ...(artifact?{sourceOutput:{schema:1,runId:snapshot.run_id,artifactId:artifact.id,artifactDigest:artifact.digest,...proof}}:{}),
     passed:proof.passed,detail:proof.passed?'Arquivos obrigatórios e preservação conferidos na candidata real; demais critérios continuam obrigatórios.'
       :proof.code+(proof.checks.length?': '+proof.checks.filter(c=>!c.passed).slice(0,16).map(c=>c.path+' ('+c.code+')').join('; '):'')});
   try{
@@ -63,6 +80,6 @@ export async function sourceOutputValidation(snapshot:Snapshot,read:Reader){
     if(artifact.run_id!==snapshot.run_id||ref.run_id!==snapshot.run_id||artifact.name!=='candidate.json'||
       artifact.digest!==ref.digest||artifact.size!==ref.size||artifact.bytes.length!==ref.size||
       (artifact.id!==undefined&&artifact.id!==ref.id))return result(invalid('SOURCE_OUTPUT_CANDIDATE_IDENTITY'));
-    return result(verifySourceOutputCandidate(frozen.contract,artifact.bytes,ref.digest));
+    return result(verifySourceOutputCandidate(frozen.contract,artifact.bytes,ref.digest),ref);
   }catch{return result(invalid('SOURCE_OUTPUT_EVIDENCE_INVALID'));}
 }

@@ -2,7 +2,7 @@ import { readModelPolicy, modelRouteAllowed } from '../bridge/model-policy.mjs';
 import { planningGenerationSettings } from './generation-timing.js';
 import { planningRecovery } from './planning-recovery.js';
 import {refreshQueuedPlanningFeedback} from './planning-feedback-refresh.js';
-import {routeVerificationPlanningRecovery} from './verification-planning-recovery.js';
+import {routeVerificationPlanningRecovery,sourceContractPlanningFailureForRun} from './verification-planning-recovery.js';
 import {planningRunFeedback} from './planning-run-feedback.js';
 import {sourceReplanForFeedback,assertSourceReplanCurrent} from './objective-source-replan.js';
 import {routedPlanningRequest} from './objective-model-route.js';
@@ -222,6 +222,10 @@ export async function reconcilePlanning() {
         )
       ).rows;
       for (const t of failed) {
+        if(t.run_state==='submitted'&&await sourceContractPlanningFailureForRun(db,t.run_id)){
+          await routeVerificationPlanningRecovery(db,t.id,t.run_id);
+          continue;
+        }
         if(t.execution?.readOnlySource){
           if(await routeVerificationPlanningRecovery(db,t.id,t.run_id)||t.run_state==='submitted')continue;
           // A blocked technical attempt still needs the existing planner path.

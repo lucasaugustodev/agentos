@@ -34,7 +34,8 @@ import { scheduledSupervisionAdmission } from './supervised-admission.js';
 import { runtimeProgressCode } from './runtime-progress-contract.js';
 import {operatorRecoveryCode} from './operator-recovery-contract.js';
 import { preservedAcceptedAuxiliaryIds } from './accepted-auxiliary.js';
-import {routeVerificationPlanningRecovery} from './verification-planning-recovery.js';
+import {routeVerificationPlanningRecovery,sourceContractPlanningFailureForRun} from './verification-planning-recovery.js';
+import {sourceContractPlanningFailure} from './source-output-validation.js';
 import {verificationCandidate,verificationInputsChanged,materialVerificationFailure} from './verification-progress.js';
 import { protocolReportRepairInstruction } from '../bridge/protocol-report-contract.mjs';
 import {
@@ -659,6 +660,8 @@ export async function resumeFailedHarness(id: string, fence: string, proof: any)
     )
       throw Error('TASK_CHANGED');
     assertStopped(proof, r, t);
+    if(r.state==='submitted'&&await sourceContractPlanningFailureForRun(db,r.id))
+      throw Error('SOURCE_CONTRACT_PLANNING_REQUIRED');
     if(t.execution?.readOnlySource && r.state==='submitted' && await materialVerificationFailure(db,r.id))
       throw Error('VERIFICATION_REPAIR_REQUIRED');
     if (await pendingSupervisionOwnsContinuation(db, t.id, id)) throw Error('SUPERVISION_PENDING');
@@ -891,6 +894,10 @@ export class ContinuationSupervisor {
           !t.execution.repairFeedback
         )
           continue;
+        if(sourceContractPlanningFailure(checks,t.run_id)){
+          await tx(async db=>{await lock(db);await routeVerificationPlanningRecovery(db,t.id,t.run_id);});
+          continue;
+        }
         // Verification must repair its implementation, not rewrite immutable QA input.
         if (t.execution.readOnlySource) {
           try {

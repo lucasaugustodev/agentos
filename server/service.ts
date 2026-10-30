@@ -24,6 +24,7 @@ import { verifyRepairSourceProof } from './repair-proof.js';
 import { readValidationSnapshot, validationReceiptId } from './validation-identity.js';
 import {assertVerificationAdmissionProgress} from './verification-progress.js';
 import {routeVerificationPlanningRecovery} from './verification-planning-recovery.js';
+import {sourceContractPlanningFailure} from './source-output-validation.js';
 export async function createGoal(raw: unknown, isDemo = false) {
   const input = goalSchema.parse(raw);
   validateDag(input.tasks);
@@ -192,7 +193,7 @@ export async function refreshGoal(db: DB, id: string) {
       state = 'active';
   }
   const old = (await db.query('SELECT state FROM goals WHERE id=$1', [id])).rows[0];
-  if (old.state !== state && old.state !== 'paused') {
+  if (old.state !== state && !['paused','cancelled'].includes(old.state)) {
     await db.query('UPDATE goals SET state=$2 WHERE id=$1', [id, state]);
     if (['completed', 'cancelled'].includes(state))
       await db.query('UPDATE objectives SET status=$2,reason=NULL,updated_at=now() WHERE id=$1', [
@@ -875,6 +876,8 @@ export async function validateTask(taskId: string, reviewer?: string) {
         '. Correct the specific failure and preserve the original criteria. '+
         (ci.actionId?'Canonical CI action '+ci.actionId+' supplies immutable receipt/log inputs to the repair.':'No registered CI was dispatched; correct the declared intent/policy handoff.'),[taskId]);
     }
+    if(!passed&&sourceContractPlanningFailure(checks,run.id))
+      await routeVerificationPlanningRecovery(db,taskId,run.id);
     await refreshGoal(db, task.goal_id);
     if (passed) {
       await db.query(
