@@ -8,6 +8,6 @@ it('binds verified preparation and replay to source bytes, generation and destin
     '-B', path.resolve('tests/fixtures/workspace_prepare_binding_test.py'),
   ], { timeout: 60_000, maxBuffer: 1024 * 1024 });
   expect(stdout).toBe('');
-  expect(stderr).toContain('Ran 30 tests');
+  expect(stderr).toContain('Ran 34 tests');
   expect(stderr).toContain('OK');
 }, 65_000);
