@@ -492,7 +492,7 @@ def inspect_preparation(params):
                 'destinationChanged':candidate['candidateDigest']!=binding['expectedSourceDigest'],
                 'checkedAt':datetime.datetime.now(datetime.timezone.utc).isoformat()}
 
-def inspect_source_binding(params):
+def inspect_source_binding(params,retry_admission=False):
     run_id=params['sourceBindingRunId'];workspace_id=params['workspace']
     if not source_binding_uuid(run_id): raise ValueError('SOURCE_BINDING_IDENTITY_INVALID')
     target=workspace(workspace_id)
@@ -504,8 +504,9 @@ def inspect_source_binding(params):
         policy,policy_digest=read_preparation_json(run_directory/'operation-policy.json',required_mode=0o600)
         marker,marker_digest,marker_raw=read_preparation_json(target/'.agentos-snapshot.json',include_raw=True)
         source_binding_marker(marker,workspace_id)
+        allowed_states={'completed','failed','cancelled'} if retry_admission else {'completed'}
         if (state.get('runId')!=run_id or state.get('workspace')!=workspace_id or state.get('runtime')!='harness'
-                or state.get('state')!='completed' or state.get('stopped') is not True):
+                or state.get('state') not in allowed_states or state.get('stopped') is not True):
             raise ValueError('SOURCE_BINDING_RUN_NOT_COMPLETED')
         if (type(policy.get('version')) is not int or policy.get('version')!=1
                 or policy.get('runId')!=run_id or policy.get('workspace')!='/workspace'
@@ -515,8 +516,8 @@ def inspect_source_binding(params):
         if policy.get('sourceSnapshotDigest')!=marker_digest:
             raise ValueError('SOURCE_BINDING_GENERATION_CHANGED')
         artifacts=state.get('artifacts');canonical=[]
-        if not isinstance(artifacts,list) or len(artifacts)>512: raise ValueError('SOURCE_BINDING_RUNTIME_ARTIFACTS')
-        for name,mime in [('candidate.json','application/json'),('changes.patch','text/plain')]:
+        if not retry_admission and (not isinstance(artifacts,list) or len(artifacts)>512): raise ValueError('SOURCE_BINDING_RUNTIME_ARTIFACTS')
+        for name,mime in ([] if retry_admission else [('candidate.json','application/json'),('changes.patch','text/plain')]):
             selected=[item for item in artifacts if isinstance(item,dict) and item.get('name')==name]
             if (len(selected)!=1 or selected[0].get('mime')!=mime or not isinstance(selected[0].get('digest'),str)
                     or not re.fullmatch(r'[0-9a-f]{64}',selected[0]['digest'])):
@@ -539,8 +540,8 @@ def inspect_source_binding(params):
             raise ValueError('SOURCE_BINDING_OBSERVATION_CHANGED')
         preparation_baseline_matches(baseline,marker['baseDigest'])
         return {'version':1,'runId':run_id,'workspace':workspace_id,
-                'state':{'runId':run_id,'workspace':workspace_id,'runtime':'harness','state':'completed',
-                         'runFence':policy['runFence'],'stopped':True,'artifacts':canonical},
+                'state':{'runId':run_id,'workspace':workspace_id,'runtime':'harness','state':state['state'],
+                         'runFence':policy['runFence'],'stopped':True,**({} if retry_admission else {'artifacts':canonical})},
                 'admission':{'authority':'runtime_operation_policy',
                              **{key:policy[key] for key in ['goalId','taskId','runId','runFence','contextVersion','workspace','sourceSnapshotDigest']},
                              'policyDigest':policy_digest},
@@ -575,6 +576,7 @@ if __name__=='__main__':
         elif action=='inspect': result=inspect(params)
         elif action=='inspect-generation': result=inspect_generation(params)
         elif action=='inspect-preparation': result=inspect_preparation(params)
+        elif action=='inspect-retry-source-binding': result=inspect_source_binding(params,retry_admission=True)
         elif action=='capacity': result=storage_capacity.capacity(ROOT,DATA)
         else: raise ValueError('INVALID_ACTION')
         print(json.dumps(result))

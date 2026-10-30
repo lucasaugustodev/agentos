@@ -28,10 +28,12 @@ const sourceResponse=z.object({version:z.literal(1),runId:uuid,workspace,
   generation,markerBase64,legacyParentGeneration:z.boolean(),candidate,
   process:z.object({unit:z.string(),checkedAt,stopped:z.literal(true),loadState:z.enum(['loaded','not-found']),
     activeState:z.enum(['inactive','failed']),subState:z.string(),mainPid:z.literal(0),cgroupExists:z.boolean(),populated:z.literal(false)}).strict(),checkedAt}).strict();
+const retrySourceResponse=sourceResponse.extend({state:sourceResponse.shape.state.omit({artifacts:true}).extend({state:z.enum(['completed','failed','cancelled'])}).strict()}).strict();
 
 export type WorkspaceGenerationInspection=z.infer<typeof generationResponse>;
 export type WorkspacePreparationInspection=z.infer<typeof preparationResponse>|z.infer<typeof missingPreparation>;
 export type WorkerSourceBindingInspection=z.infer<typeof sourceResponse>;
+export type WorkerRetrySourceBindingInspection=z.infer<typeof retrySourceResponse>;
 export type WorkspacePreparationRequest={workspace:string;sourceWorkspace:string;preparationIdentity:string;expectedSourceDigest:string;expectedSourceSnapshotDigest:string};
 export type WorkspaceInspectionRequest=(method:string,params:unknown,options?:{timeout?:number;signal?:AbortSignal})=>Promise<unknown>;
 const sha=(raw:Buffer|string)=>createHash('sha256').update(raw).digest('hex');
@@ -78,14 +80,25 @@ export async function inspectWorkspacePreparation(value:WorkspacePreparationRequ
   return result;
 }
 
-export async function inspectWorkerSourceBinding(runId:string,value:string,request:WorkspaceInspectionRequest=accountBridge.request.bind(accountBridge)):Promise<WorkerSourceBindingInspection>{
-  const requested=z.object({runId:uuid,workspace}).strict().parse({runId,workspace:value});
-  const result=parse(sourceResponse,await request('worker.inspectSourceBinding',requested,{timeout:45000}));
+function verifyAdmission(result:WorkerSourceBindingInspection|WorkerRetrySourceBindingInspection,requested:{runId:string;workspace:string}){
   if(result.runId!==requested.runId||result.workspace!==requested.workspace||result.state.runId!==requested.runId||result.state.workspace!==requested.workspace||
     result.admission.runId!==requested.runId||result.admission.runFence!==result.state.runFence||
     result.admission.sourceSnapshotDigest!==result.generation.snapshotDigest||result.process.unit!==`agentos-run-${requested.runId}`||
     result.process.checkedAt!==result.checkedAt||result.legacyParentGeneration!==(result.generation.sourceSnapshotDigest===null))fail();
+  verifyGeneration(result);
+}
+
+export async function inspectWorkerSourceBinding(runId:string,value:string,request:WorkspaceInspectionRequest=accountBridge.request.bind(accountBridge)):Promise<WorkerSourceBindingInspection>{
+  const requested=z.object({runId:uuid,workspace}).strict().parse({runId,workspace:value});
+  const result=parse(sourceResponse,await request('worker.inspectSourceBinding',requested,{timeout:45000}));
+  verifyAdmission(result,requested);
   for(const [name,mime] of [['candidate.json','application/json'],['changes.patch','text/plain']])
     if(result.state.artifacts.filter(a=>a.name===name&&a.mime===mime).length!==1)fail();
-  verifyGeneration(result);return result;
+  return result;
+}
+
+export async function inspectWorkerRetrySourceBinding(runId:string,value:string,request:WorkspaceInspectionRequest=accountBridge.request.bind(accountBridge)):Promise<WorkerRetrySourceBindingInspection>{
+  const requested=z.object({runId:uuid,workspace}).strict().parse({runId,workspace:value});
+  const result=parse(retrySourceResponse,await request('worker.inspectRetrySourceBinding',requested,{timeout:45000}));
+  verifyAdmission(result,requested);return result;
 }

@@ -26,7 +26,9 @@ test('unknown methods paths extra keys and incomplete bindings never reach the m
     ['worker.inspectGeneration',{workspace:bound.workspace,action:'prepare'}],
     ['worker.inspectPreparation',{...bound,expectedSourceDigest:'bad'}],
     ['worker.inspectPreparation',{workspace:bound.workspace}],
-    ['worker.inspectSourceBinding',{workspace:bound.workspace,runId:'../secret'}]])
+    ['worker.inspectSourceBinding',{workspace:bound.workspace,runId:'../secret'}],
+    ['worker.inspectRetrySourceBinding',{workspace:bound.workspace,runId:'../secret'}],
+    ['worker.inspectRetrySourceBinding',{workspace:bound.workspace,runId,action:'inspect'}]])
     await assert.rejects(workspaceInspection(method,params,io),/WORKSPACE_INSPECTION_REQUEST_INVALID/);
   assert.deepEqual(calls,[]);
 });
@@ -53,4 +55,17 @@ test('source binding never inspects metadata while the physical run remains live
     operation:async params=>calls.push(params),
   }),/STOP_UNCONFIRMED/);
   assert.deepEqual(calls,[]);
+});
+
+test('retry binding uses a fixed separate action and the same two physical stop probes',async()=>{
+  const calls=[];
+  const result=await workspaceInspection('worker.inspectRetrySourceBinding',{runId,workspace:bound.workspace},{
+    inspectUnit:async unit=>{calls.push('stop');return{unit,stopped:true,mainPid:0,populated:false,activeState:'inactive',checkedAt:new Date().toISOString()};},
+    operation:async params=>{calls.push(params);return{version:1,runId,workspace:bound.workspace,
+      state:{runId,workspace:bound.workspace,state:'failed',stopped:true,runFence:runId},
+      admission:{runId,runFence:runId,sourceSnapshotDigest:bound.expectedSourceSnapshotDigest},
+      generation:{workspace:bound.workspace,snapshotDigest:bound.expectedSourceSnapshotDigest}};},
+  });
+  assert.deepEqual(calls,['stop',{action:'inspect-retry-source-binding',workspace:bound.workspace,sourceBindingRunId:runId},'stop']);
+  assert.equal(result.state.state,'failed');assert.equal(result.state.artifacts,undefined);
 });

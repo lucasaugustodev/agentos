@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {stoppedRunProof,stoppedSourceBindingProof} from '../bridge/stopped-run-proof.mjs';
+import {stoppedRunProof,stoppedSourceBindingProof,stoppedRetrySourceBindingProof} from '../bridge/stopped-run-proof.mjs';
 
 const runId='bd8daedb-d7a8-42da-bad7-a2dcd1be0270',workspace='sample/ocandidate';
 const fence='3c8920ad-d11e-4e8e-b1a3-aa7c6ee10465';
@@ -83,4 +83,34 @@ test('ordinary stopped-run recovery retains its existing response without admiss
   assert.equal(result.state,'failed');
   assert.equal(result.candidate.patch,'preserved patch');
   assert.equal(result.admission,undefined);
+});
+
+test('retry admission permits terminal failures without weakening accepted-source inspection',async()=>{
+  for(const terminal of ['failed','cancelled','completed']){
+    const {calls,value,io}=fixture();value.state.state=terminal;
+    const result=await stoppedRetrySourceBindingProof(runId,workspace,io);
+    assert.equal(result.state.state,terminal);assert.equal(result.state.artifacts,undefined);
+    assert.deepEqual(calls.map(call=>call[0]),['unit','source','unit']);
+    if(terminal!=='completed')await assert.rejects(stoppedSourceBindingProof(runId,workspace,io),/SOURCE_BINDING_INSPECTION_CONFLICT/);
+  }
+});
+
+test('retry admission requires physical stop at both boundaries and propagates missing policy',async()=>{
+  for(const liveAt of [1,2]){
+    const {value,io}=fixture();value.state.state='failed';let count=0;
+    io.inspectUnit=async()=>++count===liveAt?({...stop(),populated:true,mainPid:9,stopped:false}):stop();
+    await assert.rejects(stoppedRetrySourceBindingProof(runId,workspace,io),/STOP_UNCONFIRMED/);
+  }
+  const {io}=fixture(),error=Object.assign(Error('PREPARATION_RECEIPT_MISSING'),{code:'PREPARATION_RECEIPT_MISSING'});
+  io.inspectSourceBinding=async()=>{throw error;};
+  await assert.rejects(stoppedRetrySourceBindingProof(runId,workspace,io),actual=>actual===error);
+});
+
+test('retry admission rejects nonterminal state crossed runs fences and replaced generations',async()=>{
+  for(const change of [value=>{value.state.state='running';},value=>{value.state.state='not_started';},
+    value=>{value.admission.runId='other';},value=>{value.state.runFence='other';},
+    value=>{value.admission.sourceSnapshotDigest='c'.repeat(64);}]){
+    const {value,io}=fixture();value.state.state='failed';change(value);
+    await assert.rejects(stoppedRetrySourceBindingProof(runId,workspace,io),/SOURCE_BINDING_INSPECTION_CONFLICT/);
+  }
 });

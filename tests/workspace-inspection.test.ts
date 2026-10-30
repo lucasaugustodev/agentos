@@ -3,7 +3,7 @@ import {randomUUID,createHash} from 'node:crypto';
 import {execFile} from 'node:child_process';
 import {promisify} from 'node:util';
 import path from 'node:path';
-import {inspectWorkspaceGeneration,inspectWorkspacePreparation,inspectWorkerSourceBinding} from '../server/workspace-inspection.js';
+import {inspectWorkspaceGeneration,inspectWorkspacePreparation,inspectWorkerSourceBinding,inspectWorkerRetrySourceBinding} from '../server/workspace-inspection.js';
 
 const sha=(value:string|Buffer)=>createHash('sha256').update(value).digest('hex');
 const canonical=(value:Record<string,unknown>)=>JSON.stringify(Object.fromEntries(Object.entries(value).sort(([a],[b])=>a<b?-1:a>b?1:0)));
@@ -95,9 +95,34 @@ it('rejects source binding fence physical stop and canonical artifact mismatches
   }
 });
 
+it('retry binding projects terminal admission without accepting artifacts or claiming success',async()=>{
+  const f=fixture();
+  for(const terminal of ['completed','failed','cancelled']){
+    const value:any=structuredClone(f.sourced);value.state.state=terminal;delete value.state.artifacts;
+    const request=vi.fn(async()=>value);
+    expect(await inspectWorkerRetrySourceBinding(f.runId,f.requested.workspace,request)).toEqual(value);
+    expect(request).toHaveBeenCalledWith('worker.inspectRetrySourceBinding',{runId:f.runId,workspace:f.requested.workspace},{timeout:45000});
+    await expect(inspectWorkerSourceBinding(f.runId,f.requested.workspace,async()=>value)).rejects.toThrow('WORKSPACE_INSPECTION_RESPONSE_INVALID');
+  }
+});
+
+it('retry binding rejects live crossed or malformed identities without transport retries',async()=>{
+  const f=fixture();
+  for(const change of [(v:any)=>{v.state.state='running';},(v:any)=>{v.state.state='not_started';},
+    (v:any)=>{v.admission.runId=randomUUID();},(v:any)=>{v.state.runFence=randomUUID();},
+    (v:any)=>{v.process.populated=true;},(v:any)=>{v.admission.sourceSnapshotDigest='0'.repeat(64);},
+    (v:any)=>{v.state.artifacts=[];},(v:any)=>{v.admission.contextVersion='invalid';}]){
+    const value:any=structuredClone(f.sourced);value.state.state='failed';delete value.state.artifacts;change(value);
+    await expect(inspectWorkerRetrySourceBinding(f.runId,f.requested.workspace,async()=>value)).rejects.toThrow('WORKSPACE_INSPECTION_RESPONSE_INVALID');
+  }
+  const error=Error('PREPARATION_RECEIPT_MISSING'),request=vi.fn(async()=>{throw error;});
+  await expect(inspectWorkerRetrySourceBinding(f.runId,f.requested.workspace,request)).rejects.toBe(error);
+  expect(request).toHaveBeenCalledTimes(1);
+});
+
 it('executes real readonly filesystem and bridge dispatcher adversarial fixtures',async()=>{
   const python=await promisify(execFile)('python3',['-B',path.resolve('tests/fixtures/workspace_readonly_inspection_test.py')],{timeout:60000,maxBuffer:1024*1024});
   expect(python.stdout).toBe('');expect(python.stderr).toContain('Ran 16 tests');expect(python.stderr).toContain('OK');
   const node=await promisify(execFile)(process.execPath,['--test','--test-reporter=tap',path.resolve('tests/workspace-inspection-bridge.test.mjs')],{timeout:30000,maxBuffer:1024*1024});
-  expect(node.stdout).toContain('# tests 5');expect(node.stdout).toContain('# pass 5');expect(node.stdout).toContain('# fail 0');expect(node.stdout).toContain('# skipped 0');
+  expect(node.stdout).toContain('# tests 6');expect(node.stdout).toContain('# pass 6');expect(node.stdout).toContain('# fail 0');expect(node.stdout).toContain('# skipped 0');
 },95000);

@@ -40,7 +40,7 @@ export async function stoppedRunProof(runId, notStartedWorkspace, io) {
 /** Opt-in, sanitized source admission evidence. It never treats a policy or a
  * remembered stop receipt as physical termination. The legacy recovery helper
  * above retains its original response and not-started behavior. */
-export async function stoppedSourceBindingProof(runId, workspace, io) {
+async function sourceAdmissionProof(runId, workspace, io, terminalStates) {
   if (!/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(runId ?? '') ||
       !/^[a-z0-9_-]+\/[a-z0-9_-]+$/.test(workspace ?? '')) throw Error('SOURCE_BINDING_IDENTITY_INVALID');
   const unit = `agentos-run-${runId}`;
@@ -54,7 +54,7 @@ export async function stoppedSourceBindingProof(runId, workspace, io) {
   const binding = await io.inspectSourceBinding(runId, workspace);
   if (binding?.version !== 1 || binding.runId !== runId || binding.workspace !== workspace ||
       binding.state?.runId !== runId || binding.state?.workspace !== workspace ||
-      binding.state?.state !== 'completed' || binding.state?.stopped !== true ||
+      !terminalStates.includes(binding.state?.state) || binding.state?.stopped !== true ||
       binding.admission?.runId !== runId || binding.admission?.runFence !== binding.state?.runFence ||
       binding.generation?.workspace !== workspace ||
       binding.admission?.sourceSnapshotDigest !== binding.generation?.snapshotDigest)
@@ -62,4 +62,14 @@ export async function stoppedSourceBindingProof(runId, workspace, io) {
   const after = await io.inspectUnit(unit);
   confirm(after);
   return {...binding, process: after, checkedAt: after.checkedAt};
+}
+
+export function stoppedSourceBindingProof(runId, workspace, io) {
+  return sourceAdmissionProof(runId, workspace, io, ['completed']);
+}
+
+/** Retry authority only: no artifact completeness or acceptance claim. Failed
+ * and cancelled attempts still require the same protected admission and stop. */
+export function stoppedRetrySourceBindingProof(runId, workspace, io) {
+  return sourceAdmissionProof(runId, workspace, io, ['completed','failed','cancelled']);
 }

@@ -747,7 +747,7 @@ async function dispatch(method, params, signal, emit) {
     return contextService(method, params);
   if (method === 'worker.workspaces') return workerWorkspaces();
   if (method === 'worker.prepare') return workspaceOperation({ ...params, action: 'prepare' });
-  if (['worker.inspectGeneration','worker.inspectPreparation','worker.inspectSourceBinding'].includes(method))
+  if (['worker.inspectGeneration','worker.inspectPreparation','worker.inspectSourceBinding','worker.inspectRetrySourceBinding'].includes(method))
     return workspaceInspection(method,params);
   if (method === 'worker.checkComposition') return workspaceOperation({ ...params, action: 'compose', dryRun: true });
   if (method === 'worker.storage') return workspaceOperation({ action: 'capacity' });

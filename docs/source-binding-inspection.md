@@ -143,3 +143,25 @@ unchanged clone. A retry additionally needs the owning controller to verify the
 frozen source binding, the previous attempt's admission identity, its confirmed
 stop and current ownership. This operation supplies evidence for that decision;
 it cannot authorize continuation or final acceptance by itself.
+
+## Terminal admission inspection for retries
+
+`worker.inspectRetrySourceBinding({runId, workspace})`, wrapped by
+`inspectWorkerRetrySourceBinding`, is a separate read-only contract for the last
+attempt that actually executed. It permits `completed`, `failed` or `cancelled`
+with `stopped=true`, and retains the same protected policy, generation, baseline,
+inventory and physical-stop checks before and after inspection. Its `state`
+projection deliberately contains no artifact descriptors. A failed attempt may
+have useful edits without having produced a complete canonical delivery.
+
+The result is evidence of admission and terminality, not accepted-source or QA
+evidence. `worker.inspectSourceBinding` remains completed-only and continues to
+require both canonical artifacts. A retry consumer must compare the admission's
+goal, task, run, fence and context with its frozen previous-attempt identity, and
+compare the own generation and candidate digest with the current protected
+preparation inspection. It must also retain current controller ownership.
+
+Missing policy, replaced generation, live process, stale observations or a
+nonterminal state remain errors. `not_started` does not fabricate an admission;
+that distinct path requires the existing confirmed absence/unchanged-preparation
+rules. Neither inspector retries commands, modifies source or grants acceptance.

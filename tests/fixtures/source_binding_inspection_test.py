@@ -48,6 +48,8 @@ class SourceBindingInspectionTests(unittest.TestCase):
 
     def inspect(self):return manager.inspect(self.inspection)
 
+    def inspect_retry(self):return manager.inspect_source_binding(self.inspection,retry_admission=True)
+
     def rejected(self,code):
         with self.assertRaisesRegex(ValueError,'^'+code+'$'):self.inspect()
 
@@ -123,9 +125,46 @@ class SourceBindingInspectionTests(unittest.TestCase):
 
     def test_state_must_be_completed_stopped_and_match_requested_identity(self):
         for key,value in [('runId',str(uuid.uuid4())),('workspace','sample/other'),('runtime','opencode'),
-                          ('state','running'),('stopped',False),('stopped',1)]:
+                          ('state','running'),('state','failed'),('state','cancelled'),('stopped',False),('stopped',1)]:
             self.put(self.run_dir/'state.json',{**self.state,key:value})
             self.rejected('SOURCE_BINDING_RUN_NOT_COMPLETED')
+
+    def test_retry_projects_terminal_admission_without_artifacts_or_acceptance(self):
+        for terminal in ['failed','cancelled','completed']:
+            state={key:value for key,value in self.state.items() if key!='artifacts'}
+            self.put(self.run_dir/'state.json',{**state,'state':terminal})
+            value=self.inspect_retry()
+            self.assertEqual(value['state']['state'],terminal)
+            self.assertEqual(set(value['state']),{'runId','workspace','runtime','state','stopped','runFence'})
+            self.assertEqual(value['admission']['contextVersion'],self.policy['contextVersion'])
+            self.assertEqual(value['generation']['snapshotDigest'],self.policy['sourceSnapshotDigest'])
+            self.assertNotIn('PRIVATE_',json.dumps(value))
+            self.assertNotIn('artifacts',value['state'])
+            self.rejected('SOURCE_BINDING_RUNTIME_ARTIFACTS' if terminal=='completed' else 'SOURCE_BINDING_RUN_NOT_COMPLETED')
+
+    def test_retry_refuses_live_or_cross_run_state_and_policy(self):
+        for key,value in [('runId',str(uuid.uuid4())),('workspace','sample/other'),('runtime','other'),
+                          ('state','running'),('state','not_started'),('stopped',False),('stopped',1)]:
+            self.put(self.run_dir/'state.json',{**self.state,'state':'failed',key:value})
+            with self.assertRaisesRegex(ValueError,'^SOURCE_BINDING_RUN_NOT_COMPLETED$'):self.inspect_retry()
+        self.put(self.run_dir/'state.json',{**self.state,'state':'failed'})
+        for key,value in [('runId',str(uuid.uuid4())),('runFence',str(uuid.uuid4())),('contextVersion','invalid')]:
+            self.put(self.run_dir/'operation-policy.json',{**self.policy,key:value})
+            with self.assertRaisesRegex(ValueError,'^SOURCE_BINDING_POLICY_IDENTITY$'):self.inspect_retry()
+        self.put(self.run_dir/'operation-policy.json',{**self.policy,'sourceSnapshotDigest':'0'*64})
+        with self.assertRaisesRegex(ValueError,'^SOURCE_BINDING_GENERATION_CHANGED$'):self.inspect_retry()
+
+    def test_retry_requires_real_protected_policy_even_without_artifacts(self):
+        file=self.run_dir/'operation-policy.json';file.unlink()
+        with self.assertRaisesRegex(ValueError,'^PREPARATION_RECEIPT_MISSING$'):self.inspect_retry()
+        outside=self.root/'private-retry-policy';outside.write_text('PRIVATE_NOT_JSON');file.symlink_to(outside)
+        with self.assertRaisesRegex(ValueError,'^PREPARATION_RECEIPT_UNPROTECTED$'):self.inspect_retry()
+        self.assertEqual(outside.read_text(),'PRIVATE_NOT_JSON')
+
+    def test_retry_rejects_generation_replacement_and_does_not_reconstruct_admission(self):
+        marker=self.target/'.agentos-snapshot.json';value=json.loads(marker.read_text())
+        value['createdAt']='2020-01-01T00:00:00+00:00';self.put(marker,value,0o444)
+        with self.assertRaisesRegex(ValueError,'^SOURCE_BINDING_GENERATION_CHANGED$'):self.inspect_retry()
 
     def test_policy_must_name_exact_current_marker_generation(self):
         self.put(self.run_dir/'operation-policy.json',{**self.policy,'sourceSnapshotDigest':'0'*64})
