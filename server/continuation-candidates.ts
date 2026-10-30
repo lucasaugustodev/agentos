@@ -16,7 +16,7 @@ export async function readContinuationCandidates(db: DB, now: string): Promise<a
   await requireTaskExecutionMetadataReady(db);
   const rows = (await db.query(`WITH relational AS MATERIALIZED (
     SELECT t.id,t.goal_id,t.state,t.updated_at,r.id run_id,r.fence,r.state run_state,
-      r.error_code,r.account_id run_account,r.model run_model,
+      r.error_code,r.account_id run_account,r.model run_model,g.state goal_state,
       metadata.task_id metadata_id,metadata.version metadata_version,
       metadata.goal_id metadata_goal,metadata.control
     FROM tasks t JOIN goals g ON g.id=t.goal_id
@@ -24,7 +24,7 @@ export async function readContinuationCandidates(db: DB, now: string): Promise<a
     JOIN LATERAL(SELECT id,fence,state,error_code,account_id,model
       FROM runs WHERE task_id=t.id ORDER BY attempt DESC LIMIT 1)r ON true
     LEFT JOIN task_execution_metadata metadata ON metadata.task_id=t.id
-    WHERE g.state IN ('active','failed')
+    WHERE g.state IN ('active','failed','replanning')
       AND t.state IN ('failed','submitted','recovery_blocked','reconciling','recovering_artifacts','blocked_failed')
       AND COALESCE(s.value->>'enabled','true')='true'
       AND (t.recovery->>'mode' IS DISTINCT FROM 'manual' OR s.value->>'enabled'='true')
@@ -40,6 +40,7 @@ export async function readContinuationCandidates(db: DB, now: string): Promise<a
         OR (state='blocked_failed' AND control->>'readOnlySource'='true' AND run_state='submitted'))
       AND control->>'workKind' IS DISTINCT FROM 'planning'
       AND control->>'kind' IN ('harness','opencode')
+      AND (goal_state<>'replanning' OR (control->>'readOnlySource'='true' AND run_state='submitted'))
   ), due AS MATERIALIZED (
     SELECT eligible.* FROM eligible JOIN tasks t ON t.id=eligible.id
     WHERE (t.execution->'continuation'->>'runId' IS DISTINCT FROM eligible.run_id::text

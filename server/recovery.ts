@@ -1,4 +1,5 @@
 import { pool, tx, lock, event } from './db.js';
+import {routeVerificationPlanningRecovery} from './verification-planning-recovery.js';
 
 // This loop owns transitions, not semantic judgments. A new worker receives the
 // failed evidence and a narrower repair/replanning assignment, in the same scope.
@@ -31,6 +32,8 @@ export async function recoverStoppedTasks() {
         (c: any) => !c.passed && c.type !== 'review',
       );
       if (source.run_state === 'submitted' && !failedChecks.length) continue;
+      if(source.run_state==='submitted' && source.execution?.readOnlySource &&
+        await routeVerificationPlanningRecovery(db,source.id,source.source_run_id))continue;
       if (
         source.plan_revision &&
         /CONTEXT_TOO_LARGE|INPUTS_TOO_LARGE/.test(source.error_code ?? '') &&

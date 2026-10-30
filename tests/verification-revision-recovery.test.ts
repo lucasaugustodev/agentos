@@ -55,6 +55,15 @@ async function interrupt(f:Awaited<ReturnType<typeof fixture>>,code='MODEL_OUTPU
  await pool.query('DELETE FROM acceptances WHERE run_id=$1',[f.run]);
  await pool.query("DELETE FROM artifacts WHERE run_id=$1 AND name='candidate.json'",[f.run]);
 }
+async function newVerificationInput(f:Awaited<ReturnType<typeof fixture>>){
+ const refs=(await pool.query('SELECT id,name,digest,$2::uuid task_id FROM artifacts WHERE run_id=$1',[f.parentRun,f.parent])).rows;
+ const context=randomUUID(),bytes=Buffer.from(JSON.stringify({counterexample:'New bounded browser reproduction for the failed criterion'}));
+ await pool.query("INSERT INTO contexts(id,run_id,manifest,content) VALUES($1,$2,$3,'Original QA dependency evidence')",
+  [context,f.run,JSON.stringify({dependencyArtifacts:refs})]);
+ await pool.query('UPDATE runs SET context_id=$2 WHERE id=$1',[f.run,context]);
+ await pool.query("UPDATE tasks SET execution=jsonb_set(execution,'{inputs}',$2::jsonb) WHERE id=$1",
+  [f.qa,JSON.stringify([{id:randomUUID(),name:'counterexample.json',digest:sha(bytes),base64:bytes.toString('base64')}])]);
+}
 it('consumes an already applied context-capacity revision after generic recovery deferred it to planning',async()=>{
  const f=await fixture();await interrupt(f,'CONTEXT_TOO_LARGE');
  await pool.query("UPDATE tasks SET state='recovery_blocked',reason='Planner must divide the delivery' WHERE id=$1",[f.qa]);
@@ -180,6 +189,7 @@ it.each(['bound','tampered'])('recovers a later interrupted turn only when its p
 });
 it('turns a real accepted applied QA revision into one bound independent recheck and preserves the original attempt, artifacts, implementation and criteria',async()=>{
  const f=await fixture(),before=(await pool.query('SELECT instruction_snapshot FROM runs WHERE id=$1',[f.run])).rows[0];
+ await newVerificationInput(f);
  const result=await reconcileVerificationRevisions(f.inspect);expect(result).toEqual([{taskId:f.qa,status:'recheck_queued'}]);
  const t=(await pool.query('SELECT state,execution,criteria,attempt_count,description FROM tasks WHERE id=$1',[f.qa])).rows[0];
  expect(t.state).toBe('blocked_dependencies');expect(t.execution.readOnlySource).toBe(true);expect(t.execution.workspace).toContain('/oqa-');
@@ -190,6 +200,16 @@ it('turns a real accepted applied QA revision into one bound independent recheck
  expect((await pool.query('SELECT passed FROM acceptances WHERE run_id=$1',[f.run])).rows[0].passed).toBe(false);
  expect(await reconcileVerificationRevisions(f.inspect)).toEqual([]);expect(f.inspect).toHaveBeenCalledTimes(1);
  expect((await pool.query("SELECT count(*)::int n FROM events WHERE entity_id=$1 AND kind='VERIFICATION_RECHECK_QUEUED'",[f.qa])).rows[0].n).toBe(1);
+});
+it('an applied textual revision alone routes unchanged material QA to one review instead of replaying it',async()=>{
+ const f=await fixture();
+ const result=await reconcileVerificationRevisions(f.inspect);
+ expect(result[0]).toMatchObject({taskId:f.qa,status:'review'});
+ expect((await pool.query('SELECT evidence FROM supervision_cases WHERE id=$1',[result[0].caseId])).rows[0].evidence[0].code)
+  .toBe('VERIFICATION_NO_PROGRESS');
+ expect(await reconcileVerificationRevisions(f.inspect)).toEqual([]);
+ expect((await pool.query("SELECT 1 FROM events WHERE kind='VERIFICATION_RECHECK_QUEUED' AND entity_id=$1",[f.qa])).rowCount).toBe(0);
+ expect((await pool.query('SELECT count(*)::int n FROM runs WHERE task_id=$1',[f.qa])).rows[0].n).toBe(1);
 });
 it.each(['pause','cancel','live','pending-case','accepted-result'])('does not disturb %s ownership or create a recheck',async mode=>{
  const f=await fixture();
@@ -210,6 +230,7 @@ it('rechecks decision and run fences after stop inspection; a concurrent edit gr
 });
 it('selects only the bound accepted implementation among dependencies with large inline inputs',async()=>{
  const f=await fixture();
+ await newVerificationInput(f);
  const unrelated=randomUUID(),otherRun=randomUUID(),bytes=Buffer.alloc(2*1024*1024,42);
  await pool.query(`INSERT INTO tasks(id,goal_id,key,title,description,agent_id,state,stage,execution,criteria,attempt_count)
   VALUES($1,$2,'unrelated','Unrelated evidence','Keep unrelated input out of QA source selection','qa.backend','accepted','work',$3,'[]',1)`,
@@ -241,7 +262,8 @@ it('refuses stale stop evidence and asks supervision once when the same canonica
 });
 
 it.each(['bound','tampered'])('sends a second rejected QA round with an already-consumed recheck to supervision only when its binding is %s',async mode=>{
- const f=await fixture();expect(await reconcileVerificationRevisions(f.inspect)).toEqual([{taskId:f.qa,status:'recheck_queued'}]);
+ const f=await fixture();await newVerificationInput(f);
+ expect(await reconcileVerificationRevisions(f.inspect)).toEqual([{taskId:f.qa,status:'recheck_queued'}]);
  const nextRun=randomUUID(),nextReview=randomUUID(),nextCase=randomUUID();
  await pool.query("UPDATE tasks SET attempt_count=2,state='submitted' WHERE id=$1",[f.qa]);
  await pool.query("INSERT INTO runs(id,task_id,attempt,fence,runtime,agent_version,state,finished_at) VALUES($1,$2,2,$3,'harness',1,'submitted',now())",[nextRun,f.qa,randomUUID()]);

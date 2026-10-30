@@ -2,6 +2,7 @@ import {prepareCandidateValidationEvidence,bindCandidateValidationEvidence} from
 import {readManagerCases,projectManagerCases} from './manager-material-consumption.js';
 import {readLiveFailureReview} from './manager-live-failure.js';
 import {requestPlanRecoverySupervision} from './plan-recovery-supervision.js';
+import {routeVerificationPlanningRecovery} from './verification-planning-recovery.js';
 import {readContextCaseBindings,contextCaseBindingsMatch,selectContextDeferrals,addContextDeferral,clearContextDeferral} from './manager-context-deferral.js';
 import {managerInstructions} from './manager-instructions.js';
 import {installManagerContextSections,persistManagerContextSections} from './manager-context-section-store.js';
@@ -322,6 +323,7 @@ export async function detectSupervisionCases(inspect=inspectStopped) {
       const stopped = runs.filter((r) => ['failed', 'submitted'].includes(r.state));
       if (!stopped.length) continue;
       const latest = stopped[0];
+      if(latest.state==='submitted' && await routeVerificationPlanningRecovery(db,t.id,latest.id))continue;
       if (/AUTH|QUOTA|CORRUPT|DIGEST|INVALID_WRITE|CANCEL/.test(latest.error_code ?? '')) continue;
       if (latest.error_code==='DISK_CAPACITY' && await hasStoragePreflightReceipt(db,latest.id,t.id)) continue;
       if (

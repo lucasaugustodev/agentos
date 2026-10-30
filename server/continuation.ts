@@ -34,6 +34,8 @@ import { scheduledSupervisionAdmission } from './supervised-admission.js';
 import { runtimeProgressCode } from './runtime-progress-contract.js';
 import {operatorRecoveryCode} from './operator-recovery-contract.js';
 import { preservedAcceptedAuxiliaryIds } from './accepted-auxiliary.js';
+import {routeVerificationPlanningRecovery} from './verification-planning-recovery.js';
+import {verificationCandidate,verificationInputsChanged,materialVerificationFailure} from './verification-progress.js';
 import { protocolReportRepairInstruction } from '../bridge/protocol-report-contract.mjs';
 import {
   requestSemanticReplan,
@@ -284,6 +286,7 @@ export function chooseRepairRoute(task: any, run: any, accounts: any[], now = Da
 export async function routeVerificationRepair(sourceId: string) {
   return tx(async (db) => {
     await lock(db);
+    if(await routeVerificationPlanningRecovery(db,sourceId))return null;
     // A rejected admission belongs to its fresh supervisor review. Automatic
     // candidate rechecks must not close that case while it is being reviewed.
     const supervised=(await db.query("SELECT to_regclass('supervision_cases') relation")).rows[0].relation;
@@ -302,32 +305,6 @@ export async function routeVerificationRepair(sourceId: string) {
       return null;
     }
   });
-}
-
-async function verificationCandidate(db: DB, runId: string) {
-  const refs = (
-    await db.query(
-      "SELECT id,run_id,name,digest,size FROM artifacts WHERE run_id=$1 AND name='candidate.json'",
-      [runId],
-    )
-  ).rows;
-  if (refs.length !== 1) throw Error('VERIFICATION_CANDIDATE_UNBOUND');
-  const ref = refs[0];
-  try {
-    if (!Number.isSafeInteger(ref.size) || ref.size < 0 || ref.size > 8 * 1024 * 1024)
-      throw Error('INVALID_SIZE');
-    const bytes = await readFile(path.join(config.dataDir, 'artifacts', ref.id));
-    if (bytes.length !== ref.size || hash(bytes) !== ref.digest) throw Error('INVALID_DIGEST');
-    const candidate = JSON.parse(bytes.toString());
-    if (
-      !/^[0-9a-f]{64}$/.test(candidate?.candidateDigest) ||
-      !/^[0-9a-f]{64}$/.test(candidate?.baseDigest)
-    )
-      throw Error('INVALID_CANDIDATE');
-    return { ref, candidate };
-  } catch {
-    throw Error('VERIFICATION_CANDIDATE_INVALID');
-  }
 }
 
 /** Recheck replaces only a stopped QA attempt, never its implementation or evidence. */
@@ -423,6 +400,11 @@ async function queueVerificationRecheck(db:DB,decision:any,interruption?:{caseId
     AND NOT EXISTS(SELECT 1 FROM leases l JOIN runs held ON held.id=l.run_id WHERE held.task_id=t.id)`,
     [target.id,source.goal_id,target.run_id,liveStates])).rowCount!==1)throw Error('TASK_CHANGED');
   const candidate = await verificationCandidate(db, target.run_id);
+  if(!interruption && priorCandidate && await materialVerificationFailure(db,latest.id)){
+    const tested=await verificationCandidate(db,latest.id);
+    if(tested.candidate.candidateDigest===candidate.candidate.candidateDigest &&
+      !await verificationInputsChanged(db,source,latest))throw Error('VERIFICATION_NO_PROGRESS');
+  }
   if (decision.candidateDigest && decision.candidateDigest !== candidate.candidate.candidateDigest)
     throw Error('TASK_CHANGED');
   decision = { ...decision, candidateDigest: candidate.candidate.candidateDigest };
@@ -677,6 +659,8 @@ export async function resumeFailedHarness(id: string, fence: string, proof: any)
     )
       throw Error('TASK_CHANGED');
     assertStopped(proof, r, t);
+    if(t.execution?.readOnlySource && r.state==='submitted' && await materialVerificationFailure(db,r.id))
+      throw Error('VERIFICATION_REPAIR_REQUIRED');
     if (await pendingSupervisionOwnsContinuation(db, t.id, id)) throw Error('SUPERVISION_PENDING');
     await assertSupervisedResume(db, t, r, proof);
     if (

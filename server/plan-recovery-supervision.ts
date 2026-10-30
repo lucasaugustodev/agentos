@@ -2,6 +2,7 @@ import {randomUUID} from 'node:crypto';
 import {pool,tx,lock,event,type DB} from './db.js';
 import {inspectStopped,assertStopped} from './continuation.js';
 import {hash} from './memory.js';
+import {routeVerificationPlanningRecovery} from './verification-planning-recovery.js';
 
 /** A blocked recovery is a structural request for a decision, not permission
  * to retry, waive a criterion, or replace its source with an earlier run. */
@@ -58,6 +59,7 @@ export async function requestPlanRecoverySupervision(inspect=inspectStopped){
         if(!current||!identity(current)||hash(JSON.stringify(current))!==hash(JSON.stringify(observed)))return;
         assertStopped(proof,{id:current.run_id,checkpoint:current.checkpoint},
           {execution:{workspace:current.snapshot_workspace}});
+        if(await routeVerificationPlanningRecovery(db,current.id,current.run_id))return;
         const caseId=randomUUID(),reason='Recuperação estrutural bloqueada; exige decisão de supervisão antes de nova tentativa.';
         const evidence=[{kind:'PLAN_RECOVERY_BLOCKED',runId:current.run_id,attempt:current.attempt,
           code:current.error_code,summary:current.summary,checks:current.checks}];

@@ -3,7 +3,7 @@ import {event, type DB} from './db.js';
 
 const codes = new Set(['REPAIR_TARGET_MISSING','VERIFICATION_CANDIDATE_UNBOUND',
   'VERIFICATION_CANDIDATE_INVALID','TASK_CHANGED','GOAL_NOT_ACTIVE','NO_FAILED_CHECK',
-  'BRANCH_BUSY','VERIFICATION_RECHECK_REQUIRED']);
+  'BRANCH_BUSY','VERIFICATION_RECHECK_REQUIRED','VERIFICATION_NO_PROGRESS','VERIFICATION_REPAIR_REQUIRED']);
 
 /** Error text can contain paths or provider data. Persist only known codes. */
 export function verificationRoutingCode(error: unknown): string {

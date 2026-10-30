@@ -2,6 +2,7 @@ import { readModelPolicy, modelRouteAllowed } from '../bridge/model-policy.mjs';
 import { generationTiming } from './generation-timing.js';
 import { planningRecovery } from './planning-recovery.js';
 import {refreshQueuedPlanningFeedback} from './planning-feedback-refresh.js';
+import {routeVerificationPlanningRecovery} from './verification-planning-recovery.js';
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { pool, tx, lock, event, type DB } from './db.js';
@@ -207,7 +208,7 @@ export async function reconcilePlanning() {
       if (!hasPendingFeedback && latest?.incremental && await queueNextDelivery(db, o, latest)) continue;
       const failed = (
         await db.query(
-          `SELECT t.*,r.id run_id,r.summary,r.error_code,(t.state='submitted') rejected_delivery FROM tasks t
+          `SELECT t.*,r.id run_id,r.state run_state,r.summary,r.error_code,(t.state='submitted') rejected_delivery FROM tasks t
             JOIN LATERAL(SELECT * FROM runs WHERE task_id=t.id ORDER BY attempt DESC LIMIT 1) r ON true
             WHERE t.goal_id=$1 AND (t.state='recovery_blocked' OR
               (t.state='submitted' AND r.state='submitted'
@@ -217,10 +218,21 @@ export async function reconcilePlanning() {
           [o.id],
         )
       ).rows;
-      for (const t of failed)
+      for (const t of failed) {
+        if(t.execution?.readOnlySource){
+          if(await routeVerificationPlanningRecovery(db,t.id,t.run_id)||t.run_state==='submitted')continue;
+          // A blocked technical attempt still needs the existing planner path.
+          // Material rejection cannot fall through when its owner was refused.
+          if(t.execution.continuation?.owner==='user'||!(await db.query(`SELECT 1 FROM goals g
+            LEFT JOIN settings a ON a.id='autonomy:'||g.project WHERE g.id=$1
+              AND g.state IN('active','replanning','failed') AND COALESCE(a.value->>'enabled','true')='true'
+              AND ($2::text IS DISTINCT FROM 'manual' OR a.value->>'enabled'='true')`,
+            [t.goal_id,t.recovery?.mode??null])).rowCount)continue;
+        }
         await queueFeedback(db, o.id, 'run:' + t.run_id, `${t.title}: ${t.summary ?? t.reason}`, [
           t.id,
         ]);
+      }
       const pending = (
         await db.query(
           "SELECT f.* FROM objective_feedback f WHERE objective_id=$1 AND NOT EXISTS(SELECT 1 FROM planning_runs p WHERE p.objective_id=f.objective_id AND p.feedback->'feedbackIds' ? f.id::text) ORDER BY created_at",
@@ -241,7 +253,7 @@ export async function reconcilePlanning() {
       if (
         (
           await db.query(
-            "SELECT 1 FROM runs r JOIN tasks t ON t.id=r.task_id WHERE t.goal_id=$1 AND r.state IN('queued','running','cancelling','reconciling')",
+            "SELECT 1 FROM runs r JOIN tasks t ON t.id=r.task_id WHERE t.goal_id=$1 AND (r.state IN('queued','running','cancelling','reconciling') OR EXISTS(SELECT 1 FROM leases l WHERE l.run_id=r.id))",
             [o.id],
           )
         ).rowCount

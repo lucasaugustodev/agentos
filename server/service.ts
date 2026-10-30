@@ -22,6 +22,8 @@ import { independentNativeSupervisorSql } from './native-supervision.js';
 import { readPreparedNativeAdmission, validateNativeAdmission, consumeNativeAdmission, finishNativeAdmission, inspectPreparedNativeRun, checkNativePreparation } from './supervised-opencode-admission.js';
 import { verifyRepairSourceProof } from './repair-proof.js';
 import { readValidationSnapshot, validationReceiptId } from './validation-identity.js';
+import {assertVerificationAdmissionProgress} from './verification-progress.js';
+import {routeVerificationPlanningRecovery} from './verification-planning-recovery.js';
 export async function createGoal(raw: unknown, isDemo = false) {
   const input = goalSchema.parse(raw);
   validateDag(input.tasks);
@@ -226,7 +228,7 @@ export async function readScheduleCandidates(db:DB=pool,service?:'agentos-openco
       t.account_id,t.allowed_accounts,t.model,t.resources,t.attempt_count,t.instruction_revision_id,
       t.parent_task_id,t.agent_role,t.agent_level,
       CASE WHEN t.execution IS NULL THEN NULL ELSE jsonb_build_object(
-        'kind',t.execution->>'kind','workforceLane',t.execution->>'workforceLane',
+        'kind',t.execution->>'kind','workforceLane',t.execution->>'workforceLane','readOnlySource',t.execution->'readOnlySource',
         'supervisedAdmission',t.execution->'supervisedAdmission') END execution,
       g.state goal_state,a.runtime,a.version agent_version,
       prior.id prepared_source_run_id,
@@ -311,6 +313,7 @@ export async function schedule(service?:'agentos-opencode',inspect=inspectPrepar
         await setWait('blocked_dependencies', 'Aguardando aceite das dependências.');
         continue;
       }
+      await assertVerificationAdmissionProgress(db,t);
       // Skip a draining executor before INSERT, preserving the rest of the batch.
       const laneFlags = (
         await db.query(
@@ -606,11 +609,12 @@ export async function schedule(service?:'agentos-opencode',inspect=inspectPrepar
           await db.query("UPDATE tasks SET state='waiting_resource',reason='Dois planejadores por escopo ocupados; aguardando vaga.',updated_at=now() WHERE id=$1",[t.id]);
           continue;
         }
-        if(!/^(TASK_INSTRUCTIONS_CHANGED|INSTRUCTION_CASE_CHANGED|INSTRUCTION_CASE_INVALID|INSTRUCTION_SOURCE_INVALID|INSTRUCTION_DECISION_UNVERIFIED|SUPERVISION_INPUTS_INVALID|SUPERVISION_INPUT_DIGEST|SUPERVISION_INPUTS_TOO_LARGE|SUPERVISION_INPUT_COLLISION)$/.test(code??''))throw e;
+        if(!/^(TASK_INSTRUCTIONS_CHANGED|INSTRUCTION_CASE_CHANGED|INSTRUCTION_CASE_INVALID|INSTRUCTION_SOURCE_INVALID|INSTRUCTION_DECISION_UNVERIFIED|SUPERVISION_INPUTS_INVALID|SUPERVISION_INPUT_DIGEST|SUPERVISION_INPUTS_TOO_LARGE|SUPERVISION_INPUT_COLLISION|VERIFICATION_NO_PROGRESS|VERIFICATION_CANDIDATE_UNBOUND|VERIFICATION_CANDIDATE_INVALID)$/.test(code??''))throw e;
         const reason='Admissão bloqueada: '+code+'. Contrato e evidências preservados; outras tarefas continuam.';
         await db.query("UPDATE tasks SET state='recovery_blocked',reason=$2,execution=CASE WHEN execution IS NULL THEN NULL ELSE jsonb_set(execution,'{continuation}',jsonb_build_object('state','needs_action','message',$2::text,'updatedAt',now())) END,updated_at=now() WHERE id=$1",
           [t.id,reason]);
         await event(db,'RUN_ADMISSION_BLOCKED',t.id,{code,goalId:t.goal_id,instructionRevisionId:t.instruction_revision_id,preserved:true});
+        if(code.startsWith('VERIFICATION_'))await routeVerificationPlanningRecovery(db,t.id);
       } finally {
         await db.query('RELEASE SAVEPOINT task_admission');
       }
