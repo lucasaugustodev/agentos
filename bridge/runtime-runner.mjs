@@ -1,4 +1,5 @@
-import { assertModelRoute } from './model-policy.mjs';
+import { assertModelRoute, usesSharedRequestGate } from './model-policy.mjs';
+import { workerModelSettings } from './operator-model-profile.mjs';
 import { createRuntimeGuidanceServer } from './runtime-guidance.mjs';
 import { prepareSandboxLocalhost } from './sandbox-localhost.mjs';
 import { prepareRepairFinalization, finalizeRepairArtifacts, repairFinalizationInstruction } from './repair-finalizer.mjs';
@@ -7,7 +8,7 @@ import { createServer } from 'node:http';
 import { createInterface } from 'node:readline';
 import { mkdir, readFile, writeFile, realpath, stat, readdir } from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
-import { GLM_ACCOUNT, GLM_REQUEST_ADMITTED, withAccountRequestGate } from './gated-generation.mjs';
+import { GLM_REQUEST_ADMITTED, withAccountRequestGate } from './gated-generation.mjs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -166,7 +167,7 @@ export async function runHarness(params, signal, generate, emit = () => {}) {
     // GLM uses a semantic-idle watchdog in its actual provider transport,
     // after admission. Queuing and a progressing stream do not spend a fixed
     // wall-clock generation deadline; caller cancellation still owns the run.
-    const gatedRequest = params.accountId === GLM_ACCOUNT;
+    const gatedRequest = usesSharedRequestGate(params.accountId);
     const requestTimeout = gatedRequest ? null : AbortSignal.timeout(WORKER_MODEL_TIMEOUT_MS);
     try {
       if (req.method !== 'POST' || req.url !== '/v1/chat/completions') {
@@ -203,7 +204,7 @@ export async function runHarness(params, signal, generate, emit = () => {}) {
       const input = toGeneration(JSON.parse(body), {
         accountId: params.accountId,
         model: params.model,
-        reasoning: params.model === 'glm-5.3-flash' ? 'low' : 'high',
+        reasoning: workerModelSettings(params.accountId, params.model).reasoning,
       });
       input.requestId = requestId;
       requestSequence = ++requests;

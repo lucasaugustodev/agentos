@@ -1,3 +1,4 @@
+import { assertModelRoute } from '../bridge/model-policy.mjs';
 // Dedicated native OpenCode worker queue. Shares AgentOS runs, leases, context and artifacts.
 // Does not restart the controller or publish jobs to its Harness-only queue.
 import { randomUUID } from 'node:crypto';
@@ -71,6 +72,8 @@ async function setup() {
 }
 
 async function admit() {
+  // This historical occurrence is GLM-authorized; never reinterpret it under a new policy.
+  assertModelRoute(accountId, model);
   await syncAccounts(true);
   const memory = await saveMemory({
     project: 'pg5-20261005',

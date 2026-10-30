@@ -1,3 +1,4 @@
+import { readModelPolicy } from '../bridge/model-policy.mjs';
 import {prepareCandidateValidationEvidence,bindCandidateValidationEvidence} from './candidate-validation-evidence.js';
 import {readManagerCases,projectManagerCases} from './manager-material-consumption.js';
 import {readLiveFailureReview} from './manager-live-failure.js';
@@ -1348,9 +1349,10 @@ export async function applySupervisionDecisions(inspect = inspectStopped) {
             const policy = (
               await db.query('SELECT value FROM settings WHERE id=$1', ['workforce:' + c.goal_id])
             ).rows[0].value;
+            const exclusive=readModelPolicy();
             const account =
               a.lane === 'glm'
-                ? policy.glmAccountId
+                ? exclusive?.accountId??policy.glmAccountId
                 : (
                     await db.query(
                       "SELECT id FROM accounts WHERE provider='muse' AND enabled AND id=ANY($1::text[]) ORDER BY id LIMIT 1",
@@ -1457,7 +1459,7 @@ export async function applySupervisionDecisions(inspect = inspectStopped) {
                 description,
                 native ? 'qa.backend' : 'engineering.backend.node',
                 account,
-                native ? 'glm-5.3-flash' : 'muse-spark-1.3',
+                native ? exclusive?.model??'glm-5.3-flash' : 'muse-spark-1.3',
                 JSON.stringify(['remote-slot', 'workspace:' + workspace]),
                 JSON.stringify(criteria),
                 JSON.stringify(execution),

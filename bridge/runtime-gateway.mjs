@@ -1,4 +1,5 @@
 // OpenAI wire adapter for the pinned DSH runtime. Credentials never enter the sandbox.
+import { workerModelSettings } from './operator-model-profile.mjs';
 export function toGeneration(body, route) {
   const messages = [],
     system = [];
@@ -64,7 +65,7 @@ export function toGeneration(body, route) {
       description: t.function.description,
       parameters: t.function.parameters,
     })),
-    maxOutputTokens: /^glm[-.]/i.test(route.model ?? '') ? 32768 : 8192,
+    maxOutputTokens: workerModelSettings(route.accountId, route.model).maxOutputTokens,
   };
 }
 export function completion(message, model) {

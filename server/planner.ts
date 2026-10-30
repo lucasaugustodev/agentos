@@ -442,7 +442,7 @@ export async function claimPlanning() {
       ? { account: { id: run.account_id }, model: run.model }
       : undefined;
     const exclusive = readModelPolicy();
-    if(run.feedback?.planningRecovery&&exclusive?.mode!=='glm-only'){
+    if(run.feedback?.planningRecovery&&!exclusive){
       await db.query("UPDATE planning_runs SET state='waiting_quota',next_attempt_at=now()+interval '30 seconds',error='Revisão aguarda política GLM exclusiva.' WHERE id=$1",[run.id]);
       return null;
     }

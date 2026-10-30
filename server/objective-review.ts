@@ -316,7 +316,7 @@ export class ObjectiveReviewEngine {
             [row.id,row.signal_source==='operator'?'superseded':'monitoring',row.signal_source==='operator'?'OPERATOR_REVIEW_NO_LONGER_CURRENT':'PATTERN_NO_LONGER_CURRENT']);return null;
         }
         const policy=readModelPolicy();
-        if(!policy||policy.mode!=='glm-only'){
+        if(!policy){
           await db.query("UPDATE objective_review_signals SET next_attempt_at=now()+interval '30 seconds',error_code='GLM_POLICY_REQUIRED' WHERE id=$1",[row.id]);return null;
         }
         const account=(await db.query('SELECT * FROM accounts WHERE id=$1 AND enabled AND bridge_id=$2',[policy.accountId,policy.bridgeId])).rows[0];

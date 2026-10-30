@@ -1,5 +1,5 @@
 import { assertModelRoute, readModelPolicy } from './model-policy.mjs';
-import { glmModelProfile } from './glm-model-profile.mjs';
+import { operatorModelProfile } from './operator-model-profile.mjs';
 // Runs on agentos-server, through a private SSH stdio channel. No HTTP listener.
 // Production credentials are read-only. New accounts live only in DATA.
 import {
@@ -392,13 +392,13 @@ async function generate(params, signal, emit, admission) {
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
       contextWindow: 128000,
       maxTokens: 8192,
-      ...glmModelProfile(account.id, params.model),
+      ...operatorModelProfile(account.id, params.model),
     };
     auth = { apiKey: credential.key };
     provider = { streamSimple: (m, c, o) => openAICompletionsApi().streamSimple(m, c, o) };
-    // Use the inspected transport on the verified GLM route, even when the
+    // Use the inspected transport on the operator-selected API route, even when the
     // optional SDK is installed. Other providers retain their existing path.
-    if (glmModelProfile(account.id,params.model).reasoning)
+    if (operatorModelProfile(account.id,params.model).reasoning)
       provider = openAICompletionsFallback();
   }
   // One identity before admission binds the gate and transport observations.

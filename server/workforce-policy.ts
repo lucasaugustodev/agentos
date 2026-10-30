@@ -1,4 +1,5 @@
 import { readModelPolicy, modelRouteAllowed } from '../bridge/model-policy.mjs';
+import {exclusiveModelPolicySql} from './model-policy-sql.js';
 import type { DB } from './db.js';
 import { quotaFor, supportsAccountExecution } from './accounts.js';
 
@@ -45,10 +46,10 @@ export function workforceCapacityReason(
   if (policy.museTarget !== undefined && /^muse-/i.test(task.model ?? '') &&
       active.filter(run => /^muse-/i.test(run.model ?? '')).length >= policy.museTarget)
     return 'WORKFORCE_MUSE_CAPACITY';
-  if (/^glm[-.]/i.test(task.model ?? '') || task.execution?.kind === 'opencode' ||
+  if ((exclusive && task.account_id === exclusive.accountId) || /^glm[-.]/i.test(task.model ?? '') || task.execution?.kind === 'opencode' ||
       (task.execution?.kind === 'harness' && task.execution?.workforceLane === 'glm')) {
     const nativeCount = active.filter(
-      (run) => run.runtime === 'opencode' || run.execution?.kind === 'opencode' ||
+      (run) => (exclusive && run.account_id === exclusive.accountId) || run.runtime === 'opencode' || run.execution?.kind === 'opencode' ||
         /^glm[-.]/i.test(run.model ?? '') ||
         (run.execution?.kind === 'harness' && run.execution?.workforceLane === 'glm'),
     ).length;
@@ -198,7 +199,10 @@ BEGIN
  FROM tasks t LEFT JOIN accounts a ON a.id=NEW.account_id
  LEFT JOIN settings s ON s.id='workforce:'||t.goal_id WHERE t.id=NEW.task_id;
  SELECT value INTO global_policy FROM settings WHERE id='model-policy';
- IF global_policy->>'mode'='glm-only' AND
+ IF global_policy->>'version'='2' AND NOT COALESCE(${exclusiveModelPolicySql('global_policy')},false) THEN
+   RAISE EXCEPTION 'MODEL_POLICY_INVALID';
+ END IF;
+ IF (${exclusiveModelPolicySql('global_policy')}) AND
     (TG_OP='INSERT' OR OLD.state NOT IN('queued','running','cancelling','reconciling') OR
      OLD.account_id IS DISTINCT FROM NEW.account_id OR OLD.model IS DISTINCT FROM target_model) AND
     (NEW.account_id IS DISTINCT FROM global_policy->>'accountId' OR target_model IS DISTINCT FROM global_policy->>'model') THEN
@@ -226,7 +230,8 @@ BEGIN
    RAISE EXCEPTION 'WORKFORCE_LUNA_CAPACITY: Luna worker target is full';
   END IF;
  END IF;
- IF target_kind='opencode' OR NEW.runtime='opencode' OR target_model ~* '^glm[-.]' THEN
+ IF target_kind='opencode' OR NEW.runtime='opencode' OR target_model ~* '^glm[-.]'
+    OR (NEW.account_id=global_policy->>'accountId' AND ${exclusiveModelPolicySql('global_policy')}) THEN
   PERFORM pg_advisory_xact_lock(4280001);
   IF NEW.state IN('queued','running')
    AND (TG_OP='INSERT' OR OLD.state NOT IN('queued','running','cancelling','reconciling'))
@@ -237,7 +242,8 @@ BEGIN
   IF (SELECT count(*) FROM runs r JOIN tasks t ON t.id=r.task_id
    WHERE t.goal_id=target_goal AND r.id<>NEW.id
     AND r.state IN ('queued','running','cancelling','reconciling')
-    AND (t.execution->>'kind'='opencode' OR r.runtime='opencode' OR COALESCE(r.model,t.model) ~* '^glm[-.]')) >= GREATEST(1,COALESCE((target_policy->>'glmTarget')::int,6)) THEN
+    AND (t.execution->>'kind'='opencode' OR r.runtime='opencode' OR COALESCE(r.model,t.model) ~* '^glm[-.]'
+      OR r.account_id=global_policy->>'accountId')) >= GREATEST(1,COALESCE((target_policy->>'glmTarget')::int,6)) THEN
    RAISE EXCEPTION 'WORKFORCE_GLM_CAPACITY: native worker target is full';
   END IF;
  END IF;

@@ -1,3 +1,4 @@
+import { readModelPolicy } from '../bridge/model-policy.mjs';
 import { z } from 'zod';
 import { randomUUID } from 'node:crypto';
 import { pool, tx, lock, event } from './db.js';
@@ -376,7 +377,8 @@ export async function applyBacklog(goalId: string, runId: string, raw: unknown,
           receipt('WORKFORCE_DISABLED');
           return null;
         }
-        let route = { accountId: currentPolicy.glmAccountId, model: 'glm-5.3-flash' };
+        const exclusive=readModelPolicy();
+        let route = exclusive ? {accountId:exclusive.accountId,model:exclusive.model} : { accountId: currentPolicy.glmAccountId, model: 'glm-5.3-flash' };
         if (p.lane === 'muse') {
           if (musePendingLimit(currentPolicy) === 0) {
             receipt('MUSE_LANE_DISABLED');

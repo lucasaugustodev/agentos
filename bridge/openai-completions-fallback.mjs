@@ -248,6 +248,12 @@ export function openAICompletionsFallback({ fetch: fetchImpl = fetch, random = M
             thinking:{type:'enabled',clear_thinking:false},
             reasoning_effort:model.thinkingLevelMap?.[options.reasoning ?? 'low'] ?? 'low',
           } : {}),
+          ...(model.compat?.thinkingFormat === 'deepseek' ? {
+            thinking:{type:options.reasoning === 'off' ? 'disabled' : 'enabled'},
+            ...(options.reasoning === 'off' ? {} : {
+              reasoning_effort:model.thinkingLevelMap?.[options.reasoning ?? 'low'] ?? 'low',
+            }),
+          } : {}),
           ...(tools?.length ? { tools: tools.map((t) => ({ type: 'function', function: t })) } : {}),
         };
         const request = {

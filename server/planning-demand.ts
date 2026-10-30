@@ -1,3 +1,4 @@
+import { readModelPolicy } from '../bridge/model-policy.mjs';
 import { randomUUID,createHash } from 'node:crypto';
 import {plannerPreparationBindingVersion,plannerWorkspace,selectPlannerPreparationSource,matchesPlannerPreparationSource,matchesPreparedPlannerWorkspace,type PlannerPreparationSource} from './planner-preparation-binding.js';
 import { config } from './config.js';
@@ -555,15 +556,17 @@ export async function assignPlanningRequest(requestId:string){
     if(!policy?.enabled)return null;
     const capacity=await readWorkforceReserve(db,request.goal_id,'glm',policy);
     if(!capacity.available||await hasCapacityIntentPriority(db,request.goal_id,'glm',undefined,capacity.limit-capacity.pending))return null;
+    const exclusive=readModelPolicy();
+    const accountId=exclusive?.accountId??policy.glmAccountId, model=exclusive?.model??'glm-5.3-flash';
     const id=randomUUID();
     await db.query(`INSERT INTO tasks(id,goal_id,key,title,description,agent_id,account_id,model,state,stage,priority,resources,criteria,allowed_accounts,execution)
-      VALUES($1,$2,$3,$4,$5,'research.requirements',$6,'glm-5.3-flash','ready','work',76,$7,$8,$9,$10)`,
-      [id,request.goal_id,'plan-'+requestId,'Planejar frentes — '+request.scope,description,policy.glmAccountId,
+      VALUES($1,$2,$3,$4,$5,'research.requirements',$6,$11,'ready','work',76,$7,$8,$9,$10)`,
+      [id,request.goal_id,'plan-'+requestId,'Planejar frentes — '+request.scope,description,accountId,
         JSON.stringify(['remote-slot','workspace:'+workspace]),JSON.stringify([
           {id:'scope_plan',type:'artifact',name:'scope-plan.json',label:'Plano estruturado por escopo'},
           {id:'plan_contract',type:'json_field',name:'runtime-plan-check.json',field:'verified',equals:true,label:'Escopo e bloqueios conferidos'}]),
-        JSON.stringify([policy.glmAccountId]),JSON.stringify({kind:'opencode',workspace,baseWorkspace:request.scope,sourceWorkspace:source.workspace,
-          managed:true,workforceLane:'glm',workKind:'planning',planningRequestId:requestId,writePaths:['evidence/'],inputs:context.inputs})]);
+        JSON.stringify([accountId]),JSON.stringify({kind:'opencode',workspace,baseWorkspace:request.scope,sourceWorkspace:source.workspace,
+          managed:true,workforceLane:'glm',workKind:'planning',planningRequestId:requestId,writePaths:['evidence/'],inputs:context.inputs}),model]);
     await db.query("UPDATE planning_requests SET state='assigned',task_id=$2,updated_at=now() WHERE id=$1",[requestId,id]);
     await event(db,'SCOPED_PLANNER_ASSIGNED',request.goal_id,{requestId,taskId:id,scope:request.scope});return id;
   });

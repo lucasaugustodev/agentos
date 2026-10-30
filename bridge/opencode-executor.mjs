@@ -1,3 +1,5 @@
+import { readModelPolicy, assertModelRoute } from './model-policy.mjs';
+import { operatorModelProfile } from './operator-model-profile.mjs';
 import { classifyProviderError, temporaryProviderReply, providerBackoff, isRateLimitClientError, mergeProviderBackoff, successfulProviderRequest, requestWithProviderBackoff } from './opencode-provider-error.mjs';
 // One JSON request on stdin, JSON-line events/result on stdout. No provider secret enters bwrap.
 import { spawn } from 'node:child_process';
@@ -29,8 +31,8 @@ const DATA = '/var/lib/agentos-bridge/worker-runs';
 const ROOT = '/srv/agentos/workspaces';
 const NODE = '/opt/deepseek-harness/node/bin/node';
 const PROFILE = '/var/lib/agentos-bridge/opencode';
-const ACCOUNT = 'agentos:api:00000000-0000-4000-8000-000000000001';
-const MODEL = 'glm-5.3-flash';
+const LEGACY_ACCOUNT = 'agentos:api:00000000-0000-4000-8000-000000000001';
+const LEGACY_MODEL = 'glm-5.3-flash';
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const workspaceKey = /^[a-z0-9_-]+\/[a-z0-9_-]+$/;
 const digest = (bytes) => createHash('sha256').update(bytes).digest('hex');
@@ -59,6 +61,26 @@ export function usageFromFrames(text, usage) {
   } catch {}
 }
 
+export function openCodeRoute(params) {
+  const policy=readModelPolicy();
+  const accountId=policy?.bridgeId??LEGACY_ACCOUNT, model=policy?.model??LEGACY_MODEL;
+  if ((params.accountId && ![accountId,policy?.accountId??accountId.replaceAll(':','-')].includes(params.accountId)) ||
+      (params.model && params.model!==model)) throw failure('INVALID_ROUTE');
+  assertModelRoute(accountId,model);
+  return {accountId,model};
+}
+
+// Keep every assistant reasoning_content byte supplied by the runtime, including
+// assistant turns without tool calls. Only the operator controls wire options.
+export function openCodeCompletionPayload(payload, route) {
+  assertModelRoute(route.accountId,route.model);
+  if (payload.model!==route.model) throw failure('INVALID_ROUTE');
+  const profile=operatorModelProfile(route.accountId,route.model);
+  if (profile.compat?.thinkingFormat!=='deepseek') return payload;
+  const {max_completion_tokens, ...rest}=payload;
+  return {...rest,max_tokens:32768,thinking:{type:'enabled'},reasoning_effort:'low'};
+}
+
 export async function runOpenCode(params, signal, emit = () => {}) {
   try { return await executeOpenCode(params, signal, emit); }
   catch (e) {
@@ -77,8 +99,8 @@ async function executeOpenCode(params, signal, emit) {
   if (!Array.isArray(writePaths) || !writePaths.length ||
       new Set(writePaths).size !== writePaths.length ||
       writePaths.some((item) => !['qa-protocol/', 'evidence/'].includes(item))) throw failure('INVALID_WRITE_SCOPE');
-  if ((params.accountId && params.accountId !== ACCOUNT && params.accountId !== ACCOUNT.replaceAll(':', '-')) ||
-      (params.model && params.model !== MODEL)) throw failure('INVALID_ROUTE');
+  const route=openCodeRoute(params);
+  const {accountId:ACCOUNT,model:MODEL}=route;
   const memory = openCodeMemory(params);
   const account = JSON.parse(await readFile('/var/lib/agentos-bridge/accounts.json', 'utf8'))
     .find((item) => item.id === ACCOUNT);
@@ -180,7 +202,7 @@ async function executeOpenCode(params, signal, emit) {
         permission: { task: 'deny', question: 'deny', webfetch: 'deny', websearch: 'deny', skill: 'deny' } } },
       provider: { agentos: { npm: '@ai-sdk/openai-compatible', name: 'AgentOS scoped gateway',
         options: { baseURL: 'http://127.0.0.1:17820/v1', apiKey: 'no-provider-secret' },
-        models: { [MODEL]: { name: 'GLM 5.3 Flash', tool_call: true, reasoning: true, attachment: true,
+        models: { [MODEL]: { name: MODEL, tool_call: true, reasoning: true, attachment: true,
           modalities: { input: ['text', 'image'], output: ['text'] },
           interleaved: { field: 'reasoning_content' }, limit: { context: 1048576, output: 32768 },
           options: { reasoningEffort: 'low' }, variants: {
@@ -206,17 +228,20 @@ async function executeOpenCode(params, signal, emit) {
           body += chunk;
           if (body.length > 4 * 1024 * 1024) throw failure('CONTEXT_TOO_LARGE');
         }
-        const payload = JSON.parse(body);
+        const payload = openCodeCompletionPayload(JSON.parse(body),route);
         if (payload.model !== MODEL) throw failure('INVALID_ROUTE');
         const identity = { runId: params.runId, workspace: params.workspace, model: MODEL };
         const upstreamFailure = await requestWithProviderBackoff(
           { ...identity, providerBackoff: providerWait }, identity, () => requestGatedModel(
           {
-            runId: params.runId,
+            runId: params.runId, accountId: ACCOUNT, model: MODEL,
             signal: AbortSignal.any([combined, requestController.signal]),
             emit,
-            beforeRequest: () => requestWithProviderBackoff(
-              { ...identity, providerBackoff: providerWait }, identity, () => undefined),
+            beforeRequest: () => {
+              assertModelRoute(ACCOUNT,MODEL);
+              return requestWithProviderBackoff(
+                { ...identity, providerBackoff: providerWait }, identity, () => undefined);
+            },
             onRequest: () => {
               requests++;
               emit('MODEL_REQUEST', {
