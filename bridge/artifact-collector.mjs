@@ -17,6 +17,10 @@ export function parseArtifactResult(text) {
     const fences = [...input.matchAll(/^[\t ]*```([^\r\n]*)$/gm)];
     if (fences.length !== 2 || !/^(?:json)?\s*$/i.test(fences[0][1]) || fences[1][1].trim())
       throw fail('RESULT_FORMAT', 'invalid_json');
+    // Another object outside the envelope may be an example or an unfinished
+    // final answer. Never certify the fenced draft by guessing which one wins.
+    const outside = input.slice(0, fences[0].index) + input.slice(fences[1].index + fences[1][0].length);
+    if (outside.includes('{')) throw fail('RESULT_FORMAT', 'ambiguous_envelope');
     const body = input.slice(fences[0].index + fences[0][0].length, fences[1].index).trim();
     try { value = JSON.parse(body); }
     catch { throw fail('RESULT_FORMAT', 'invalid_json'); }

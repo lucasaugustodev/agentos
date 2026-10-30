@@ -29,3 +29,9 @@ the same acceptance gate.
 These checks prove source packaging and preservation, not behavioral correctness
 or benchmark speed. Original tests, registered CI and independent QA remain
 required. A failed source check preserves the canonical artifacts for repair.
+The text fallback accepts a complete JSON answer or one explicit JSON fence.
+It refuses multiple envelopes and any object outside that fence, including an
+unfinished later answer; it never selects the last balanced example as evidence.
+Workers can use the existing run-bound delivery manifest to recover real output
+without depending on their final prose. Neither packaging path grants acceptance.
+
