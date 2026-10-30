@@ -11,6 +11,9 @@ import {managerAuthoritySql} from '../server/manager-authority.js';
 import {generationTiming} from '../server/generation-timing.js';
 import {managementRoutes} from '../server/management.js';
 import {resolveSupervisedRoute} from '../server/supervised-route.js';
+import {claimPlanning,submitObjective} from '../server/planner.js';
+import {objectiveSchema} from '../server/objective-contracts.js';
+import {chooseChatAccount} from '../server/accounts.js';
 
 const policy={version:2,mode:'exclusive-model',accountId:'agentos-api-11111111-2222-4333-8444-555555555555',
   bridgeId:'agentos:api:11111111-2222-4333-8444-555555555555',model:'deepseek-v4-pro-0813',requestLimit:6,sessionLimit:12};
@@ -112,4 +115,31 @@ it('checks native dependencies for the selected v2 account even on an analytical
   const f=await fixture();await f.install();const parent=await f.task(),child=await f.task();
   await pool.query('INSERT INTO dependencies(task_id,depends_on) VALUES($1,$2)',[child,parent]);
   await expect(f.run(child)).rejects.toThrow('DEPENDENCIES_PENDING');
+});
+it('a pending historical planner retains account, model, fence, context and attempt instead of switching providers',async()=>{
+  await fixture();
+  const request=objectiveSchema.parse({message:'Preserve all original requirements and QA.',project:'fixture',workspaces:['test/base'],mode:'plan',idempotencyKey:randomUUID()});
+  const {objectiveId}=await submitObjective(request);
+  await pool.query("UPDATE planning_runs SET attempt=2,account_id='old-account',model='glm-5.3-flash',context='{\"preserve\":\"original context\"}' WHERE objective_id=$1",[objectiveId]);
+  const fields='id,account_id,model,fence,context,attempt,output';
+  const before=(await pool.query('SELECT '+fields+' FROM planning_runs WHERE objective_id=$1',[objectiveId])).rows[0];
+  expect(await claimPlanning()).toBeNull();
+  expect((await pool.query('SELECT '+fields+' FROM planning_runs WHERE objective_id=$1',[objectiveId])).rows[0]).toEqual(before);
+  expect((await pool.query('SELECT state FROM planning_runs WHERE objective_id=$1',[objectiveId])).rows[0].state).toBe('waiting_quota');
+  await pool.query("UPDATE planning_runs SET output='{\"persisted\":true}',state='queued',next_attempt_at=now() WHERE objective_id=$1",[objectiveId]);
+  const prepared=await claimPlanning();
+  expect(prepared).toMatchObject({id:before.id,model:'glm-5.3-flash',account:{id:'old-account'},output:{persisted:true}});
+});
+it('planner and chat count the shared twelve sessions even if account max_concurrency is larger',async()=>{
+  const f=await fixture();await f.install();
+  await pool.query('UPDATE accounts SET max_concurrency=99,allow_unknown=true WHERE id=$1',[policy.accountId]);
+  const runs=[];for(let i=0;i<12;i++)runs.push(await f.run(await f.task()));
+  await expect(chooseChatAccount()).rejects.toMatchObject({code:'ACCOUNT_UNAVAILABLE'});
+  const request=objectiveSchema.parse({message:'New isolated DeepSeek occurrence.',project:'fixture',workspaces:['test/base'],mode:'plan',idempotencyKey:randomUUID()});
+  const {objectiveId}=await submitObjective(request);
+  expect(await claimPlanning()).toBeNull();
+  await pool.query("UPDATE runs SET state='submitted' WHERE id=$1",[runs[0]]);
+  expect((await chooseChatAccount()).model).toBe(policy.model);
+  await pool.query('UPDATE planning_runs SET next_attempt_at=now() WHERE objective_id=$1',[objectiveId]);
+  expect(await claimPlanning()).toMatchObject({model:policy.model,account:{id:policy.accountId}});
 });

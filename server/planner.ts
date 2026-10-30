@@ -442,6 +442,11 @@ export async function claimPlanning() {
       ? { account: { id: run.account_id }, model: run.model }
       : undefined;
     const exclusive = readModelPolicy();
+    if(exclusive?.version===2 && !run.output && run.attempt>0 &&
+        (run.account_id!==exclusive.accountId || run.model!==exclusive.model)){
+      await db.query("UPDATE planning_runs SET state='waiting_quota',next_attempt_at=now()+interval '30 seconds',error='Planejamento preservado: rota histórica incompatível com a política atual.' WHERE id=$1",[run.id]);
+      return null;
+    }
     if(run.feedback?.planningRecovery&&!exclusive){
       await db.query("UPDATE planning_runs SET state='waiting_quota',next_attempt_at=now()+interval '30 seconds',error='Revisão aguarda política GLM exclusiva.' WHERE id=$1",[run.id]);
       return null;
@@ -476,7 +481,7 @@ export async function claimPlanning() {
           )
         ).rows[0].n,
       );
-      if (n < a.max_concurrency) {
+      if (n < (exclusive?.version===2 ? Math.min(a.max_concurrency,exclusive.sessionLimit) : a.max_concurrency)) {
         selected = { account: a, model };
         break;
       }
