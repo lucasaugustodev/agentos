@@ -43,7 +43,7 @@ async function noEffect(){expect(await current()).toEqual(previous);expect((awai
 it('installs once atomically, preserves the drain, and reconciles concurrent/lost replies without a second event',async()=>{
   const f=await fixture(),maintenance=(await pool.query("SELECT value FROM settings WHERE id='maintenance'")).rows[0].value;
   const goal=randomUUID(),task=randomUUID(),agent=(await pool.query('SELECT id FROM agents LIMIT 1')).rows[0].id;
-  await pool.query("INSERT INTO goals(id,title,description,project,idempotency_key) VALUES($1,'Historical','Preserve QA','fixture',$1::text)",[goal]);
+  await pool.query("INSERT INTO goals(id,title,description,project,idempotency_key) VALUES($1::uuid,'Historical','Preserve QA','fixture',$1::text)",[goal]);
   await pool.query("INSERT INTO tasks(id,goal_id,key,title,description,agent_id,model,criteria) VALUES($1,$2,'qa','Historical QA','Preserve exact acceptance',$3,'glm-5.3-flash','[]')",[task,goal,agent]);
   const original=(await pool.query('SELECT * FROM tasks WHERE id=$1',[task])).rows[0];
   const results=await Promise.all([installOperatorModelPolicy(f.input,f.observe),installOperatorModelPolicy(f.input,f.observe)]);
@@ -90,7 +90,7 @@ it.each(['preparation','planning-preparation','chat','queue'])('refuses addition
     await pool.query("INSERT INTO chat_messages(id,chat_id,role,state) VALUES($1,$2,'assistant','running')",[randomUUID(),id]);
   }
   if(kind==='preparation'){
-    const goal=randomUUID();await pool.query("INSERT INTO goals(id,title,description,project,idempotency_key) VALUES($1,'Fixture','Fixture','fixture',$1::text)",[goal]);
+    const goal=randomUUID();await pool.query("INSERT INTO goals(id,title,description,project,idempotency_key) VALUES($1::uuid,'Fixture','Fixture','fixture',$1::text)",[goal]);
     await pool.query("INSERT INTO workspace_preparations(id,goal_id,workspace,source_workspace,state) VALUES($1,$2,'fixture/copy','fixture/base','failed')",[randomUUID(),goal]);
   }
   if(kind==='queue')await pool.query("INSERT INTO agentos_queue.job(name,state,data) VALUES('runs','active','{}')");

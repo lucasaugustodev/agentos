@@ -123,7 +123,7 @@ it('checks native dependencies for the selected v2 account even on an analytical
 });
 it('a pending historical planner retains account, model, fence, context and attempt instead of switching providers',async()=>{
   await fixture();
-  const request=objectiveSchema.parse({message:'Preserve all original requirements and QA.',project:'fixture',workspaces:['test/base'],mode:'plan',idempotencyKey:randomUUID()});
+  const request=objectiveSchema.parse({message:'Preserve all original requirements and QA.',project:'fixture',workspaces:['fixture/base'],mode:'plan',idempotencyKey:randomUUID()});
   const {objectiveId}=await submitObjective(request);
   await pool.query("UPDATE planning_runs SET attempt=2,account_id='old-account',model='glm-5.3-flash',context='{\"preserve\":\"original context\"}' WHERE objective_id=$1",[objectiveId]);
   const fields='id,account_id,model,fence,context,attempt,output';
@@ -140,7 +140,7 @@ it('planner and chat count the shared twelve sessions even if account max_concur
   await pool.query('UPDATE accounts SET max_concurrency=99,allow_unknown=true WHERE id=$1',[policy.accountId]);
   const runs=[];for(let i=0;i<12;i++)runs.push(await f.run(await f.task()));
   await expect(chooseChatAccount()).rejects.toMatchObject({code:'ACCOUNT_UNAVAILABLE'});
-  const request=objectiveSchema.parse({message:'New isolated DeepSeek occurrence.',project:'fixture',workspaces:['test/base'],mode:'plan',idempotencyKey:randomUUID()});
+  const request=objectiveSchema.parse({message:'New isolated DeepSeek occurrence.',project:'fixture',workspaces:['fixture/base'],mode:'plan',idempotencyKey:randomUUID()});
   const {objectiveId}=await submitObjective(request);
   expect(await claimPlanning()).toBeNull();
   await pool.query("UPDATE runs SET state='submitted' WHERE id=$1",[runs[0]]);
