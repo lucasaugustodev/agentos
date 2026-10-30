@@ -11,7 +11,7 @@ it('reads only protected admission metadata and refuses ambiguous or changing so
   expect(stderr).toContain('Ran 23 tests');
   expect(stderr).toContain('OK');
   const stopped=await promisify(execFile)(process.execPath,[
-    '--test',path.resolve('tests/source-binding-stop.test.mjs'),
+    '--test','--test-reporter=tap',path.resolve('tests/source-binding-stop.test.mjs'),
   ],{timeout:30_000,maxBuffer:1024*1024});
   expect(stopped.stdout).toContain('# tests 8');
   expect(stopped.stdout).toContain('# pass 8');
