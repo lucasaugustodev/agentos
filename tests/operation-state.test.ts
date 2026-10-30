@@ -349,7 +349,7 @@ it('builds the one-line productivity metric with single-cause idle block classif
     maxGlmCalls: 6,
     acceptedDeliveries: 1,
     blockReason: 'nenhum',
-    line: 'trabalho pronto: 1 | sessões ativas: 1/12 | chamadas GLM: ?/6 | entregas aceitas: 1 | bloqueio: nenhum',
+    line: 'trabalho pronto: 1 | sessões ativas: 1/12 | chamadas ao provedor: ?/6 | entregas aceitas: 1 | bloqueio: nenhum',
   });
   expect(
     operationProductivityLine(
@@ -392,7 +392,7 @@ it('never saturates a real gate reading and flags values above the global limit'
   });
   expect(over.glmCalls).toBe(7);
   expect(over.glmOverLimit).toBe(true);
-  expect(over.line).toContain('chamadas GLM: 7/6 (acima do limite!)');
+  expect(over.line).toContain('chamadas ao provedor: 7/6 (acima do limite!)');
   const within = operationProductivityLine(detail, {
     settings: { 'glm-gate': { effectiveActive: 3, limit: 6 } },
     runs: [],
@@ -400,7 +400,7 @@ it('never saturates a real gate reading and flags values above the global limit'
   });
   expect(within.glmCalls).toBe(3);
   expect(within.glmOverLimit).toBe(false);
-  expect(within.line).toContain('chamadas GLM: 3/6');
+  expect(within.line).toContain('chamadas ao provedor: 3/6');
 });
 
 it('counts accepted deliveries as the union of completed requirements across revisions', () => {

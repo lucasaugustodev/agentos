@@ -13,7 +13,7 @@ export function Autonomy({ api }: { api: (url: string) => Promise<any> }) {
     <div className="autonomy-cards">
       <article><strong>{data.finalDeliveries?.length??0}</strong><span>Entregas finais aceitas do objetivo</span></article>
       <article><strong>{q.autonomousPassed} / {q.total}</strong><span>Ensaios autônomos · meta 54 / 60</span></article>
-      <article><strong>{data.gate?.effectiveActive??'?' } / 6</strong><span>Chamadas GLM · {data.gate?.queued??'?'} na fila</span></article>
+      <article><strong>{data.gate?.effectiveActive??'?' } / 6</strong><span>Chamadas ao provedor · {data.gate?.queued??'?'} na fila</span></article>
       <article><strong>{data.active?.length??0}</strong><span>Sessões ativas no sistema</span></article>
     </div>
     <p>{data.status==='schema_pending'?'Atualização de banco pendente.':data.status==='no_verified_delivery'?'Ainda não há entrega final aceita neste objetivo.':data.status==='model_policy_pending'?'Há execuções anteriores à política GLM para reconciliar.':data.status==='observation_failed'?'A leitura falhou; atividade atual não confirmada.':'Observação em andamento.'}</p>
