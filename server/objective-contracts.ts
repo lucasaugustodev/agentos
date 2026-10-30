@@ -1,10 +1,13 @@
 import { z } from 'zod';
 import { taskSchema, criterionSchema, DomainError } from './contracts.js';
 import {isAttemptLocalWriteScope} from './attempt-local-write-scope.js';
+import {requirementContractsSchema,requirementOutcomesCriterionSchema,requirementOutcomeCriterion} from './requirement-outcomes.js';
+import {sourceContractSchema,normalizeSourceContract,combineSourceContracts,sourcePathWithin,type SourceContract} from './source-contract-schema.js';
 const artifactName = z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,100}$/);
 const planCriterion = z.discriminatedUnion('type', [
   criterionSchema.options[0].extend({ name: artifactName }),
   criterionSchema.options[1].extend({ name: artifactName }),
+  requirementOutcomesCriterionSchema,
 ]);
 export const workspaceId = z
   .string()
@@ -25,6 +28,8 @@ export const objectiveSchema = z
     idempotencyKey: z.string().min(8).max(160),
     chatId: z.uuid().optional(),
     planningStrategy: z.enum(['complete', 'incremental']).optional(),
+    sourceContractVersion: z.literal(1).optional(),
+    completionContractVersion:z.literal(2).optional(),
   })
   .refine((r) => r.workspaces.every((w) => w.split('/')[0] === r.project), {
     message: 'Os workspaces devem pertencer ao projeto do objetivo.',
@@ -52,8 +57,12 @@ export const proposedTaskSchema = taskSchema
     sourceTask: z.string().optional(),
     parentKey: z.string().optional(),
     agentRole: z.enum(['coordinator', 'specialist', 'worker', 'validator']).optional(),
+    sourceContract: sourceContractSchema.optional(),
   });
 export const planSchema = z.object({
+  sourceContractVersion: z.literal(1).optional(),
+  completionContractVersion:z.literal(2).optional(),
+  requirementContracts:requirementContractsSchema.optional(),
   title: z.string().min(3).max(200),
   summary: z.string().min(5).max(5000),
   requirements: z
@@ -78,6 +87,46 @@ export const planSchema = z.object({
 });
 export type ProposedPlan = z.infer<typeof planSchema>;
 
+/** Stored plans retain their original contract. New opted-in generations must
+ * supply explicit source obligations, including an explanation for report-only work. */
+export function planGenerationSchema(version?:1,completionVersion?:2){
+  const schema=version===1?planSchema.extend({sourceContractVersion:z.literal(1),
+    tasks:z.array(proposedTaskSchema.extend({sourceContract:sourceContractSchema})).min(1).max(80)}):planSchema;
+  return completionVersion===2?schema.extend({completionContractVersion:z.literal(2),requirementContracts:requirementContractsSchema}):schema;
+}
+
+export function effectivePlanningRequest(request:ObjectiveInput,feedback?:any):ObjectiveInput {
+  return {...request,...(feedback?.sourceContractVersion===1?{sourceContractVersion:1 as const}:{}),
+    ...(feedback?.completionContractVersion===2?{completionContractVersion:2 as const}:{})};
+}
+
+/** The controller binds final outcome criteria. A model cannot replace them by
+ * a local passed boolean or nominate its own smaller set of requirements. */
+export function bindRequirementOutcomeContracts(plan:ProposedPlan,request:ObjectiveInput,previous?:ProposedPlan):ProposedPlan{
+  if(request.completionContractVersion!==2&&previous?.completionContractVersion!==2)return plan;
+  const contracts=requirementContractsSchema.parse(plan.requirementContracts??previous?.requirementContracts);
+  if(JSON.stringify(contracts.map(r=>r.id).sort())!==JSON.stringify(plan.requirements.map(r=>r.id).sort()))
+    throw new DomainError('PLAN_INVALID','Contratos de resultado devem cobrir exatamente todos os requisitos.');
+  // JSONB changes object-key order; compare schema-normalized objects while
+  // preserving every predicate, authority and array element.
+  if(previous?.completionContractVersion===2&&JSON.stringify(contracts)!==JSON.stringify(requirementContractsSchema.parse(previous.requirementContracts)))
+    throw new DomainError('PLAN_INVALID','Observáveis de conclusão anteriores não podem ser reduzidos ou substituídos.');
+  const result=structuredClone(plan);result.completionContractVersion=2;result.requirementContracts=contracts;
+  const finalKeys=new Set(result.tasks.filter(t=>t.stage==='verify'&&!result.tasks.some(other=>other.dependencies.includes(t.key))).map(t=>t.key));
+  for(const task of result.tasks)if(finalKeys.has(task.key)){
+    task.criteria=[...task.criteria.filter(c=>c.type!=='requirement_outcomes'),requirementOutcomeCriterion(contracts.filter(c=>task.covers.includes(c.id)))];
+    task.description+='\nCOMPLETION CONTRACT V2: publish evidence/requirement-outcomes.json with {version:2,outcomes:[{requirementId,status:"completed"|"partial"|"externally_blocked",scope:"full"|"partial",observations:[{observableId,name,digest,inputId?}],dependency?:{key,kind:"external_input"|"external_event",reason}}]}. Cover exactly these requirement IDs: '+JSON.stringify(task.covers)+'. Frozen observable predicates: '+JSON.stringify(contracts.filter(c=>task.covers.includes(c.id)))+'. Each observation references a separate published artifact by basename and exact SHA256, or an authenticated objective_input by inputId/name/digest according to its frozen authority; it must satisfy its declared predicate. Do not use verification.json, candidate.json or this report as product evidence. completed requires full scope and every observable; missing evidence is partial, an unmet declared external prerequisite is externally_blocked with its factual dependency. A blocked key must exist in externalDependencies and its expected canonical input predicate must still be unavailable; do not invent a waiting reason. Local verification.passed certifies the checks actually performed, never converts partial/blocked into completion. Existing acceptance and historical measurements remain evidence with their original scope. A worker-written report or copied external receipt is not authenticated external validation; preserve canonical input receipt provenance and do not claim effects you did not observe.';
+    if(task.criteria.length>30||task.description.length>20000)
+      throw new DomainError('PLAN_INVALID','Contrato de resultados excede o limite da tarefa; simplifique a descrição sem omitir requisitos.');
+  }
+  return result;
+}
+
+export function sourceContractsInclude(actual:SourceContract,expected:SourceContract){
+  return (['required','preserve'] as const).every(field=>expected[field].every(entry=>actual[field]
+    .some(value=>value.path===entry.path&&value.kind===entry.kind&&(!entry.sha256||value.sha256===entry.sha256))));
+}
+
 export function validatePlan(
   plan: ProposedPlan,
   request: ObjectiveInput,
@@ -89,6 +138,18 @@ export function validatePlan(
   const fail = (message: string, detail?: Record<string, unknown>): never => {
     throw Object.assign(new DomainError('PLAN_INVALID', message, 400), { detail });
   };
+  const sourceVersion=request.sourceContractVersion??plan.sourceContractVersion;
+  if(request.completionContractVersion===2&&plan.completionContractVersion!==2)
+    fail('O plano exige o contrato de conclusão v2.',{violation:'REQUIREMENT_OUTCOME_VERSION_REQUIRED'});
+  if(plan.completionContractVersion===2){
+    const contracts=requirementContractsSchema.safeParse(plan.requirementContracts);
+    if(!contracts.success||JSON.stringify(contracts.data.map(r=>r.id).sort())!==JSON.stringify(plan.requirements.map(r=>r.id).sort()))
+      fail('Observáveis ausentes ou cobertura de requisitos inválida.',{violation:'REQUIREMENT_OUTCOME_CONTRACT_REQUIRED'});
+  }
+  if(sourceVersion===1&&plan.sourceContractVersion!==1)
+    fail('O plano precisa declarar o contrato de fonte solicitado.',{violation:'SOURCE_CONTRACT_VERSION_REQUIRED'});
+  if(!sourceVersion&&plan.tasks.some(task=>task.sourceContract))
+    fail('Contrato de fonte sem versão do plano.',{violation:'SOURCE_CONTRACT_VERSION_REQUIRED'});
   if (byKey.size !== plan.tasks.length) fail('Chaves de tarefas duplicadas.');
   if (new Set(plan.requirements.map((r) => r.id)).size !== plan.requirements.length)
     fail('Requisitos duplicados.');
@@ -164,6 +225,26 @@ export function validatePlan(
     );
     if (refusedPath !== undefined)
       fail('Escopo de escrita inválido.', { task: t.key, writePath: refusedPath });
+    if(sourceVersion===1){
+      if(!t.sourceContract)fail('Toda tarefa precisa declarar seus produtos de fonte ou justificar somente evidências.',
+        {violation:'SOURCE_CONTRACT_REQUIRED',task:t.key});
+      const contract=normalizeSourceContract(t.sourceContract);
+      if(t.stage!=='verify')for(const entry of contract.required){
+        if(!t.writePaths.length||!t.writePaths.some(scope=>sourcePathWithin(entry.path,scope)))
+          fail('Produto de fonte fora do escopo explícito de escrita.',{violation:'SOURCE_OUTPUT_OUTSIDE_WRITE_SCOPE',task:t.key,path:entry.path});
+      }
+      if(t.stage==='integrate'||t.stage==='verify'){
+        const contributors=t.stage==='verify'?[byKey.get(t.sourceTask??'')].filter(Boolean):
+          plan.tasks.filter(other=>other.stage==='work'&&ancestry.get(t.key)!.has(other.key));
+        if(contributors.some(other=>!other!.sourceContract))
+          fail('Dependência sem contrato de fonte.',{violation:'SOURCE_CONTRACT_REQUIRED',task:t.key});
+        let expected:SourceContract;
+        try{expected=combineSourceContracts(contributors.map(other=>other!.sourceContract!));}
+        catch{fail('Obrigações de fonte conflitantes.',{violation:'SOURCE_CONTRACT_CONFLICT',task:t.key});}
+        if(!sourceContractsInclude(contract,expected!))
+          fail('Integração e QA precisam conservar as obrigações da candidata.',{violation:'SOURCE_CONTRACT_OBLIGATION_DROPPED',task:t.key});
+      }
+    }
     if (t.stage === 'integrate' && t.sourceTask)
       fail('Integração deve partir da base comum e aplicar os patches.');
     if (
@@ -239,4 +320,10 @@ export function validatePlan(
   for (const req of requiredNow)
     if (!plan.tasks.some((t) => finalValidators.has(t.key) && t.covers.includes(req.id)))
       fail('Requisito sem validação final: ' + req.id);
+  if(plan.completionContractVersion===2)for(const key of finalValidators){
+    const task=byKey.get(key)!,expected=requirementOutcomeCriterion(plan.requirementContracts!.filter(r=>task.covers.includes(r.id)));
+    const gates=task.criteria.filter(c=>c.type==='requirement_outcomes');
+    if(gates.length!==1||JSON.stringify(gates[0])!==JSON.stringify(expected))
+      fail('Validação final sem contrato canônico por requisito.',{violation:'REQUIREMENT_OUTCOME_GATE_REQUIRED',task:key});
+  }
 }

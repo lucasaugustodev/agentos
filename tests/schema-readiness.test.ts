@@ -28,7 +28,9 @@ it('fails closed without proof and does not install anything at boot', async () 
 it('records the complete real migration and performs boot checking in a read-only transaction', async () => {
   const receipt = await prepareSchema();
   expect(receipt.alreadyApplied).toBe(false);
-  expect(receipt.modules).toHaveLength(7);
+  expect(receipt.modules).toHaveLength(migrationModules.length);
+  expect(receipt.modules.map((module:{path:string})=>module.path)).toContain('server/model-policy-sql.ts');
+  expect(receipt.modules.map((module:{path:string})=>module.path)).toContain('server/objective-model-route-schema.ts');
   const client = await pool.connect();
   try {
     await client.query('BEGIN READ ONLY');

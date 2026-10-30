@@ -770,7 +770,7 @@ it.each([
   for (const runId of [implementationRun, f.run]) {
     const id = randomUUID(),
       candidateDigest = hash(
-        runId === f.run && ['stale-candidate', 'rechecking-race', 'admission-supervision', 'prepared-admission'].includes(mode)
+        runId === f.run && ['corrected', 'stale-candidate', 'rechecking-race', 'admission-supervision', 'prepared-admission'].includes(mode)
           ? 'older-candidate'
           : 'current-candidate',
       );

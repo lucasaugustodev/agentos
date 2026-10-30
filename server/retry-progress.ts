@@ -5,6 +5,7 @@ import {providerAvailabilityFailure} from '../shared/recovery.js';
 import {readTaskObligation} from './work-obligations.js';
 import {supervisionGenerationReady} from './supervision-generations.js';
 import {assertStopped} from './continuation.js';
+import {materialVerificationFailure} from './verification-progress.js';
 
 /** These executor codes describe provider transport, not a refuted solution. */
 export function retryAvailabilityFailure(code?:string|null) {
@@ -47,6 +48,8 @@ export async function retryProgressSignature(db: DB, task: any, run: any, candid
 /** Runs under the admission lock. A new supervisor UUID is not evidence of progress. */
 export async function assertRetryProgress(db: DB, task: any, run: any, proof: any) {
   if(run.state==='failed' && retryAvailabilityFailure(run.error_code))return;
+  if(task.execution?.readOnlySource && run.state==='submitted' && await materialVerificationFailure(db,run.id))
+    throw Error('VERIFICATION_REPAIR_REQUIRED');
   if (!proof.candidate?.candidateDigest) return;
   const signature = await retryProgressSignature(db, task, run, proof.candidate.candidateDigest);
   const history = (

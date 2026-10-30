@@ -19,9 +19,20 @@ Request fields:
   reason: why this original input is needed
   requestReplan: true by default; false registers for future plans only
 
-Limits: 64 KiB decoded per file and twenty registered inputs per objective.
+Limits: 64 KiB decoded per file and 32 registered inputs per objective.
+The full objective-input set is therefore at most 2 MiB decoded. Write admission
+and verified reads share this count limit; reads reject an oversized stored set
+instead of silently truncating it. Registration retains previous inputs and
+rejects a new 33rd identity without recording bytes, an event or feedback. Replays
+of an existing identity still return its original receipt at capacity.
 Credential material and credential filenames are rejected. The response contains
 metadata and a receipt digest, not the file contents.
+
+This count does not expand model context or combined runtime transport limits.
+Requirement filtering and the planner's 6000-character per-document and shared
+12000-character content/summary budgets remain unchanged; omitted content stays
+explicit. Workers receive the original bytes within the existing 24 MiB combined
+execution-input transport limit, including any other runtime artifacts.
 
 The registration transaction records the immutable bytes and their provenance
 event. With requestReplan=true it also queues canonical objective feedback.

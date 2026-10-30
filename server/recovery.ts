@@ -1,4 +1,6 @@
 import { pool, tx, lock, event } from './db.js';
+import {routeVerificationPlanningRecovery} from './verification-planning-recovery.js';
+import {sourceContractPlanningFailure} from './source-output-validation.js';
 
 // This loop owns transitions, not semantic judgments. A new worker receives the
 // failed evidence and a narrower repair/replanning assignment, in the same scope.
@@ -31,6 +33,13 @@ export async function recoverStoppedTasks() {
         (c: any) => !c.passed && c.type !== 'review',
       );
       if (source.run_state === 'submitted' && !failedChecks.length) continue;
+      const contractFailure=sourceContractPlanningFailure(source.checks,source.source_run_id);
+      if(source.run_state==='submitted' && (source.execution?.readOnlySource||contractFailure)) {
+        const routed=await routeVerificationPlanningRecovery(db,source.id,source.source_run_id);
+        // Refusing planner ownership (manual, cancellation, lease) never makes
+        // an impossible base contract safe to replay through generic recovery.
+        if(routed||contractFailure)continue;
+      }
       if (
         source.plan_revision &&
         /CONTEXT_TOO_LARGE|INPUTS_TOO_LARGE/.test(source.error_code ?? '') &&

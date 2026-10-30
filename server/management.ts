@@ -129,7 +129,12 @@ export async function installManagement() {
 /** Explicit capability candidates, not credentials or the entire account catalog. */
 export function managementRoutes(task: any, accounts: any[], policy: any) {
   if (!task.execution || !['harness', 'opencode'].includes(task.execution.kind)) return [];
-  const lanes = readModelPolicy() || task.execution.kind === 'opencode' ? ['glm'] :
+  const exclusive=readModelPolicy();
+  // Check the original binding before the candidate loop substitutes accounts.
+  if (exclusive?.version===2 && task.id &&
+      ((task.account_id!=null&&task.account_id!==exclusive.accountId)||
+       (task.model!=null&&task.model!==exclusive.model))) return [];
+  const lanes = exclusive || task.execution.kind === 'opencode' ? ['glm'] :
     [...(policy.glmHarnessEnabled === true ? ['glm'] : []), 'muse', 'luna', 'kimi', 'qwen'];
   const routes: any[] = [];
   for (const lane of lanes)
@@ -887,7 +892,11 @@ export async function recordManagementReviews(frontierReader:typeof readObjectiv
       const frontierObservedAt=olderFrontier ? previousFrontier.observedAt : frontierObservation.observedAt;
       const priorReceipts:string[]=previousFrontier?.knownReceipts ?? [];
       const advanced=frontier.receipts.some(receipt=>!priorReceipts.includes(receipt));
-      const unchangedReviews=advanced ? 0 : (previousFrontier?.unchangedReviews ?? 0)+1;
+      const waitingExternal=frontier.next==='await_external_dependency';
+      const unchangedReviews=advanced ? 0 : (previousFrontier?.unchangedReviews ?? 0)+(waitingExternal?0:1);
+      if(waitingExternal)receipts.push({code:'REQUIREMENTS_EXTERNALLY_BLOCKED',
+        requirementIds:frontier.requirements.filter(r=>r.state==='externally_blocked').map(r=>r.id),
+        reason:'Subentregas aceitas; o resultado ainda aguarda insumo externo canônico. Ausência de novos aceites não pede repetição ou reposição de trabalho.'});
       await db.query('INSERT INTO settings VALUES($1,$2) ON CONFLICT(id) DO UPDATE SET value=excluded.value',
         ['work-frontier:'+r.goal_id,JSON.stringify({...frontier,knownReceipts:[...new Set([...priorReceipts,...frontier.receipts])],
           unchangedReviews,reviewRunId:r.id,observedAt:frontierObservedAt,reviewedAt:new Date().toISOString()})]);
@@ -896,14 +905,14 @@ export async function recordManagementReviews(frontierReader:typeof readObjectiv
       const assessment=valid.success ? valid.data.capacityAssessment ?? [] : [];
       const uncovered=frontier.scopeSummary.filter(scope=>(!focusScope || scope.scope===focusScope) && scope.pending>0 && !assessment.some(a=>
         a.scope===scope.scope && a.taskIds.length>0 && a.taskIds.every(id=>frontier.entries.some(e=>e.taskId===id && e.scope===a.scope))));
-      if(health?.needsPlanning && !(valid.success && valid.data.actions.length) &&
+      if(!waitingExternal && health?.needsPlanning && !(valid.success && valid.data.actions.length) &&
         !proposed?.task_ids?.length && !(Array.isArray(coordination?.backlog?.tasks) && coordination.backlog.tasks.length) && uncovered.length)
         receipts.push({code:'CAPACITY_ASSESSMENT_REQUIRED',scopes:uncovered.map(s=>s.scope),
           reason:'Identifique critérios/insumos e próxima ação por escopo; no_work sem cobertura não encerra a investigação.'});
-      if(!frontier.complete && unchangedReviews>=3)
+      if(!waitingExternal && !frontier.complete && unchangedReviews>=3)
         receipts.push({code:'DELIVERY_STAGNATION',unchangedReviews,
           reason:'Nenhum critério final novo foi aceito; atividade, memória e relatórios auxiliares não reiniciam este contador.'});
-      const stagnant=progress.stagnation.detected || (!frontier.complete && unchangedReviews>=3);
+      const stagnant=!waitingExternal && (progress.stagnation.detected || (!frontier.complete && unchangedReviews>=3));
       if(stagnant || frontierObservation.materialDecision)
         receipts.push({...frontierObservation.followThrough,observedAt:frontierObservation.observedAt});
       if ((stagnant || frontierObservation.materialDecision) && !frontierObservation.followThrough.satisfied) {

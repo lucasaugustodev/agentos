@@ -9,18 +9,22 @@ import {submitObjective,claimPlanning,applyPlannedResult,reconcilePlanning,Plann
 import {accountBridge} from '../server/bridge.js';
 import {config} from '../server/config.js';
 import {planningContractVersion} from '../server/planning-supervision.js';
+import {planningPreparationFixture} from './fixtures/planning-preparation.js';
 vi.mock('../bridge/model-policy.mjs',async original=>({...await original<any>(),readModelPolicy:vi.fn()}));
 const policy={version:1,mode:'glm-only',accountId:'agentos-api-00000000-0000-4000-8000-000000000001',bridgeId:'agentos:api:00000000-0000-4000-8000-000000000001',model:'glm-5.3-flash',requestLimit:6,sessionLimit:12} as const;
 let f:any;
-const item=(id='req-1')=>({requirementId:id,title:'Implementar e comprovar entrega',agentId:'engineering.backend.node',action:'Implementar integralmente o requisito preservando os controles e a candidata aceita.',verification:'Executar os controles originais e todos os negativos na mesma candidata acumulada.'});
+let preparation:ReturnType<typeof planningPreparationFixture>;
+const item=(id='req-1')=>({kind:'delivery' as const,requirementId:id,title:'Implementar e comprovar entrega',agentId:'engineering.backend.node',action:'Implementar integralmente o requisito preservando os controles e a candidata aceita.',verification:'Executar os controles originais e todos os negativos na mesma candidata acumulada.',
+ sourceContract:{version:1 as const,required:[],preserve:[],noSourceReason:'Synthetic planner-recovery fixture exercises controller transitions without implementation source.'}});
 beforeAll(()=>migrate());
 beforeEach(async()=>{
+ preparation=planningPreparationFixture();
  vi.mocked(readModelPolicy).mockReturnValue(policy);
  await pool.query('TRUNCATE goals,agents,accounts,memories,events CASCADE');await seedRegistry();
  await pool.query("UPDATE accounts SET enabled=false");
  await pool.query(`INSERT INTO accounts(id,label,provider,model,models,bridge_id,enabled,allow_unknown,max_concurrency) VALUES($1,'Synthetic GLM','openai',$2,$3,$4,true,true,12)`,[policy.accountId,policy.model,JSON.stringify([policy.model]),policy.bridgeId]);
  config.bridgeHost='fixture';config.remoteExecution=true;
- const input=objectiveSchema.parse({message:'Qualificar a recuperação do planner sem repetir trabalho aceito.',project:'test',workspaces:['test/base'],mode:'execute',requirements:['Corrigir e verificar o primeiro módulo.','Qualificar o segundo módulo integralmente.'],idempotencyKey:randomUUID()});
+ const input=objectiveSchema.parse({message:'Qualificar a recuperação do planner sem repetir trabalho aceito.',project:'test',workspaces:['test/base'],mode:'execute',sourceContractVersion:1,requirements:['Corrigir e verificar o primeiro módulo.','Qualificar o segundo módulo integralmente.'],idempotencyKey:randomUUID()});
  const {objectiveId:goal}=await submitObjective(input),initial=await claimPlanning();
  await applyPlannedResult(initial,compileDelivery(item(),input));
  await acceptAll(goal,1);await reconcilePlanning();const advance=await claimPlanning();
@@ -33,8 +37,15 @@ beforeEach(async()=>{
 afterEach(()=>{vi.restoreAllMocks();config.bridgeHost='';config.remoteExecution=false;});
 afterAll(()=>pool.end());
 async function acceptAll(goal:string,revision:number){
- for(const t of (await pool.query('SELECT id FROM tasks WHERE goal_id=$1 AND plan_revision=$2',[goal,revision])).rows){
-  const run=randomUUID();await pool.query("INSERT INTO runs(id,task_id,attempt,state,fence,runtime,agent_version) VALUES($1,$2,1,'submitted',$3,'harness',1)",[run,t.id,randomUUID()]);
+ for(const t of (await pool.query('SELECT id,execution FROM tasks WHERE goal_id=$1 AND plan_revision=$2',[goal,revision])).rows){
+  const run=randomUUID(),fence=randomUUID(),contextId=randomUUID();
+  await pool.query("INSERT INTO runs(id,task_id,attempt,state,fence,runtime,agent_version) VALUES($1,$2,1,'submitted',$3,'harness',1)",[run,t.id,fence]);
+  // These synthetic acceptances are controller fixtures, but their source owner
+  // still needs the real frozen identity contract before preparing a new lot.
+  await pool.query('INSERT INTO contexts(id,run_id,manifest,content) VALUES($1,$2,$3,$4)',[contextId,run,
+    JSON.stringify({runIdentity:{goalId:goal,taskId:t.id,runId:run,runFence:fence},dependencyArtifacts:[]}),'Synthetic accepted source context']);
+  await pool.query('UPDATE runs SET context_id=$2 WHERE id=$1',[run,contextId]);
+  preparation.registerSource({goalId:goal,taskId:t.id,runId:run,fence,contextId,workspace:t.execution.workspace,sourceWorkspace:t.execution.sourceWorkspace});
   await pool.query("UPDATE tasks SET state='accepted',attempt_count=1 WHERE id=$1",[t.id]);
   await pool.query("INSERT INTO acceptances(id,task_id,run_id,passed,checks,reviewer) VALUES($1,$2,$3,true,'[]','synthetic-controller-test')",[randomUUID(),t.id,run]);
   await pool.query("INSERT INTO artifacts(id,run_id,name,mime,digest,size) VALUES($1,$2,'candidate.json','application/json',$3,2)",[randomUUID(),run,'a'.repeat(64)]);
@@ -42,12 +53,14 @@ async function acceptAll(goal:string,revision:number){
 }
 function bridge(generate:(params:any)=>Promise<any>){
  return vi.spyOn(accountBridge,'request').mockImplementation(async(method,p:any)=>{
-  if(method==='memory.search')return {items:[]};if(method==='worker.workspaces')return [{id:'test/base'}];if(method==='worker.prepare')return {};
+  if(method==='memory.search')return {items:[]};if(method==='worker.workspaces')return [{id:'test/base'}];
+  const inspection=preparation(method,p);if(inspection!==undefined)return inspection;
   if(method==='generate'){expect(p.accountId).toBe(policy.bridgeId);expect(p.model).toBe(policy.model);return generate(p);}
   throw Error('Unexpected RPC: '+method);
  });
 }
-const response=(value:any)=>({message:{content:[{type:'text',text:JSON.stringify(value)}]}});
+const response=(value:any)=>({message:{content:[{type:'text',text:JSON.stringify({...value,
+ requirementContracts:['req-1','req-2'].map(id=>({id,observables:[{id:'result',name:id+'-result.json',authority:'current_run',type:'artifact',description:'Synthetic supervisor fixture product evidence'}]}))})}]}});
 it('reconciles the existing failed identity once, retaining attempts, source/QA proof and accepted tasks',async()=>{
  const before=(await pool.query('SELECT id,state,execution,criteria FROM tasks WHERE goal_id=$1 ORDER BY id',[f.goal])).rows;
  await reconcilePlanning();await reconcilePlanning();
@@ -62,7 +75,11 @@ it('reconciles the existing failed identity once, retaining attempts, source/QA 
 it('lets the GLM supervisor apply a corrected multi-task proposal, then verifies effect only after independent batch acceptance',async()=>{
  await reconcilePlanning();
  bridge(async p=>{
-  const message=JSON.parse(p.messages[0].content);expect(message.eligible).toEqual(['req-2']);expect(message.planningSupervision.mode).toBe('supervised');
+  const message=JSON.parse(p.messages[0].content);
+  // A v1 subdelivery remains accepted, but cannot manufacture a v2 outcome.
+  expect(message.eligible).toEqual(['req-1','req-2']);expect(message.completed).toEqual([]);
+  expect(message.completionMigration.requirementCompletion).toBe('unproven_without_v2_outcomes');
+  expect(message.planningSupervision.mode).toBe('supervised');
   return response({deliveries:[{...item('req-2'),key:'a',writePaths:['src/a.ts']},{...item('req-2'),key:'b',dependsOn:['a'],writePaths:['src/b.ts']}]});
  });
  const engine=new PlanningEngine();await engine.execute(await claimPlanning(),new AbortController().signal);
@@ -85,7 +102,7 @@ it('escalates one invalid supervised proposal to a complete serial fallback, wit
  await reconcilePlanning();let calls=0;
  bridge(async p=>{
   const message=JSON.parse(p.messages[0].content);
-  if(++calls===1)return response({...item('req-1')});
+  if(++calls===1)return response({...item('invented')});
   expect(message.planningSupervision.mode).toBe('serial');expect(message.schema.properties).not.toHaveProperty('deliveries');
   return response(item('req-2'));
  });

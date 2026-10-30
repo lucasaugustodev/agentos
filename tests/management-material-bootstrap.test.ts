@@ -120,7 +120,7 @@ it.each([
   {version:1,bindingState:'needs_revalidation',previousIdentityDigest:'f'.repeat(64),requests:[]},
   {version:1,bindingState:'control_metadata_revalidated',identityDigest:'e'.repeat(64)},
   {version:99,futureRequirement:{mustStay:true}},false,0,'unknown-prior',
-])('preserves every non-null prior without replacing its revalidation or unknown contract',prior=>{
+])('preserves every non-null prior without replacing its revalidation or unknown contract [case %#]',prior=>{
   const f=fixture(),before=structuredClone(prior);
   expect(f.bootstrap(prior)).toBe(prior);expect(prior).toEqual(before);
   expect(bootstrapRequiredMaterialDecision('invalid',null,[],prior)).toBe(prior);

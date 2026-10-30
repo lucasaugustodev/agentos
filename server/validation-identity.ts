@@ -13,7 +13,17 @@ const reviewerIdentity = (reviewer?: string) => reviewer ?? 'deterministic-contr
 const inputsSql = (filter: string) => `
   WITH current_tasks AS MATERIALIZED (
     SELECT t.id,t.goal_id,t.title,t.state,t.criteria,t.attempt_count,t.instruction_revision_id,t.stage,t.covers,
-      r.id run_id,r.fence run_fence,r.attempt run_attempt,r.state run_state
+      r.id run_id,r.fence run_fence,r.attempt run_attempt,r.state run_state,
+      NULLIF(r.instruction_snapshot->'workerValidation','null'::jsonb) worker_validation,
+      CASE WHEN COALESCE(t.execution ? 'sourceContract',false) OR
+        COALESCE((r.instruction_snapshot#>'{task,execution}') ? 'sourceContract',false)
+        THEN jsonb_build_object('schema',r.instruction_snapshot->'schema',
+          'current',jsonb_build_object('kind',t.execution->'kind','workspace',t.execution->'workspace',
+            'sourceWorkspace',t.execution->'sourceWorkspace','contract',t.execution->'sourceContract'),
+          'frozen',jsonb_build_object('kind',r.instruction_snapshot#>'{task,execution,kind}',
+            'workspace',r.instruction_snapshot#>'{task,execution,workspace}',
+            'sourceWorkspace',r.instruction_snapshot#>'{task,execution,sourceWorkspace}',
+            'contract',r.instruction_snapshot#>'{task,execution,sourceContract}')) ELSE NULL END source_output
     FROM tasks t JOIN runs r ON r.task_id=t.id AND r.attempt=t.attempt_count
     WHERE ${filter} AND r.state='submitted'
       AND NOT EXISTS(SELECT 1 FROM runs newer WHERE newer.task_id=t.id AND newer.attempt>r.attempt)
@@ -30,8 +40,18 @@ const inputsSql = (filter: string) => `
       'reviewAttested',$3::boolean,'taskId',m.id,'goalId',m.goal_id,
       'runId',m.run_id,'fence',m.run_fence,'attempt',m.run_attempt,
       'contract',jsonb_build_object('criteria',m.criteria,'revision',m.instruction_revision_id,
-        'stage',m.stage,'covers',m.covers),'artifacts',m.artifacts) validation_input
+        'stage',m.stage,'covers',m.covers),'artifacts',m.artifacts)
+      ||CASE WHEN m.source_output IS NULL THEN '{}'::jsonb ELSE jsonb_build_object('sourceOutput',m.source_output) END
+      ||CASE WHEN m.worker_validation IS NULL THEN '{}'::jsonb ELSE jsonb_build_object('workerValidation',
+        jsonb_build_object('policy',m.worker_validation,'currentPolicy',p.value,'handoff',h.value,
+          'state',j.value->'state','result',j.value->'result','code',j.value->'code',
+          'evidenceState',e.value->'state','evidenceDigest',encode(sha256(convert_to((e.value#>'{body,authority}')::text,'UTF8')),'hex')))
+        END validation_input
     FROM manifests m
+    LEFT JOIN settings p ON m.worker_validation IS NOT NULL AND p.id='worker-validation:'||m.goal_id
+    LEFT JOIN settings h ON m.worker_validation IS NOT NULL AND h.id='worker-validation-handoff:'||m.run_id
+    LEFT JOIN settings j ON j.id='candidate-validation:'||(h.value->>'actionId')
+    LEFT JOIN settings e ON e.id='candidate-validation-evidence:'||(h.value->>'actionId')
   ), keyed AS (
     SELECT v.*,encode(sha256(convert_to(v.validation_input::text,'UTF8')),'hex') validation_key
     FROM validation_inputs v
@@ -75,6 +95,11 @@ export async function readPendingValidations(db: DB = pool, limit = 20) {
   return (await db.query(inputsSql("t.state='submitted'") + `
     SELECT v.id FROM keyed v ${receiptJoin}
     WHERE NOT COALESCE(${receiptMatches},false)
+      AND (v.worker_validation IS NULL
+        OR v.validation_input#>'{workerValidation,currentPolicy}' IS DISTINCT FROM v.worker_validation
+        OR v.validation_input#>>'{workerValidation,handoff,state}'='rejected'
+        OR v.validation_input#>>'{workerValidation,state}' IN('failed','rejected')
+        OR v.validation_input#>>'{workerValidation,evidenceState}'='published')
     ORDER BY v.id LIMIT $4`,
     [validationVersion, reviewerIdentity(), false, limit])).rows as { id: string }[];
 }

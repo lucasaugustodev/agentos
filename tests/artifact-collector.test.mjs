@@ -201,6 +201,9 @@ test('ambiguous, truncated or invalid fenced delivery stays rejected',()=>{
   const raw=JSON.stringify({summary:'result',artifacts:[]});
   for(const answer of [
     '```json\n'+raw+'\n```\n```json\n'+raw+'\n```',
+    'Example: '+raw+'\n```json\n'+raw+'\n```',
+    '```json\n'+raw+'\n```\nThe actual result: '+raw,
+    '```json\n'+raw+'\n```\nThe actual result: {"summary":"unfinished',
     '```json\n'+raw,
     '```json\n{"summary": "incomplete"\n```',
     '```javascript\n'+raw+'\n```',

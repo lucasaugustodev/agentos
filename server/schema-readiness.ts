@@ -10,10 +10,12 @@ export const migrationModules = [
   'server/db.ts',
   'server/workstream-policy.ts',
   'server/workforce-policy.ts',
+  'server/model-policy-sql.ts',
   'server/artifact-recovery-policy.ts',
   'server/cycles/store.ts',
   'server/task-instructions.ts',
   'server/runtime-lookup-indexes.ts',
+  'server/objective-model-route-schema.ts',
 ] as const;
 export const migrationReceiptKey = 'schema:migration-active';
 export const migrationAdvisoryLock = 4280101;

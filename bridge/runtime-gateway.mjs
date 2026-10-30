@@ -1,4 +1,5 @@
 // OpenAI wire adapter for the pinned DSH runtime. Credentials never enter the sandbox.
+import { workerModelSettings } from './operator-model-profile.mjs';
 export function toGeneration(body, route) {
   const messages = [],
     system = [];
@@ -25,7 +26,7 @@ export function toGeneration(body, route) {
       });
     } else if (m.role === 'assistant') {
       const content = text ? [{ type: 'text', text }] : [];
-      if (typeof m.reasoning_content === 'string' && m.reasoning_content)
+      if (typeof m.reasoning_content === 'string')
         content.unshift({type:'thinking',thinking:m.reasoning_content});
       for (const t of m.tool_calls ?? [])
         content.push({
@@ -64,7 +65,7 @@ export function toGeneration(body, route) {
       description: t.function.description,
       parameters: t.function.parameters,
     })),
-    maxOutputTokens: /^glm[-.]/i.test(route.model ?? '') ? 32768 : 8192,
+    maxOutputTokens: workerModelSettings(route.accountId, route.model).maxOutputTokens,
   };
 }
 export function completion(message, model) {
@@ -81,7 +82,7 @@ export function completion(message, model) {
       function: { name: b.name, arguments: JSON.stringify(b.arguments) },
     }));
   const reasoning = message.content.filter(b=>b.type==='thinking').map(b=>b.thinking).join('');
-  const delta = { role: 'assistant', content, ...(reasoning ? {reasoning_content:reasoning} : {}), ...(tool_calls.length ? { tool_calls } : {}) };
+  const delta = { role: 'assistant', content, ...(message.content.some(b=>b.type==='thinking') ? {reasoning_content:reasoning} : {}), ...(tool_calls.length ? { tool_calls } : {}) };
   const finish_reason = tool_calls.length
     ? 'tool_calls'
     : message.stopReason === 'length'

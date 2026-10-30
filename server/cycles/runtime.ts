@@ -10,6 +10,7 @@ import { rankContext } from '../context-rank.js';
 import { importRecall } from '../recall.js';
 import { actionProfiles, bitrixSnapshot, clean } from './integrations.js';
 import { cycleEvent } from './store.js';
+import { isRegisteredValidation, confirmRegisteredValidationStop } from './validation-action.js';
 
 export async function readCycleArtifact(id: string) {
   const a = (await pool.query('SELECT * FROM cycle_artifacts WHERE id=$1', [id])).rows[0];
@@ -249,6 +250,7 @@ export async function runCycleAction(
   const profile = (await actionProfiles())[action];
   if (!profile || !profile.projects.includes(o.definition.project))
     throw new DomainError('ACTION_UNAVAILABLE', 'Ação não cadastrada para este projeto.');
+  const registeredValidation = isRegisteredValidation(action, profile);
   if (profile.effect === 'destructive') {
     const approvals = (
       await pool.query(
@@ -299,16 +301,29 @@ export async function runCycleAction(
     return null;
   });
   if (previous?.state === 'completed') {
+    if (registeredValidation) {
+      // A cached legacy receipt without this attempt-bound terminal contract
+      // cannot silently authorize either success or another validation.
+      await confirmRegisteredValidationStop(previous.receipt?.validationAttemptId, previous.receipt);
+    }
     if (previous.input_hash !== fingerprint && profile.effect !== 'read')
       throw new DomainError('ACTION_CHANGED', 'A entrada mudou após a execução.');
     if (previous.input_hash === fingerprint) return previous.receipt;
   }
-  if (previous && previous.state !== 'rejected' && profile.effect !== 'read')
+  if (previous && ((registeredValidation && previous.state !== 'completed') ||
+      (previous.state !== 'rejected' && profile.effect !== 'read')))
     throw new DomainError(
       'STOP_UNCONFIRMED',
       'Ação externa enviada sem confirmação. Reconcilie o recibo antes de repetir.',
     );
-  if (previous)
+  if (previous && registeredValidation) {
+    const claimed = await pool.query(
+      "UPDATE cycle_action_receipts SET state='started',input_hash=$2,receipt=NULL,updated_at=now() WHERE action_key=$1 AND state='completed' AND input_hash=$3 AND receipt=$4::jsonb RETURNING action_key",
+      [actionKey, fingerprint, previous.input_hash, JSON.stringify(previous.receipt)],
+    );
+    if (claimed.rowCount !== 1)
+      throw new DomainError('STOP_UNCONFIRMED', 'Outra retomada já assumiu esta validação; reconcilie antes de repetir.');
+  } else if (previous)
     await pool.query(
       "UPDATE cycle_action_receipts SET state='started',input_hash=$2,receipt=NULL,updated_at=now() WHERE action_key=$1",
       [actionKey, fingerprint],
@@ -322,7 +337,15 @@ export async function runCycleAction(
     });
     let stdout = '',
       stderr = '';
-    const timer = setTimeout(() => child.kill('SIGTERM'), (profile.timeoutSeconds ?? 120) * 1000);
+    const timer = setTimeout(() => {
+      child.kill('SIGTERM');
+      if (registeredValidation)
+        reject(new DomainError('STOP_UNCONFIRMED', 'O prazo do executor expirou; término ainda não confirmado.'));
+    }, (profile.timeoutSeconds ?? 120) * 1000);
+    if (registeredValidation) child.stdin.once('error', () => {
+      clearTimeout(timer);
+      reject(new DomainError('STOP_UNCONFIRMED', 'A comunicação com o validador foi interrompida.'));
+    });
     child.stdin.end(JSON.stringify(payload));
     child.stdout.on('data', (b) => {
       stdout += b.toString();
@@ -335,7 +358,7 @@ export async function runCycleAction(
       clearTimeout(timer);
       reject(
         new DomainError(
-          profile.effect === 'read' ? 'ACTION_FAILED' : 'STOP_UNCONFIRMED',
+          profile.effect === 'read' && !registeredValidation ? 'ACTION_FAILED' : 'STOP_UNCONFIRMED',
           'O executor não confirmou a ação.',
         ),
       );
@@ -346,7 +369,7 @@ export async function runCycleAction(
         void onEvent('ACTION_DIAGNOSTIC', { code, diagnostic: clean(stderr) });
         reject(
           new DomainError(
-            profile.effect === 'read' ? 'ACTION_FAILED' : 'STOP_UNCONFIRMED',
+            profile.effect === 'read' && !registeredValidation ? 'ACTION_FAILED' : 'STOP_UNCONFIRMED',
             'Ação sem resultado confirmado; consulte o diagnóstico.',
           ),
         );
@@ -354,6 +377,11 @@ export async function runCycleAction(
       }
       try {
         const r = JSON.parse(stdout);
+        if (registeredValidation) {
+          const stop = await confirmRegisteredValidationStop(a.id, r);
+          resolve({ ...clean(r), validationAttemptId: a.id, validationStopProof: stop });
+          return;
+        }
         if (r.ok === false && typeof r.code === 'string') {
           if (r.effect === 'none')
             await pool.query(
@@ -368,16 +396,34 @@ export async function runCycleAction(
       } catch {
         reject(
           new DomainError(
-            profile.effect === 'read' ? 'RESULT_FORMAT' : 'STOP_UNCONFIRMED',
+            profile.effect === 'read' && !registeredValidation ? 'RESULT_FORMAT' : 'STOP_UNCONFIRMED',
             'Resultado estruturado inválido.',
           ),
         );
       }
     });
+  }).catch(async (error) => {
+    if (!registeredValidation) throw error;
+    // The durable started receipt already blocks a second invocation, even if
+    // this update fails during a database outage. No absent unit can clear a
+    // lost dispatcher's ownership: it might still start that unit afterwards.
+    try {
+      await pool.query(
+        "UPDATE cycle_action_receipts SET state='uncertain',receipt=$2,updated_at=now() WHERE action_key=$1 AND state='started'",
+        [actionKey, JSON.stringify({ code: 'STOP_UNCONFIRMED', attemptId: a.id })],
+      );
+    } catch { /* Keep the original started ownership; do not convert to retry. */ }
+    throw new DomainError('STOP_UNCONFIRMED', 'Validação sem término confirmado. Reconcilie o executor antes de repetir.');
   });
-  await pool.query(
-    "UPDATE cycle_action_receipts SET state='completed',receipt=$2,updated_at=now() WHERE action_key=$1",
-    [actionKey, JSON.stringify(result)],
-  );
+  try {
+    await pool.query(
+      "UPDATE cycle_action_receipts SET state='completed',receipt=$2,updated_at=now() WHERE action_key=$1",
+      [actionKey, JSON.stringify(result)],
+    );
+  } catch (error) {
+    if (registeredValidation)
+      throw new DomainError('STOP_UNCONFIRMED', 'O término foi observado, mas seu recibo não foi persistido. Reconcilie antes de repetir.');
+    throw error;
+  }
   return result;
 }

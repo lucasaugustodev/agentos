@@ -1,7 +1,9 @@
+import { readModelPolicy } from '../bridge/model-policy.mjs';
 import {prepareCandidateValidationEvidence,bindCandidateValidationEvidence} from './candidate-validation-evidence.js';
 import {readManagerCases,projectManagerCases} from './manager-material-consumption.js';
 import {readLiveFailureReview} from './manager-live-failure.js';
 import {requestPlanRecoverySupervision} from './plan-recovery-supervision.js';
+import {routeVerificationPlanningRecovery} from './verification-planning-recovery.js';
 import {readContextCaseBindings,contextCaseBindingsMatch,selectContextDeferrals,addContextDeferral,clearContextDeferral} from './manager-context-deferral.js';
 import {managerInstructions} from './manager-instructions.js';
 import {installManagerContextSections,persistManagerContextSections} from './manager-context-section-store.js';
@@ -35,6 +37,7 @@ import { requestProgressReplan, hasUnchangedBlockedRetry } from './retry-progres
 import { backlogInstruction } from './backlog.js';
 import { glmRepairInstruction, glmRepairCriteria, glmRepairHandoff } from './glm-repair.js';
 import { protocolReportDiagnostic } from '../bridge/protocol-report-contract.mjs';
+import {migrationTableLocks} from './migration-table-locks.js';
 import { managerContextVersion, projectManagerReview } from './manager-context.js';
 import { selectManagerFocus,selectManagerCaseWindow,managerFocusServiceHistory } from './manager-focus.js';
 import {bootstrapRequiredMaterialDecision} from './management-material-decision.js';
@@ -90,7 +93,7 @@ Use capacidade disponível para subproblemas diferentes que desbloqueiam a entre
 
 export async function installSupervision() {
   await installManagerContextSections(pool);
-  await pool.query(`CREATE TABLE IF NOT EXISTS supervision_cases(
+  await pool.query(migrationTableLocks(['accounts','goals','outbox','runs','settings','supervision_cases','supervisor_jobs','tasks'])+`CREATE TABLE IF NOT EXISTS supervision_cases(
     id uuid PRIMARY KEY,goal_id uuid REFERENCES goals(id),task_id uuid REFERENCES tasks(id),source_run_id uuid REFERENCES runs(id),
     state text NOT NULL DEFAULT 'open',reason text NOT NULL,evidence jsonb NOT NULL,decision jsonb,decision_run_id uuid REFERENCES runs(id),
     support_task_id uuid REFERENCES tasks(id),applied_attempt integer,created_at timestamptz DEFAULT now(),updated_at timestamptz DEFAULT now(),
@@ -322,6 +325,7 @@ export async function detectSupervisionCases(inspect=inspectStopped) {
       const stopped = runs.filter((r) => ['failed', 'submitted'].includes(r.state));
       if (!stopped.length) continue;
       const latest = stopped[0];
+      if(latest.state==='submitted' && await routeVerificationPlanningRecovery(db,t.id,latest.id))continue;
       if (/AUTH|QUOTA|CORRUPT|DIGEST|INVALID_WRITE|CANCEL/.test(latest.error_code ?? '')) continue;
       if (latest.error_code==='DISK_CAPACITY' && await hasStoragePreflightReceipt(db,latest.id,t.id)) continue;
       if (
@@ -1345,9 +1349,10 @@ export async function applySupervisionDecisions(inspect = inspectStopped) {
             const policy = (
               await db.query('SELECT value FROM settings WHERE id=$1', ['workforce:' + c.goal_id])
             ).rows[0].value;
+            const exclusive=readModelPolicy();
             const account =
               a.lane === 'glm'
-                ? policy.glmAccountId
+                ? exclusive?.accountId??policy.glmAccountId
                 : (
                     await db.query(
                       "SELECT id FROM accounts WHERE provider='muse' AND enabled AND id=ANY($1::text[]) ORDER BY id LIMIT 1",
@@ -1454,7 +1459,7 @@ export async function applySupervisionDecisions(inspect = inspectStopped) {
                 description,
                 native ? 'qa.backend' : 'engineering.backend.node',
                 account,
-                native ? 'glm-5.3-flash' : 'muse-spark-1.3',
+                native ? exclusive?.model??'glm-5.3-flash' : 'muse-spark-1.3',
                 JSON.stringify(['remote-slot', 'workspace:' + workspace]),
                 JSON.stringify(criteria),
                 JSON.stringify(execution),

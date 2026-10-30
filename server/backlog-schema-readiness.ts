@@ -24,10 +24,12 @@ export const backlogMigrationModules = [
   'server/planning-events.ts', 'server/supervision.ts',
   'server/manager-context-section-store.ts', 'server/manager-context-sections.ts',
   'server/management.ts', 'server/delivery-transitions.ts',
+  'server/manager-authority.ts', 'server/model-policy-sql.ts',
     'server/candidate-validation.ts', 'server/candidate-validation-evidence.ts', 'server/published-rebase.ts',
   'server/verification-source-binding.ts', 'scripts/agentos-verification-source-binding.py',
   'server/followups.ts', 'server/config.ts',
   'server/task-execution-metadata.ts',
+  'server/migration-table-locks.ts',
 ] as const;
 const installerNames = ['backlog', 'planning-demand', 'planning-events', 'supervision', 'management', 'followups'];
 const implementationModule = 'server/backlog-schema-readiness.ts';

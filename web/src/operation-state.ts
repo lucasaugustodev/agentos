@@ -346,6 +346,6 @@ export function operationProductivityLine(detail: Row, data: Row) {
     maxGlmCalls: 6,
     acceptedDeliveries,
     blockReason,
-    line: `trabalho pronto: ${ready} | sessões ativas: ${activeSessions}/12 | chamadas GLM: ${glmCalls === null ? '?/6' : `${glmCalls}/6${glmOverLimit ? ' (acima do limite!)' : ''}`} | entregas aceitas: ${acceptedDeliveries} | bloqueio: ${blockReason}`,
+    line: `trabalho pronto: ${ready} | sessões ativas: ${activeSessions}/12 | chamadas ao provedor: ${glmCalls === null ? '?/6' : `${glmCalls}/6${glmOverLimit ? ' (acima do limite!)' : ''}`} | entregas aceitas: ${acceptedDeliveries} | bloqueio: ${blockReason}`,
   };
 }

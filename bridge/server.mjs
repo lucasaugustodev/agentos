@@ -1,5 +1,5 @@
 import { assertModelRoute, readModelPolicy } from './model-policy.mjs';
-import { glmModelProfile } from './glm-model-profile.mjs';
+import { operatorModelProfile } from './operator-model-profile.mjs';
 // Runs on agentos-server, through a private SSH stdio channel. No HTTP listener.
 // Production credentials are read-only. New accounts live only in DATA.
 import {
@@ -185,6 +185,8 @@ async function state() {
   return { accounts: [...inherited, ...additional], checkedAt: new Date().toISOString() };
 }
 function safeError(error) {
+  const inspectionError=workspaceInspectionError(error);
+  if(inspectionError)return inspectionError;
   if (
     [
       'GUIDANCE_IDENTITY_INVALID','GUIDANCE_IDENTITY_MISMATCH','GUIDANCE_REQUEST_INVALID','GUIDANCE_ACTION_CHANGED','GUIDANCE_RUNTIME_CLOSED','GUIDANCE_FRAME_TOO_LARGE','GUIDANCE_FAILED','GUIDANCE_OUTCOME_UNCONFIRMED','GUIDANCE_CHANNEL_UNAVAILABLE','GUIDANCE_RECEIPT_INVALID',
@@ -390,24 +392,23 @@ async function generate(params, signal, emit, admission) {
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
       contextWindow: 128000,
       maxTokens: 8192,
-      ...glmModelProfile(account.id, params.model),
+      ...operatorModelProfile(account.id, params.model),
     };
     auth = { apiKey: credential.key };
     provider = { streamSimple: (m, c, o) => openAICompletionsApi().streamSimple(m, c, o) };
-    // Use the inspected transport on the verified GLM route, even when the
+    // Use the inspected transport on the operator-selected API route, even when the
     // optional SDK is installed. Other providers retain their existing path.
-    if (glmModelProfile(account.id,params.model).reasoning)
+    if (operatorModelProfile(account.id,params.model).reasoning)
       provider = openAICompletionsFallback();
   }
+  // One identity before admission binds the gate and transport observations.
+  const requestId = typeof params.requestId === 'string' &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(params.requestId)
+    ? params.requestId : randomUUID();
   return withAccountRequestGate(
-    params,
+    {...params,requestId},
     signal,
     async (requestSignal) => {
-      // The worker announces this identity before admission. Direct generate
-      // calls get a private identity too; provider payloads cannot replace it.
-      const requestId = typeof params.requestId === 'string' &&
-        /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(params.requestId)
-        ? params.requestId : randomUUID();
       const stream = provider.streamSimple(
         model,
         { systemPrompt: params.system ?? '', messages: params.messages, tools: params.tools ?? [] },
@@ -417,6 +418,7 @@ async function generate(params, signal, emit, admission) {
           reasoning: params.reasoning ?? 'low',
           transport: 'sse',
           maxTokens: params.maxOutputTokens ?? 4096,
+          onTelemetry: (kind,payload) => emit(kind,{...payload,requestId}),
           onProgress: progress => emit('MODEL_STREAM_PROGRESS', {
             requestId,
             characters: progress.characters,
@@ -747,6 +749,8 @@ async function dispatch(method, params, signal, emit) {
     return contextService(method, params);
   if (method === 'worker.workspaces') return workerWorkspaces();
   if (method === 'worker.prepare') return workspaceOperation({ ...params, action: 'prepare' });
+  if (['worker.inspectGeneration','worker.inspectPlanningSource','worker.inspectPreparation','worker.inspectSourceBinding','worker.inspectRetrySourceBinding'].includes(method))
+    return workspaceInspection(method,params);
   if (method === 'worker.checkComposition') return workspaceOperation({ ...params, action: 'compose', dryRun: true });
   if (method === 'worker.storage') return workspaceOperation({ action: 'capacity' });
   if (method === 'worker.execute') {
@@ -842,4 +846,5 @@ process.stdin.on('end', () => {
   setTimeout(() => process.exit(0), 2000).unref();
 });
 import { workspaceOperation } from './workspaces.mjs';
+import { workspaceInspection,workspaceInspectionError } from './workspace-inspection.mjs';
 import { contextService } from './context-services.mjs';

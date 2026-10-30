@@ -1,4 +1,5 @@
 import { chooseWorkforceRoute, workforceCapacityReason } from './workforce-policy.js';
+import {readModelPolicy,modelRouteAllowed} from '../bridge/model-policy.mjs';
 
 export type SupervisedRoute = { accountId: string; model: string };
 
@@ -8,6 +9,11 @@ const glmModel = /^glm[-.]/i;
 
 /** Validate an explicit supervisor route using the same account and workforce policy as admission. */
 export function resolveSupervisedRoute(task: any, route: SupervisedRoute, policy: any, accounts: any[], activeRuns: any[], now = Date.now()) {
+  const exclusive=readModelPolicy();
+  if (exclusive?.version===2 && task?.id &&
+      ((task.account_id!=null&&task.account_id!==exclusive.accountId)||
+       (task.model!=null&&task.model!==exclusive.model)))
+    return {ok:false as const,code:'SUPERVISION_ROUTE_UNAVAILABLE'};
   if (!route || typeof route.accountId !== 'string' || typeof route.model !== 'string' ||
       task?.stage === 'coordinate' || task?.execution?.kind !== 'harness' ||
       task?.execution?.readOnlySource === true || !['work', 'integrate'].includes(task?.stage) ||
@@ -21,7 +27,9 @@ export function resolveSupervisedRoute(task: any, route: SupervisedRoute, policy
   // Derive the lane only from the requested account/model identity. It is not
   // an additional model-controlled permission and remains subject to policy.
   let lane: string | undefined;
-  if (glmModel.test(route.model) && account.id === policy.glmAccountId) lane = 'glm';
+  if (exclusive?.version===2 && account.bridge_id===exclusive.bridgeId &&
+      modelRouteAllowed(account.id,route.model,exclusive)) lane='glm';
+  else if (glmModel.test(route.model) && account.id === policy.glmAccountId) lane = 'glm';
   else if (lunaModel.test(route.model) && account.provider === 'codex') lane = 'luna';
   else if (['kimi', 'qwen', 'muse'].includes(account.provider)) lane = account.provider;
   else if (account.provider === 'agy' && task.execution.kind !== 'harness') lane = 'agy';

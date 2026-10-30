@@ -744,6 +744,8 @@ it('serializes publication swap and pending write with the rollout lock in an is
     { timeout: 15000 },
   );
   expect(JSON.parse(stdout)).toEqual({
+    invalidOriginRejected: true,
+    originChecked: true,
     lockedBeforeSwap: true,
     lockedThroughPending: true,
     publishedAfterRelease: true,

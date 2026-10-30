@@ -6,6 +6,7 @@ import { pool, migrate, lock, tx } from '../server/db.js';
 import { schedule,failRun } from '../server/service.js';
 import {quotaFor} from '../server/accounts.js';
 import {assertRetryProgress} from '../server/retry-progress.js';
+import {assertVerificationAdmissionProgress} from '../server/verification-progress.js';
 import {providerAvailabilityFailure} from '../shared/recovery.js';
 import {requestRecoveryReview} from '../server/recovery-supervision.js';
 import { hash } from '../server/memory.js';
@@ -352,7 +353,7 @@ async function candidateArtifact(
   );
   return ref;
 }
-async function verificationFixture() {
+async function verificationFixture(inputs:any[] = []) {
   const f = await fixture();
   await pool.query("UPDATE tasks SET state='accepted' WHERE id=$1", [f.task]);
   await pool.query(
@@ -367,6 +368,7 @@ async function verificationFixture() {
       readOnlySource: true,
       workspace: 'continuation-test/qa',
       sourceWorkspace: 'continuation-test/fix',
+      ...(inputs.length?{inputs}:{}),
     }),
   ]);
   const qaRun = randomUUID();
@@ -537,10 +539,10 @@ async function newerCandidate(
   const candidate = await candidateArtifact(runId, digest, hash('baseline'));
   return { runId, candidate };
 }
-it('an older QA cannot reopen a newer accepted implementation, even with unchanged candidate bytes', async () => {
+it('a new implementation attempt with unchanged candidate and inputs cannot replay material QA', async () => {
   const f = await verificationFixture();
   const current = await newerCandidate(f, hash('candidate-a'));
-  expect(await routeVerificationRepair(f.child)).toBeNull();
+  await expect(routeVerificationRepair(f.child)).rejects.toThrow('VERIFICATION_NO_PROGRESS');
   expect(
     (await pool.query('SELECT state,attempt_count FROM tasks WHERE id=$1', [f.task])).rows[0],
   ).toEqual({ state: 'accepted', attempt_count: 4 });
@@ -548,10 +550,9 @@ it('an older QA cannot reopen a newer accepted implementation, even with unchang
     await pool.query('SELECT state,execution,max_attempts FROM tasks WHERE id=$1', [f.child])
   ).rows[0];
   expect(qa).toMatchObject({
-    state: 'blocked_dependencies',
+    state: 'submitted',
     execution: {
-      workspace: 'continuation-test/oqa-' + f.qaRun,
-      verificationRecheck: { reason: 'SOURCE_ATTEMPT_CHANGED', targetRunId: current.runId },
+      workspace: 'continuation-test/qa',
     },
   });
   expect(
@@ -600,23 +601,74 @@ it('deduplicates parallel negative QA routes by source run, target and candidate
     candidateArtifact: { id: f.targetCandidate.id, digest: f.targetCandidate.digest },
   });
 });
-it('a consumed legacy QA receipt schedules a new QA rather than reopening corrected integration', async () => {
+it('a consumed legacy QA receipt cannot replay the same candidate and inputs', async () => {
   const f = await verificationFixture();
   await pool.query(
     "INSERT INTO events(kind,entity_id,payload) VALUES('VERIFICATION_REPAIR_ROUTED',$1,$2)",
     [f.child, JSON.stringify({ sourceRunId: f.qaRun, targetTaskId: f.task })],
   );
-  expect(await routeVerificationRepair(f.child)).toBeNull();
+  await expect(routeVerificationRepair(f.child)).rejects.toThrow('VERIFICATION_NO_PROGRESS');
   expect(
     (await pool.query("SELECT 1 FROM events WHERE kind='VERIFICATION_REPAIR_ROUTED'")).rowCount,
   ).toBe(1);
   expect(
     (await pool.query("SELECT 1 FROM events WHERE kind='VERIFICATION_RECHECK_QUEUED'")).rowCount,
-  ).toBe(1);
-  await expect(routeVerificationRepair(f.child)).rejects.toThrow('TASK_CHANGED');
+  ).toBe(0);
+  await expect(routeVerificationRepair(f.child)).rejects.toThrow('VERIFICATION_NO_PROGRESS');
   expect(
     (await pool.query("SELECT 1 FROM events WHERE kind='VERIFICATION_RECHECK_QUEUED'")).rowCount,
-  ).toBe(1);
+  ).toBe(0);
+});
+it.each(['candidate','input'])('a consumed QA may recheck after changed %s content',async kind=>{
+  const f=await verificationFixture();
+  await pool.query("INSERT INTO events(kind,entity_id,payload) VALUES('VERIFICATION_REPAIR_ROUTED',$1,$2)",
+    [f.child,JSON.stringify({sourceRunId:f.qaRun,targetTaskId:f.task})]);
+  if(kind==='candidate')await newerCandidate(f);
+  else await pool.query("UPDATE tasks SET execution=execution||$2::jsonb WHERE id=$1",[f.child,JSON.stringify({inputs:[{
+    id:randomUUID(),name:'counterexample.json',digest:hash('new evidence'),base64:Buffer.from('new evidence').toString('base64')}]})]);
+  expect(await routeVerificationRepair(f.child)).toBeNull();
+  expect((await pool.query("SELECT 1 FROM events WHERE kind='VERIFICATION_RECHECK_QUEUED'")).rowCount).toBe(1);
+});
+it.each(['removed','new_uuid'])('input %s cannot disguise an unchanged material QA',async kind=>{
+  const input={id:randomUUID(),name:'counterexample.json',digest:hash('same evidence'),base64:Buffer.from('same evidence').toString('base64')};
+  const f=await verificationFixture([input]);
+  await pool.query("INSERT INTO events(kind,entity_id,payload) VALUES('VERIFICATION_REPAIR_ROUTED',$1,$2)",
+    [f.child,JSON.stringify({sourceRunId:f.qaRun,targetTaskId:f.task})]);
+  await pool.query("UPDATE tasks SET execution=jsonb_set(execution,'{inputs}',$2::jsonb) WHERE id=$1",
+    [f.child,JSON.stringify(kind==='removed'?[]:[{...input,id:randomUUID()}])]);
+  await expect(routeVerificationRepair(f.child)).rejects.toThrow('VERIFICATION_NO_PROGRESS');
+  expect((await pool.query("SELECT 1 FROM events WHERE kind='VERIFICATION_RECHECK_QUEUED'")).rowCount).toBe(0);
+});
+it('a submitted material QA cannot enter the generic runtime retry path',async()=>{
+  const f=await verificationFixture();
+  const run=(await pool.query('SELECT fence FROM runs WHERE id=$1',[f.qaRun])).rows[0];
+  const proof={...f.proof,runId:f.qaRun,workspace:'continuation-test/qa',
+    process:{...f.proof.process,unit:'agentos-run-'+f.qaRun}};
+  await expect(resumeFailedHarness(f.qaRun,run.fence,proof)).rejects.toThrow('VERIFICATION_REPAIR_REQUIRED');
+  expect((await pool.query('SELECT attempt_count FROM tasks WHERE id=$1',[f.child])).rows[0].attempt_count).toBe(1);
+  const task=(await pool.query('SELECT * FROM tasks WHERE id=$1',[f.child])).rows[0];
+  const previous=(await pool.query('SELECT * FROM runs WHERE id=$1',[f.qaRun])).rows[0];
+  await expect(assertRetryProgress(pool,task,previous,proof)).rejects.toThrow('VERIFICATION_REPAIR_REQUIRED');
+  await expect(assertRetryProgress(pool,task,{...previous,state:'failed',error_code:'MODEL_TRANSPORT_ERROR'},proof)).resolves.toBeUndefined();
+});
+it('scheduler admission does not replay a failed QA after an unchanged implementation is accepted again',async()=>{
+  const f=await verificationFixture();await newerCandidate(f,hash('candidate-a'));
+  await pool.query("UPDATE tasks SET state='blocked_dependencies' WHERE id=$1",[f.child]);
+  expect(await schedule()).toEqual([]);
+  expect((await pool.query('SELECT state,attempt_count FROM tasks WHERE id=$1',[f.child])).rows[0])
+    .toEqual({state:'recovery_blocked',attempt_count:1});
+  expect((await pool.query("SELECT payload->>'code' code FROM events WHERE kind='RUN_ADMISSION_BLOCKED' AND entity_id=$1",[f.child])).rows)
+    .toEqual([{code:'VERIFICATION_NO_PROGRESS'}]);
+  expect((await pool.query('SELECT 1 FROM runs WHERE task_id=$1',[f.child])).rowCount).toBe(1);
+});
+it.each(['candidate','input','transport'])('admission preserves a %s opportunity after material failure',async kind=>{
+  const f=await verificationFixture();
+  if(kind==='candidate')await newerCandidate(f);
+  if(kind==='input')await pool.query("UPDATE tasks SET execution=execution||$2::jsonb WHERE id=$1",[f.child,JSON.stringify({inputs:[{
+    id:randomUUID(),name:'counterexample.json',digest:hash('new evidence'),base64:Buffer.from('new evidence').toString('base64')}]})]);
+  if(kind==='transport')await pool.query("UPDATE runs SET state='failed',error_code='MODEL_TRANSPORT_ERROR' WHERE id=$1",[f.qaRun]);
+  const task=(await pool.query('SELECT * FROM tasks WHERE id=$1',[f.child])).rows[0];
+  await expect(tx(async db=>{await lock(db);await assertVerificationAdmissionProgress(db,task);})).resolves.toBeUndefined();
 });
 it('a consumed QA does not send the same correction twice while implementation is still waiting', async () => {
   const f = await verificationFixture();

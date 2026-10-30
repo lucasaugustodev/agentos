@@ -3,7 +3,8 @@ import { randomUUID, timingSafeEqual } from 'node:crypto';
 import { mkdir, writeFile, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { pool, tx, event, lock, type DB } from './db.js';
-import { objectiveFrontierNodes, projectWorkFrontier } from './work-frontier.js';
+import { objectiveFrontierNodes, projectWorkFrontier, readObjectiveFrontier } from './work-frontier.js';
+import {verifyRequirementOutcomes,readOutcomeInputs,type RequirementOutcomeProof} from './requirement-outcomes.js';
 import { config } from './config.js';
 import {
   goalSchema,
@@ -22,6 +23,9 @@ import { independentNativeSupervisorSql } from './native-supervision.js';
 import { readPreparedNativeAdmission, validateNativeAdmission, consumeNativeAdmission, finishNativeAdmission, inspectPreparedNativeRun, checkNativePreparation } from './supervised-opencode-admission.js';
 import { verifyRepairSourceProof } from './repair-proof.js';
 import { readValidationSnapshot, validationReceiptId } from './validation-identity.js';
+import {assertVerificationAdmissionProgress} from './verification-progress.js';
+import {routeVerificationPlanningRecovery} from './verification-planning-recovery.js';
+import {sourceContractPlanningFailure} from './source-output-validation.js';
 export async function createGoal(raw: unknown, isDemo = false) {
   const input = goalSchema.parse(raw);
   validateDag(input.tasks);
@@ -177,14 +181,27 @@ export async function refreshGoal(db: DB, id: string) {
   if (state === 'completed') {
     const latest = (await db.query('SELECT plan FROM plan_revisions WHERE objective_id=$1 ORDER BY revision DESC LIMIT 1',[id])).rows[0]?.plan;
     if (latest?.incremental?.pendingRequirementIds?.length) state = 'active';
+    if(latest?.completionContractVersion===2){
+      const frontier=await readObjectiveFrontier(db,id);
+      if(!frontier.complete)state='active';
+      await db.query(`UPDATE objectives SET reason=$2,updated_at=now() WHERE id=$1
+        AND reason IS DISTINCT FROM $2 AND EXISTS(SELECT 1 FROM goals g WHERE g.id=$1 AND g.state NOT IN('paused','cancelled'))`,
+        [id,frontier.next==='await_external_dependency'?'REQUIREMENTS_EXTERNALLY_BLOCKED':null]);
+    }
+    // Same supersede rule as the planner advance: feedback a later completed
+    // plan could already see cannot veto completion forever (legacy zombies
+    // attached only to terminally failed planning runs never get consumed).
     if (state === 'completed' && (await db.query(`SELECT 1 FROM objective_feedback f
       WHERE f.objective_id=$1 AND NOT EXISTS(SELECT 1 FROM planning_runs p
         WHERE p.objective_id=f.objective_id AND p.state='completed'
-          AND p.feedback->'feedbackIds' ? f.id::text) LIMIT 1`,[id])).rowCount)
+          AND p.feedback->'feedbackIds' ? f.id::text)
+        AND NOT EXISTS(SELECT 1 FROM planning_runs c
+          WHERE c.objective_id=f.objective_id AND c.state='completed'
+            AND c.created_at>f.created_at) LIMIT 1`,[id])).rowCount)
       state = 'active';
   }
   const old = (await db.query('SELECT state FROM goals WHERE id=$1', [id])).rows[0];
-  if (old.state !== state && old.state !== 'paused') {
+  if (old.state !== state && !['paused','cancelled'].includes(old.state)) {
     await db.query('UPDATE goals SET state=$2 WHERE id=$1', [id, state]);
     if (['completed', 'cancelled'].includes(state))
       await db.query('UPDATE objectives SET status=$2,reason=NULL,updated_at=now() WHERE id=$1', [
@@ -220,7 +237,7 @@ export async function readScheduleCandidates(db:DB=pool,service?:'agentos-openco
       t.account_id,t.allowed_accounts,t.model,t.resources,t.attempt_count,t.instruction_revision_id,
       t.parent_task_id,t.agent_role,t.agent_level,
       CASE WHEN t.execution IS NULL THEN NULL ELSE jsonb_build_object(
-        'kind',t.execution->>'kind','workforceLane',t.execution->>'workforceLane',
+        'kind',t.execution->>'kind','workforceLane',t.execution->>'workforceLane','readOnlySource',t.execution->'readOnlySource',
         'supervisedAdmission',t.execution->'supervisedAdmission') END execution,
       g.state goal_state,a.runtime,a.version agent_version,
       prior.id prepared_source_run_id,
@@ -305,6 +322,7 @@ export async function schedule(service?:'agentos-opencode',inspect=inspectPrepar
         await setWait('blocked_dependencies', 'Aguardando aceite das dependências.');
         continue;
       }
+      await assertVerificationAdmissionProgress(db,t);
       // Skip a draining executor before INSERT, preserving the rest of the batch.
       const laneFlags = (
         await db.query(
@@ -600,11 +618,12 @@ export async function schedule(service?:'agentos-opencode',inspect=inspectPrepar
           await db.query("UPDATE tasks SET state='waiting_resource',reason='Dois planejadores por escopo ocupados; aguardando vaga.',updated_at=now() WHERE id=$1",[t.id]);
           continue;
         }
-        if(!/^(TASK_INSTRUCTIONS_CHANGED|INSTRUCTION_CASE_CHANGED|INSTRUCTION_CASE_INVALID|INSTRUCTION_SOURCE_INVALID|INSTRUCTION_DECISION_UNVERIFIED|SUPERVISION_INPUTS_INVALID|SUPERVISION_INPUT_DIGEST|SUPERVISION_INPUTS_TOO_LARGE|SUPERVISION_INPUT_COLLISION)$/.test(code??''))throw e;
+        if(!/^(TASK_INSTRUCTIONS_CHANGED|INSTRUCTION_CASE_CHANGED|INSTRUCTION_CASE_INVALID|INSTRUCTION_SOURCE_INVALID|INSTRUCTION_DECISION_UNVERIFIED|SUPERVISION_INPUTS_INVALID|SUPERVISION_INPUT_DIGEST|SUPERVISION_INPUTS_TOO_LARGE|SUPERVISION_INPUT_COLLISION|VERIFICATION_NO_PROGRESS|VERIFICATION_CANDIDATE_UNBOUND|VERIFICATION_CANDIDATE_INVALID)$/.test(code??''))throw e;
         const reason='Admissão bloqueada: '+code+'. Contrato e evidências preservados; outras tarefas continuam.';
         await db.query("UPDATE tasks SET state='recovery_blocked',reason=$2,execution=CASE WHEN execution IS NULL THEN NULL ELSE jsonb_set(execution,'{continuation}',jsonb_build_object('state','needs_action','message',$2::text,'updatedAt',now())) END,updated_at=now() WHERE id=$1",
           [t.id,reason]);
         await event(db,'RUN_ADMISSION_BLOCKED',t.id,{code,goalId:t.goal_id,instructionRevisionId:t.instruction_revision_id,preserved:true});
+        if(code.startsWith('VERIFICATION_'))await routeVerificationPlanningRecovery(db,t.id);
       } finally {
         await db.query('RELEASE SAVEPOINT task_admission');
       }
@@ -738,12 +757,22 @@ export async function validateTask(taskId: string, reviewer?: string) {
   const task = await readValidationSnapshot(pool, taskId, reviewer);
   if (!task)
     throw new DomainError('NOT_SUBMITTED', 'A tarefa ainda não está pronta para validação.');
+  const {verifiedWorkerValidationGate,workerValidationCommitIdentity,validationDigest}=await import('./worker-validation.js');
+  const proof=task.validation_input.workerValidation?await verifiedWorkerValidationGate(pool,task.run_id):null;
+  const ci:import('./worker-validation.js').WorkerValidationGate=proof?.gate??{required:false,state:'legacy',detail:''};
+  if(ci.state==='pending') return {passed:false,pending:true,checks:[{id:'registered-ci',label:'CI registrado da candidata',
+    type:'registered_ci',passed:false,detail:ci.detail}],duplicate:false};
+  if(task.receipt_match && ci.required && ci.state!=='passed' && task.accepted_passed)
+    throw new DomainError('STATE_CHANGED','A prova de CI perdeu autoridade; o aceite histórico foi preservado.');
   if (task.receipt_match)
     return { passed: task.accepted_passed!, checks: task.accepted_checks!, duplicate: true };
   if (task.state !== 'submitted')
     throw new DomainError('NOT_SUBMITTED', 'A tarefa ainda não está pronta para validação.');
   const run = { id: task.run_id, fence: task.run_fence };
   const artifacts = task.artifacts;
+  const outcomeInputs=task.criteria.some((c:any)=>c.type==='requirement_outcomes'&&
+    c.requirements?.some((r:any)=>r.externalDependencies?.length||r.observables?.some((o:any)=>o.authority==='objective_input')))
+    ?await readOutcomeInputs(pool,task.goal_id):[];
   const checks: Array<{
     id: string;
     label: string;
@@ -751,14 +780,28 @@ export async function validateTask(taskId: string, reviewer?: string) {
     passed: boolean;
     detail: string;
     evidence?: ReturnType<typeof verifyRepairSourceProof> & { patchArtifactId: string; reportArtifactId: string };
+    requirementOutcomes?:RequirementOutcomeProof;
   }> = [];
+  if(ci.required) checks.push({id:'registered-ci',label:'CI registrado da candidata',type:'registered_ci',
+    passed:ci.state==='passed',detail:ci.detail});
+  const {sourceOutputValidation}=await import('./source-output-validation.js');
+  const sourceOutput=await sourceOutputValidation(task,readArtifact);
+  if(sourceOutput)checks.push(sourceOutput);
   for (const c of task.criteria as Criterion[]) {
     let passed = false,
       detail = '';
     let evidence: typeof checks[number]['evidence'];
+    let requirementOutcomes:RequirementOutcomeProof|undefined;
     if (c.type === 'review') {
       passed = !!reviewer;
       detail = reviewer ? 'Revisão atestada por ' + reviewer : 'Aguardando revisão do critério.';
+    } else if(c.type==='requirement_outcomes'){
+      try{
+        requirementOutcomes=await verifyRequirementOutcomes(c,task,readArtifact,outcomeInputs);
+        passed=true;detail='Relatório de resultados validado. Aceite da subentrega não conclui requisitos parciais ou dependências externas.';
+      }catch(error:any){
+        detail=/^REQUIREMENT_[A-Z_]+$/.test(error?.message??'')?error.message:'REQUIREMENT_OUTCOME_INVALID';
+      }
     } else if (c.type === 'repair_source_proof') {
       try {
         if (c.version !== 1 || c.name !== 'repair-report.json' || c.patch !== 'implementation.patch')
@@ -794,7 +837,8 @@ export async function validateTask(taskId: string, reviewer?: string) {
         }
       } else detail = 'Artefato obrigatório ausente.';
     }
-    checks.push({ id: c.id, label: c.label, type: c.type, passed, detail, ...(evidence ? { evidence } : {}) });
+    checks.push({ id: c.id, label: c.label, type: c.type, passed, detail, ...(evidence ? { evidence } : {}),
+      ...(requirementOutcomes?{requirementOutcomes}:{}) });
   }
   const passed = checks.every((c) => c.passed);
   return tx(async (db) => {
@@ -803,6 +847,8 @@ export async function validateTask(taskId: string, reviewer?: string) {
     const fresh = await readValidationSnapshot(db, taskId, reviewer);
     if (!fresh || fresh.validation_key !== task.validation_key)
       throw new DomainError('STATE_CHANGED', 'A tentativa, contrato ou evidência mudou durante a validação.');
+    if(proof && validationDigest(await workerValidationCommitIdentity(db,fresh.run_id))!==validationDigest(proof.identity))
+      throw new DomainError('STATE_CHANGED','A autoridade ou evidência de CI mudou durante a validação.');
     // Another validator may have completed while this call was reading bytes.
     if (fresh.receipt_match)
       return { passed: fresh.accepted_passed!, checks: fresh.accepted_checks!, duplicate: true };
@@ -843,6 +889,16 @@ export async function validateTask(taskId: string, reviewer?: string) {
       validationKey: fresh.validation_key,
       acceptanceId,
     });
+    if(!passed && ci.required && ci.state==='failed' &&
+      (await db.query('SELECT 1 FROM objectives WHERE id=$1',[task.goal_id])).rowCount) {
+      const {queueFeedback}=await import('./planner.js');
+      await queueFeedback(db,task.goal_id,'registered-ci:'+task.run_id+':'+fresh.validation_key,
+        'Registered candidate CI did not satisfy acceptance: '+ci.detail+
+        '. Correct the specific failure and preserve the original criteria. '+
+        (ci.actionId?'Canonical CI action '+ci.actionId+' supplies immutable receipt/log inputs to the repair.':'No registered CI was dispatched; correct the declared intent/policy handoff.'),[taskId]);
+    }
+    if(!passed&&sourceContractPlanningFailure(checks,run.id))
+      await routeVerificationPlanningRecovery(db,taskId,run.id);
     await refreshGoal(db, task.goal_id);
     if (passed) {
       await db.query(
@@ -1165,7 +1221,7 @@ export async function goalDetail(id: string) {
   ).rows;
   const runs = (
     await pool.query(
-      `SELECT r.id,r.task_id,r.attempt,r.state,r.worker_id,r.account_id,r.runtime,r.agent_version,
+      `SELECT r.id,r.task_id,r.attempt,r.fence,r.state,r.worker_id,r.account_id,r.runtime,r.agent_version,
        r.parent_task_id,r.agent_role,r.agent_level,
        r.created_at,r.started_at,r.finished_at,r.heartbeat_at,r.context_id,r.summary,r.error_code,r.usage,r.checkpoint,r.model,
        r.instruction_snapshot->'task'->'criteria' accepted_criteria
@@ -1181,7 +1237,7 @@ export async function goalDetail(id: string) {
   ).rows;
   const objective =
     (await pool.query('SELECT * FROM objectives WHERE id=$1', [id])).rows[0] ?? null;
-  const frontierArtifacts=(await pool.query(`SELECT a.run_id,a.name,a.digest FROM artifacts a
+  const frontierArtifacts=(await pool.query(`SELECT a.id,a.run_id,a.name,a.digest,a.size FROM artifacts a
     JOIN runs r ON r.id=a.run_id JOIN tasks t ON t.id=r.task_id
     WHERE t.goal_id=$1 AND r.attempt=t.attempt_count`,[id])).rows;
   const revisions = objective
@@ -1205,13 +1261,13 @@ export async function goalDetail(id: string) {
     tasks: tasks.filter((t) => t.state !== 'superseded'),
     retiredTasks: tasks.filter((t) => t.state === 'superseded'),
     dependencies,
-    runs:runs.map(({accepted_criteria,...run})=>run),
+    runs:runs.map(({fence,accepted_criteria,...run})=>run),
     acceptances,
     objective,
     revisions,
     planning,
     frontier:projectWorkFrontier({kind:'objective',id,version:revisions[0]?.revision},
-      objectiveFrontierNodes(tasks,runs,acceptances,dependencies,frontierArtifacts),revisions[0]?.plan.requirements ?? []),
+      objectiveFrontierNodes(tasks,runs,acceptances,dependencies,frontierArtifacts),revisions[0]?.plan.requirements ?? [],revisions[0]?.plan.completionContractVersion),
     planningAttempts: objective
       ? (
           await pool.query(

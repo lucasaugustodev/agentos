@@ -7,6 +7,7 @@ import { frameworkProjectAuthorization } from './candidate-validation.js';
 import { acceptedSnapshotProof } from './deferred-handoffs.js';
 import { readArtifact } from './service.js';
 import { runtimeCandidateDigest } from './operation-progress.js';
+import {migrationTableLocks} from './migration-table-locks.js';
 
 const failure = (code: string) => Object.assign(new Error(code), { code });
 const sha = (value: string | Buffer) => createHash('sha256').update(value).digest('hex');
@@ -101,7 +102,7 @@ function makeRequest(snapshot: BindingSnapshot, id: string) {
 }
 
 export async function installVerificationSourceBinding(db: DB = pool) {
-  await db.query(`CREATE OR REPLACE FUNCTION agentos_verification_binding_owned(target uuid) RETURNS boolean LANGUAGE sql STABLE AS $$
+  await db.query(migrationTableLocks(['acceptances','artifacts','dependencies','runs','settings','tasks'])+`CREATE OR REPLACE FUNCTION agentos_verification_binding_owned(target uuid) RETURNS boolean LANGUAGE sql STABLE AS $$
     SELECT EXISTS(SELECT 1 FROM settings s WHERE s.id='verification-source-binding:'||target::text
       AND s.value->>'state'=ANY(ARRAY['proposed','preparing','prepared','uncertain','applying'])) $$;
     CREATE OR REPLACE FUNCTION agentos_verification_binding_required(target uuid) RETURNS boolean LANGUAGE sql STABLE AS $$

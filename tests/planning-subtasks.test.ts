@@ -13,11 +13,13 @@ beforeEach(async()=>{
  await pool.query(`UPDATE accounts SET model='test-model',models='["test-model"]',bridge_id='test',max_concurrency=4,allow_unknown=true`);
 });
 afterAll(()=>pool.end());
-const request=()=>objectiveSchema.parse({message:'Qualificar vinte cenários e preservar o restante do objetivo.',project:'test',workspaces:['test/base'],mode:'execute',planningStrategy:'incremental',requirements:['Executar vinte cenários com três variantes, contando negativos e pendências.','Publicar a candidata validada preservando os critérios.'],idempotencyKey:randomUUID()});
+const request=()=>objectiveSchema.parse({message:'Qualificar vinte cenários e preservar o restante do objetivo.',project:'test',workspaces:['test/base'],mode:'execute',planningStrategy:'incremental',sourceContractVersion:1,requirements:['Executar vinte cenários com três variantes, contando negativos e pendências.','Publicar a candidata validada preservando os critérios.'],idempotencyKey:randomUUID()});
+const reportOnly={version:1 as const,required:[],preserve:[],noSourceReason:'This scope-only controller fixture publishes diagnostic evidence without claiming implementation source.'};
 const part=(key:string,dependsOn:string[]=[])=>({key,dependsOn,requirementId:'req-1',title:'Implementar '+key,
  action:'Implementar a contribuição delimitada e registrar resultados reais dos controles.',
  verification:'Executar controles discriminantes preservando o denominador e todos os negativos.',
- agentId:'engineering.backend.node',writePaths:['qualification/'+key]});
+ agentId:'engineering.backend.node',writePaths:['qualification/'+key],sourceContract:{version:1 as const,
+  required:[{path:'qualification/'+key,kind:'directory' as const}],preserve:[]}});
 async function accept(id:string){
  const run=randomUUID();
  await pool.query("INSERT INTO runs(id,task_id,attempt,state,fence,runtime,agent_version) VALUES($1,$2,1,'submitted',$3,'harness',1)",[run,id,randomUUID()]);
@@ -54,7 +56,7 @@ it('rejects duplicate keys, cycles, unknown dependencies, QA as implementation a
  bad([part('a',['missing'])],'UNKNOWN_DEPENDENCY');
  bad([{...part('a'),agentId:'qa.integration'}],'VALIDATOR_AS_WORKER');
  bad([{...part('a'),requirementId:'invented'}],'INELIGIBLE_REQUIREMENT');
- bad([part('a'),{...part('b'),writePaths:['qualification/a/nested']}],'WRITE_SCOPE_CONFLICT');
+ bad([part('a'),{...part('b'),writePaths:['qualification/a/nested'],sourceContract:reportOnly}],'WRITE_SCOPE_CONFLICT');
  bad([part('a',['b','b']),part('b')],'DUPLICATE_DEPENDENCY');
  expect(()=>compileDelivery({...part('a'),deliveries:[part('b')]},input)).toThrowError(expect.objectContaining({detail:expect.objectContaining({violation:'AMBIGUOUS_DECISION'})}));
  expect(()=>compileDelivery({deliveries:[part('a'),{...part('b'),writePaths:['qualification/./a']}]},input)).toThrow();
@@ -65,6 +67,8 @@ it('enforces write isolation for a single requirement even when the raw plan is 
  plan.tasks[1].writePaths=plan.tasks[0].writePaths;
  expect(()=>validatePlan(plan,input,[],[])).toThrow();
  const agents=(await pool.query('SELECT * FROM agents')).rows;
+ expect(()=>validatePlan(plan,input,agents,[])).toThrowError(expect.objectContaining({detail:expect.objectContaining({violation:'SOURCE_OUTPUT_OUTSIDE_WRITE_SCOPE'})}));
+ plan.tasks[1].sourceContract=reportOnly;
  expect(()=>validatePlan(plan,input,agents,[])).toThrowError(/disjuntos/);
 });
 it('keeps identically named local outputs in different workspaces without a false source conflict',async()=>{
@@ -81,7 +85,7 @@ it('keeps identically named local outputs in different workspaces without a fals
 });
 it('allows explicit local-output-only contributions while keeping final integration and independent QA',async()=>{
  const input=request(),plan=compileDelivery({deliveries:[
-  {...part('a'),writePaths:['evidence/review']},{...part('b'),writePaths:['evidence/review','data/scratch']} ]},input);
+  {...part('a'),writePaths:['evidence/review'],sourceContract:reportOnly},{...part('b'),writePaths:['evidence/review','data/scratch'],sourceContract:reportOnly} ]},input);
  validatePlan(plan,input,(await pool.query('SELECT * FROM agents')).rows,[]);
  expect(plan.tasks.filter(t=>t.stage==='work')).toHaveLength(2);
  expect(plan.tasks.find(t=>t.stage==='integrate')?.dependencies).toHaveLength(2);
@@ -92,11 +96,11 @@ it('never treats source folders with similar names, aliases or forbidden paths a
   expect(isAttemptLocalWriteScope(value)).toBe(false);
  const input=request();
  for(const source of ['server/shared','src/evidence','src/data','database','evidence-source'])
-  expect(()=>compileDelivery({deliveries:[{...part('a'),writePaths:[source,'evidence/x']},
-   {...part('b'),writePaths:[source+'/child','evidence/x']} ]},input)).toThrowError(expect.objectContaining({detail:expect.objectContaining({violation:'WRITE_SCOPE_CONFLICT'})}));
+  expect(()=>compileDelivery({deliveries:[{...part('a'),writePaths:[source,'evidence/x'],sourceContract:reportOnly},
+   {...part('b'),writePaths:[source+'/child','evidence/x'],sourceContract:reportOnly} ]},input)).toThrowError(expect.objectContaining({detail:expect.objectContaining({violation:'WRITE_SCOPE_CONFLICT'})}));
  for(const value of ['evidence/../server','evidence/./x','evidence//x'])
   expect(()=>compileDelivery({deliveries:[part('a'),{...part('b'),writePaths:[value]}]},input)).toThrow();
- const forbidden=compileDelivery({deliveries:[part('a'),{...part('b'),writePaths:['data/.git/config']}]},input);
+ const forbidden=compileDelivery({deliveries:[part('a'),{...part('b'),writePaths:['data/.git/config'],sourceContract:reportOnly}]},input);
  const agents=(await pool.query('SELECT * FROM agents')).rows;
  expect(()=>validatePlan(forbidden,input,agents,[])).toThrowError(expect.objectContaining({detail:expect.objectContaining({writePath:'data/.git/config'})}));
 });
@@ -121,7 +125,7 @@ it('advertises only eligible requirement IDs and supports a serial supervisor fa
  const schema=deliveryDecisionSchema(agents,['req-2'],true);
  expect(schema.safeParse({deliveries:[part('a')]}).success).toBe(false);
  expect(schema.safeParse(part('a')).success).toBe(false);
- expect(schema.safeParse({...part('a'),requirementId:'req-2'}).success).toBe(true);
+ expect(schema.safeParse({...part('a'),kind:'delivery',requirementId:'req-2'}).success).toBe(true);
 });
 it('preserves every accepted partial branch as input while keeping a join out of the accumulated source after a consumer failure',async()=>{
  const input=request();const {objectiveId}=await submitObjective(input);

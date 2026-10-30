@@ -1,3 +1,4 @@
+import { readModelPolicy } from '../bridge/model-policy.mjs';
 import {z} from 'zod';
 import {createHash} from 'node:crypto';
 import {tx,type DB} from './db.js';
@@ -21,7 +22,9 @@ type Notify=(kind:string,payload:Record<string,unknown>)=>Promise<void>;
 /** The ordinary analytical path stays unchanged unless this is a frozen manager
  * contract on a provider with demonstrated tool support. */
 export function managerReadOwner(run:any,task:any,account:any):ManagerReadOwner|null {
- if(task.stage!=='coordinate'||task.execution!=null||!((account.family??account.provider)==='codex'||
+ const policy=readModelPolicy();
+ const selected=!!policy&&account.bridge_id===policy.bridgeId&&task.model===policy.model;
+ if(task.stage!=='coordinate'||task.execution!=null||!((account.family??account.provider)==='codex'||selected||
    (account.bridge_id==='agentos:api:00000000-0000-4000-8000-000000000001'&&task.model==='glm-5.3-flash'))||
   !task.description?.includes('MANAGEMENT_V1')||!task.description.includes('FOCUSED_DECISION_V2'))return null;
  if(![run.id,run.fence,task.id,task.goal_id].every(value=>z.uuid().safeParse(value).success)||run.task_id!==task.id)return null;

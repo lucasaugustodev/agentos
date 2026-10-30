@@ -139,7 +139,7 @@ export async function chooseChatAccount(accountId?: string, model?: string) {
         )
       ).rows[0].n,
     );
-    if (n >= account.max_concurrency) continue;
+    if (n >= (exclusive?.version===2 ? Math.min(account.max_concurrency,exclusive.sessionLimit) : account.max_concurrency)) continue;
     return { account, model: selectedModel };
   }
   throw new DomainError(

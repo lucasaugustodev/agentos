@@ -27,17 +27,16 @@ test('GLM reasoning survives both wire adapters and is absent from progress even
   assert.ok(!JSON.stringify(events).includes('private reasoning'));
   assert.equal(events.at(-1).reasoningCharacters,17);
 });
-test('a retry of an incomplete model response does not duplicate tool dispatch',async()=>{
+test('an incomplete response with material never retries or dispatches a tool',async()=>{
   let calls=0;const retries=[];
   const provider=openAICompletionsFallback({random:()=>0,fetch:async()=>{
     calls++;
     const data=calls===1?[{choices:[{delta:{content:'partial'}}]}]:[{choices:[{delta:{content:'complete'},finish_reason:'stop'}]}];
     return {ok:true,headers:new Headers({'content-type':'text/event-stream'}),body:sse(data)};
   }});
-  const result=await provider.streamSimple({id:'glm-5.3-flash',baseUrl:'https://provider.example/v1'},
-    {messages:[]},{apiKey:'fixture',onRetry:r=>retries.push(r)}).result();
-  assert.equal(calls,2);assert.equal(result.content[0].text,'complete');
-  assert.equal(retries[0].code,'MODEL_INCOMPLETE_RESPONSE');
+  await assert.rejects(provider.streamSimple({id:'glm-5.3-flash',baseUrl:'https://provider.example/v1'},
+    {messages:[]},{apiKey:'fixture',onRetry:r=>retries.push(r)}).result(),{code:'MODEL_INCOMPLETE_RESPONSE'});
+  assert.equal(calls,1);assert.deepEqual(retries,[]);
 });
 test('trusted handoff binds unverified notes to the run and does not manufacture acceptance',async()=>{
   const identity={runId:'run',runFence:'fence',workspace:'test/work'};

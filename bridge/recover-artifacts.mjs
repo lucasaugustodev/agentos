@@ -94,11 +94,12 @@ export async function recoverArtifacts(id, readOnlySource = false, testFile, exa
   if (!before.stopped) throw Error('STOP_UNCONFIRMED');
   const workspace = `${options.workspaceRoot ?? '/srv/agentos/workspaces'}/${state.workspace}`;
   if (await realpath(workspace) !== workspace) throw Error('INVALID_WORKSPACE');
-  const initial = await operation({ action: 'inspect', workspace: state.workspace });
+  const sourceInventory=state.sourceContractVersion===1?{includeBaseFiles:true}:{};
+  const initial = await operation({ action: 'inspect', workspace: state.workspace,...sourceInventory });
   if (exactCompletedNative) {
     const identity = { runId: id, workspace: state.workspace };
     const value = await readCompletedNativeResult(dir, state, initial, identity);
-    const candidate = await operation({ action: 'inspect', workspace: state.workspace });
+    const candidate = await operation({ action: 'inspect', workspace: state.workspace,...sourceInventory });
     // A new execution or external write must not turn these old bytes into a
     // delivery for a different candidate. Both workspace reads retain SOURCE_BUSY.
     verifyCompletedNativeResult(state, value, candidate, identity);
@@ -128,7 +129,7 @@ export async function recoverArtifacts(id, readOnlySource = false, testFile, exa
     }
   }
   const artifacts = manifestDelivery?.artifacts ?? await collectArtifacts(value, workspace);
-  const candidate = await operation({ action: 'inspect', workspace: state.workspace });
+  const candidate = await operation({ action: 'inspect', workspace: state.workspace,...sourceInventory });
   if (initial.candidateDigest !== candidate.candidateDigest) throw Error('SOURCE_CHANGED_DURING_COLLECTION');
   if (readOnlySource && candidate.baseDigest !== candidate.candidateDigest) throw Error('SOURCE_CHANGED_DURING_VALIDATION');
   const reservedClaims = preserveRuntimeArtifactClaims(artifacts);

@@ -13,6 +13,8 @@ import {
 import { assertStopped } from './continuation.js';
 import { mergeSupervisorInputs } from './execution-inputs.js';
 import { actionSchema } from './supervision-actions.js';
+import {verifyWorkerValidationAuthority,requiredDatabaseTestSchema} from './worker-validation.js';
+import {readDeliverySourceIdentity,sourceIdentityFrozen} from './delivery-source-resolution.js';
 
 const sha = (value: Buffer | string) => createHash('sha256').update(value).digest('hex');
 const canonical = (v: any): any =>
@@ -26,7 +28,9 @@ const canonical = (v: any): any =>
         )
       : v;
 const digest = (v: any) => sha(JSON.stringify(canonical(v)));
-const registeredSha = 'e66fcf513aaa513ff2216d87556fb5dba771597dc933ca4b4b38573d8842d5b5';
+const registeredShas = ['e66fcf513aaa513ff2216d87556fb5dba771597dc933ca4b4b38573d8842d5b5',
+  '02a92158a4084a1aeb3b4c55998b6740d90428f80acb06a225730a1423ba9c26',
+  '39843bdbde81e84b5093ed6667484378d1f4444c66aa33424b52d28b45b0cc44'] as const;
 const key = (id: string) => 'candidate-validation-evidence:' + id;
 const uuid = z.uuid(),
   hash = z.string().regex(/^[a-f0-9]{64}$/);
@@ -81,7 +85,11 @@ const exportSchema = z
             state: z.literal('completed'),
           })
           .strict(),
-        registeredActionSha: z.literal(registeredSha),
+        registeredActionSha: z.enum(registeredShas),
+        coverage:z.object({version:z.literal(1),source:z.literal('registered_vitest_json'),
+          profile:z.literal('agentos.validate'),candidateDigest:hash,obligationsDigest:hash,
+          reportDigest:hash,requiredTests:z.array(requiredDatabaseTestSchema.extend({
+            status:z.enum(['passed','failed','skipped','missing'])}).strict()).min(1).max(128)}).strict().optional(),
         registeredCommand: z.tuple([
           z.literal('/usr/bin/python3'),
           z.literal('/opt/agentos-control/agentos-release-action.py'),
@@ -156,9 +164,7 @@ export async function installCandidateValidationEvidence(db: DB = pool) {
     CREATE TRIGGER agentos_ci_evidence_immutable BEFORE UPDATE OR DELETE ON settings FOR EACH ROW EXECUTE FUNCTION agentos_ci_evidence_immutable();`);
 }
 
-function scope(task: any) {
-  const execution = { ...task.execution };
-  for (const name of [
+const scopeExecutionOmissions=[
     'workspace',
     'sourceWorkspace',
     'snapshot',
@@ -173,7 +179,11 @@ function scope(task: any) {
     'verificationRecheck',
     'candidateValidationEvidence',
     'workforceLane',
-  ])
+  ];
+const scopeTaskFields=['id','goal_id','stage','criteria','covers','agent_id','resources','required_memories','allowed_accounts'];
+function scope(task: any) {
+  const execution = { ...task.execution };
+  for (const name of scopeExecutionOmissions)
     delete execution[name];
   return digest({
     id: task.id,
@@ -188,7 +198,7 @@ function scope(task: any) {
     allowedAccounts: task.allowed_accounts,
   });
 }
-async function source(db: DB, actionId: string) {
+async function source(db: DB, actionId: string,mode:'current'|'historical_runtime_evidence'='current') {
   uuid.parse(actionId);
   const v = (
     await db.query('SELECT value FROM settings WHERE id=$1', ['candidate-validation:' + actionId])
@@ -203,14 +213,24 @@ async function source(db: DB, actionId: string) {
     )
   )
     failure('CI_EVIDENCE_NOT_COMPLETED');
-  await verifyAcceptedManagementAction(db, v.goalId, v.managerRunId, v.index, proposal(v));
-  const authorization = await frameworkProjectAuthorization(db, v.goalId);
-  if (digest(authorization.authorization) !== digest(v.request.frameworkAuthorization))
-    failure('CI_EVIDENCE_AUTHORIZATION_CHANGED');
+  if(v.authority==='runtime_artifact') await verifyWorkerValidationAuthority(db,v,
+    mode==='historical_runtime_evidence'?'historical_evidence':'current');
+  else await verifyAcceptedManagementAction(db, v.goalId, v.managerRunId, v.index, proposal(v));
+  if(mode!=='historical_runtime_evidence' || v.authority!=='runtime_artifact') {
+    const authorization = await frameworkProjectAuthorization(db, v.goalId);
+    if (digest(authorization.authorization) !== digest(v.request.frameworkAuthorization))
+      failure('CI_EVIDENCE_AUTHORIZATION_CHANGED');
+  }
   const r = (
     await db.query(
-      'SELECT r.*,t.goal_id FROM runs r JOIN tasks t ON t.id=r.task_id WHERE r.id=$1',
-      [v.runId],
+      `SELECT r.id,r.task_id,r.fence,r.context_id,r.attempt,r.state,r.finished_at,t.goal_id,
+        jsonb_typeof(r.instruction_snapshot->'task')='object' frozen_task_present,
+        (SELECT COALESCE(jsonb_object_agg(k,val),'{}'::jsonb)
+          FROM jsonb_each(r.instruction_snapshot->'task') e(k,val) WHERE k=ANY($3::text[]))
+        ||CASE WHEN (r.instruction_snapshot->'task') ? 'execution' THEN jsonb_build_object('execution',
+          (r.instruction_snapshot#>'{task,execution}')-$2::text[]) ELSE '{}'::jsonb END scope_task
+        FROM runs r JOIN tasks t ON t.id=r.task_id WHERE r.id=$1`,
+      [v.runId,scopeExecutionOmissions,scopeTaskFields],
     )
   ).rows[0];
   if (
@@ -219,7 +239,7 @@ async function source(db: DB, actionId: string) {
     r.task_id !== v.taskId ||
     r.fence !== v.runFence ||
     r.context_id !== v.contextVersion ||
-    !r.instruction_snapshot?.task ||
+    !r.frozen_task_present ||
     r.attempt !== v.expectedAttempt ||
     !['submitted', 'failed'].includes(r.state) ||
     !r.finished_at
@@ -235,15 +255,15 @@ async function source(db: DB, actionId: string) {
   )
     failure('CI_EVIDENCE_CANDIDATE_CHANGED');
   const context = (
-    await db.query('SELECT manifest FROM contexts WHERE id=$1 AND run_id=$2', [r.context_id, r.id])
+    await db.query("SELECT manifest->'dependencyArtifacts' dependencies FROM contexts WHERE id=$1 AND run_id=$2", [r.context_id, r.id])
   ).rows[0];
   if (!context) failure('CI_EVIDENCE_PRODUCER_CHANGED');
   return {
     v,
     run: r,
-    scopeDigest: scope(r.instruction_snapshot.task),
-    criteriaDigest: digest(r.instruction_snapshot.task.criteria),
-    contextDependencyDigest: digest(context.manifest.dependencyArtifacts ?? []),
+    scopeDigest: scope(r.scope_task),
+    criteriaDigest: digest(r.scope_task.criteria),
+    contextDependencyDigest: digest(context.dependencies ?? []),
   };
 }
 
@@ -352,6 +372,53 @@ function checkedExport(raw: any, current: Awaited<ReturnType<typeof source>>) {
   )
     failure('CI_EVIDENCE_BYTES_CHANGED');
   return value;
+}
+
+/** Controller-only evidence can gate this exact current attempt. Historical
+ * artifacts and acceptances remain untouched; exported receipts are not worker reports. */
+export async function readRuntimeCandidateValidationEvidence(db:DB,actionId:string) {
+  const job=(await db.query('SELECT value FROM settings WHERE id=$1',[key(actionId)])).rows[0]?.value;
+  if(job?.state!=='published') return null;
+  const current=await source(db,actionId),v=current.v;
+  if(v.authority!=='runtime_artifact' || v.result.stale===true) failure('CI_EVIDENCE_AUTHORIZATION_CHANGED');
+  const target=await readDeliverySourceIdentity(db,v.taskId);
+  if(!target || !sourceIdentityFrozen(target) || target.live || target.leased || target.cancelled ||
+    target.run_id!==v.runId || target.fence!==v.runFence || target.contract_digest!==v.request.contractDigest)
+    failure('CI_EVIDENCE_PRODUCER_CHANGED');
+  const body=checkedExport({...job.body,inputs:job.body.inputs.map(({id,source,...input}:any)=>input)},current);
+  if(job.requestDigest!==body.requestDigest || job.resultDigest!==body.resultDigest ||
+    job.scopeDigest!==current.scopeDigest || job.criteriaDigest!==current.criteriaDigest ||
+    job.contextDependencyDigest!==current.contextDependencyDigest) failure('CI_EVIDENCE_PUBLICATION_CHANGED');
+  return body;
+}
+
+/** Feed a future repair through existing immutable execution inputs. This never
+ * adds artifacts to the producer or impersonates a manager's revise action. */
+export async function runtimeValidationRepairInputs(db:DB,goalId:string,taskIds:string[],covers:string[]) {
+  if(!taskIds.length || !covers.length) return [];
+  const rows=(await db.query(`SELECT e.value FROM settings e JOIN tasks t ON t.id::text=e.value->>'taskId'
+    JOIN settings v ON v.id='candidate-validation:'||(e.value->>'actionId')
+    WHERE e.id LIKE 'candidate-validation-evidence:%' AND e.value->>'state'='published'
+      AND t.goal_id=$1 AND t.id=ANY($2::uuid[]) AND t.covers ?| $3::text[]
+      AND v.value->>'authority'='runtime_artifact'
+      AND EXISTS(SELECT 1 FROM acceptances a WHERE a.run_id::text=v.value->>'runId' AND NOT a.passed)
+    ORDER BY e.value->>'updatedAt' DESC,e.id LIMIT 1`,[goalId,taskIds,covers])).rows;
+  if(!rows.length) return [];
+  const job=rows[0].value,current=await source(db,job.actionId,'historical_runtime_evidence');
+  const body=checkedExport({...job.body,inputs:job.body.inputs.map(({id,source,...input}:any)=>input)},current);
+  if(job.requestDigest!==body.requestDigest || job.resultDigest!==body.resultDigest ||
+    job.criteriaDigest!==current.criteriaDigest || job.scopeDigest!==current.scopeDigest)
+    failure('CI_EVIDENCE_PUBLICATION_CHANGED');
+  // This small immutable-derived input keeps historical proof useful after
+  // revocation without representing it as authority for the next candidate.
+  const note=Buffer.from(JSON.stringify({version:1,kind:'historical_candidate_ci',diagnosticOnly:true,
+    authorizesExecution:false,authorizesAcceptance:false,actionId:job.actionId,producer:body.authority.producer,
+    originalPolicyRegistrationId:current.v.request.runtimeAuthority.policyRegistration.registrationId,
+    originalPolicyDigest:current.v.request.runtimeAuthority.policyRegistration.policyDigest,receiptDigest:body.receiptDigest}));
+  const noteHash=sha('ci-diagnostic-scope:'+job.actionId),id=noteHash.slice(0,8)+'-'+noteHash.slice(8,12)+
+    '-5'+noteHash.slice(13,16)+'-8'+noteHash.slice(17,20)+'-'+noteHash.slice(20,32);
+  return [...job.body.inputs,{id,name:'ci-diagnostic-scope.json',mime:'application/json',digest:sha(note),
+    size:note.length,base64:note.toString('base64'),source:'registered_external_ci_diagnostic'}];
 }
 
 /** Durable publication is retryable because the RPC is strictly read-only.

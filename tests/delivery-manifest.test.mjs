@@ -172,6 +172,19 @@ for (const runtime of ['harness', 'opencode', 'muse']) test(`stopped ${runtime} 
   } finally { await f.close(); }
 });
 
+test('recovery retains the opted-in baseline inventory required by source acceptance', async () => {
+  const f=await fixture();
+  try {
+    f.state.sourceContractVersion=1;await f.saveState();
+    const baseFiles=[{path:'src/winner.ts',sha256:hash('known-good')}];let inspections=0;
+    const result=await recoverArtifacts(f.contract.runId,false,undefined,false,{...f.options,
+      operation:async params=>{assert.equal(params.includeBaseFiles,true);inspections++;return {...f.candidate,baseFiles};}});
+    assert.equal(inspections,2);
+    const candidate=JSON.parse(Buffer.from(result.artifacts.find(a=>a.name==='candidate.json').base64,'base64'));
+    assert.deepEqual(candidate.baseFiles,baseFiles);
+  } finally {await f.close();}
+});
+
 test('generic collection refuses incomplete turns, cancellations and changed candidates', async () => {
   const f = await fixture();
   try {

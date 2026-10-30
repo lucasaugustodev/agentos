@@ -1,3 +1,4 @@
+import { assertModelRoute } from '../bridge/model-policy.mjs';
 // Dedicated native OpenCode worker queue. Shares AgentOS runs, leases, context and artifacts.
 // Does not restart the controller or publish jobs to its Harness-only queue.
 import { randomUUID } from 'node:crypto';
@@ -24,6 +25,7 @@ import { assembleContext, hash, saveMemory } from '../server/memory.js';
 import { acceptedDependencyArtifacts } from '../server/recovery.js';
 import { observeInputFailureBounded } from '../server/input-failure-observation.js';
 import { instructionTask } from '../server/task-instructions.js';
+import {workerValidationInstruction} from '../server/worker-validation.js';
 import { runtimeInputs } from '../server/execution-inputs.js';
 import { recordOpenCodeNotStarted } from '../server/not-started.js';
 import { recordWorkerReadiness } from '../server/worker-readiness.js';
@@ -70,6 +72,8 @@ async function setup() {
 }
 
 async function admit() {
+  // This historical occurrence is GLM-authorized; never reinterpret it under a new policy.
+  assertModelRoute(accountId, model);
   await syncAccounts(true);
   const memory = await saveMemory({
     project: 'pg5-20261005',
@@ -429,6 +433,7 @@ async function execute(id: string, reservation: NativeReservation) {
             task.title +
             '\n\n' +
             task.description +
+            '\n\n'+workerValidationInstruction(run)+
             (task.execution.revisionFeedback ? '\n\nRECIBOS DA PROPOSTA ANTERIOR (corrija a proposta, não repita o JSON recusado): '+JSON.stringify(task.execution.revisionFeedback) : '') +
             '\n\nINSTRUCTION MANIFEST: ' +
             JSON.stringify((context.manifest as any).taskInstructions),

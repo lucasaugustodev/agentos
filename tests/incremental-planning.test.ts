@@ -8,11 +8,14 @@ import { objectiveSchema,validatePlan } from '../server/objective-contracts.js';
 import { compileDelivery,bindDeliveryFeedback,incrementalEligible,verifiedBatch } from '../server/incremental-planning.js';
 import { submitObjective,feedbackObjective,claimPlanning,applyPlannedResult,reconcilePlanning,PlanningEngine } from '../server/planner.js';
 import { refreshGoal } from '../server/service.js';
+import {planningPreparationFixture} from './fixtures/planning-preparation.js';
 
 const request = () => objectiveSchema.parse({message:'Corrigir dois defeitos independentes e verificar a candidata acumulada.',project:'test',
-  workspaces:['test/base'],mode:'execute',planningStrategy:'incremental',requirements:['O endpoint deve persistir a alteração correta.','A interface deve exibir o progresso correto.'],idempotencyKey:randomUUID()});
-const decision = (requirementId='req-1') => ({requirementId,title:'Corrigir persistência',action:'Reproduzir a falha de persistência e corrigir sua causa com teste discriminante.',
-  verification:'Executar regressão que falha na base e passa na candidata, preservando os demais controles.',agentId:'engineering.backend.node'});
+  workspaces:['test/base'],mode:'execute',planningStrategy:'incremental',sourceContractVersion:1,requirements:['O endpoint deve persistir a alteração correta.','A interface deve exibir o progresso correto.'],idempotencyKey:randomUUID()});
+const decision = (requirementId='req-1') => ({kind:'delivery' as const,requirementId,title:'Corrigir persistência',action:'Reproduzir a falha de persistência e corrigir sua causa com teste discriminante.',
+  verification:'Executar regressão que falha na base e passa na candidata, preservando os demais controles.',agentId:'engineering.backend.node',
+  sourceContract:{version:1 as const,required:[],preserve:[],noSourceReason:'Synthetic transition fixture emits diagnostic evidence without claiming a real source implementation.'}});
+const generatedContracts=['req-1','req-2'].map(id=>({id,observables:[{id:'observable',name:id+'-result.json',authority:'current_run',type:'artifact',description:'Synthetic fixture product evidence for the original requirement'}]}));
 beforeAll(()=>migrate());
 beforeEach(async()=>{
   await pool.query('TRUNCATE goals,agents,accounts,memories,events CASCADE');
@@ -207,6 +210,20 @@ it('cannot complete with unconsumed feedback and reopens a completed objective w
   expect((await pool.query('SELECT state FROM goals WHERE id=$1',[objectiveId])).rows[0].state).toBe('active');
   expect((await pool.query('SELECT count(*) FROM acceptances WHERE passed=true')).rows[0].count).toBe('6');
 });
+it('completes when the only unconsumed feedback was superseded by a later completed plan',async()=>{
+  const {objectiveId,input,plan}=await start();
+  // Legacy zombie: old feedback referenced only by a terminally failed run,
+  // with completed plans created after it. This mirrors the deployed repair.
+  await feedbackObjective(objectiveId,'legacy-zombie','Old counterexample superseded by completed planning revisions.');
+  const zombie=(await pool.query("SELECT id FROM objective_feedback WHERE objective_id=$1 AND trigger_key='legacy-zombie'",[objectiveId])).rows[0];
+  await pool.query("UPDATE objective_feedback SET created_at=now()-interval '2 days' WHERE id=$1",[zombie.id]);
+  await pool.query("INSERT INTO planning_runs(id,objective_id,base_revision,trigger_key,state,fence,feedback,created_at) VALUES($1,$2,1,'feedback:legacy-zombie','failed',$3,$4,now()-interval '2 days')",[randomUUID(),objectiveId,randomUUID(),JSON.stringify({feedbackIds:[zombie.id],reports:['legacy'],acceptedCount:0})]);
+  await acceptBatch(objectiveId,1);await reconcilePlanning();
+  const run=await claimPlanning();await applyPlannedResult(run,compileDelivery(decision('req-2'),input,plan,true));
+  await acceptBatch(objectiveId,2);
+  await tx(async db=>{await lock(db);await refreshGoal(db,objectiveId);});
+  expect((await pool.query('SELECT state FROM goals WHERE id=$1',[objectiveId])).rows[0].state).toBe('completed');
+});
 it('fails visibly instead of silently truncating feedback beyond the existing task context limit',()=>{
   expect(()=>compileDelivery(decision(),request(),undefined,false,['x'.repeat(21000)])).toThrowError(expect.objectContaining({code:'REQUIRED_CONTEXT'}));
 });
@@ -245,16 +262,17 @@ it('resumes a fenced planning claim after executor loss without applying its sta
   expect((await pool.query('SELECT count(*) FROM tasks')).rows[0].count).toBe('2');
 });
 it('recovers a confirmed timeout with the small contract and reuses persisted output during preparation',async()=>{
-  let generated=0,prepared=0;
+  let generated=0,prepared=0;const preparation=planningPreparationFixture();
   vi.spyOn(accountBridge,'request').mockImplementation(async(method,p:any)=>{
     if(method==='memory.search')return {items:[]};
     if(method==='worker.workspaces')return [{id:'test/base'}];
     if(method==='generate'){
       expect(p.maxOutputTokens).toBe(8192);expect(JSON.parse(p.messages[0].content)).not.toHaveProperty('previousPlan');
       if(++generated===1)throw Object.assign(Error('confirmed'),{code:'PROVIDER_TIMEOUT'});
-      return {message:{content:[{type:'text',text:JSON.stringify(decision())}]}};
+      return {message:{content:[{type:'text',text:JSON.stringify({...decision(),requirementContracts:generatedContracts})}]}};
     }
-    if(method==='worker.prepare'){if(++prepared===1)throw Object.assign(Error('busy'),{code:'SOURCE_BUSY'});return {};}
+    if(method==='worker.prepare'&&++prepared===1)throw Object.assign(Error('busy'),{code:'SOURCE_BUSY'});
+    const inspection=preparation(method,p);if(inspection!==undefined)return inspection;
     throw Error('ranking fallback');
   });
   await submitObjective(request());const engine=new PlanningEngine();
@@ -280,15 +298,16 @@ it('honors paused goals between lots',async()=>{
 });
 
 it('repairs the first invalid agent after nineteen transport failures without consuming semantic retries',async()=>{
-  let generated=0;
+  let generated=0;const preparation=planningPreparationFixture();
   vi.spyOn(accountBridge,'request').mockImplementation(async(method,p:any)=>{
     if(method==='memory.search')return {items:[]};if(method==='worker.workspaces')return [{id:'test/base'}];
-    if(method==='worker.prepare')return {};
+    const inspection=preparation(method,p);if(inspection!==undefined)return inspection;
     if(method==='generate'){
       const schema=JSON.parse(p.messages[0].content).schema;
-      expect(schema.properties.agentId.enum).toContain('engineering.backend.node');
-      expect(schema.properties.agentId.enum).not.toContain('engineering.backend.nodejs');
-      return {message:{content:[{type:'text',text:JSON.stringify({...decision(),agentId:++generated===1?'engineering.backend.nodejs':'engineering.backend.node'})}]}};
+      const deliverySchema=schema.anyOf[0];
+      expect(deliverySchema.properties.agentId.enum).toContain('engineering.backend.node');
+      expect(deliverySchema.properties.agentId.enum).not.toContain('engineering.backend.nodejs');
+      return {message:{content:[{type:'text',text:JSON.stringify({...decision(),requirementContracts:generatedContracts,agentId:++generated===1?'engineering.backend.nodejs':'engineering.backend.node'})}]}};
     }
     throw Error('ranking fallback');
   });
@@ -317,7 +336,7 @@ it('persists a child before its parent atomically and rejects cyclic or absent p
 
 it('compiles and advances a parallel incremental window with disjoint writePaths, integration and verification',async()=>{
   const input=objectiveSchema.parse({message:'Corrigir três módulos independentes com verificação acumulada.',project:'test',
-    workspaces:['test/base'],mode:'execute',planningStrategy:'incremental',
+    workspaces:['test/base'],mode:'execute',planningStrategy:'incremental',sourceContractVersion:1,
     requirements:['O módulo A deve rejeitar entradas nulas.','O módulo B deve preservar precisão decimal.','O módulo C deve registrar auditoria.'],
     idempotencyKey:randomUUID()});
   const agents=(await pool.query('SELECT * FROM agents')).rows;
@@ -364,6 +383,7 @@ it('rebinds unaccepted agentos objectives to the current published agentos-sourc
     workspaces:[staleSource],
     mode:'execute',
     planningStrategy:'incremental',
+    sourceContractVersion:1,
     requirements:['O módulo A deve rejeitar entradas nulas.','O módulo B deve preservar precisão decimal.'],
     idempotencyKey:randomUUID(),
   });

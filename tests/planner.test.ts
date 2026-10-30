@@ -1,9 +1,10 @@
 import { beforeAll, beforeEach, afterEach, afterAll, it, expect, vi } from 'vitest';
-import { randomUUID } from 'node:crypto';
+import { createHash,randomUUID } from 'node:crypto';
 import { config } from '../server/config.js';
 import { pool, migrate } from '../server/db.js';
 import { seedRegistry } from '../server/registry.js';
 import { accountBridge } from '../server/bridge.js';
+import {planningPreparationFixture} from './fixtures/planning-preparation.js';
 import { objectiveSchema, planSchema, validatePlan } from '../server/objective-contracts.js';
 import {
   submitObjective,
@@ -28,7 +29,7 @@ const criterion = {
   equals: true,
 };
 function plan() {
-  return planSchema.parse({
+  const fixture=planSchema.parse({
     title: 'Entrega composta',
     summary: 'Duas frentes, integração e verificação independente.',
     requirements: [{ id: 'working', description: 'As duas funções devem passar seus testes.' }],
@@ -78,6 +79,11 @@ function plan() {
       },
     ],
   });
+  // This suite exercises orchestration using result.json, without source files.
+  fixture.sourceContractVersion=1;
+  for(const task of fixture.tasks)task.sourceContract={version:1,required:[],preserve:[],
+    noSourceReason:'Synthetic controller fixture emits only result.json; no implementation source is claimed by this test.'};
+  return fixture;
 }
 function request(extra = {}) {
   return objectiveSchema.parse({
@@ -88,6 +94,12 @@ function request(extra = {}) {
     idempotencyKey: randomUUID(),
     ...extra,
   });
+}
+// Only fresh model outputs use v2; manually applied legacy plans stay v1.
+function generatedPlan() {
+  return {...plan(),completionContractVersion:2,requirementContracts:[{id:'working',
+    observables:[{id:'result',name:'result.json',authority:'current_run',type:'artifact',
+      description:'Synthetic controller fixture output; not an external measurement'}]}]};
 }
 beforeAll(async () => {
   await migrate();
@@ -110,6 +122,9 @@ afterAll(() => pool.end());
 async function finish(id: string, passed = true) {
   const r = await service.startRun(id, 'test');
   await service.writeArtifact(id, r.fence, 'result.json', JSON.stringify({ passed }));
+  // Explicit virtual empty-source runtime fixture, not real worker evidence.
+  const empty=createHash('sha256').update('[]').digest('hex');
+  await service.writeArtifact(id,r.fence,'candidate.json',JSON.stringify({baseDigest:empty,candidateDigest:empty,files:[],baseFiles:[]}));
   await service.completeRun(id, r.fence, 'Verified test fixture');
   return service.validateTask(r.task_id);
 }
@@ -226,7 +241,7 @@ it('never creates tasks or prepares workspaces for planning-only requests', asyn
     if (method === 'memory.search') return { items: [] };
     if (method === 'worker.workspaces') return [{ id: 'test/base' }];
     if (method === 'generate')
-      return { message: { content: [{ type: 'text', text: JSON.stringify(plan()) }] } };
+      return { message: { content: [{ type: 'text', text: JSON.stringify(generatedPlan()) }] } };
     throw Error('Expected fallback or forbidden mutation: ' + method);
   });
   const { objectiveId } = await submitObjective(request({ mode: 'plan' }));
@@ -331,17 +346,19 @@ it('batches Laya candidates and rejects incomplete rankings', async () => {
 it('reuses a validated proposal when workspace preparation must wait', async () => {
   let prepares = 0,
     generations = 0;
-  vi.spyOn(accountBridge, 'request').mockImplementation(async (method) => {
+  const preparation=planningPreparationFixture();
+  vi.spyOn(accountBridge, 'request').mockImplementation(async (method,params:any) => {
     if (method === 'memory.search') return { items: [] };
     if (method === 'worker.workspaces') return [{ id: 'test/base' }];
     if (method === 'generate') {
       generations++;
-      return { message: { content: [{ type: 'text', text: JSON.stringify(plan()) }] } };
+      return { message: { content: [{ type: 'text', text: JSON.stringify(generatedPlan()) }] } };
     }
     if (method === 'worker.prepare') {
       if (++prepares === 1) throw Object.assign(Error('busy'), { code: 'SOURCE_BUSY' });
-      return {};
+      return preparation(method,params);
     }
+    const prepared=preparation(method,params);if(prepared!==undefined)return prepared;
     throw Error('ranking fallback');
   });
   await submitObjective(request());
@@ -358,14 +375,15 @@ it('reuses a validated proposal when workspace preparation must wait', async () 
 
 it('recovers a confirmed generation timeout without creating duplicate work', async () => {
   let generations = 0;
-  vi.spyOn(accountBridge, 'request').mockImplementation(async (method) => {
+  const preparation=planningPreparationFixture();
+  vi.spyOn(accountBridge, 'request').mockImplementation(async (method,params:any) => {
     if (method === 'memory.search') return { items: [] };
     if (method === 'worker.workspaces') return [{ id: 'test/base' }];
     if (method === 'generate') {
       if (++generations === 1) throw Object.assign(Error('confirmed timeout'), { code: 'PROVIDER_TIMEOUT' });
-      return { message: { content: [{ type: 'text', text: JSON.stringify(plan()) }] } };
+      return { message: { content: [{ type: 'text', text: JSON.stringify(generatedPlan()) }] } };
     }
-    if (method === 'worker.prepare') return {};
+    const prepared=preparation(method,params);if(prepared!==undefined)return prepared;
     throw Error('ranking fallback');
   });
   const { objectiveId } = await submitObjective(request());
@@ -382,21 +400,22 @@ it('recovers a confirmed generation timeout without creating duplicate work', as
 
 it.each([
   ['generate', 'STOP_UNCONFIRMED', 1, 'failed', false],
-  ['worker.prepare', 'PROVIDER_TIMEOUT', 1, 'failed', false],
+  ['worker.prepare', 'PROVIDER_TIMEOUT', 1, 'queued', false],
   ['generate', 'PROVIDER_TIMEOUT', 3, 'queued', false],
   ['generate', 'STOP_UNCONFIRMED', 1, 'failed', true],
   ['worker.prepare', 'STOP_UNCONFIRMED', 1, 'failed', true],
-])('distinguishes confirmed model failure from uncertain effects: %s %s attempt %s -> %s', async (phase, code, attempt, expectedState, interrupt) => {
+])('distinguishes confirmed model failure from uncertain effects [case %#]: %s %s attempt %s -> %s', async (phase, code, attempt, expectedState, interrupt) => {
   const controller = new AbortController();
-  vi.spyOn(accountBridge, 'request').mockImplementation(async (method) => {
+  const preparation=planningPreparationFixture();
+  vi.spyOn(accountBridge, 'request').mockImplementation(async (method,params:any) => {
     if (method === phase) {
       if (interrupt) controller.abort();
       throw Object.assign(Error(code), { code });
     }
     if (method === 'memory.search') return { items: [] };
     if (method === 'worker.workspaces') return [{ id: 'test/base' }];
-    if (method === 'generate') return { message: { content: [{ type: 'text', text: JSON.stringify(plan()) }] } };
-    if (method === 'worker.prepare') return {};
+    if (method === 'generate') return { message: { content: [{ type: 'text', text: JSON.stringify(generatedPlan()) }] } };
+    const prepared=preparation(method,params);if(prepared!==undefined)return prepared;
     throw Error('ranking fallback');
   });
   await submitObjective(request());
@@ -417,8 +436,8 @@ it('automatically replans rejected QA while retaining previously accepted branch
   await recoverStoppedTasks();
   await reconcilePlanning();
   const next = await claimPlanning();
-  expect(next.feedback.sourceOverrides['test/base']).toContain('-check');
-  expect(next.feedback.artifacts).toHaveLength(1);
+  expect(next.feedback.sourceOverrides).not.toHaveProperty('test/base');
+  expect(next.feedback.artifacts.map((artifact:any)=>artifact.name).sort()).toEqual(['candidate.json','result.json']);
   const repair = plan();
   repair.approachChange = 'Reproduzir e corrigir o caso mínimo que reprovou a candidata.';
   repair.tasks = [

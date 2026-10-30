@@ -1,4 +1,4 @@
-import { assertModelRoute } from './model-policy.mjs';
+import { assertModelRoute, usesSharedRequestGate } from './model-policy.mjs';
 import { randomUUID } from 'node:crypto';
 import { acquireGlmRequestSlot } from './glm-request-slot.mjs';
 import { requestModel, DeferredModelRequest } from './model-request.mjs';
@@ -12,11 +12,14 @@ export const GLM_REQUEST_ADMITTED = Symbol('agentos.glm.request.admitted');
 // While queued only caller cancellation applies; the provider timeout starts
 // after admission. Never bypass a missing or disconnected gate.
 export async function withGlmRequestSlot(
-  { runId, signal, emit = () => {}, socketPath, requestTimeoutMs },
+  { runId, requestId, accountId = GLM_ACCOUNT, model, signal, emit = () => {}, socketPath, requestTimeoutMs },
   operation,
   dependencies = {},
 ) {
   const acquire = dependencies.acquire ?? acquireGlmRequestSlot;
+  const monotonicNow=dependencies.telemetryNow??(()=>performance.now());
+  let started=null,lastElapsed=0;
+  try {const value=monotonicNow();if(Number.isFinite(value))started=value;}catch{}
   const queued = new AbortController();
   const upstream = new AbortController();
   const cancelQueue = () => queued.abort(signal.reason);
@@ -24,7 +27,15 @@ export async function withGlmRequestSlot(
   if (signal?.aborted) cancelQueue();
   let slot, lost, timer, lastQueueState;
   const safeEmit = (kind, state = {}) => {
-    const payload = { runId, accountId: GLM_ACCOUNT };
+    const payload = { runId, accountId, ...(typeof model === 'string' ? {model} : {}) };
+    if(typeof requestId==='string'&&/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(requestId))payload.requestId=requestId;
+    payload.gateElapsedMs=null;
+    try {
+      const value=monotonicNow();
+      if(started!==null&&Number.isFinite(value)){
+        lastElapsed=Math.max(lastElapsed,value-started);payload.gateElapsedMs=Math.round(lastElapsed*1000)/1000;
+      }
+    } catch{}
     for (const key of [
       'active',
       'queued',
@@ -37,7 +48,7 @@ export async function withGlmRequestSlot(
       if (Number.isFinite(state[key])) payload[key] = state[key];
     }
     try {
-      emit(kind, payload);
+      Promise.resolve(emit(kind, payload)).catch(()=>{});
     } catch {
       /* Observation must not alter permits. */
     }
@@ -95,11 +106,14 @@ export function withAccountRequestGate(params, signal, operation, emit, dependen
   assertModelRoute(params.accountId, params.model);
   const original = operation;
   operation = (signal) => { assertModelRoute(params.accountId, params.model); return original(signal); };
-  if (params.accountId !== GLM_ACCOUNT || admission === GLM_REQUEST_ADMITTED)
+  if (!usesSharedRequestGate(params.accountId) || admission === GLM_REQUEST_ADMITTED)
     return operation(signal);
   return withGlmRequestSlot(
     {
       runId: params.runId ?? randomUUID(),
+      requestId: params.requestId,
+      accountId: params.accountId,
+      model: params.model,
       signal,
       emit,
       requestTimeoutMs: params.requestTimeoutMs,

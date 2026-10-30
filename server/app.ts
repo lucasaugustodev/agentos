@@ -28,6 +28,9 @@ import { chatEngine, listChats, newChat, chatDetail } from './chat.js';
 import type { WorkerEngine } from './worker.js';
 import { submitObjective, objectiveDetail, feedbackObjective } from './planner.js';
 import {registerObjectiveInput} from './objective-inputs.js';
+import {registerSourceReplanFeedback} from './objective-source-replan.js';
+import {objectiveModelRoute,registerObjectiveModelRoute} from './objective-model-route.js';
+import {registerWorkerValidationPolicy} from './worker-validation.js';
 import {configureObjectiveReview,objectiveReviews,requestObjectiveReview} from './objective-review.js';
 import {reconcileInheritedCancellation} from './objective-state-repair.js';
 import { cycleRoutes } from './cycles/routes.js';
@@ -153,6 +156,11 @@ export function makeApp(engine?: WorkerEngine) {
     return registerObjectiveInput(z.uuid().parse((req.params as any).id),req.body,
       {channel:bearer&&equal(bearer,config.apiToken)?'api-token':'operator-session'});
   });
+  app.post('/api/objectives/:id/validation-policy',async req=>{
+    const bearer=(req.headers.authorization??'').replace(/^Bearer /,'');
+    return registerWorkerValidationPolicy(z.uuid().parse((req.params as any).id),req.body,
+      {channel:bearer&&equal(bearer,config.apiToken)?'api-token':'operator-session'});
+  });
   app.get('/api/objectives/:id/reviews',async req=>objectiveReviews(z.uuid().parse((req.params as any).id)));
   app.post('/api/objectives/:id/reviews',{bodyLimit:8192},async req=>{
     const bearer=(req.headers.authorization??'').replace(/^Bearer /,'');
@@ -170,7 +178,17 @@ export function makeApp(engine?: WorkerEngine) {
     ...(await objectiveDetail(z.uuid().parse((req.params as any).id))),
     ...(await goalDetail((req.params as any).id)),
   }));
+  app.get('/api/objectives/:id/model-route', async req =>
+    objectiveModelRoute(z.uuid().parse((req.params as any).id)));
+  app.post('/api/objectives/:id/model-route', async req =>
+    registerObjectiveModelRoute(z.uuid().parse((req.params as any).id),req.body,
+      {channel:equal((req.headers.authorization??'').replace(/^Bearer /,''),config.apiToken)?'api-token':'operator-session'}));
   app.post('/api/objectives/:id/feedback', async (req) => {
+    if((req.body as any)?.sourceReplan!==undefined){
+      const bearer=(req.headers.authorization??'').replace(/^Bearer /,'');
+      return registerSourceReplanFeedback(z.uuid().parse((req.params as any).id),req.body,
+        {channel:bearer&&equal(bearer,config.apiToken)?'api-token':'operator-session'});
+    }
     const b = z
       .object({
         idempotencyKey: z.string().min(8).max(160),

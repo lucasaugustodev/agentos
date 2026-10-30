@@ -474,6 +474,8 @@ export class CycleEngine {
           ? await runCycleAgent(o, s, a, account, controller.signal, emit)
           : await runCycleAction(o, s, a, controller.signal, emit);
       await saveCycleArtifacts(a.id, result.artifacts ?? []);
+      if (s.definition.action === 'agentos.validate' && result.output?.passed === false)
+        throw new DomainError('VALIDATION_CHECKS_FAILED', 'A validação terminou e registrou testes ou cobertura obrigatória sem aprovação.');
       for (const criterion of s.definition.criteria) {
         const artifact = (
           await pool.query('SELECT id FROM cycle_artifacts WHERE attempt_id=$1 AND name=$2', [

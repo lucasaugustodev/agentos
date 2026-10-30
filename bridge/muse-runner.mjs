@@ -125,6 +125,7 @@ async function executeMuse(params, signal, account, emit) {
           unit,
           runtime: 'muse',
           deliveryContract: outputContract,
+          ...(params.sourceContract?{sourceContractVersion:1}:{}),
           model: params.model,
           requests: stats?.requests ?? 0,
           toolCalls: events.toolCalls,
@@ -414,6 +415,7 @@ async function executeMuse(params, signal, account, emit) {
       const candidate = await workspaceOperation({
         action: 'inspect',
         workspace: params.workspace,
+        ...(params.sourceContract?{includeBaseFiles:true}:{}),
       });
       if (params.readOnlySource && candidate.baseDigest !== candidate.candidateDigest)
         throw failure('SOURCE_CHANGED_DURING_VALIDATION');

@@ -8,6 +8,7 @@ import {queueFeedback} from './planner.js';
 
 const digest=z.string().regex(/^[a-f0-9]{64}$/);
 const requirement=z.string().regex(/^[a-z0-9_-]{1,50}$/);
+const objectiveInputLimit=32;
 export const objectiveInputSchema=z.object({
   requestId:z.uuid(),expectedRevision:z.number().int().nonnegative(),
   name:z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,100}$/)
@@ -16,6 +17,7 @@ export const objectiveInputSchema=z.object({
   requirementIds:z.array(requirement).min(1).max(30),
   sourceRef:z.string().trim().min(3).max(240),
   reason:z.string().trim().min(10).max(1000),
+  planningSummary:z.string().trim().min(20).max(3000).refine(value=>!value.includes('\0')).optional(),
   requestReplan:z.boolean().default(true),
 }).strict();
 type InputRequest=z.infer<typeof objectiveInputSchema>;
@@ -53,7 +55,7 @@ function checkedRequest(raw:unknown):InputRequest{
   const bytes=Buffer.from(input.base64,'base64');
   if(bytes.length>65536)throw failure('OBJECTIVE_INPUT_TOO_LARGE','Entrada de operador excede 64 KiB.',400);
   checkMemoryContent(bytes.toString('utf8'));
-  checkMemoryContent(request.sourceRef+'\n'+request.reason);
+  checkMemoryContent(request.sourceRef+'\n'+request.reason+'\n'+(request.planningSummary??''));
   return request;
 }
 function receipt(row:any,duplicate:boolean){
@@ -75,7 +77,8 @@ async function verifiedRow(db:DB,row:any){
   if(!(await db.query(`SELECT 1 FROM events WHERE kind='OBJECTIVE_INPUT_REGISTERED' AND entity_id=$1
     AND payload->>'inputId'=$2 AND payload->>'receiptDigest'=$3`,[row.goal_id,row.id,row.receipt_digest])).rowCount)
     throw failure('OBJECTIVE_INPUT_INTEGRITY','Proveniência da entrada ausente.');
-  return {id:row.id,name:p.name,digest:p.digest,base64:request.base64,requirementIds:p.requirementIds};
+  return {id:row.id,name:p.name,digest:p.digest,base64:request.base64,requirementIds:p.requirementIds,
+    ...(request.planningSummary!==undefined?{planningSummary:request.planningSummary}:{})};
 }
 
 /** Bytes come from the authenticated operator, never from a model-selected host
@@ -100,8 +103,8 @@ export async function registerObjectiveInput(goalId:string,raw:unknown,auth:Auth
     const requirements=(await db.query('SELECT plan->\'requirements\' requirements FROM plan_revisions WHERE objective_id=$1 ORDER BY revision DESC LIMIT 1',[goalId])).rows[0]?.requirements;
     if(!requirements||request.requirementIds.some(id=>!requirements.some((r:any)=>r.id===id)))
       throw failure('OBJECTIVE_INPUT_REQUIREMENTS','A entrada deve apontar para requisitos existentes.');
-    if(Number((await db.query('SELECT count(*) n FROM objective_inputs WHERE goal_id=$1',[goalId])).rows[0].n)>=20)
-      throw failure('OBJECTIVE_INPUT_LIMIT','Objetivo já possui vinte entradas de operador.');
+    if(Number((await db.query('SELECT count(*) n FROM objective_inputs WHERE goal_id=$1',[goalId])).rows[0].n)>=objectiveInputLimit)
+      throw failure('OBJECTIVE_INPUT_LIMIT',`Objetivo já possui ${objectiveInputLimit} entradas de operador.`);
     const id=randomUUID(),payload={version:1,id,goalId,name:request.name,digest:request.digest,
       size:Buffer.byteLength(request.base64,'base64'),requirementIds:request.requirementIds,
       authChannel:auth.channel,requestReplan:request.requestReplan,request};
@@ -123,8 +126,8 @@ export async function registerObjectiveInput(goalId:string,raw:unknown,auth:Auth
 /** Called while applying a new plan, before attempts/instructions are frozen. */
 export async function readObjectiveInputs(db:DB,goalId:string){
   if(!(await db.query("SELECT to_regclass('public.objective_inputs') name")).rows[0]?.name)return [];
-  const rows=(await db.query('SELECT * FROM objective_inputs WHERE goal_id=$1 ORDER BY created_at,id LIMIT 21',[goalId])).rows;
-  if(rows.length>20)throw failure('OBJECTIVE_INPUT_LIMIT','Entradas excedem o contrato.');
+  const rows=(await db.query('SELECT * FROM objective_inputs WHERE goal_id=$1 ORDER BY created_at,id LIMIT $2',[goalId,objectiveInputLimit+1])).rows;
+  if(rows.length>objectiveInputLimit)throw failure('OBJECTIVE_INPUT_LIMIT','Entradas excedem o contrato.');
   const result=[];
   for(const row of rows)result.push(await verifiedRow(db,row));
   return result;
@@ -132,5 +135,5 @@ export async function readObjectiveInputs(db:DB,goalId:string){
 
 export function inputsForRequirements(inputs:{id:string;name:string;digest:string;base64:string;requirementIds:string[]}[],covers:string[]){
   return mergeSupervisorInputs([],inputs.filter(input=>input.requirementIds.some(id=>covers.includes(id)))
-    .map(({requirementIds,...input})=>input));
+    .map(({id,name,digest,base64})=>({id,name,digest,base64})));
 }

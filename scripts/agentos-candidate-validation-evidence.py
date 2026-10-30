@@ -11,6 +11,7 @@ STATE = pathlib.Path('/var/lib/agentos-bridge/candidate-validations')
 MAX_RESULT = 16 * 1024 * 1024
 spec = importlib.util.spec_from_file_location('ci_broker', pathlib.Path(__file__).with_name('agentos-candidate-validation.py'))
 broker = importlib.util.module_from_spec(spec); spec.loader.exec_module(broker)
+from validation_coverage import verified_coverage
 sha = broker.sha
 canonical = broker.canonical
 
@@ -67,9 +68,9 @@ def verified_export(request):
         receipt.get('candidateDigest') != request['candidateDigest'] or
         receipt.get('validatedCandidateDigest') != request['candidateDigest'] or
         receipt.get('frozenWorkspace') != 'agentos/ocv' + request['actionId'].replace('-', '') or
-        receipt.get('registeredActionSha') != broker.REGISTERED_HASH or
         receipt.get('requestDigest') != sha(intent)):
         raise ValueError('CI_EVIDENCE_RECEIPT_UNBOUND')
+    executor_sha = broker.verified_execution_registration(receipt)
     result_bytes = protected_read(directory / 'result.json', MAX_RESULT)
     if sha(result_bytes) != receipt.get('resultDigest'):
         raise ValueError('CI_EVIDENCE_RESULT_CHANGED')
@@ -93,7 +94,7 @@ def verified_export(request):
         'requestDigest': sha(intent), 'receiptDigest': sha(receipt_bytes), 'resultDigest': sha(result_bytes),
         'producer': {k: request[k] for k in ['goalId','taskId','runId','runFence','contextVersion','expectedAttempt','candidateDigest','contractDigest']},
         'outcome': {'passed': receipt['passed'], 'code': receipt.get('code'), 'state': receipt['state']},
-        'registeredActionSha': broker.REGISTERED_HASH,
+        'registeredActionSha': executor_sha,
         'registeredCommand': [profile['command'], *profile['args']],
         'publishedBaselineDigest': receipt.get('publishedBaselineDigest'),
         'publicationProofDigest': receipt.get('publicationProofDigest'),
@@ -105,6 +106,9 @@ def verified_export(request):
                 'source': 'registered_action_validation.log', 'commandStdoutMayBeTruncatedByRegisteredAction': True},
         'acceptance': False,
     }
+    coverage = verified_coverage(request, output, executor_sha)
+    if coverage is not None:
+        authority['coverage'] = coverage
     proof = canonical(authority)
     return {'version':1, 'actionId':request['actionId'], 'requestDigest':sha(intent),
             'resultDigest':sha(result_bytes), 'receiptDigest':sha(receipt_bytes), 'authority':authority,

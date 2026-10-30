@@ -60,7 +60,7 @@ export async function installTaskInstructions(db: DB) {
     ALTER TABLE tasks ADD COLUMN IF NOT EXISTS instruction_revision_id uuid REFERENCES task_instruction_revisions(id);
     ALTER TABLE runs ADD COLUMN IF NOT EXISTS instruction_snapshot jsonb;
     CREATE OR REPLACE FUNCTION agentos_instruction_snapshot() RETURNS trigger LANGUAGE plpgsql AS $$
-    DECLARE t tasks; r task_instruction_revisions; item jsonb; prior jsonb; entries jsonb='[]'; bytes bytea; total bigint=0; BEGIN
+    DECLARE t tasks; r task_instruction_revisions; item jsonb; prior jsonb; entries jsonb='[]'; bytes bytea; total bigint=0; ci jsonb; BEGIN
       IF TG_OP='UPDATE' THEN
         IF NEW.instruction_snapshot IS DISTINCT FROM OLD.instruction_snapshot THEN RAISE EXCEPTION 'INSTRUCTION_SNAPSHOT_IMMUTABLE'; END IF; RETURN NEW;
       END IF;
@@ -96,6 +96,12 @@ export async function installTaskInstructions(db: DB) {
         END IF;
       END LOOP;
       NEW.instruction_snapshot:=jsonb_build_object('schema',1,'task',to_jsonb(t),'revisionId',r.id,'executionInputs',entries);
+      SELECT value INTO ci FROM settings WHERE id='worker-validation:'||t.goal_id
+        AND value#>>'{policy,enabled}'='true' AND (value#>'{policy,stages}') ? t.stage
+        AND t.execution->>'kind' IN('harness','opencode');
+      IF ci IS NOT NULL AND NOT EXISTS(SELECT 1 FROM events WHERE kind='WORKER_VALIDATION_POLICY_REGISTERED'
+        AND entity_id=t.goal_id::text AND payload=ci) THEN RAISE EXCEPTION 'VALIDATION_POLICY_UNREGISTERED'; END IF;
+      NEW.instruction_snapshot:=NEW.instruction_snapshot||jsonb_build_object('workerValidationContract',1,'workerValidation',ci);
       RETURN NEW; END $$;
     DROP TRIGGER IF EXISTS agentos_instruction_snapshot ON runs;
     CREATE TRIGGER agentos_instruction_snapshot BEFORE INSERT OR UPDATE OF instruction_snapshot ON runs FOR EACH ROW EXECUTE FUNCTION agentos_instruction_snapshot();

@@ -35,9 +35,11 @@ await new Promise((resolve, reject) => {
   proxy.listen(17820, '127.0.0.1', resolve);
 });
 const config = await readFile('/home/agent/opencode.json', 'utf8');
+const selectedModel=JSON.parse(config).model;
+if (!['agentos/glm-5.3-flash','agentos/deepseek-v4-pro-0813'].includes(selectedModel)) throw Error('INVALID_ROUTE');
 const prompt = await readFile('/home/agent/prompt.txt', 'utf8');
 const child = spawn('/opt/agentos-opencode/opencode', [
-  'run', '--pure', '--format', 'json', '--model', 'agentos/glm-5.3-flash',
+  'run', '--pure', '--format', 'json', '--model', selectedModel,
   '--agent', 'agentos-worker', '--title', 'AgentOS isolated task',
 ], {
   cwd: '/workspace',

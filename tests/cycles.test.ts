@@ -18,6 +18,8 @@ import { makeApp } from '../server/app.js';
 import * as integrations from '../server/cycles/integrations.js';
 import { trustedTailnet } from '../server/tailnet.js';
 import { saveCycleArtifacts, readCycleArtifact } from '../server/cycles/runtime.js';
+import * as cycleRuntime from '../server/cycles/runtime.js';
+import { DomainError } from '../server/contracts.js';
 const definition = (steps: any[] = []) => ({
   name: 'Ciclo isolado',
   project: 'fixture',
@@ -341,4 +343,58 @@ it('starts self-development from the currently published source snapshot', async
   } finally {
     await pool.query("DELETE FROM settings WHERE id='agentos-source-workspace'");
   }
+});
+
+const validationCycle = () => ({ ...definition([{
+  key: 'validate', title: 'Validação registrada', kind: 'action', action: 'agentos.validate', maxAttempts: 3,
+}]), project: 'agentos', allowedActions: ['agentos.validate'] });
+
+it('keeps a lost registered validator in reconciliation without scheduling another attempt', async () => {
+  const action = vi.spyOn(cycleRuntime, 'runCycleAction').mockRejectedValue(
+    new DomainError('STOP_UNCONFIRMED', 'Guard perdido após despacho; unidade pode iniciar depois.'),
+  );
+  const cycle = await createCycle(validationCycle(), 'uncertain-validator-cycle');
+  const occurrence = await runCycle(cycle.id, 'uncertain-validator-run');
+  await engine.execute(await engine.claim());
+  await engine.recover();
+  await engine.reconcile();
+  const detail = await occurrenceDetail(occurrence.id);
+  expect(detail.attempts).toHaveLength(1);
+  expect(detail.attempts[0]).toMatchObject({ state: 'reconciling', error_code: 'STOP_UNCONFIRMED' });
+  expect(detail.steps[0].state).toBe('reconciling');
+  expect(detail.occurrence.state).toBe('reconciling');
+  expect(detail.events.some(event => event.kind === 'RETRY_SCHEDULED')).toBe(false);
+  expect(await engine.claim()).toBeNull();
+  expect(action).toHaveBeenCalledTimes(1);
+});
+
+it('preserves confirmed failed-CI artifacts and permits repair even without a configured criterion', async () => {
+  vi.spyOn(cycleRuntime, 'runCycleAction').mockResolvedValue({
+    ok: true, output: { passed: false }, validationStopProof: { populated: false },
+    artifacts: [{ name: 'verification.json', content: '{"passed":false}' }],
+  });
+  const cycle = await createCycle(validationCycle(), 'failed-validator-cycle');
+  const occurrence = await runCycle(cycle.id, 'failed-validator-run');
+  await engine.execute(await engine.claim());
+  const detail = await occurrenceDetail(occurrence.id);
+  expect(detail.attempts[0]).toMatchObject({ state: 'failed', error_code: 'VALIDATION_CHECKS_FAILED' });
+  expect(detail.steps[0].state).toBe('retry');
+  expect(detail.occurrence.state).toBe('recovering');
+  expect(detail.artifacts).toHaveLength(1);
+  expect(JSON.parse((await readCycleArtifact(detail.artifacts[0].id)).bytes.toString())).toEqual({ passed: false });
+  expect(detail.events.some(event => event.kind === 'RETRY_SCHEDULED')).toBe(true);
+});
+
+it('completes a successful registered validation after the runtime confirmed its stop', async () => {
+  vi.spyOn(cycleRuntime, 'runCycleAction').mockResolvedValue({
+    ok: true, output: { digest: 'a'.repeat(64) }, validationStopProof: { populated: false },
+    artifacts: [{ name: 'verification.json', content: '{"passed":true}' }],
+  });
+  const cycle = await createCycle(validationCycle(), 'passed-validator-cycle');
+  const occurrence = await runCycle(cycle.id, 'passed-validator-run');
+  await engine.execute(await engine.claim());
+  await engine.recover();
+  const detail = await occurrenceDetail(occurrence.id);
+  expect(detail.attempts[0].state).toBe('completed');
+  expect(detail.occurrence.state).toBe('completed');
 });
