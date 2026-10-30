@@ -64,9 +64,12 @@ async function assertWorkerValidationRegistrationOwner(db:DB,goalId:string) {
   const row=(await db.query(`SELECT g.state,o.mode,
     EXISTS(SELECT 1 FROM settings s WHERE s.id IN('management:'||g.id,'workforce:'||g.id) AND s.value->>'enabled'='true') manager,
     (SELECT value->>'enabled' FROM settings WHERE id='autonomy:'||g.project) autonomy,
-    EXISTS(SELECT 1 FROM runs r JOIN tasks t ON t.id=r.task_id WHERE t.goal_id=g.id
+    EXISTS(SELECT 1 FROM runs r JOIN tasks t ON t.id=r.task_id
+      LEFT JOIN settings h ON h.id='worker-validation-handoff:'||r.id WHERE t.goal_id=g.id
       AND (r.state IN('queued','running','cancelling','reconciling') OR EXISTS(SELECT 1 FROM leases l WHERE l.run_id=r.id)
-        OR EXISTS(SELECT 1 FROM settings h WHERE h.id='worker-validation-handoff:'||r.id AND h.value->>'state'='pending'))) live,
+        OR h.value->>'state'='pending' OR (r.state='submitted' AND t.state='submitted' AND r.attempt=t.attempt_count
+          AND r.instruction_snapshot->'workerValidation' IS NOT NULL AND r.instruction_snapshot->'workerValidation'<>'null'::jsonb
+          AND COALESCE(h.value->>'state','pending')='pending'))) live,
     EXISTS(SELECT 1 FROM settings s WHERE s.id LIKE 'candidate-validation:%' AND s.value->>'goalId'=g.id::text
       AND s.value->>'state' IN('proposed','freezing','frozen','running','uncertain')) validation_owner
     FROM goals g LEFT JOIN objectives o ON o.id=g.id WHERE g.id=$1`,[goalId])).rows[0];

@@ -77,6 +77,16 @@ it('refuses an unresolved handoff even before it has reserved a validator job',a
     ['worker-validation-handoff:'+run,JSON.stringify({runId:run,state:'pending',code:'STOP_UNCONFIRMED'})]);
   await expect(register()).rejects.toThrow('VALIDATION_RUNTIME_UNAUTHORIZED');
 });
+it('preserves an admitted policy after submission even before the handoff row exists',async()=>{
+  await state('active');const original=await register(),{run,task}=await admit();
+  await pool.query("UPDATE runs SET state='submitted',finished_at=now() WHERE id=$1",[run]);
+  await pool.query("UPDATE tasks SET state='submitted' WHERE id=$1",[task]);await state('failed');
+  expect((await pool.query('SELECT 1 FROM settings WHERE id=$1',['worker-validation-handoff:'+run])).rowCount).toBe(0);
+  await expect(register()).rejects.toThrow('VALIDATION_RUNTIME_UNAUTHORIZED');
+  expect((await pool.query('SELECT value FROM settings WHERE id=$1',['worker-validation:'+goal])).rows[0].value).toEqual(original);
+  expect((await snapshot(run)).workerValidation).toEqual(original);
+  expect((await pool.query("SELECT count(*)::int n FROM events WHERE kind='WORKER_VALIDATION_POLICY_REGISTERED' AND entity_id=$1",[goal])).rows[0].n).toBe(1);
+});
 it.each(['proposed','freezing','frozen','running','uncertain'])('preserves a %s validator owner before future policy replacement',async(value)=>{
   await pool.query('INSERT INTO settings(id,value) VALUES($1,$2)',['candidate-validation:'+randomUUID(),JSON.stringify({goalId:goal,state:value})]);
   await expect(register()).rejects.toThrow('VALIDATION_RUNTIME_UNAUTHORIZED');
