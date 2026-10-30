@@ -14,7 +14,7 @@ beforeEach(async()=>{
     OR id LIKE 'management:%' OR id LIKE 'workforce:%' OR id='autonomy:agentos'`);
   await pool.query('TRUNCATE goals,agents,accounts,events CASCADE');await seedRegistry();goal=randomUUID();
   await pool.query(`INSERT INTO goals(id,title,description,project,state,idempotency_key)
-    VALUES($1,'Future validation','Preconfigure only','agentos','failed',$1::text)`,[goal]);
+    VALUES($1::uuid,'Future validation','Preconfigure only','agentos','failed',$1::text)`,[goal]);
   await pool.query("INSERT INTO objectives(id,request,request_hash,mode,status) VALUES($1,'{}','fixture','execute','failed')",[goal]);
   await pool.query("INSERT INTO settings(id,value) VALUES('autonomy:agentos','{\"enabled\":true}')");
 });
@@ -28,7 +28,7 @@ async function state(value:string){
 async function admit(runState='running'){
   const task=randomUUID(),run=randomUUID();
   await pool.query(`INSERT INTO tasks(id,goal_id,key,title,description,agent_id,state,stage,criteria,execution,attempt_count)
-    VALUES($1,$2,$1::text,'Fixture work','Frozen admission','qa.integration','running','work','[]',
+    VALUES($1::uuid,$2,$1::text,'Fixture work','Frozen admission','qa.integration','running','work','[]',
       '{"kind":"harness","workspace":"agentos/ofuture"}',1)`,[task,goal]);
   await pool.query("INSERT INTO runs(id,task_id,attempt,fence,runtime,agent_version,state) VALUES($1,$2,1,$3,'harness',1,$4)",
     [run,task,randomUUID(),runState]);
