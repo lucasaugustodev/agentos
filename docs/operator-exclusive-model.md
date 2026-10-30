@@ -43,3 +43,46 @@ without final JSON. A 32768 allowance produced schema-valid JSON, as did a faste
 disabled-thinking probe, but their proposed changes differed. The default keeps
 high reasoning; speed alone does not establish equivalent plans, task completion
 or QA acceptance. No probe output was applied by this change.
+
+## Installing the operator file into SQL authority
+
+`scripts/install-model-policy.ts` is a root-only command for the existing global
+worker-rollout window. The wrapper keeps `/var/lib/agentos/releases/publication.lock`
+exclusively locked, installs `/etc/agentos/model-policy.json` while services are
+stopped, and passes that open lock descriptor using `pass_fds`. Invoke the command
+from the exact managed candidate with `--publication-lock-fd <fd>` and one JSON
+object on stdin:
+
+```json
+{
+  "version": 1,
+  "token": "11111111-2222-4333-8444-555555555555",
+  "candidate": "/opt/agentos/releases/managed-11111111-2222-4333-8444-555555555555",
+  "digest": "<exact workerSourceDigest>",
+  "expectedPolicyFileDigest": "<SHA256 of exact protected file bytes>",
+  "expectedPreviousPolicyDigest": "<modelPolicyDigest of current SQL value, or null if absent>"
+}
+```
+
+The descriptor must name the canonical lock and show a kernel `FLOCK WRITE`
+reservation. The policy must be a bounded regular root-owned single-link file,
+mode 0600 or 0640. The selected account must be connected and enabled, have the
+exact bridge ID and model in its catalog, and have twelve configured sessions.
+The CLI requires both source-bound schema receipts, the same global/restarting
+drain token and release identity, all controllers physically stopped, and no
+uncertain preparations, jobs, chats, leases or active queue jobs. It first requires
+an empty six-slot gate, then owns all six administrative permits until the SQL
+transaction finishes; this barrier makes no provider request.
+
+Policy, `model-policy-install:<token>` receipt and `MODEL_POLICY_INSTALLED` event
+commit together after recapture. Repeating the exact operation returns the same
+receipt; mismatched previous policy, file, source, owner or completed receipt
+fails closed. A lost reply requires reconciliation under that same window, never
+a blind reset. Failure leaves maintenance active. The CLI never writes the
+policy file, performs DDL, stops/starts services, or releases the drain.
+
+This does not migrate existing managers or their workforce configuration. Legacy
+tasks/runs and their QA remain bound; new occurrences may use v2. Any explicit
+operator retry must use the existing reviewed retry path. Updating the configured
+coordinator account/model for an old workforce needs a separate canonical
+operation; this installer does not create one or claim autonomous legacy migration.
