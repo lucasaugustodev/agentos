@@ -1,5 +1,5 @@
 """Own AgentOS snapshots only. Never copies source Git config, credentials or links."""
-import contextlib, datetime, difflib, fcntl, hashlib, json, os, pathlib, re, shutil, subprocess, sys, uuid, stat
+import base64, contextlib, datetime, difflib, fcntl, hashlib, json, os, pathlib, re, shutil, subprocess, sys, uuid, stat
 import importlib.util
 _storage_spec=importlib.util.spec_from_file_location('agentos_storage_capacity',pathlib.Path(__file__).with_name('storage-capacity.py'))
 storage_capacity=importlib.util.module_from_spec(_storage_spec);_storage_spec.loader.exec_module(storage_capacity)
@@ -134,14 +134,15 @@ def protected_preparation_directory(path,create=False):
         current=current.parent
     return path
 
-def read_preparation_json(path,immutable=False):
+def read_preparation_json(path,immutable=False,required_mode=None,include_raw=False):
     try: fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
     except FileNotFoundError: raise ValueError('PREPARATION_RECEIPT_MISSING')
     except OSError: raise ValueError('PREPARATION_RECEIPT_UNPROTECTED')
     with os.fdopen(fd,'rb') as handle:
         before=os.fstat(handle.fileno())
         if (not stat.S_ISREG(before.st_mode) or before.st_uid!=os.geteuid() or before.st_nlink!=1
-                or before.st_mode&(0o222 if immutable else 0o022)):
+                or before.st_mode&(0o222 if immutable else 0o022)
+                or (required_mode is not None and stat.S_IMODE(before.st_mode)!=required_mode)):
             raise ValueError('PREPARATION_RECEIPT_UNPROTECTED')
         raw=handle.read(128*1024+1)
         after=os.fstat(handle.fileno())
@@ -149,10 +150,17 @@ def read_preparation_json(path,immutable=False):
                           info.st_nlink,info.st_size,info.st_mtime_ns,info.st_ctime_ns)
     if identity(before)!=identity(after) or len(raw)>128*1024:
         raise ValueError('PREPARATION_RECEIPT_CHANGED')
-    try: value=json.loads(raw)
+    def unique_object(pairs):
+        value={}
+        for key,item in pairs:
+            if key in value: raise ValueError('DUPLICATE_JSON_KEY')
+            value[key]=item
+        return value
+    try: value=json.loads(raw,object_pairs_hook=unique_object)
     except (ValueError,UnicodeError): raise ValueError('PREPARATION_RECEIPT_INVALID')
     if not isinstance(value,dict): raise ValueError('PREPARATION_RECEIPT_INVALID')
-    return value,hashlib.sha256(raw).hexdigest()
+    result=(value,hashlib.sha256(raw).hexdigest())
+    return (*result,raw) if include_raw else result
 
 def write_preparation_json(path,value):
     raw=json.dumps(value,sort_keys=True,separators=(',',':'),ensure_ascii=False).encode()
@@ -384,7 +392,89 @@ def prepare(params):
                 if baseline_staging.exists():
                     if baseline_staging.is_symlink() or baseline_staging.resolve().parent!=(DATA/'workspace-baselines').resolve(): raise ValueError('INVALID_STAGING')
                     shutil.rmtree(baseline_staging)
+def source_binding_marker(marker,workspace_id):
+    required={'workspace','sourceWorkspace','baseDigest','createdAt'}
+    allowed=required|{'sourceSnapshotDigest','preparation'}
+    valid_hash=lambda value:isinstance(value,str) and re.fullmatch(r'[0-9a-f]{64}',value) is not None
+    if (not required.issubset(marker) or not set(marker).issubset(allowed) or marker['workspace']!=workspace_id
+            or not isinstance(marker['sourceWorkspace'],str)
+            or not re.fullmatch(r'[a-z0-9_-]+/[a-z0-9_-]+',marker['sourceWorkspace'])
+            or marker['sourceWorkspace'].split('/')[0]!=workspace_id.split('/')[0]
+            or not valid_hash(marker['baseDigest']) or not isinstance(marker['createdAt'],str)
+            or not re.fullmatch(r'\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,6})?(?:Z|\+00:00)',marker['createdAt'])
+            or ('sourceSnapshotDigest' in marker and not valid_hash(marker['sourceSnapshotDigest']))):
+        raise ValueError('SOURCE_BINDING_MARKER_INVALID')
+    if 'preparation' in marker:
+        value=marker['preparation']
+        if (not isinstance(value,dict) or set(value)!={'version','preparationIdentity','bindingDigest','receiptDigest'}
+                or type(value['version']) is not int or value['version']!=1
+                or not source_binding_uuid(value['preparationIdentity'])
+                or not all(valid_hash(value[key]) for key in ['bindingDigest','receiptDigest'])):
+            raise ValueError('SOURCE_BINDING_MARKER_INVALID')
+
+def source_binding_uuid(value):
+    return isinstance(value,str) and re.fullmatch(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}',value) is not None
+
+def inspect_source_binding(params):
+    run_id=params['sourceBindingRunId'];workspace_id=params['workspace']
+    if not source_binding_uuid(run_id): raise ValueError('SOURCE_BINDING_IDENTITY_INVALID')
+    target=workspace(workspace_id)
+    protected_preparation_directory(DATA)
+    run_directory=protected_preparation_directory(DATA/'worker-runs'/run_id)
+    protected_preparation_directory(target)
+    with preparation_locks([workspace_id]):
+        state,state_digest=read_preparation_json(run_directory/'state.json',required_mode=0o600)
+        policy,policy_digest=read_preparation_json(run_directory/'operation-policy.json',required_mode=0o600)
+        marker,marker_digest,marker_raw=read_preparation_json(target/'.agentos-snapshot.json',include_raw=True)
+        source_binding_marker(marker,workspace_id)
+        if (state.get('runId')!=run_id or state.get('workspace')!=workspace_id or state.get('runtime')!='harness'
+                or state.get('state')!='completed' or state.get('stopped') is not True):
+            raise ValueError('SOURCE_BINDING_RUN_NOT_COMPLETED')
+        if (type(policy.get('version')) is not int or policy.get('version')!=1
+                or policy.get('runId')!=run_id or policy.get('workspace')!='/workspace'
+                or not all(source_binding_uuid(policy.get(key)) for key in ['goalId','taskId','runId','runFence','contextVersion'])
+                or state.get('runFence')!=policy['runFence']):
+            raise ValueError('SOURCE_BINDING_POLICY_IDENTITY')
+        if policy.get('sourceSnapshotDigest')!=marker_digest:
+            raise ValueError('SOURCE_BINDING_GENERATION_CHANGED')
+        artifacts=state.get('artifacts');canonical=[]
+        if not isinstance(artifacts,list) or len(artifacts)>512: raise ValueError('SOURCE_BINDING_RUNTIME_ARTIFACTS')
+        for name,mime in [('candidate.json','application/json'),('changes.patch','text/plain')]:
+            selected=[item for item in artifacts if isinstance(item,dict) and item.get('name')==name]
+            if (len(selected)!=1 or selected[0].get('mime')!=mime or not isinstance(selected[0].get('digest'),str)
+                    or not re.fullmatch(r'[0-9a-f]{64}',selected[0]['digest'])):
+                raise ValueError('SOURCE_BINDING_RUNTIME_ARTIFACTS')
+            canonical.append({'name':name,'digest':selected[0]['digest'],'mime':mime})
+        baseline=DATA/'workspace-baselines'/digest_key(workspace_id)
+        preparation_baseline_matches(baseline,marker['baseDigest'])
+        files=sources(target)
+        candidate={'baseDigest':marker['baseDigest'],'candidateDigest':source_hash(files),
+                   'files':[{'path':name,'sha256':hashlib.sha256(raw).hexdigest()} for name,raw in sorted(files.items())]}
+        # Recheck each fixed protected file and the inventory before releasing
+        # the workspace lock. No caller-selected path, state body or prompt is
+        # exported. The outer inspector still probes the physical unit twice.
+        for path,expected,mode in [(run_directory/'state.json',state_digest,0o600),
+                                    (run_directory/'operation-policy.json',policy_digest,0o600),
+                                    (target/'.agentos-snapshot.json',marker_digest,None)]:
+            if read_preparation_json(path,required_mode=mode)[1]!=expected:
+                raise ValueError('SOURCE_BINDING_OBSERVATION_CHANGED')
+        if source_hash(sources(target))!=candidate['candidateDigest']:
+            raise ValueError('SOURCE_BINDING_OBSERVATION_CHANGED')
+        preparation_baseline_matches(baseline,marker['baseDigest'])
+        return {'version':1,'runId':run_id,'workspace':workspace_id,
+                'state':{'runId':run_id,'workspace':workspace_id,'runtime':'harness','state':'completed',
+                         'runFence':policy['runFence'],'stopped':True,'artifacts':canonical},
+                'admission':{'authority':'runtime_operation_policy',
+                             **{key:policy[key] for key in ['goalId','taskId','runId','runFence','contextVersion','workspace','sourceSnapshotDigest']},
+                             'policyDigest':policy_digest},
+                'generation':{'workspace':workspace_id,'sourceWorkspace':marker['sourceWorkspace'],
+                              'baseDigest':marker['baseDigest'],'snapshotDigest':marker_digest,
+                              'sourceSnapshotDigest':marker.get('sourceSnapshotDigest')},
+                'markerBase64':base64.b64encode(marker_raw).decode('ascii'),
+                'legacyParentGeneration':'sourceSnapshotDigest' not in marker,'candidate':candidate}
+
 def inspect(params):
+    if 'sourceBindingRunId' in params: return inspect_source_binding(params)
     target_id=params['workspace']; root=workspace(target_id)
     with locks([target_id]):
         baseline=DATA/'workspace-baselines'/digest_key(target_id)

@@ -36,3 +36,30 @@ export async function stoppedRunProof(runId, notStartedWorkspace, io) {
     checkedAt: after.checkedAt,
   };
 }
+
+/** Opt-in, sanitized source admission evidence. It never treats a policy or a
+ * remembered stop receipt as physical termination. The legacy recovery helper
+ * above retains its original response and not-started behavior. */
+export async function stoppedSourceBindingProof(runId, workspace, io) {
+  if (!/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(runId ?? '') ||
+      !/^[a-z0-9_-]+\/[a-z0-9_-]+$/.test(workspace ?? '')) throw Error('SOURCE_BINDING_IDENTITY_INVALID');
+  const unit = `agentos-run-${runId}`;
+  const confirm = proof => {
+    const age = Date.now() - Date.parse(proof?.checkedAt);
+    if (proof?.unit !== unit || proof.stopped !== true || proof.mainPid !== 0 ||
+        proof.populated !== false || !['inactive', 'failed'].includes(proof.activeState) ||
+        !Number.isFinite(age) || age < 0 || age > 60_000) throw Error('STOP_UNCONFIRMED');
+  };
+  confirm(await io.inspectUnit(unit));
+  const binding = await io.inspectSourceBinding(runId, workspace);
+  if (binding?.version !== 1 || binding.runId !== runId || binding.workspace !== workspace ||
+      binding.state?.runId !== runId || binding.state?.workspace !== workspace ||
+      binding.state?.state !== 'completed' || binding.state?.stopped !== true ||
+      binding.admission?.runId !== runId || binding.admission?.runFence !== binding.state?.runFence ||
+      binding.generation?.workspace !== workspace ||
+      binding.admission?.sourceSnapshotDigest !== binding.generation?.snapshotDigest)
+    throw Error('SOURCE_BINDING_INSPECTION_CONFLICT');
+  const after = await io.inspectUnit(unit);
+  confirm(after);
+  return {...binding, process: after, checkedAt: after.checkedAt};
+}
