@@ -466,7 +466,9 @@ def persist_rollback_observation(receipt,record,value):
  fd=os.open(temporary,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
  with os.fdopen(fd,'w') as stream:
   json.dump(value,stream,sort_keys=True,separators=(',',':'));stream.flush();os.fsync(stream.fileno())
- os.replace(temporary,path)
+ # An occurrence gets one immutable rollback observation. A lost response or
+ # returned pointer cannot erase the previous failed publication history.
+ os.link(temporary,path,follow_symlinks=False);os.unlink(temporary)
  fd=os.open(path.parent,os.O_RDONLY|os.O_DIRECTORY)
  try:os.fsync(fd)
  finally:os.close(fd)
@@ -550,6 +552,7 @@ def main():
    if not record.get('publishedAt'):raise ValueError('PUBLICATION_EFFECT_UNCONFIRMED')
    print(json.dumps({'ok':True,'summary':'Versão já publicada.','output':record}));return
   if str(previous)!=record['base']:raise ValueError('BASE_CHANGED_REVALIDATE')
+  if receipt.with_name(receipt.stem+'.rollback.json').exists():raise ValueError('PUBLICATION_ROLLBACK_RECONCILE')
   origin_module.require_publish_origin(record)
   record['publicationExecutor']=publication_executor(origin_module)
   swap=ROOT/('current-'+occurrence);os.symlink(candidate,swap);os.replace(swap,ROOT/'current')
