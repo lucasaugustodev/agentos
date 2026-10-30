@@ -5,6 +5,13 @@ import {accountBridge} from '../server/bridge.js';
 import {generationTiming} from '../server/generation-timing.js';
 import * as manager from '../server/manager-turn-generation.js';
 
+// The private composition binds this profile to its own account. Keep the
+// mocked generations on that GLM route without embedding a deployment ID.
+const profileModule=new URL('../bridge/glm-model-profile.mjs',import.meta.url).href;
+const {glmModelProfile}=await import(profileModule);
+const glmRoutes=[...new Set<string>(String(glmModelProfile).match(/agentos:api:[0-9a-f-]{36}/g)??[])];
+if(glmRoutes.length!==1)throw Error('GLM profile fixture requires one bound route');
+
 afterEach(()=>vi.restoreAllMocks());
 function pending(){
   let resolve!:()=>void;
@@ -16,7 +23,7 @@ function input():RuntimeInput {
     description:'Report only what the supplied evidence establishes.',stage:'work',agent_id:'research.review',
     model:'glm-5.3-flash',execution:null,criteria:[{id:'report',type:'artifact',name:'report.json'}]};
   return {task,run:{id:randomUUID(),task_id:task.id,fence:randomUUID(),runtime:'analytical'},
-    account:{bridge_id:'agentos:api:00000000-0000-4000-8000-000000000001',provider:'opencode',model:'glm-5.3-flash'},
+    account:{bridge_id:glmRoutes[0],provider:'opencode',model:'glm-5.3-flash'},
     context:{content:'Evidence only.',manifest:{selected:[],dependencyArtifacts:[],executionInputs:[]}},
     signal:new AbortController().signal,onEvent:async()=>{}};
 }
@@ -100,6 +107,7 @@ it('retains separate manager notifications across two generations and never dupl
   i.task.stage='coordinate';i.task.criteria=[{id:'review',type:'artifact',name:'coordination.json'}];
   i.task.description='MANAGEMENT_V1\nFOCUSED_DECISION_V2\n'+JSON.stringify({cases:[{id:caseId,taskId:sourceTaskId}],
     operation:{focus:{caseId,taskId:sourceTaskId,scope:'review/source'}}});
+  expect(glmModelProfile(i.account.bridge_id,i.task.model).reasoning).toBe(true);
   expect(manager.managerReadOwner(i.run,i.task,i.account)).not.toBeNull();
   const read=vi.spyOn(manager,'readManagerTurnContext').mockResolvedValue({results:[],dataOnly:true,actionAuthority:false} as any);
   const recorded:Array<{kind:string;payload:Record<string,unknown>}>=[];
