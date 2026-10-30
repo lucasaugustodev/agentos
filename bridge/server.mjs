@@ -185,6 +185,8 @@ async function state() {
   return { accounts: [...inherited, ...additional], checkedAt: new Date().toISOString() };
 }
 function safeError(error) {
+  const inspectionError=workspaceInspectionError(error);
+  if(inspectionError)return inspectionError;
   if (
     [
       'GUIDANCE_IDENTITY_INVALID','GUIDANCE_IDENTITY_MISMATCH','GUIDANCE_REQUEST_INVALID','GUIDANCE_ACTION_CHANGED','GUIDANCE_RUNTIME_CLOSED','GUIDANCE_FRAME_TOO_LARGE','GUIDANCE_FAILED','GUIDANCE_OUTCOME_UNCONFIRMED','GUIDANCE_CHANNEL_UNAVAILABLE','GUIDANCE_RECEIPT_INVALID',
@@ -747,7 +749,7 @@ async function dispatch(method, params, signal, emit) {
     return contextService(method, params);
   if (method === 'worker.workspaces') return workerWorkspaces();
   if (method === 'worker.prepare') return workspaceOperation({ ...params, action: 'prepare' });
-  if (['worker.inspectGeneration','worker.inspectPreparation','worker.inspectSourceBinding','worker.inspectRetrySourceBinding'].includes(method))
+  if (['worker.inspectGeneration','worker.inspectPlanningSource','worker.inspectPreparation','worker.inspectSourceBinding','worker.inspectRetrySourceBinding'].includes(method))
     return workspaceInspection(method,params);
   if (method === 'worker.checkComposition') return workspaceOperation({ ...params, action: 'compose', dryRun: true });
   if (method === 'worker.storage') return workspaceOperation({ action: 'capacity' });
@@ -844,5 +846,5 @@ process.stdin.on('end', () => {
   setTimeout(() => process.exit(0), 2000).unref();
 });
 import { workspaceOperation } from './workspaces.mjs';
-import { workspaceInspection } from './workspace-inspection.mjs';
+import { workspaceInspection,workspaceInspectionError } from './workspace-inspection.mjs';
 import { contextService } from './context-services.mjs';

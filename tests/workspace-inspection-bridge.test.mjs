@@ -1,10 +1,18 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {workspaceInspection} from '../bridge/workspace-inspection.mjs';
+import {workspaceInspection,workspaceInspectionError} from '../bridge/workspace-inspection.mjs';
 
 const runId='bd8daedb-d7a8-42da-bad7-a2dcd1be0270';
 const bound={workspace:'sample/otarget',sourceWorkspace:'sample/osource',preparationIdentity:runId,
   expectedSourceDigest:'a'.repeat(64),expectedSourceSnapshotDigest:'b'.repeat(64)};
+
+test('reconciliation codes survive the bridge without arbitrary error details',()=>{
+  for(const code of ['PREPARATION_PARTIAL_STATE','PREPARATION_EFFECT_UNCONFIRMED','PREPARATION_SOURCE_GENERATION_CHANGED','SOURCE_INVENTORY_BOUND']){
+    const result=workspaceInspectionError({code,message:'PRIVATE PATH OR CONTENT'});
+    assert.equal(result.code,code);assert.ok(!result.message.includes('PRIVATE'));
+  }
+  assert.equal(workspaceInspectionError({code:'PREPARATION_PRIVATE_VALUE',message:'secret'}),null);
+});
 
 test('generation inspection forwards only the fixed readonly manager action',async()=>{
   const calls=[];
@@ -18,6 +26,19 @@ test('preparation inspection forwards the exact binding without calling prepare'
   const calls=[];
   await workspaceInspection('worker.inspectPreparation',bound,{operation:async params=>calls.push(params)});
   assert.deepEqual(calls,[{action:'inspect-preparation',...bound}]);
+});
+
+test('planning source inspection uses explicit root authority and a closed readonly action',async()=>{
+  const calls=[];
+  await workspaceInspection('worker.inspectPlanningSource',{workspace:'sample/raw',sourceGenerationKind:'root'},
+    {operation:async params=>calls.push(params)});
+  await workspaceInspection('worker.inspectPreparation',{...bound,sourceGenerationKind:'unmarked'},
+    {operation:async params=>calls.push(params)});
+  assert.deepEqual(calls,[{action:'inspect-planning-source',workspace:'sample/raw',sourceGenerationKind:'root'},
+    {action:'inspect-preparation',...bound,sourceGenerationKind:'unmarked'}]);
+  for(const params of [{workspace:'sample/raw'},{workspace:'sample/raw',sourceGenerationKind:'anything'},
+    {workspace:'sample/raw',sourceGenerationKind:'root',allowUnsafe:true}])
+    await assert.rejects(workspaceInspection('worker.inspectPlanningSource',params),/WORKSPACE_INSPECTION_REQUEST_INVALID/);
 });
 
 test('unknown methods paths extra keys and incomplete bindings never reach the manager',async()=>{

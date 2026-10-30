@@ -1,6 +1,7 @@
 import {beforeAll,beforeEach,afterEach,afterAll,it,expect,vi} from 'vitest';
 import {createHash,randomUUID} from 'node:crypto';
 import {migrate,pool} from '../server/db.js';
+import {config} from '../server/config.js';
 import {seedRegistry} from '../server/registry.js';
 import {accountBridge} from '../server/bridge.js';
 import * as service from '../server/service.js';
@@ -15,14 +16,19 @@ const canonical=(v:any):any=>Array.isArray(v)?v.map(canonical):v&&typeof v==='ob
 const files=(v:string)=>[{path:'src/code.ts',sha256:sha(v)}];
 const inventoryDigest=(f:ReturnType<typeof files>)=>sha(JSON.stringify(f.map(x=>[x.path,x.sha256])));
 const signal=()=>new AbortController().signal;
-beforeAll(async()=>{await migrate();});
-beforeEach(async()=>{await pool.query('TRUNCATE goals,agents,accounts,events CASCADE');await seedRegistry();});
-afterEach(()=>vi.restoreAllMocks());
+beforeAll(async()=>{expect(new URL(config.databaseUrl).pathname).toBe('/agentos_test');await migrate();});
+beforeEach(async()=>{
+ await pool.query('TRUNCATE goals,agents,accounts,events CASCADE');
+ await pool.query("DELETE FROM settings WHERE id LIKE 'planning-source-preparation:%' OR id LIKE 'candidate-validation:%'");
+ await seedRegistry();
+});
+afterEach(()=>{vi.restoreAllMocks();vi.useRealTimers();});
 afterAll(()=>pool.end());
 
 function preparedResponse(request:any,sourceFiles:ReturnType<typeof files>){
  const binding={version:1,preparationIdentity:request.preparationIdentity,sourceWorkspace:request.sourceWorkspace,
-  targetWorkspace:request.workspace,expectedSourceDigest:request.expectedSourceDigest,expectedSourceSnapshotDigest:request.expectedSourceSnapshotDigest};
+  targetWorkspace:request.workspace,expectedSourceDigest:request.expectedSourceDigest,expectedSourceSnapshotDigest:request.expectedSourceSnapshotDigest,
+  ...(request.sourceGenerationKind?{sourceGenerationKind:request.sourceGenerationKind}:{})};
  const body={...binding,bindingDigest:preparationHash(binding),observedSourceDigest:request.expectedSourceDigest,
   sourceSnapshotDigest:request.expectedSourceSnapshotDigest,cloneBaseDigest:request.expectedSourceDigest,
   baselineDigest:request.expectedSourceDigest,createdAt:'2026-10-30T00:00:00Z'};
@@ -89,40 +95,174 @@ async function fixture(withAccepted=true){
    loadState:'loaded',activeState:'inactive',subState:'dead',mainPid:0,cgroupExists:false,populated:false},checkedAt:''};
  vi.spyOn(service,'readArtifact').mockImplementation(async id=>{const a=artifacts.get(id);if(!a)throw Error('UNKNOWN_ARTIFACT');return a;});
  const preparations=new Map<string,any>(),calls:Array<{method:string;params:any}>=[];
- const behavior={loseReplyOnce:false,abortBeforeReserve:false,unconfirmed:false};
+ const sourceInspections=new Map<string,any>([[workspace,runtimeInspection]]);
+ const behavior={loseReplyOnce:false,abortBeforeReserve:false,unconfirmed:false,beforeCopy:null as null|(()=>Promise<void>),
+  beforeStop:null as null|(()=>void)};
  const spy=vi.spyOn(accountBridge,'request').mockImplementation(async(method,params:any)=>{
   calls.push({method,params:structuredClone(params)});
   if(method==='worker.inspectGeneration'){
    if(behavior.abortBeforeReserve)throw Object.assign(Error('cancelled'),{code:'ABORTED'});
    return {...baseInspection,checkedAt:new Date().toISOString()};
   }
+  if(method==='worker.inspectPlanningSource'){
+   const checkedAt=new Date().toISOString(),origin=sourceInspections.get(params.workspace);
+   if(origin){
+    const snapshot={version:1,workspace:params.workspace,generation:origin.generation,markerBase64:origin.markerBase64,
+      legacyParentGeneration:false,candidate:origin.candidate,checkedAt};
+    return {version:1,workspace:params.workspace,sourceGenerationKind:'snapshot',sourceDigest:origin.candidate.candidateDigest,
+      generationDigest:origin.generation.snapshotDigest,snapshot,checkedAt};
+   }
+   const directoryIdentity={device:'1',inode:'2'};
+   return {version:1,workspace:params.workspace,sourceGenerationKind:'unmarked',sourceDigest:baseDigest,
+    generationDigest:preparationHash({version:1,kind:'unmarked',workspace:params.workspace,sourceDigest:baseDigest,...directoryIdentity}),
+    directoryIdentity,files:baseFiles,checkedAt};
+  }
   if(method==='worker.inspectSourceBinding'){
    const checkedAt=new Date().toISOString();return {...runtimeInspection,checkedAt,process:{...runtimeInspection.process,checkedAt}};
   }
+  if(method==='worker.inspectRetrySourceBinding'){
+   if(behavior.beforeStop){const action=behavior.beforeStop;behavior.beforeStop=null;action();}
+   const origin=sourceInspections.get(params.workspace),checkedAt=new Date().toISOString();
+   const {artifacts,...state}=origin.state;
+   return {...origin,state,checkedAt,process:{...origin.process,checkedAt}};
+  }
   if(method==='worker.inspectPreparation'){
+   if(behavior.beforeCopy){const mutate=behavior.beforeCopy;behavior.beforeCopy=null;await mutate();}
    const prepared=preparations.get(params.preparationIdentity);
    return prepared?{...prepared,checkedAt:new Date().toISOString()}:{version:1,exists:false,confirmed:!behavior.unconfirmed,
     workspace:params.workspace,preparationIdentity:params.preparationIdentity,checkedAt:new Date().toISOString()};
   }
   if(method==='worker.prepare'){
    if(!params.preparationIdentity)return {workspace:params.workspace};
-   preparations.set(params.preparationIdentity,preparedResponse(params,candidate.files));
+   preparations.set(params.preparationIdentity,preparedResponse(params,sourceInspections.get(params.sourceWorkspace)?.candidate.files??baseFiles));
    if(behavior.loseReplyOnce){behavior.loseReplyOnce=false;throw Object.assign(Error('lost reply'),{code:'PROVIDER_TIMEOUT'});}
    return {workspace:params.workspace};
   }
   throw Error('UNEXPECTED_RPC_'+method);
  });
  const saved=async()=>((await pool.query('SELECT value FROM settings WHERE id=$1',[`planning-source-preparation:${planning.id}:0`])).rows[0]?.value);
- return {goalId,planning,plan,taskId,runId,workspace,base,baseInspection,runtimeInspection,refs,preparations,calls,behavior,spy,saved,freshPlanning};
+ const override=async(source:string,p=planning,extra:any={})=>{
+  p.feedback={sourceOverrides:{[base]:source},...extra};
+  await pool.query('UPDATE planning_runs SET feedback=$2 WHERE id=$1',[p.id,JSON.stringify(p.feedback)]);return p;
+ };
+ const addSource=async(name:string)=>{
+  const task=randomUUID(),run=randomUUID(),runFence=randomUUID(),context=randomUUID();
+  const sourceCandidate={baseDigest,candidateDigest:inventoryDigest(files(name)),files:files(name)};
+  const raw=Buffer.from(JSON.stringify({workspace:name,sourceWorkspace:root,baseDigest,sourceSnapshotDigest:sha(baseMarker),createdAt:'2026-10-30T00:00:00Z'}));
+  await pool.query(`INSERT INTO tasks(id,goal_id,key,title,description,agent_id,state,stage,criteria,execution,attempt_count,plan_revision)
+   VALUES($1,$2,$3,'Source','Fixture','qa.backend','accepted','work','[]',$4,1,$5)`,
+   [task,goalId,task,JSON.stringify({kind:'harness',workspace:name,sourceWorkspace:root,baseWorkspace:base}),revision]);
+  await pool.query("INSERT INTO runs(id,task_id,attempt,state,fence,runtime,agent_version) VALUES($1,$2,1,'submitted',$3,'harness',1)",[run,task,runFence]);
+  await pool.query("INSERT INTO contexts(id,run_id,manifest,content) VALUES($1,$2,$3,'source')",[context,run,
+   JSON.stringify({runIdentity:{goalId,taskId:task,runId:run,runFence},dependencyArtifacts:[]})]);
+  await pool.query('UPDATE runs SET context_id=$2 WHERE id=$1',[run,context]);
+  sourceInspections.set(name,{...runtimeInspection,runId:run,workspace:name,candidate:sourceCandidate,markerBase64:raw.toString('base64'),
+   generation:{workspace:name,sourceWorkspace:root,baseDigest,snapshotDigest:sha(raw),sourceSnapshotDigest:sha(baseMarker)},
+   state:{...runtimeInspection.state,runId:run,workspace:name,runFence},
+   admission:{...runtimeInspection.admission,taskId:task,runId:run,runFence,contextVersion:context,sourceSnapshotDigest:sha(raw)},
+   process:{...runtimeInspection.process,unit:'agentos-run-'+run}});
+  return {taskId:task,runId:run,workspace:name};
+ };
+ return {goalId,planning,plan,taskId,runId,workspace,base,baseInspection,runtimeInspection,refs,preparations,calls,behavior,spy,saved,freshPlanning,override,addSource};
 }
 
-it('keeps first-revision fallback unchanged and creates no reuse authority',async()=>{
+it('binds an initial unmarked root without inventing accepted reuse authority',async()=>{
  const f=await fixture(false),sources=await preparePlanningSources(f.planning,f.plan,signal());
- expect(sources.size).toBe(0);expect(f.calls).toEqual([{method:'worker.prepare',params:{sourceWorkspace:f.base,
-  workspace:`example/o${f.goalId.replaceAll('-','').slice(0,12)}r1-base-0`}}]);
- expect(await f.saved()).toBeUndefined();await applyPlannedResult(f.planning,f.plan,sources);
+ expect(sources.size).toBe(1);expect(f.calls.filter(c=>c.method==='worker.prepare')).toHaveLength(1);
+ expect((await f.saved()).request).toMatchObject({sourceWorkspace:f.base,sourceGenerationKind:'unmarked'});
+ expect((await f.saved()).proof.kind).toBe('explicit_planning_source');await applyPlannedResult(f.planning,f.plan,sources);
  const rows=(await pool.query('SELECT execution FROM tasks WHERE goal_id=$1',[f.goalId])).rows;
- expect(rows).toHaveLength(2);expect(rows.every(x=>!x.execution.sourceReuse&&!x.execution.sourcePreparation)).toBe(true);
+ expect(rows).toHaveLength(2);expect(rows.every(x=>!x.execution.sourceReuse&&x.execution.planningSource.acceptance===false)).toBe(true);
+ expect(rows.filter(x=>x.execution.sourcePreparation)).toHaveLength(1);
+});
+
+it('retains the first prepared target after rejected apply and binds a later override to its own identity',async()=>{
+ const f=await fixture();await f.override(f.workspace);
+ const first=await preparePlanningSources(f.planning,f.plan,signal()),firstSource=first.get(f.base)!;
+ const nextSource=await f.addSource('example/second-source');
+ // A branch becomes busy after preparation, so application must not erase the clone.
+ await f.override(f.workspace,f.planning,{replaceTaskIds:[nextSource.taskId]});
+ await pool.query("UPDATE runs SET state='running' WHERE id=$1",[nextSource.runId]);
+ await expect(applyPlannedResult(f.planning,f.plan,first)).rejects.toMatchObject({code:'SOURCE_PREPARATION_BRANCH_BUSY'});
+ expect((await f.saved()).state).toBe('prepared');expect(f.preparations.has(firstSource.intent.request.preparationIdentity)).toBe(true);
+ await pool.query("UPDATE runs SET state='submitted' WHERE id=$1",[nextSource.runId]);
+ await pool.query("UPDATE planning_runs SET state='failed' WHERE id=$1",[f.planning.id]);
+ const next=await f.freshPlanning();await f.override(nextSource.workspace,next);
+ const second=await preparePlanningSources(next,f.plan,signal()),secondSource=second.get(f.base)!;
+ expect(secondSource.intent.request.sourceWorkspace).toBe(nextSource.workspace);
+ expect(secondSource.intent.request.workspace).not.toBe(firstSource.intent.request.workspace);
+ expect(secondSource.intent.request.preparationIdentity).not.toBe(firstSource.intent.request.preparationIdentity);
+ expect(f.preparations.size).toBe(2);
+ await applyPlannedResult(next,f.plan,second);
+ expect(f.preparations.has(firstSource.intent.request.preparationIdentity)).toBe(true);
+});
+
+it.each(['root','override'] as const)('reconciles a lost %s preparation reply without another copy',async mode=>{
+ const f=await fixture(mode==='override');if(mode==='override')await f.override(f.workspace);
+ f.behavior.loseReplyOnce=true;
+ await expect(preparePlanningSources(f.planning,f.plan,signal())).rejects.toMatchObject({code:'SOURCE_PREPARATION_RECONCILE'});
+ const saved=await f.saved();const result=await preparePlanningSources(f.planning,f.plan,signal());
+ expect(result.get(f.base)!.intent.request.preparationIdentity).toBe(saved.request.preparationIdentity);
+ expect(f.calls.filter(c=>c.method==='worker.prepare')).toHaveLength(1);
+});
+
+it.each(['source','replacement'] as const)('does not prepare while a %s run is queued',async owner=>{
+ const f=await fixture(),other=await f.addSource('example/other');
+ await f.override(f.workspace,f.planning,owner==='replacement'?{replaceTaskIds:[other.taskId]}:{});
+ await pool.query("UPDATE runs SET state='queued' WHERE id=$1",[owner==='source'?f.runId:other.runId]);
+ await expect(preparePlanningSources(f.planning,f.plan,signal())).rejects.toMatchObject({code:'SOURCE_PREPARATION_BRANCH_BUSY'});
+ expect(f.calls).toHaveLength(0);expect(await f.saved()).toBeUndefined();
+});
+
+it('allows an unrelated queued run and still binds the explicit source',async()=>{
+ const f=await fixture(),other=await f.addSource('example/unrelated');await f.override(f.workspace);
+ await pool.query("UPDATE runs SET state='queued' WHERE id=$1",[other.runId]);
+ const result=await preparePlanningSources(f.planning,f.plan,signal());
+ expect(result.get(f.base)!.intent.request.sourceWorkspace).toBe(f.workspace);
+});
+
+it('does not renew an old source observation through a later stop probe',async()=>{
+ const f=await fixture();await f.override(f.workspace);vi.useFakeTimers({toFake:['Date']});
+ f.behavior.beforeStop=()=>vi.setSystemTime(Date.now()+61000);
+ await expect(preparePlanningSources(f.planning,f.plan,signal())).rejects.toMatchObject({code:'SOURCE_PREPARATION_STALE'});
+ expect(f.calls.some(c=>c.method==='worker.prepare')).toBe(false);expect(await f.saved()).toBeUndefined();
+});
+
+it('rejects missing ownership metadata instead of silently treating the task source as an unmarked root',async()=>{
+ const f=await fixture();await f.override(f.workspace);
+ await pool.query('DELETE FROM task_execution_metadata WHERE task_id=$1',[f.taskId]);
+ await expect(preparePlanningSources(f.planning,f.plan,signal())).rejects.toMatchObject({code:'SOURCE_PREPARATION_AUTHORITY_CHANGED'});
+ expect(f.calls).toHaveLength(0);expect(await f.saved()).toBeUndefined();
+});
+
+it('keeps large execution inputs out of explicit-source ownership scans and captures',async()=>{
+ const f=await fixture();await f.override(f.workspace);
+ const bytes=Buffer.alloc(1024*1024,97),payload=bytes.toString('base64');
+ await pool.query("UPDATE tasks SET execution=execution||$2::jsonb WHERE id=$1",[f.taskId,
+  JSON.stringify({inputs:[{id:randomUUID(),name:'large-context.txt',digest:sha(bytes),base64:payload}]})]);
+ const queries=vi.spyOn(pool,'query');await preparePlanningSources(f.planning,f.plan,signal());
+ const captures=queries.mock.calls.map((args,index)=>({sql:String(args[0]),result:queries.mock.results[index].value}))
+  .filter(x=>x.sql.startsWith('SELECT g.project'));
+ expect(captures.length).toBeGreaterThan(0);
+ for(const captured of captures){
+  expect(captured.sql).not.toContain("t.execution->>");
+  const returned=JSON.stringify((await captured.result).rows);
+  expect(returned.length).toBeLessThan(20000);expect(returned).not.toContain(payload.slice(0,100));
+ }
+});
+
+it.each(['fence','feedback','sourceOverride','writer','validation'] as const)('recaptures %s before the preparation effect',async mutation=>{
+ const f=await fixture();await f.override(f.workspace);
+ f.behavior.beforeCopy=async()=>{
+  if(mutation==='fence')await pool.query('UPDATE planning_runs SET fence=$2 WHERE id=$1',[f.planning.id,randomUUID()]);
+  if(mutation==='sourceOverride')await pool.query("UPDATE planning_runs SET feedback=jsonb_set(feedback,'{sourceOverrides}', $2) WHERE id=$1",[f.planning.id,JSON.stringify({[f.base]:'example/other'})]);
+  if(mutation==='feedback')await pool.query("INSERT INTO objective_feedback(id,objective_id,trigger_key,description) VALUES($1,$2,'new','New evidence')",[randomUUID(),f.goalId]);
+  if(mutation==='writer')await pool.query("UPDATE runs SET state='running' WHERE id=$1",[f.runId]);
+  if(mutation==='validation')await pool.query('INSERT INTO settings(id,value) VALUES($1,$2)',[
+   'candidate-validation:'+randomUUID(),JSON.stringify({state:'uncertain',request:{workspace:f.workspace}})]);
+ };
+ await expect(preparePlanningSources(f.planning,f.plan,signal())).rejects.toBeDefined();
+ expect(f.calls.some(c=>c.method==='worker.prepare')).toBe(false);
 });
 
 it('reserves a bound source, prepares its receipt and atomically installs a future consumer without accepting the objective',async()=>{

@@ -22,7 +22,8 @@ afterAll(async()=>{await pool.end();});
 
 function inspection(request:SourcePreparationRequest,changed=false){
   const binding={version:1,preparationIdentity:request.preparationIdentity,sourceWorkspace:request.sourceWorkspace,
-    targetWorkspace:request.workspace,expectedSourceDigest:request.expectedSourceDigest,expectedSourceSnapshotDigest:request.expectedSourceSnapshotDigest};
+    targetWorkspace:request.workspace,expectedSourceDigest:request.expectedSourceDigest,expectedSourceSnapshotDigest:request.expectedSourceSnapshotDigest,
+    ...(request.sourceGenerationKind?{sourceGenerationKind:request.sourceGenerationKind}:{})};
   const body={...binding,bindingDigest:preparationHash(binding),observedSourceDigest:request.expectedSourceDigest,
     sourceSnapshotDigest:request.expectedSourceSnapshotDigest,cloneBaseDigest:request.expectedSourceDigest,
     baselineDigest:request.expectedSourceDigest,createdAt:'2026-01-01T00:00:00+00:00'};
@@ -37,26 +38,33 @@ function inspection(request:SourcePreparationRequest,changed=false){
     candidate:{baseDigest:request.expectedSourceDigest,candidateDigest:changed?sha('preserved edits'):request.expectedSourceDigest},
     destinationChanged:changed,checkedAt:Date.now()};
 }
-async function fixture(prior=0,knownNotStarted=false,inputBytes=0){
+async function fixture(prior=0,knownNotStarted=false,inputBytes=0,explicit=false){
   const goalId=randomUUID(),taskId=randomUUID(),planningRunId=randomUUID(),planFence=randomUUID(),identity=randomUUID();
   const base='sample/o'+goalId.replaceAll('-','').slice(0,12)+'r2-base-0-p'+identity.replaceAll('-','');
   const baseRequest={workspace:base,sourceWorkspace:'sample/accepted',preparationIdentity:identity,
-    expectedSourceDigest:sha('accepted source'),expectedSourceSnapshotDigest:sha('accepted generation')};
+    expectedSourceDigest:sha('accepted source'),expectedSourceSnapshotDigest:sha('accepted generation'),
+    ...(explicit?{sourceGenerationKind:'unmarked' as const}:{})};
   const basePrepared=verifySourcePreparation(baseRequest,inspection(baseRequest),{requireUnchanged:true});
   const request=preparedBaselineBinding(basePrepared,base,'sample/consumer',randomUUID())!;
   const artifacts=['candidate.json','changes.patch'].map(name=>({id:randomUUID(),runId:randomUUID(),name,digest:sha(name),size:11}));
-  const proof={version:1,kind:'repair_source_reuse',proofDigest:sha('controller verified proof'),acceptance:false,finalVerificationRequired:true,
+  const acceptedProof={version:1,kind:'repair_source_reuse',proofDigest:sha('controller verified proof'),acceptance:false,finalVerificationRequired:true,
     scope:{goalId,project:'sample',revision:1,baseWorkspace:'sample/logical'},
     selectedSource:{workspace:baseRequest.sourceWorkspace,candidateDigest:baseRequest.expectedSourceDigest,snapshotDigest:baseRequest.expectedSourceSnapshotDigest},
     incorporatedContributors:[{candidateArtifact:artifacts[0],patchArtifact:artifacts[1]}]};
+  const explicitBody={version:1,kind:'explicit_planning_source',scope:acceptedProof.scope,
+    selectedSource:{...acceptedProof.selectedSource,sourceGenerationKind:'unmarked'},databaseFingerprint:sha('captured explicit authority'),
+    acceptance:false,finalVerificationRequired:true};
+  const proof=explicit?{...explicitBody,proofDigest:preparationHash(explicitBody)}:acceptedProof;
   const intent={version:1,planningRunId,ownerFence:planFence,goalId,baseRevision:1,baseIndex:0,baseWorkspace:'sample/logical',state:'applied',
-    request:baseRequest,prepared:basePrepared,proof};
+    request:baseRequest,prepared:basePrepared,proof,...(explicit?{kind:'explicit_source'}:{})};
   const intentKey=`planning-source-preparation:${planningRunId}:0`;
   const sourceReuse={version:1,planningRunId,proofDigest:proof.proofDigest,preparationIdentity:identity,
     receiptDigest:basePrepared.receipt.receiptDigest,baselineWorkspace:base,incorporatedArtifacts:artifacts,acceptance:false,finalVerificationRequired:true};
   const payload=Buffer.alloc(inputBytes,97);
   const execution={kind:'harness',workspace:request.workspace,sourceWorkspace:base,baseWorkspace:'sample/logical',
-    profile:'code',sourcePreparation:request,sourceReuse,...(inputBytes?{inputs:[{id:randomUUID(),name:'context.txt',
+    profile:'code',sourcePreparation:request,
+    ...(explicit?{planningSource:Object.fromEntries(Object.entries(sourceReuse).filter(([key])=>key!=='incorporatedArtifacts'))}:{sourceReuse}),
+    ...(inputBytes?{inputs:[{id:randomUUID(),name:'context.txt',
       digest:sha(payload),base64:payload.toString('base64')}]}:{})};
   const resources=['remote-slot','workspace:'+request.workspace];
   await pool.query("INSERT INTO goals(id,title,description,project,idempotency_key) VALUES($1::uuid,'Bound clone','Fixture','sample',$1::text)",[goalId]);
@@ -120,6 +128,30 @@ it('checks the first unchanged clone and applied intent without preparing it aga
   await assertBoundRuntimePreparationCurrent(f.input);
   expect(f.rpc.mock.calls.map(x=>x[0])).toEqual(['worker.inspectPreparation']);expect(f.inspectStop).not.toHaveBeenCalled();
   expect((await pool.query('SELECT count(*)::int n FROM acceptances')).rows[0].n).toBe(0);
+});
+
+it('admits an explicitly bound root without claiming accepted-chain reuse',async()=>{
+  const f=await fixture(0,false,0,true);
+  expect(f.input.task.execution.sourceReuse).toBeUndefined();
+  expect(await prepareBoundRuntimeWorkspace(f.input)).toBe(true);
+  await assertBoundRuntimePreparationCurrent(f.input);
+  expect(f.rpc.mock.calls.map(x=>x[0])).toEqual(['worker.inspectPreparation']);
+});
+
+it('preserves explicit-source retry edits using the same physical admission checks',async()=>{
+  const f=await fixture(1,false,0,true);
+  expect(await prepareBoundRuntimeWorkspace(f.input)).toBe(true);
+  await assertBoundRuntimePreparationCurrent(f.input);
+  expect(f.rpc.mock.calls.map(x=>x[0])).toEqual(['worker.inspectPreparation','worker.inspectRetrySourceBinding']);
+});
+
+it.each(['proof','mode','dual-authority'] as const)('rejects changed explicit %s authority before RPC',async change=>{
+  const f=await fixture(0,false,0,true);
+  if(change==='proof')await pool.query("UPDATE settings SET value=jsonb_set(value,'{proof,databaseFingerprint}',to_jsonb($2::text)) WHERE id=$1",[f.intentKey,sha('changed')]);
+  if(change==='mode')await pool.query("UPDATE settings SET value=jsonb_set(value,'{kind}','\"accepted_reuse\"') WHERE id=$1",[f.intentKey]);
+  if(change==='dual-authority')f.input.task.execution.sourceReuse={...f.input.task.execution.planningSource,incorporatedArtifacts:[]};
+  await expect(prepareBoundRuntimeWorkspace(f.input)).rejects.toHaveProperty('code');
+  expect(f.rpc).not.toHaveBeenCalled();
 });
 
 it('keeps large frozen execution inputs out of runtime authority projections',async()=>{

@@ -12,11 +12,14 @@ import {preparationHash,verifySourcePreparation,preparedBaselineBinding,
 import type {ProposedPlan} from './objective-contracts.js';
 import {inspectWorkspaceGeneration,inspectWorkspacePreparation,inspectWorkerSourceBinding,
   type WorkspaceInspectionRequest} from './workspace-inspection.js';
+import {assertPlanningSourcesIdle,captureExplicitSourceAuthority,recaptureExplicitSourceAuthority,observeExplicitSource,
+  type ExplicitSourceCapture,type ExplicitSourceProof} from './planning-explicit-source.js';
 
 type Intent={version:1;planningRunId:string;goalId:string;baseRevision:number;baseIndex:number;baseWorkspace:string;
-  planDigest:string;capture:SourceReuseCapture;proof:AcceptedSourceChainProof;request:SourcePreparationRequest;
+  planDigest:string;request:SourcePreparationRequest;
   state:'reserved'|'preparing'|'uncertain'|'prepared'|'applied';ownerFence:string;prepared?:VerifiedSourcePreparation;
-  errorCode?:string;updatedAt:string};
+  errorCode?:string;updatedAt:string}&({kind?:'accepted_reuse';capture:SourceReuseCapture;proof:AcceptedSourceChainProof}|
+    {kind:'explicit_source';capture:ExplicitSourceCapture;proof:ExplicitSourceProof});
 export type PreparedPlanningSource={intent:Intent;prepared:VerifiedSourcePreparation;proofCheckedAt:number};
 export type PreparedPlanningSources=Map<string,PreparedPlanningSource>;
 const key=(runId:string,index:number)=>`planning-source-preparation:${runId}:${index}`;
@@ -24,13 +27,27 @@ const failure=(code:string)=>new DomainError(code,'A origem preparada exige reco
 const target=(run:any,base:string,index:number)=>`${base.split('/')[0]}/o${run.objective_id.replaceAll('-','').slice(0,12)}r${run.base_revision+1}-base-${index}`;
 
 async function assertPlanOwner(db:DB,run:any,planDigest:string){
-  const row=(await db.query(`SELECT p.state,p.fence,p.base_revision,p.output,o.revision,o.mode,g.state goal_state
+  const row=(await db.query(`SELECT p.state,p.fence,p.base_revision,p.output,p.feedback,o.revision,o.mode,g.state goal_state
     FROM planning_runs p JOIN objectives o ON o.id=p.objective_id JOIN goals g ON g.id=o.id WHERE p.id=$1 AND o.id=$2`,
     [run.id,run.objective_id])).rows[0];
   if(!row||row.state!=='running'||row.fence!==run.fence||row.base_revision!==run.base_revision||
     row.revision!==run.base_revision||row.mode!=='execute'||['paused','cancelled','completed'].includes(row.goal_state)||
-    preparationHash(row.output)!==planDigest)throw failure('STALE_PLAN');
+    preparationHash(row.output)!==planDigest||preparationHash(row.feedback??{})!==preparationHash(run.feedback??{}))throw failure('STALE_PLAN');
   await assertPlanningFeedbackCurrent(db,run);
+  const bases=[...new Set((row.output?.tasks??[]).map((task:any)=>task.baseWorkspace))] as string[];
+  await assertPlanningSourcesIdle(db,run,bases.map(base=>run.feedback?.sourceOverrides?.[base]??base));
+}
+
+async function recapture(db:DB,run:any,intent:Intent){
+  if(intent.kind==='explicit_source')return recaptureExplicitSourceAuthority(db,run,intent.capture);
+  if(!(await recaptureSourceReuseAuthority(db,intent.capture)).eligible)throw failure('SOURCE_REUSE_AUTHORITY_CHANGED');
+}
+async function refresh(intent:Intent,signal:AbortSignal){
+  if(intent.kind==='explicit_source')return observeExplicitSource(intent.capture,
+    (method,params,options)=>accountBridge.request(method,params,{...options,signal}));
+  const result=await observe(intent.capture,signal);
+  if(!result.eligible)throw failure('SOURCE_REUSE_AUTHORITY_CHANGED');
+  return result;
 }
 
 /** All artifact/remote I/O stays outside admission transactions. A bounded
@@ -73,6 +90,7 @@ export async function preparePlanningSources(run:any,plan:ProposedPlan,signal:Ab
   const request:WorkspaceInspectionRequest=(method,params,options)=>accountBridge.request(method,params,{...options,signal});
   const prepared=new Map<string,PreparedPlanningSource>(),bases=[...new Set(plan.tasks.map(t=>t.baseWorkspace))];
   const planDigest=preparationHash(plan);
+  await tx(async db=>{await lock(db);await assertPlanOwner(db,run,planDigest);});
   for(let index=0;index<bases.length;index++){
     const base=bases[index],destination=target(run,base,index);
     let intent=(await pool.query('SELECT value FROM settings WHERE id=$1',[key(run.id,index)])).rows[0]?.value as Intent|undefined;
@@ -98,7 +116,7 @@ export async function preparePlanningSources(run:any,plan:ProposedPlan,signal:Ab
         intent=await tx(async db=>{await lock(db);await assertPlanOwner(db,run,planDigest);
           const existing=(await db.query('SELECT value FROM settings WHERE id=$1',[key(run.id,index)])).rows[0]?.value;
           if(existing)return existing;
-          if(!(await recaptureSourceReuseAuthority(db,proposal.capture)).eligible)throw failure('SOURCE_REUSE_AUTHORITY_CHANGED');
+          await recapture(db,run,proposal);
           await db.query('INSERT INTO settings(id,value) VALUES($1,$2)',[key(run.id,index),JSON.stringify(proposal)]);
           await event(db,'PLANNING_SOURCE_RESERVED',run.objective_id,{planningRunId:run.id,baseIndex:index,
             preparationIdentity:request.preparationIdentity,proofDigest:proposal.proof.proofDigest,
@@ -109,27 +127,47 @@ export async function preparePlanningSources(run:any,plan:ProposedPlan,signal:Ab
         {planningRunId:run.id,baseIndex:index,reason:result.reason,acceptance:false}));
     }
     if(!intent){
-      await accountBridge.request('worker.prepare',{sourceWorkspace:run.feedback?.sourceOverrides?.[base]??base,workspace:destination},
-        {signal,timeout:180000});
-      continue;
+      const capture=await captureExplicitSourceAuthority(pool,run,base);
+      const observed=await observeExplicitSource(capture,request),preparationIdentity=randomUUID(),selected=observed.proof.selectedSource;
+      const preparation:SourcePreparationRequest={workspace:destination+'-p'+preparationIdentity.replaceAll('-',''),
+        sourceWorkspace:selected.workspace,preparationIdentity,expectedSourceDigest:selected.candidateDigest,
+        expectedSourceSnapshotDigest:selected.snapshotDigest,
+        ...(selected.sourceGenerationKind==='unmarked'?{sourceGenerationKind:'unmarked' as const}:{})};
+      const proposal:Intent={version:1,kind:'explicit_source',planningRunId:run.id,goalId:run.objective_id,
+        baseRevision:run.base_revision,baseIndex:index,baseWorkspace:base,planDigest,capture,proof:observed.proof,
+        request:preparation,state:'reserved',ownerFence:run.fence,updatedAt:new Date().toISOString()};
+      intent=await tx(async db=>{await lock(db);await assertPlanOwner(db,run,planDigest);
+        const existing=(await db.query('SELECT value FROM settings WHERE id=$1',[key(run.id,index)])).rows[0]?.value;
+        if(existing)return existing;
+        await recapture(db,run,proposal);
+        await db.query('INSERT INTO settings(id,value) VALUES($1,$2)',[key(run.id,index),JSON.stringify(proposal)]);
+        await event(db,'PLANNING_SOURCE_RESERVED',run.objective_id,{planningRunId:run.id,baseIndex:index,
+          preparationIdentity,proofDigest:proposal.proof.proofDigest,sourceWorkspace:selected.workspace,
+          targetWorkspace:preparation.workspace,kind:'explicit_source',acceptance:false});
+        return proposal;
+      });
     }
-    if(intent.version!==1||intent.planningRunId!==run.id||intent.goalId!==run.objective_id||intent.baseIndex!==index||
+    if(!intent||intent.version!==1||intent.planningRunId!==run.id||intent.goalId!==run.objective_id||intent.baseIndex!==index||
       intent.baseRevision!==run.base_revision||intent.baseWorkspace!==base||intent.planDigest!==planDigest||
       intent.request.workspace!==destination+'-p'+intent.request.preparationIdentity.replaceAll('-','')||
       intent.state==='applied')throw failure('SOURCE_PREPARATION_INTENT_CHANGED');
     try{
       await tx(async db=>{await lock(db);await assertPlanOwner(db,run,planDigest);
-        if(!(await recaptureSourceReuseAuthority(db,intent!.capture)).eligible)throw failure('SOURCE_REUSE_AUTHORITY_CHANGED');});
+        await recapture(db,run,intent!);});
       let inspection=await inspectWorkspacePreparation(intent.request,request);
       if(inspection?.exists===false&&inspection?.confirmed===true){
+        // A successful old inspection is never a renewed stop observation.
+        const beforeCopy=await refresh(intent,signal);
+        if(beforeCopy.proof.proofDigest!==intent.proof.proofDigest)throw failure('SOURCE_PREPARATION_AUTHORITY_CHANGED');
+        await tx(async db=>{await lock(db);await assertPlanOwner(db,run,planDigest);await recapture(db,run,intent!);});
         await mark(run,index,'preparing');
         await accountBridge.request('worker.prepare',intent.request,{signal,timeout:180000});
         inspection=await inspectWorkspacePreparation(intent.request,request);
       }
       verifySourcePreparation(intent.request,inspection,{requireUnchanged:true});
       // A long copy does not extend the producer's old stop observation.
-      const refreshed=await observe(intent.capture,signal);
-      if(!refreshed.eligible||refreshed.proof.proofDigest!==intent.proof.proofDigest)throw failure('SOURCE_REUSE_AUTHORITY_CHANGED');
+      const refreshed=await refresh(intent,signal);
+      if(refreshed.proof.proofDigest!==intent.proof.proofDigest)throw failure('SOURCE_PREPARATION_AUTHORITY_CHANGED');
       // Re-observe the actual destination after the producer checks; neither a
       // receipt nor the pre-copy timestamp extends its freshness.
       inspection=await inspectWorkspacePreparation(intent.request,request);
@@ -163,15 +201,20 @@ export async function assertPreparedPlanningSources(db:DB,run:any,plan:ProposedP
       current.proof.proofDigest!==source.intent.proof.proofDigest||preparationHash(current.request)!==preparationHash(source.intent.request)||
       preparationHash(current.prepared)!==preparationHash(source.prepared)||Date.now()-source.proofCheckedAt>60000||
       source.proofCheckedAt>Date.now()||Date.now()-source.prepared.checkedAt>60000)throw failure('SOURCE_PREPARATION_STALE');
-    if(!(await recaptureSourceReuseAuthority(db,current.capture)).eligible)throw failure('SOURCE_REUSE_AUTHORITY_CHANGED');
+    await recapture(db,run,current);
   }
 }
 
 export function planningSourceExecution(source:PreparedPlanningSource|undefined,execution:any,preparationIdentity:string){
   if(!source)return {};
   const proof=source.intent.proof;
-  const incorporatedArtifacts=proof.incorporatedContributors.flatMap(c=>[c.candidateArtifact,c.patchArtifact]);
   const sourcePreparation=preparedBaselineBinding(source.prepared,execution.sourceWorkspace,execution.workspace,preparationIdentity);
+  if(source.intent.kind==='explicit_source')return {
+    planningSource:{version:1,planningRunId:source.intent.planningRunId,proofDigest:proof.proofDigest,
+      preparationIdentity:source.intent.request.preparationIdentity,receiptDigest:source.prepared.receipt.receiptDigest,
+      baselineWorkspace:source.intent.request.workspace,acceptance:false,finalVerificationRequired:true},
+    ...(sourcePreparation?{sourcePreparation}:{})};
+  const incorporatedArtifacts=source.intent.proof.incorporatedContributors.flatMap(c=>[c.candidateArtifact,c.patchArtifact]);
   return {sourceReuse:{version:1,planningRunId:source.intent.planningRunId,proofDigest:proof.proofDigest,
     preparationIdentity:source.intent.request.preparationIdentity,receiptDigest:source.prepared.receipt.receiptDigest,
     baselineWorkspace:source.intent.request.workspace,incorporatedArtifacts,acceptance:false,finalVerificationRequired:true},
@@ -182,7 +225,7 @@ export async function applyPreparedPlanningSources(db:DB,run:any,sources:Prepare
   for(const {intent} of sources.values()){
     await db.query("UPDATE settings SET value=value||$2::jsonb WHERE id=$1",[key(run.id,intent.baseIndex),
       JSON.stringify({state:'applied',updatedAt:new Date().toISOString()})]);
-    await event(db,'PLANNING_SOURCE_REUSED',run.objective_id,{planningRunId:run.id,baseIndex:intent.baseIndex,
+    await event(db,intent.kind==='explicit_source'?'PLANNING_SOURCE_PREPARED':'PLANNING_SOURCE_REUSED',run.objective_id,{planningRunId:run.id,baseIndex:intent.baseIndex,
       proofDigest:intent.proof.proofDigest,preparationIdentity:intent.request.preparationIdentity,acceptance:false});
   }
 }

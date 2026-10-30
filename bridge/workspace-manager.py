@@ -37,20 +37,23 @@ def ignored(directory,names):
         if name in SKIP or name.startswith('.env') or name in {'.ssh','.aws','.codex','.claude'}: result.append(name)
         elif p.is_symlink(): raise ValueError('SOURCE_SYMLINK')
     return result
-def sources(root):
-    out={}
+def sources(root,max_files=None,max_bytes=None):
+    out={};total_bytes=0
     for folder,dirs,files in os.walk(root,followlinks=False):
         dirs[:]=[d for d in sorted(dirs) if d not in SKIP and d!='assets' and not d.startswith('.env')]
         for d in dirs:
             if (pathlib.Path(folder)/d).is_symlink(): raise ValueError('SOURCE_SYMLINK')
         for name in sorted(files):
             if name in SKIP or name.startswith('.env') or name.endswith('.log') or name.endswith('.pyc'): continue
+            if max_files is not None and len(out)>=max_files: raise ValueError('SOURCE_INVENTORY_BOUND')
             p=pathlib.Path(folder)/name
             fd=os.open(p,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
             with os.fdopen(fd,'rb') as f:
                 if not stat.S_ISREG(os.fstat(f.fileno()).st_mode): raise ValueError('SOURCE_NOT_REGULAR')
                 b=f.read(8*1024*1024+1)
             if len(b)>8*1024*1024: raise ValueError('SOURCE_TOO_LARGE')
+            total_bytes+=len(b)
+            if max_bytes is not None and total_bytes>max_bytes: raise ValueError('SOURCE_INVENTORY_BOUND')
             out[str(p.relative_to(root))]=b
     return out
 def source_hash(files):
@@ -102,7 +105,9 @@ def make_new_clone_editable(staging):
 
 def preparation_binding(params):
     keys=('expectedSourceDigest','expectedSourceSnapshotDigest','preparationIdentity')
-    if not any(key in params for key in keys): return None
+    if not any(key in params for key in keys) and 'sourceGenerationKind' not in params: return None
+    if 'sourceGenerationKind' in params and params['sourceGenerationKind']!='unmarked':
+        raise ValueError('PREPARATION_BINDING_INVALID')
     if not all(isinstance(params.get(key),str) for key in keys):
         raise ValueError('PREPARATION_BINDING_INVALID')
     if not all(re.fullmatch(r'[0-9a-f]{64}',params[key]) for key in keys[:2]):
@@ -113,7 +118,8 @@ def preparation_binding(params):
     return {'version':1,'preparationIdentity':params['preparationIdentity'],
             'sourceWorkspace':params['sourceWorkspace'],'targetWorkspace':params['workspace'],
             'expectedSourceDigest':params['expectedSourceDigest'],
-            'expectedSourceSnapshotDigest':params['expectedSourceSnapshotDigest']}
+            'expectedSourceSnapshotDigest':params['expectedSourceSnapshotDigest'],
+            **({'sourceGenerationKind':'unmarked'} if params.get('sourceGenerationKind')=='unmarked' else {})}
 
 def preparation_digest(value):
     return digest_key(json.dumps(value,sort_keys=True,separators=(',',':'),ensure_ascii=False))
@@ -206,6 +212,13 @@ def flush_preparation_tree(root,names):
         finally: os.close(fd)
 
 def preparation_source_matches(source,binding):
+    if binding.get('sourceGenerationKind')=='unmarked':
+        value=unmarked_source_identity(source,binding['sourceWorkspace'])
+        if value['generationDigest']!=binding['expectedSourceSnapshotDigest']:
+            raise ValueError('PREPARATION_SOURCE_GENERATION_CHANGED')
+        if value['sourceDigest']!=binding['expectedSourceDigest']:
+            raise ValueError('PREPARATION_SOURCE_DIGEST_CHANGED')
+        return
     marker,generation=read_preparation_json(source/'.agentos-snapshot.json')
     if marker.get('workspace')!=binding['sourceWorkspace'] or generation!=binding['expectedSourceSnapshotDigest']:
         raise ValueError('PREPARATION_SOURCE_GENERATION_CHANGED')
@@ -295,10 +308,6 @@ def prepare_bound(params,binding):
             try:
                 shutil.copytree(source,staging,ignore=ignored)
                 make_new_clone_editable(staging)
-                ignore=staging/'.gitignore'
-                existing=ignore.read_text() if ignore.exists() else ''
-                if any(name not in existing.splitlines() for name in ['assets/','evidence/','data/','node_modules/','.agentos-snapshot.json']):
-                    raise ValueError('PREPARATION_SOURCE_NORMALIZATION')
                 project_deps=pathlib.Path('/opt/agentos-project-deps')/target_id.split('/')[0]/'node_modules'
                 (staging/'node_modules').symlink_to(str(project_deps) if project_deps.is_dir() else '/opt/agentos-runtime/node_modules',target_is_directory=True)
                 (staging/'evidence').mkdir(exist_ok=True);(staging/'data').mkdir(exist_ok=True)
@@ -314,7 +323,11 @@ def prepare_bound(params,binding):
                     with os.fdopen(fd,'wb') as handle:
                         os.fchmod(handle.fileno(),0o444);handle.write(raw)
                 env={**os.environ,'GIT_CONFIG_NOSYSTEM':'1','GIT_CONFIG_GLOBAL':'/dev/null','GIT_AUTHOR_NAME':'AgentOS','GIT_AUTHOR_EMAIL':'agentos@localhost','GIT_COMMITTER_NAME':'AgentOS','GIT_COMMITTER_EMAIL':'agentos@localhost'}
-                for args in [['init','-q'],['-c','core.hooksPath=/dev/null','add','.'],['-c','core.hooksPath=/dev/null','commit','-qm','Isolated objective baseline','--allow-empty']]:
+                subprocess.run(['git','init','-q'],cwd=staging,env=env,check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                # Git-local excludes preserve arbitrary source .gitignore bytes,
+                # including a raw root subsequently used as a marked origin.
+                (staging/'.git/info/exclude').write_text('\n'.join(sorted(SKIP|{'assets'}))+'\n')
+                for args in [['-c','core.hooksPath=/dev/null','add','.'],['-c','core.hooksPath=/dev/null','commit','-qm','Isolated objective baseline','--allow-empty']]:
                     subprocess.run(['git',*args],cwd=staging,env=env,check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
                 if source_hash(sources(staging))!=expected: raise ValueError('PREPARATION_CLONE_CHANGED')
                 preparation_source_matches(source,binding)
@@ -454,6 +467,38 @@ def inspect_generation(params):
                 'markerBase64':base64.b64encode(marker_raw).decode('ascii'),'legacyParentGeneration':'sourceSnapshotDigest' not in marker,
                 'candidate':candidate,'checkedAt':datetime.datetime.now(datetime.timezone.utc).isoformat()}
 
+def unmarked_source_identity(source,workspace_id):
+    """Read-only identity of an explicitly authorized raw root, not ancestry.
+
+    A present, unsafe or dangling marker can never select this mode. Directory
+    identity and complete source bytes are checked twice under the caller lock.
+    """
+    protected_preparation_directory(source)
+    marker=source/'.agentos-snapshot.json'
+    if marker.exists() or marker.is_symlink(): raise ValueError('PREPARATION_SOURCE_GENERATION_CHANGED')
+    before=source.stat();files=sources(source,max_files=10000,max_bytes=128*1024*1024);digest=source_hash(files)
+    identity={'version':1,'kind':'unmarked','workspace':workspace_id,'sourceDigest':digest,
+              'device':str(before.st_dev),'inode':str(before.st_ino)}
+    after=source.stat()
+    if ((before.st_dev,before.st_ino)!=(after.st_dev,after.st_ino) or marker.exists() or marker.is_symlink()
+            or source_hash(sources(source,max_files=10000,max_bytes=128*1024*1024))!=digest): raise ValueError('SOURCE_BINDING_OBSERVATION_CHANGED')
+    return {'version':1,'workspace':workspace_id,'sourceGenerationKind':'unmarked','sourceDigest':digest,
+            'generationDigest':preparation_digest(identity),'directoryIdentity':{'device':identity['device'],'inode':identity['inode']},
+            'files':[{'path':name,'sha256':hashlib.sha256(raw).hexdigest()} for name,raw in sorted(files.items())],
+            'checkedAt':datetime.datetime.now(datetime.timezone.utc).isoformat()}
+
+def inspect_planning_source(params):
+    workspace_id=params['workspace'];source=workspace(workspace_id)
+    # Mode is supplied by controller authority, never chosen after an error.
+    if params.get('sourceGenerationKind')=='root' and not ((source/'.agentos-snapshot.json').exists() or (source/'.agentos-snapshot.json').is_symlink()):
+        protected_preparation_directory(DATA)
+        with preparation_locks([workspace_id]): return unmarked_source_identity(source,workspace_id)
+    if params.get('sourceGenerationKind') not in ('root','snapshot'): raise ValueError('PREPARATION_BINDING_INVALID')
+    value=inspect_generation({'workspace':workspace_id})
+    return {'version':1,'workspace':workspace_id,'sourceGenerationKind':'snapshot',
+            'sourceDigest':value['candidate']['candidateDigest'],'generationDigest':value['generation']['snapshotDigest'],
+            'snapshot':value,'checkedAt':value['checkedAt']}
+
 def inspect_preparation(params):
     binding=preparation_binding(params)
     if binding is None: raise ValueError('PREPARATION_BINDING_INVALID')
@@ -578,6 +623,7 @@ if __name__=='__main__':
         elif action=='prepare': result=prepare(params)
         elif action=='inspect': result=inspect(params)
         elif action=='inspect-generation': result=inspect_generation(params)
+        elif action=='inspect-planning-source': result=inspect_planning_source(params)
         elif action=='inspect-preparation': result=inspect_preparation(params)
         elif action=='inspect-retry-source-binding': result=inspect_source_binding(params,retry_admission=True)
         elif action=='capacity': result=storage_capacity.capacity(ROOT,DATA)

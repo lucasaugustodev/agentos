@@ -129,12 +129,13 @@ class BoundPreparationTests(unittest.TestCase):
         self.rejected('PREPARATION_RECEIPT_UNPROTECTED')
         self.no_destination()
 
-    def test_normalization_is_rejected_without_changing_source(self):
+    def test_bound_clone_never_normalizes_source_gitignore(self):
         (self.source/'.gitignore').write_text('assets/\n')
         params={**self.params,'expectedSourceDigest':manager.source_hash(manager.sources(self.source))}
-        self.rejected('PREPARATION_SOURCE_NORMALIZATION',params)
+        manager.prepare(params)
         self.assertEqual((self.source/'.gitignore').read_text(),'assets/\n')
-        self.no_destination()
+        self.assertEqual(manager.sources(self.source),manager.sources(self.target))
+        self.assertIn('node_modules',(self.target/'.git/info/exclude').read_text().splitlines())
 
     def test_source_mutation_during_copy_is_rejected(self):
         original = manager.shutil.copytree
@@ -347,6 +348,56 @@ class BoundPreparationTests(unittest.TestCase):
         (target/'src/main.py').write_text('legacy work preserved\n')
         self.assertEqual(manager.prepare(params),result)
         self.assertEqual((target/'src/main.py').read_text(),'legacy work preserved\n')
+
+    def test_explicit_unmarked_root_preserves_bytes_without_normalizing_gitignore(self):
+        raw=self.workspaces/'sample/raw';(raw/'.gitignore').write_text('dist/\n')
+        before=manager.sources(raw)
+        observed=manager.inspect_planning_source({'workspace':'sample/raw','sourceGenerationKind':'root'})
+        params={**self.params,'sourceWorkspace':'sample/raw','sourceGenerationKind':'unmarked',
+                'expectedSourceDigest':observed['sourceDigest'],'expectedSourceSnapshotDigest':observed['generationDigest']}
+        result=manager.prepare(params)
+        self.assertEqual(manager.sources(raw),before)
+        self.assertFalse((raw/'.agentos-snapshot.json').exists())
+        self.assertEqual(manager.sources(self.target),before)
+        self.assertEqual(result['preparationReceipt']['sourceGenerationKind'],'unmarked')
+        self.assertEqual(manager.prepare(params),result)
+        self.assertEqual(manager.inspect_preparation(params)['preparationReceipt'],result['preparationReceipt'])
+        with self.assertRaisesRegex(ValueError,'PREPARATION_BINDING_MISMATCH'):
+            manager.inspect_preparation({k:v for k,v in params.items() if k!='sourceGenerationKind'})
+        child={'workspace':'sample/ochild','sourceWorkspace':params['workspace'],'preparationIdentity':str(uuid.uuid4()),
+               'expectedSourceDigest':observed['sourceDigest'],
+               'expectedSourceSnapshotDigest':hashlib.sha256((self.target/'.agentos-snapshot.json').read_bytes()).hexdigest()}
+        manager.prepare(child)
+        self.assertEqual(manager.sources(self.workspaces/'sample/ochild'),before)
+
+    def test_unmarked_inspection_is_bounded_and_cannot_observe_a_live_root(self):
+        raw=self.workspaces/'sample/raw'
+        with self.assertRaisesRegex(ValueError,'SOURCE_INVENTORY_BOUND'):manager.sources(raw,max_files=1)
+        with self.assertRaisesRegex(ValueError,'SOURCE_INVENTORY_BOUND'):manager.sources(raw,max_bytes=1)
+        file=self.data/'locks'/('workspace-'+manager.digest_key('sample/raw'))
+        with file.open('a') as handle:
+            fcntl.flock(handle,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            with self.assertRaisesRegex(ValueError,'SOURCE_BUSY'):
+                manager.inspect_planning_source({'workspace':'sample/raw','sourceGenerationKind':'root'})
+
+    def test_explicit_unmarked_never_downgrades_existing_or_unsafe_marker(self):
+        with self.assertRaisesRegex(ValueError,'PREPARATION_SOURCE_GENERATION_CHANGED'):
+            manager.prepare({**self.params,'sourceGenerationKind':'unmarked'})
+        marker=self.source/'.agentos-snapshot.json';marker.chmod(0o666)
+        with self.assertRaisesRegex(ValueError,'PREPARATION_RECEIPT_UNPROTECTED'):
+            manager.inspect_planning_source({'workspace':'sample/osource','sourceGenerationKind':'root'})
+        self.no_destination()
+
+    def test_explicit_root_generation_changes_when_same_bytes_get_another_directory(self):
+        raw=self.workspaces/'sample/raw'
+        observed=manager.inspect_planning_source({'workspace':'sample/raw','sourceGenerationKind':'root'})
+        prior=raw.with_name('prior-root');raw.rename(prior)
+        import shutil
+        shutil.copytree(prior,raw)
+        params={**self.params,'sourceWorkspace':'sample/raw','sourceGenerationKind':'unmarked',
+                'expectedSourceDigest':observed['sourceDigest'],'expectedSourceSnapshotDigest':observed['generationDigest']}
+        with self.assertRaisesRegex(ValueError,'PREPARATION_SOURCE_GENERATION_CHANGED'):manager.prepare(params)
+        self.no_destination()
 
 
 if __name__=='__main__':unittest.main()

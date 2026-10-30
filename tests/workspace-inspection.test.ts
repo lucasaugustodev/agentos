@@ -3,7 +3,7 @@ import {randomUUID,createHash} from 'node:crypto';
 import {execFile} from 'node:child_process';
 import {promisify} from 'node:util';
 import path from 'node:path';
-import {inspectWorkspaceGeneration,inspectWorkspacePreparation,inspectWorkerSourceBinding,inspectWorkerRetrySourceBinding} from '../server/workspace-inspection.js';
+import {inspectWorkspaceGeneration,inspectWorkspacePreparation,inspectWorkerSourceBinding,inspectWorkerRetrySourceBinding,inspectPlanningSource} from '../server/workspace-inspection.js';
 
 const sha=(value:string|Buffer)=>createHash('sha256').update(value).digest('hex');
 const canonical=(value:Record<string,unknown>)=>JSON.stringify(Object.fromEntries(Object.entries(value).sort(([a],[b])=>a<b?-1:a>b?1:0)));
@@ -36,6 +36,28 @@ it('exposes typed generation metadata using only the fixed readonly account brid
   const f=fixture(),request=vi.fn(async()=>f.generated);
   expect(await inspectWorkspaceGeneration(f.requested.workspace,request)).toEqual(f.generated);
   expect(request).toHaveBeenCalledWith('worker.inspectGeneration',{workspace:f.requested.workspace},{timeout:45000});
+});
+
+it('binds an unmarked root to exact inventory and directory identity only with explicit root authority',async()=>{
+  const workspace='sample/root',directoryIdentity={device:'1',inode:'42'},sourceDigest=inventory();
+  const generationDigest=sha(canonical({version:1,kind:'unmarked',workspace,sourceDigest,...directoryIdentity}));
+  const value={version:1,workspace,sourceGenerationKind:'unmarked',sourceDigest,generationDigest,directoryIdentity,files,checkedAt:new Date().toISOString()};
+  expect(await inspectPlanningSource(workspace,'root',async()=>value)).toEqual(value);
+  await expect(inspectPlanningSource(workspace,'snapshot',async()=>value)).rejects.toThrow('WORKSPACE_INSPECTION_RESPONSE_INVALID');
+  for(const change of [(v:any)=>{v.directoryIdentity.inode='43';},(v:any)=>{v.files=[];},
+    (v:any)=>{v.workspace='sample/other';},(v:any)=>{v.checkedAt=new Date(Date.now()-61000).toISOString();}]){
+    const changed=structuredClone(value);change(changed);
+    await expect(inspectPlanningSource(workspace,'root',async()=>changed)).rejects.toThrow('WORKSPACE_INSPECTION_RESPONSE_INVALID');
+  }
+});
+
+it('retains the full snapshot checks when an explicit source already has a marker',async()=>{
+  const f=fixture(),value={version:1,workspace:f.generated.workspace,sourceGenerationKind:'snapshot',
+    sourceDigest:f.generated.candidate.candidateDigest,generationDigest:f.generated.generation.snapshotDigest,
+    snapshot:f.generated,checkedAt:f.generated.checkedAt};
+  expect(await inspectPlanningSource(value.workspace,'root',async()=>value)).toEqual(value);
+  value.snapshot.generation.snapshotDigest='0'.repeat(64);
+  await expect(inspectPlanningSource(value.workspace,'root',async()=>value)).rejects.toThrow('WORKSPACE_INSPECTION_RESPONSE_INVALID');
 });
 
 it('rejects malformed generation bytes inventories identity and unknown returned fields',async()=>{
@@ -124,5 +146,5 @@ it('executes real readonly filesystem and bridge dispatcher adversarial fixtures
   const python=await promisify(execFile)('python3',['-B',path.resolve('tests/fixtures/workspace_readonly_inspection_test.py')],{timeout:60000,maxBuffer:1024*1024});
   expect(python.stdout).toBe('');expect(python.stderr).toContain('Ran 16 tests');expect(python.stderr).toContain('OK');
   const node=await promisify(execFile)(process.execPath,['--test','--test-reporter=tap',path.resolve('tests/workspace-inspection-bridge.test.mjs')],{timeout:30000,maxBuffer:1024*1024});
-  expect(node.stdout).toContain('# tests 6');expect(node.stdout).toContain('# pass 6');expect(node.stdout).toContain('# fail 0');expect(node.stdout).toContain('# skipped 0');
+  expect(node.stdout).toContain('# tests 8');expect(node.stdout).toContain('# pass 8');expect(node.stdout).toContain('# fail 0');expect(node.stdout).toContain('# skipped 0');
 },95000);

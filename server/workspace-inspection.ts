@@ -11,7 +11,7 @@ const generation=z.object({workspace,sourceWorkspace:workspace,baseDigest:hash,s
 const candidate=z.object({baseDigest:hash,candidateDigest:hash,files:z.array(z.object({path:z.string().min(1).max(500),sha256:hash}).strict()).max(10000)}).strict();
 const markerBase64=z.string().min(4).max(Math.ceil(128*1024/3)*4);
 const binding=z.object({version:z.literal(1),preparationIdentity:uuid,sourceWorkspace:workspace,targetWorkspace:workspace,
-  expectedSourceDigest:hash,expectedSourceSnapshotDigest:hash}).strict();
+  expectedSourceDigest:hash,expectedSourceSnapshotDigest:hash,sourceGenerationKind:z.literal('unmarked').optional()}).strict();
 const receipt=binding.extend({bindingDigest:hash,observedSourceDigest:hash,sourceSnapshotDigest:hash,
   cloneBaseDigest:hash,baselineDigest:hash,createdAt:checkedAt,receiptDigest:hash}).strict();
 const marker=z.object({workspace,sourceWorkspace:workspace,baseDigest:hash,createdAt:checkedAt,
@@ -34,7 +34,7 @@ export type WorkspaceGenerationInspection=z.infer<typeof generationResponse>;
 export type WorkspacePreparationInspection=z.infer<typeof preparationResponse>|z.infer<typeof missingPreparation>;
 export type WorkerSourceBindingInspection=z.infer<typeof sourceResponse>;
 export type WorkerRetrySourceBindingInspection=z.infer<typeof retrySourceResponse>;
-export type WorkspacePreparationRequest={workspace:string;sourceWorkspace:string;preparationIdentity:string;expectedSourceDigest:string;expectedSourceSnapshotDigest:string};
+export type WorkspacePreparationRequest={workspace:string;sourceWorkspace:string;preparationIdentity:string;expectedSourceDigest:string;expectedSourceSnapshotDigest:string;sourceGenerationKind?:'unmarked'};
 export type WorkspaceInspectionRequest=(method:string,params:unknown,options?:{timeout?:number;signal?:AbortSignal})=>Promise<unknown>;
 const sha=(raw:Buffer|string)=>createHash('sha256').update(raw).digest('hex');
 const flatDigest=(value:Record<string,unknown>)=>sha(JSON.stringify(Object.fromEntries(Object.entries(value).sort(([a],[b])=>a<b?-1:a>b?1:0))));
@@ -61,17 +61,45 @@ export async function inspectWorkspaceGeneration(value:string,request:WorkspaceI
   verifyGeneration(result);return result;
 }
 
+const planningSourceResponse=z.discriminatedUnion('sourceGenerationKind',[
+  z.object({version:z.literal(1),workspace,sourceGenerationKind:z.literal('snapshot'),sourceDigest:hash,generationDigest:hash,
+    snapshot:generationResponse,checkedAt}).strict(),
+  z.object({version:z.literal(1),workspace,sourceGenerationKind:z.literal('unmarked'),sourceDigest:hash,generationDigest:hash,
+    directoryIdentity:z.object({device:z.string().regex(/^\d+$/),inode:z.string().regex(/^\d+$/)}).strict(),
+    files:candidate.shape.files,checkedAt}).strict(),
+]);
+export type PlanningSourceInspection=z.infer<typeof planningSourceResponse>;
+export async function inspectPlanningSource(value:string,kind:'root'|'snapshot',request:WorkspaceInspectionRequest):Promise<PlanningSourceInspection>{
+  const requested=workspace.parse(value);
+  const result=parse(planningSourceResponse,await request('worker.inspectPlanningSource',
+    {workspace:requested,sourceGenerationKind:kind},{timeout:45000}));
+  if(result.workspace!==requested)fail();current(result.checkedAt);
+  if(result.sourceGenerationKind==='snapshot'){
+    const snapshot=result.snapshot;verifyGeneration(snapshot);
+    if(snapshot.workspace!==requested||snapshot.checkedAt!==result.checkedAt||snapshot.generation.snapshotDigest!==result.generationDigest||
+      snapshot.candidate.candidateDigest!==result.sourceDigest||snapshot.legacyParentGeneration!==(snapshot.generation.sourceSnapshotDigest===null))fail();
+  }else{
+    if(kind!=='root'||flatDigest({version:1,kind:'unmarked',workspace:requested,sourceDigest:result.sourceDigest,
+      ...result.directoryIdentity})!==result.generationDigest)fail();
+    const bytes=Buffer.from(JSON.stringify({baseDigest:result.sourceDigest,candidateDigest:result.sourceDigest,files:result.files}));
+    if(runtimeCandidateDigest(bytes,sha(bytes))!==result.sourceDigest)fail();
+  }
+  return result;
+}
+
 export async function inspectWorkspacePreparation(value:WorkspacePreparationRequest,request:WorkspaceInspectionRequest=accountBridge.request.bind(accountBridge)):Promise<WorkspacePreparationInspection>{
-  const requested=z.object({workspace,sourceWorkspace:workspace,preparationIdentity:uuid,expectedSourceDigest:hash,expectedSourceSnapshotDigest:hash}).strict().parse(value);
+  const requested=z.object({workspace,sourceWorkspace:workspace,preparationIdentity:uuid,expectedSourceDigest:hash,expectedSourceSnapshotDigest:hash,
+    sourceGenerationKind:z.literal('unmarked').optional()}).strict().parse(value);
   const result=parse(z.union([preparationResponse,missingPreparation]),await request('worker.inspectPreparation',requested,{timeout:45000}));
   if(result.workspace!==requested.workspace)fail();
   if(!result.exists){if(result.preparationIdentity!==requested.preparationIdentity)fail();current(result.checkedAt);return result;}
   const r=result.preparationReceipt;
   if(r.targetWorkspace!==requested.workspace||r.sourceWorkspace!==requested.sourceWorkspace||r.preparationIdentity!==requested.preparationIdentity||
-    r.expectedSourceDigest!==requested.expectedSourceDigest||r.expectedSourceSnapshotDigest!==requested.expectedSourceSnapshotDigest||
+    r.expectedSourceDigest!==requested.expectedSourceDigest||r.expectedSourceSnapshotDigest!==requested.expectedSourceSnapshotDigest||r.sourceGenerationKind!==requested.sourceGenerationKind||
     result.destinationChanged!==(result.candidate.candidateDigest!==requested.expectedSourceDigest))fail();
   const m=verifyGeneration(result),bound={version:1,preparationIdentity:r.preparationIdentity,sourceWorkspace:r.sourceWorkspace,targetWorkspace:r.targetWorkspace,
-    expectedSourceDigest:r.expectedSourceDigest,expectedSourceSnapshotDigest:r.expectedSourceSnapshotDigest};
+    expectedSourceDigest:r.expectedSourceDigest,expectedSourceSnapshotDigest:r.expectedSourceSnapshotDigest,
+    ...(r.sourceGenerationKind?{sourceGenerationKind:r.sourceGenerationKind}:{})};
   const {receiptDigest,...body}=r;
   if(r.bindingDigest!==flatDigest(bound)||receiptDigest!==flatDigest(body)||
     [r.observedSourceDigest,r.cloneBaseDigest,r.baselineDigest,result.candidate.baseDigest].some(value=>value!==requested.expectedSourceDigest)||

@@ -12,12 +12,20 @@ const artifact=z.object({id:uuid,runId:uuid,name:z.enum(['candidate.json','chang
 const reuseSchema=z.object({version:z.literal(1),planningRunId:uuid,proofDigest:sha,preparationIdentity:uuid,
   receiptDigest:sha,baselineWorkspace:z.string(),incorporatedArtifacts:z.array(artifact).min(2).max(128),
   acceptance:z.literal(false),finalVerificationRequired:z.literal(true)}).strict();
+const planningSourceSchema=reuseSchema.omit({incorporatedArtifacts:true}).strict();
 const terminal=new Set(['submitted','failed','cancelled']);
 const failure=(code:string)=>new DomainError(code,'A preparação vinculada exige reconciliação; o workspace existente foi preservado.');
 const requireProof=(ok:unknown,code='SOURCE_PREPARATION_AUTHORITY_CHANGED')=>{if(!ok)throw failure(code);};
 const same=(a:unknown,b:unknown)=>preparationHash(a)===preparationHash(b);
-const control=(e:any)=>Object.fromEntries(['kind','workspace','sourceWorkspace','baseWorkspace','sourcePreparation','sourceReuse'].map(k=>[k,e?.[k]??null]));
-const sqlControl=(e:string)=>`jsonb_build_object(${['kind','workspace','sourceWorkspace','baseWorkspace','sourcePreparation','sourceReuse'].map(k=>`'${k}',${e}->'${k}'`).join(',')})`;
+const control=(e:any)=>Object.fromEntries(['kind','workspace','sourceWorkspace','baseWorkspace','sourcePreparation','sourceReuse','planningSource'].map(k=>[k,e?.[k]??null]));
+const sqlControl=(e:string)=>`jsonb_build_object(${['kind','workspace','sourceWorkspace','baseWorkspace','sourcePreparation','sourceReuse','planningSource'].map(k=>`'${k}',${e}->'${k}'`).join(',')})`;
+function authority(execution:any){
+  const explicit=Object.hasOwn(execution,'planningSource');
+  requireProof(explicit!==Object.hasOwn(execution,'sourceReuse'),'SOURCE_PREPARATION_BINDING_INVALID');
+  const parsed=explicit?planningSourceSchema.safeParse(execution.planningSource):reuseSchema.safeParse(execution.sourceReuse);
+  requireProof(parsed.success,'SOURCE_PREPARATION_BINDING_INVALID');
+  return {explicit,value:parsed.data!};
+}
 type Captured={fingerprint:string;previous:any[];request:SourcePreparationRequest};
 type Prepared={capture:Captured;verified:VerifiedSourcePreparation;stop:any|null;admission:any|null;requireUnchanged:boolean};
 const prepared=new WeakMap<RuntimeInput,Prepared>();
@@ -26,7 +34,7 @@ const prepared=new WeakMap<RuntimeInput,Prepared>();
  * instructions, execution inputs, candidate bodies and source trees stay out
  * of both the initial read and the admission-lock recapture. */
 async function capture(db:DB,input:RuntimeInput,request:SourcePreparationRequest):Promise<Captured>{
-  const reuse=reuseSchema.parse(input.task.execution.sourceReuse);
+  const {explicit,value:reuse}=authority(input.task.execution);
   const row=(await db.query(`SELECT r.id,r.task_id,r.attempt,r.fence,r.context_id,r.state,r.runtime,r.worker_id,
     t.goal_id,t.plan_revision,t.attempt_count,t.state task_state,g.state goal_state,g.project,o.revision objective_revision,o.mode,
     r.instruction_snapshot->>'schema' instruction_schema,r.instruction_snapshot#>>'{task,id}' frozen_task,
@@ -54,6 +62,7 @@ async function capture(db:DB,input:RuntimeInput,request:SourcePreparationRequest
         FROM runs WHERE task_id=t.id AND attempt<r.attempt ORDER BY attempt DESC LIMIT 65) p) previous,
     (SELECT jsonb_agg(jsonb_build_object('key',s.id,'version',s.value->'version','state',s.value->'state',
       'planningRunId',s.value->'planningRunId','ownerFence',s.value->'ownerFence','goalId',s.value->'goalId','baseRevision',s.value->'baseRevision',
+      'kind',s.value->'kind','explicitProof',CASE WHEN s.value->>'kind'='explicit_source' THEN s.value->'proof' ELSE NULL END,
       'baseIndex',s.value->'baseIndex','baseWorkspace',s.value->'baseWorkspace','request',s.value->'request','prepared',s.value->'prepared',
       'proofVersion',s.value#>'{proof,version}','proofKind',s.value#>'{proof,kind}','proofDigest',s.value#>'{proof,proofDigest}',
       'proofScope',s.value#>'{proof,scope}','selectedSource',jsonb_build_object('workspace',s.value#>'{proof,selectedSource,workspace}',
@@ -91,21 +100,31 @@ async function capture(db:DB,input:RuntimeInput,request:SourcePreparationRequest
     intent.baseWorkspace===input.task.execution.baseWorkspace&&intent.proofScope?.goalId===input.task.goal_id&&
     intent.proofScope?.project===row.project&&request.workspace.split('/')[0]===row.project&&
     intent.proofScope?.revision===intent.baseRevision&&intent.proofScope?.baseWorkspace===intent.baseWorkspace&&
-    intent.proofVersion===1&&intent.proofKind==='repair_source_reuse'&&intent.acceptance===false&&intent.finalVerificationRequired===true);
+    intent.proofVersion===1&&intent.proofKind===(explicit?'explicit_planning_source':'repair_source_reuse')&&
+    (explicit?intent.kind==='explicit_source':!intent.kind||intent.kind==='accepted_reuse')&&
+    intent.acceptance===false&&intent.finalVerificationRequired===true);
+  if(explicit){
+    const proof=intent.explicitProof,{proofDigest,...body}=proof??{};
+    requireProof(proof&&proofDigest===preparationHash(body)&&proofDigest===intent.proofDigest&&
+      sha.safeParse(proof.databaseFingerprint).success&&
+      ['snapshot','unmarked'].includes(proof.selectedSource?.sourceGenerationKind)&&
+      (proof.selectedSource.sourceGenerationKind==='unmarked')===(intent.request.sourceGenerationKind==='unmarked'));
+  }
   requireProof(stored?.version===1&&same(stored.request,intent.request)&&sha.safeParse(stored.targetSnapshotDigest).success&&
     stored.destinationChanged===false&&stored.currentCandidateDigest===intent.request.expectedSourceDigest&&
     intent.selectedSource.workspace===intent.request.sourceWorkspace&&intent.selectedSource.candidateDigest===intent.request.expectedSourceDigest&&
     intent.selectedSource.snapshotDigest===intent.request.expectedSourceSnapshotDigest);
   const receipt=stored.receipt,{receiptDigest,...body}=receipt??{};
   const binding={version:1,preparationIdentity:intent.request.preparationIdentity,sourceWorkspace:intent.request.sourceWorkspace,
-    targetWorkspace:intent.request.workspace,expectedSourceDigest:intent.request.expectedSourceDigest,expectedSourceSnapshotDigest:intent.request.expectedSourceSnapshotDigest};
+    targetWorkspace:intent.request.workspace,expectedSourceDigest:intent.request.expectedSourceDigest,expectedSourceSnapshotDigest:intent.request.expectedSourceSnapshotDigest,
+    ...(intent.request.sourceGenerationKind?{sourceGenerationKind:intent.request.sourceGenerationKind}:{})};
   requireProof(receipt&&Object.entries(binding).every(([k,v])=>receipt[k as keyof typeof receipt]===v)&&
     receipt.bindingDigest===preparationHash(binding)&&receiptDigest===preparationHash(body)&&
-    receipt.sourceSnapshotDigest===intent.request.expectedSourceSnapshotDigest&&
+    receipt.sourceSnapshotDigest===intent.request.expectedSourceSnapshotDigest&&receipt.sourceGenerationKind===intent.request.sourceGenerationKind&&
     [receipt.observedSourceDigest,receipt.cloneBaseDigest,receipt.baselineDigest].every(d=>d===intent.request.expectedSourceDigest));
   requireProof(same(reuse,{version:1,planningRunId:intent.planningRunId,proofDigest:intent.proofDigest,
     preparationIdentity:intent.request.preparationIdentity,receiptDigest,baselineWorkspace:intent.request.workspace,
-    incorporatedArtifacts:intent.incorporatedArtifacts,acceptance:false,finalVerificationRequired:true})&&
+    ...(!explicit?{incorporatedArtifacts:intent.incorporatedArtifacts}:{}),acceptance:false,finalVerificationRequired:true})&&
     same(request,preparedBaselineBinding(stored,request.sourceWorkspace,request.workspace,request.preparationIdentity)));
   const previous=row.previous??[];
   requireProof(row.prior_count<=64&&previous.length===row.prior_count&&row.prior_count===row.attempt-1,'SOURCE_PREPARATION_HISTORY_INCOMPLETE');
@@ -181,7 +200,8 @@ export async function prepareBoundRuntimeWorkspace(input:RuntimeInput):Promise<b
     frozen.goal_id===input.task.goal_id&&same(control(frozen.execution),control(input.task.execution))&&
     input.task.execution.kind==='harness','SOURCE_PREPARATION_FROZEN_BINDING_REQUIRED');
   const parsed=sourcePreparationRequestSchema.safeParse(frozen.execution.sourcePreparation);
-  requireProof(parsed.success&&reuseSchema.safeParse(frozen.execution.sourceReuse).success,'SOURCE_PREPARATION_BINDING_INVALID');
+  requireProof(parsed.success,'SOURCE_PREPARATION_BINDING_INVALID');
+  authority(frozen.execution);
   const request=parsed.data!;
   requireProof(request.workspace===input.task.execution.workspace&&request.sourceWorkspace===input.task.execution.sourceWorkspace);
   const captured=await capture(pool,input,request),stop=await stopped(input,captured);

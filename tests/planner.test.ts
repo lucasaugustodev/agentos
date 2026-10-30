@@ -4,6 +4,7 @@ import { config } from '../server/config.js';
 import { pool, migrate } from '../server/db.js';
 import { seedRegistry } from '../server/registry.js';
 import { accountBridge } from '../server/bridge.js';
+import {planningPreparationFixture} from './fixtures/planning-preparation.js';
 import { objectiveSchema, planSchema, validatePlan } from '../server/objective-contracts.js';
 import {
   submitObjective,
@@ -339,7 +340,8 @@ it('batches Laya candidates and rejects incomplete rankings', async () => {
 it('reuses a validated proposal when workspace preparation must wait', async () => {
   let prepares = 0,
     generations = 0;
-  vi.spyOn(accountBridge, 'request').mockImplementation(async (method) => {
+  const preparation=planningPreparationFixture();
+  vi.spyOn(accountBridge, 'request').mockImplementation(async (method,params:any) => {
     if (method === 'memory.search') return { items: [] };
     if (method === 'worker.workspaces') return [{ id: 'test/base' }];
     if (method === 'generate') {
@@ -348,8 +350,9 @@ it('reuses a validated proposal when workspace preparation must wait', async () 
     }
     if (method === 'worker.prepare') {
       if (++prepares === 1) throw Object.assign(Error('busy'), { code: 'SOURCE_BUSY' });
-      return {};
+      return preparation(method,params);
     }
+    const prepared=preparation(method,params);if(prepared!==undefined)return prepared;
     throw Error('ranking fallback');
   });
   await submitObjective(request());
@@ -366,14 +369,15 @@ it('reuses a validated proposal when workspace preparation must wait', async () 
 
 it('recovers a confirmed generation timeout without creating duplicate work', async () => {
   let generations = 0;
-  vi.spyOn(accountBridge, 'request').mockImplementation(async (method) => {
+  const preparation=planningPreparationFixture();
+  vi.spyOn(accountBridge, 'request').mockImplementation(async (method,params:any) => {
     if (method === 'memory.search') return { items: [] };
     if (method === 'worker.workspaces') return [{ id: 'test/base' }];
     if (method === 'generate') {
       if (++generations === 1) throw Object.assign(Error('confirmed timeout'), { code: 'PROVIDER_TIMEOUT' });
       return { message: { content: [{ type: 'text', text: JSON.stringify(plan()) }] } };
     }
-    if (method === 'worker.prepare') return {};
+    const prepared=preparation(method,params);if(prepared!==undefined)return prepared;
     throw Error('ranking fallback');
   });
   const { objectiveId } = await submitObjective(request());
@@ -390,13 +394,14 @@ it('recovers a confirmed generation timeout without creating duplicate work', as
 
 it.each([
   ['generate', 'STOP_UNCONFIRMED', 1, 'failed', false],
-  ['worker.prepare', 'PROVIDER_TIMEOUT', 1, 'failed', false],
+  ['worker.prepare', 'PROVIDER_TIMEOUT', 1, 'queued', false],
   ['generate', 'PROVIDER_TIMEOUT', 3, 'queued', false],
   ['generate', 'STOP_UNCONFIRMED', 1, 'failed', true],
   ['worker.prepare', 'STOP_UNCONFIRMED', 1, 'failed', true],
 ])('distinguishes confirmed model failure from uncertain effects [case %#]: %s %s attempt %s -> %s', async (phase, code, attempt, expectedState, interrupt) => {
   const controller = new AbortController();
-  vi.spyOn(accountBridge, 'request').mockImplementation(async (method) => {
+  const preparation=planningPreparationFixture();
+  vi.spyOn(accountBridge, 'request').mockImplementation(async (method,params:any) => {
     if (method === phase) {
       if (interrupt) controller.abort();
       throw Object.assign(Error(code), { code });
@@ -404,7 +409,7 @@ it.each([
     if (method === 'memory.search') return { items: [] };
     if (method === 'worker.workspaces') return [{ id: 'test/base' }];
     if (method === 'generate') return { message: { content: [{ type: 'text', text: JSON.stringify(plan()) }] } };
-    if (method === 'worker.prepare') return {};
+    const prepared=preparation(method,params);if(prepared!==undefined)return prepared;
     throw Error('ranking fallback');
   });
   await submitObjective(request());

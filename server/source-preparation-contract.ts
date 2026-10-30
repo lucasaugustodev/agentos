@@ -9,11 +9,13 @@ const sha=(b:Buffer)=>createHash('sha256').update(b).digest('hex');
 const fail=()=>{throw Object.assign(new Error('SOURCE_PREPARATION_PROOF_INVALID'),{code:'SOURCE_PREPARATION_PROOF_INVALID'});};
 
 export const sourcePreparationRequestSchema=z.object({workspace,sourceWorkspace:workspace,
-  preparationIdentity:z.uuid(),expectedSourceDigest:hash,expectedSourceSnapshotDigest:hash}).strict();
+  preparationIdentity:z.uuid(),expectedSourceDigest:hash,expectedSourceSnapshotDigest:hash,
+  sourceGenerationKind:z.literal('unmarked').optional()}).strict();
 export type SourcePreparationRequest=z.infer<typeof sourcePreparationRequestSchema>;
 const receiptSchema=z.object({version:z.literal(1),preparationIdentity:z.uuid(),sourceWorkspace:workspace,targetWorkspace:workspace,
   expectedSourceDigest:hash,expectedSourceSnapshotDigest:hash,bindingDigest:hash,observedSourceDigest:hash,
-  sourceSnapshotDigest:hash,cloneBaseDigest:hash,baselineDigest:hash,createdAt:z.string().min(1).max(100),receiptDigest:hash}).strict();
+  sourceSnapshotDigest:hash,cloneBaseDigest:hash,baselineDigest:hash,createdAt:z.string().min(1).max(100),receiptDigest:hash,
+  sourceGenerationKind:z.literal('unmarked').optional()}).strict();
 const markerSchema=z.object({workspace,sourceWorkspace:workspace,baseDigest:hash,sourceSnapshotDigest:hash,
   createdAt:z.string().min(1).max(100),preparation:z.object({version:z.literal(1),preparationIdentity:z.uuid(),bindingDigest:hash,receiptDigest:hash}).strict()}).strict();
 export type SourcePreparationReceipt=z.infer<typeof receiptSchema>;
@@ -34,9 +36,10 @@ export function verifySourcePreparation(request:SourcePreparationRequest,inspect
     request.workspace.split('/')[0]!==request.sourceWorkspace.split('/')[0])return fail();
   const expected={version:1,preparationIdentity:request.preparationIdentity,sourceWorkspace:request.sourceWorkspace,
     targetWorkspace:request.workspace,expectedSourceDigest:request.expectedSourceDigest,
-    expectedSourceSnapshotDigest:request.expectedSourceSnapshotDigest};
+    expectedSourceSnapshotDigest:request.expectedSourceSnapshotDigest,
+    ...(request.sourceGenerationKind?{sourceGenerationKind:request.sourceGenerationKind}:{})};
   const r=receipt.data,{receiptDigest,...body}=r;
-  if(Object.entries(expected).some(([k,v])=>r[k as keyof typeof r]!==v)||r.bindingDigest!==preparationHash(expected)||
+  if(r.sourceGenerationKind!==request.sourceGenerationKind||Object.entries(expected).some(([k,v])=>r[k as keyof typeof r]!==v)||r.bindingDigest!==preparationHash(expected)||
     receiptDigest!==preparationHash(body)||r.sourceSnapshotDigest!==request.expectedSourceSnapshotDigest||
     [r.observedSourceDigest,r.cloneBaseDigest,r.baselineDigest].some(d=>d!==request.expectedSourceDigest))return fail();
   if(typeof inspection?.markerBase64!=='string'||inspection.markerBase64.length>175000)return fail();
