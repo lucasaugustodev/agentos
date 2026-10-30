@@ -5,6 +5,7 @@ import { DomainError } from './contracts.js';
 import { event, type DB } from './db.js';
 import { planSchema, type ObjectiveInput, type ProposedPlan } from './objective-contracts.js';
 import {isAttemptLocalWriteScope} from './attempt-local-write-scope.js';
+import {sourceContractSchema,normalizeSourceContract,combineSourceContracts,sourcePathWithin,type SourceContract} from './source-contract-schema.js';
 
 // Semantic choices only. IDs, dependencies, runtime envelopes and receipt
 // formats are controller-owned. Inspired by Ruflo's action/precondition split;
@@ -29,6 +30,7 @@ const singleDeliveryFields = {
   verification: z.string().min(25).max(1200),
   agentId: z.string(),
   writePaths: z.array(writePathItemSchema).max(20).optional(),
+  sourceContract: sourceContractSchema.optional(),
 };
 
 export const nextDeliveryItemSchema = z.object(singleDeliveryFields).strict();
@@ -44,20 +46,22 @@ export const nextDeliverySchema = z.object({
   verification: z.string().min(25).max(1200).optional(),
   agentId: z.string().optional(),
   writePaths: z.array(writePathItemSchema).max(20).optional(),
+  sourceContract: singleDeliveryFields.sourceContract,
   deliveries: z.array(nextDeliveryItemSchema).min(1).max(6).optional(),
 }).strict();
 
-export function deliveryDecisionSchema(agents: {id:string;runtime:string}[],eligible?:string[],serial=false) {
+export function deliveryDecisionSchema(agents: {id:string;runtime:string}[],eligible?:string[],serial=false,sourceContractVersion?:1) {
   const ids = [...new Set(agents.filter(a=>a.runtime==='harness'&&a.id!=='qa.integration').map(a=>a.id))];
   if (!ids.length) throw new DomainError('SCOPE_MISSING','Nenhum agente de execução disponível.');
   const agentEnum = z.enum(ids as [string,...string[]]);
   const requirementId=eligible?.length?z.enum(eligible as [string,...string[]]):z.string();
   const delivery=nextDeliveryItemSchema.extend({kind:z.literal('delivery'),
-    validationTargetKey:z.never().optional(),agentId:agentEnum,requirementId});
+    validationTargetKey:z.never().optional(),agentId:agentEnum,requirementId,
+    sourceContract:sourceContractVersion===1?sourceContractSchema:singleDeliveryFields.sourceContract});
   if(serial)return delivery;
   const validation=nextDeliveryItemSchema.extend({kind:z.literal('validation'),
     validationTargetKey:singleDeliveryFields.validationTargetKey.unwrap(),
-    agentId:z.literal('qa.integration'),requirementId});
+    agentId:z.literal('qa.integration'),requirementId,sourceContract:z.never().optional()});
   const item=z.discriminatedUnion('kind',[delivery,validation]);
   return z.union([delivery,z.object({deliveries:z.array(item).min(1).max(6)}).strict()]);
 }
@@ -92,6 +96,26 @@ export function compileDelivery(raw: unknown, request: ObjectiveInput, previous?
   if(parsed.deliveries&&Object.keys(singleDeliveryFields).some(key=>(parsed as any)[key]!==undefined))
     invalid('AMBIGUOUS_DECISION','Use uma entrega única ou deliveries; não misture os dois formatos.');
   const items = parsed.deliveries?.length ? parsed.deliveries : [nextDeliveryItemSchema.parse(raw)];
+  const sourceContractVersion=request.sourceContractVersion??previous?.sourceContractVersion;
+  if(!sourceContractVersion&&items.some(item=>item.sourceContract))
+    invalid('SOURCE_CONTRACT_VERSION_REQUIRED','Um contrato de fonte exige planejamento com a versão explícita.');
+  for(const item of items){
+    if(item.kind==='validation'){
+      if(item.sourceContract)invalid('VALIDATION_SOURCE_CONTRACT','O controlador herda o contrato da candidata alvo; o validador não o redefine.');
+      continue;
+    }
+    if(sourceContractVersion===1){
+      if(!item.sourceContract)invalid('SOURCE_CONTRACT_REQUIRED','Declare os arquivos de fonte obrigatórios ou uma justificativa de trabalho somente em evidências.',{key:item.key});
+      item.sourceContract=normalizeSourceContract(item.sourceContract);
+      for(const output of item.sourceContract.required)if(!item.writePaths?.some(scope=>sourcePathWithin(output.path,scope)))
+        invalid('SOURCE_OUTPUT_OUTSIDE_WRITE_SCOPE','O produto de fonte precisa caber no escopo explícito, sem ampliar writePaths.',{key:item.key,path:output.path});
+    }
+  }
+  const combined=(contracts:Array<SourceContract|undefined>)=>{
+    if(sourceContractVersion!==1)return {};
+    try{return {sourceContract:combineSourceContracts(contracts as SourceContract[])};}
+    catch{invalid('SOURCE_CONTRACT_CONFLICT','As contribuições têm obrigações de fonte conflitantes.');}
+  };
   const { requirements, completed, eligible } = deliveryFrontier(request, previous, advance);
   const selectedIds = [...new Set(items.filter(i=>i.kind!=='validation').map(i => i.requirementId))];
   if (items.some(i=>!eligible.includes(i.requirementId)))
@@ -135,6 +159,7 @@ export function compileDelivery(raw: unknown, request: ObjectiveInput, previous?
     const decision = items[0];
     const selected = requirements.find(r => r.id === decision.requirementId)!;
     const plan = planSchema.parse({
+      ...(sourceContractVersion?{sourceContractVersion}:{}),
       title: previous?.title ?? request.message.slice(0, 120),
       summary: `Lote verificável: ${decision.title}. ${pending.length} requisito(s) ainda pendente(s).`,
       requirements,
@@ -145,11 +170,13 @@ export function compileDelivery(raw: unknown, request: ObjectiveInput, previous?
         key: 'deliver', title: decision.title, agentId: decision.agentId, stage: 'work',
         baseWorkspace: request.workspaces[0], covers: [decision.requirementId],
         ...(decision.writePaths?.length ? { writePaths: decision.writePaths } : {}),
-        description: `${decision.action}\nEntregue integralmente este requisito: ${selected.description}\nReproduza o defeito antes de corrigir quando aplicável; execute os controles: ${decision.verification}\nPreserve funcionalidades e mudanças dos lotes anteriores. Trabalhe de forma incremental e verificavel: escreva primeiro um esqueleto minimo dos arquivos de entrega e sele evidencias a cada etapa concluida, em vez de auditar a arvore inteira antes da primeira escrita. Limite a exploracao aos arquivos do contrato e das dependencias diretas. Nao crie bancos, containers ou dados de runtime locais (nada de pgdata, docker ou DATABASE_URL inventada): validacao com PostgreSQL e somente pelo request_validation protegido; sem ele, registre a limitacao em evidence/. Registre comandos, resultados e limitações em evidence/delivery.json. O campo passed só pode ser true após verificar a entrega; não basta produzir um plano ou relatório.`,
+        ...combined([decision.sourceContract]),
+        description: `${decision.action}\nEntregue integralmente este requisito: ${selected.description}\nReproduza o defeito antes de corrigir quando aplicável; execute os controles: ${decision.verification}\nPreserve funcionalidades e mudanças dos lotes anteriores. Trabalhe de forma incremental e verificavel: escreva primeiro um esqueleto minimo dos arquivos de entrega e sele evidencias a cada etapa concluida, em vez de auditar a arvore inteira antes da primeira escrita. Limite a exploracao aos arquivos do contrato e das dependencias diretas. Nao crie bancos, containers ou dados de runtime locais (nada de pgdata, docker ou DATABASE_URL inventada): request_validation e uma acao exclusiva do manager, nunca uma ferramenta do worker. Siga a capacidade de CI capturada na admissao: com politica registrada, entregue validation-intent.json e encerre para o controlador executar CI; sem politica, registre a limitacao sem inventar testes ou infraestrutura. Codigo exigido como produto pertence aos caminhos de fonte declarados, nunca apenas em evidence/ ou data/. Registre comandos, resultados e limitações em evidence/delivery.json. O campo passed só pode ser true após verificar a entrega; não basta produzir um plano ou relatório.`,
         criteria: [{id:'delivery',label:'Entrega implementada e controles executados',type:'json_field',name:'delivery.json',field:'passed',equals:true}],
       }, {
         key:'verify',title: pending.length ? 'Verificar lote e regressões' : 'Verificar entrega completa',agentId:'qa.integration',stage:'verify',
         baseWorkspace:request.workspaces[0],sourceTask:'deliver',dependencies:['deliver'],covers,
+        ...combined([decision.sourceContract]),
         description:`Verifique independentemente a candidata imutável e repita os controles: ${decision.verification}\n${pending.length ? 'Este aceite cobre apenas o lote selecionado, não encerra o objetivo. Verifique também regressões das entregas anteriores.' : 'Esta é a verificação final: comprove TODOS os requisitos do objetivo na mesma candidata acumulada, incluindo os lotes anteriores.'}\nInspecione evidências reais, registre comandos e resultados em evidence/verification.json. passed deve ser false se houver falhas, critérios não verificados ou evidência ausente. Não repare a candidata.`,
         criteria:[{id:'verified',label:'Verificação independente da candidata',type:'json_field',name:'verification.json',field:'passed',equals:true}],
       }],
@@ -189,6 +216,7 @@ export function compileDelivery(raw: unknown, request: ObjectiveInput, previous?
     key:taskKey(item.partKey),title:item.title,agentId:'qa.integration',agentRole:'validator',stage:'verify',
     baseWorkspace:request.workspaces[0],sourceTask:taskKey(item.validationTargetKey!),
     dependencies:item.dependsOn!.map(taskKey),covers:[item.requirementId],writePaths:item.writePaths??[],
+    ...combined([byKey.get(item.validationTargetKey!)!.sourceContract]),
     description:`${item.action}\nValide somente a candidata aceita de ${taskKey(item.validationTargetKey!)}. Outras dependências fornecem evidências, não substituem a candidata alvo.\nExecute os controles: ${item.verification}\nA fonte é somente leitura. Grave relatórios e scripts em evidence/ e estado temporário em data/. Registre comandos, resultados e limitações em evidence/verification.json. passed deve ser false para qualquer falha, critério não verificado ou evidência ausente. Não repare a candidata. Este aceite não substitui a verificação final da entrega acumulada.`,
     criteria:[{id:'verified',label:'Validação independente da candidata alvo',type:'json_field',name:'verification.json',field:'passed',equals:true}],
   }));
@@ -208,6 +236,7 @@ export function compileDelivery(raw: unknown, request: ObjectiveInput, previous?
         agentId:'engineering.integration',stage:'integrate',baseWorkspace:request.workspaces[0],
         dependencies:parents.map(p=>taskKey(p.partKey)),covers:[...new Set(parents.map(p=>p.requirementId))],
         writePaths:[...new Set(parents.flatMap(p=>p.writePaths??[]))],
+        ...combined(parents.map(parent=>parent.sourceContract)),
         description:`Integre os patches canônicos das dependências ${parents.map(p=>taskKey(p.partKey)).join(', ')} na ordem indicada sobre a base comum. Preserve todas as pré-imagens e os lotes anteriores. Esta preparação fornece insumos à subtarefa ${item.partKey}; não conclui nenhum requisito. Execute os controles das dependências: ${parents.map(p=>p.verification).join(' | ')}. Registre evidence/delivery.json, passed:true somente se todos passarem.`,
         criteria:[{id:'joined',label:'Insumos integrados e verificados',type:'json_field',name:'delivery.json',field:'passed',equals:true}]});
     }
@@ -221,13 +250,15 @@ export function compileDelivery(raw: unknown, request: ObjectiveInput, previous?
       baseWorkspace: request.workspaces[0],
       covers: [item.requirementId],
       writePaths: item.writePaths??[],
-      description: `${item.action}\n${shared?'Entregue a contribuição delimitada desta subtarefa; a integração e o QA deverão comprovar o requisito inteiro':'Entregue integralmente este requisito'}: ${selected.description}\nIdentidade da subtarefa: ${item.partKey}. Dependências: ${(item.dependsOn??[]).join(', ')||'nenhuma'}.\nEscopo exclusivo de escrita desta subtarefa: ${(item.writePaths??[]).join(', ')}\nReproduza o defeito antes de corrigir quando aplicável; execute os controles: ${item.verification}\nPreserve funcionalidades e mudanças dos lotes anteriores. Trabalhe de forma incremental e verificavel: escreva primeiro um esqueleto minimo dos arquivos de entrega e sele evidencias a cada etapa concluida, em vez de auditar a arvore inteira antes da primeira escrita. Limite a exploracao aos arquivos do contrato e das dependencias diretas. Nao crie bancos, containers ou dados de runtime locais (nada de pgdata, docker ou DATABASE_URL inventada): validacao com PostgreSQL e somente pelo request_validation protegido; sem ele, registre a limitacao em evidence/. Registre comandos, resultados e limitações em evidence/delivery.json. O campo passed só pode ser true após verificar a entrega; não basta produzir um plano ou relatório.`,
+      ...combined([item.sourceContract]),
+      description: `${item.action}\n${shared?'Entregue a contribuição delimitada desta subtarefa; a integração e o QA deverão comprovar o requisito inteiro':'Entregue integralmente este requisito'}: ${selected.description}\nIdentidade da subtarefa: ${item.partKey}. Dependências: ${(item.dependsOn??[]).join(', ')||'nenhuma'}.\nEscopo exclusivo de escrita desta subtarefa: ${(item.writePaths??[]).join(', ')}\nReproduza o defeito antes de corrigir quando aplicável; execute os controles: ${item.verification}\nPreserve funcionalidades e mudanças dos lotes anteriores. Trabalhe de forma incremental e verificavel: escreva primeiro um esqueleto minimo dos arquivos de entrega e sele evidencias a cada etapa concluida, em vez de auditar a arvore inteira antes da primeira escrita. Limite a exploracao aos arquivos do contrato e das dependencias diretas. Nao crie bancos, containers ou dados de runtime locais (nada de pgdata, docker ou DATABASE_URL inventada): request_validation e uma acao exclusiva do manager, nunca uma ferramenta do worker. Siga a capacidade de CI capturada na admissao: com politica registrada, entregue validation-intent.json e encerre para o controlador executar CI; sem politica, registre a limitacao sem inventar testes ou infraestrutura. Codigo exigido como produto pertence aos caminhos de fonte declarados, nunca apenas em evidence/ ou data/. Registre comandos, resultados e limitações em evidence/delivery.json. O campo passed só pode ser true após verificar a entrega; não basta produzir um plano ou relatório.`,
       criteria: [{id:'delivery',label:'Entrega implementada e controles executados',type:'json_field' as const,name:'delivery.json',field:'passed',equals:true}],
     };
   });
   const combinedVerification = items.map(i => `[${i.requirementId}] ${i.verification}`).join(' | ');
   const combinedWritePaths = [...new Set(deliveries.flatMap(i => i.writePaths ?? []))];
   const plan = planSchema.parse({
+    ...(sourceContractVersion?{sourceContractVersion}:{}),
     title: previous?.title ?? request.message.slice(0, 120),
     summary: `Janela paralela verificável (${items.length} entregas): ${items.map(i => i.title).join('; ')}. ${pending.length} requisito(s) ainda pendente(s).`,
     requirements,
@@ -251,6 +282,7 @@ export function compileDelivery(raw: unknown, request: ObjectiveInput, previous?
         dependencies: workTasks.map(w => w.key),
         covers: selectedIds,
         writePaths: combinedWritePaths,
+        ...combined(deliveries.map(item=>item.sourceContract)),
         description: `Aplique os patches canônicos (changes.patch em /home/agent/inputs) das tarefas aceitas deste lote (${workTasks.map(w => w.key).join(', ')}) sobre a base comum na ordem indicada sem omitir nenhuma alteração. Cada patch de uma subtarefa dependente é o delta da sua própria fonte já integrada; não substitua a base por uma branch parcial.\nRequisitos completos que o conjunto deve satisfazer: ${JSON.stringify(requirements.filter(r=>selectedIds.includes(r.id)))}\nExecute os controles combinados: ${combinedVerification}\nPreserve todas as entregas dos lotes anteriores e registre o resultado real da integração em evidence/delivery.json com passed:true somente após comprovar os requisitos inteiros e todos os controles combinados.`,
         criteria: [{id:'integrated',label:'Patches integrados e controles combinados executados',type:'json_field',name:'delivery.json',field:'passed',equals:true}],
       },
@@ -262,6 +294,7 @@ export function compileDelivery(raw: unknown, request: ObjectiveInput, previous?
         baseWorkspace: request.workspaces[0],
         sourceTask: 'integrate',
         dependencies: ['integrate',...validationTasks.map(task=>task.key)],
+        ...combined(deliveries.map(item=>item.sourceContract)),
         covers,
         description: `Verifique independentemente a candidata integrada imutável e repita os controles combinados: ${combinedVerification}\nComprove os requisitos COMPLETOS: ${JSON.stringify(requirements.filter(r=>selectedIds.includes(r.id)))}. Aceites parciais das subtarefas não comprovam a entrega conjunta.\n${pending.length ? 'Este aceite cobre apenas a janela selecionada, não encerra o objetivo. Verifique também regressões das entregas anteriores.' : 'Esta é a verificação final: comprove TODOS os requisitos do objetivo na mesma candidata acumulada, incluindo os lotes anteriores.'}\nInspecione evidências reais, registre comandos e resultados em evidence/verification.json. passed deve ser false se houver falhas, critérios não verificados ou evidência ausente. Não repare a candidata.`,
         criteria: [{id:'verified',label:'Verificação independente da candidata',type:'json_field',name:'verification.json',field:'passed',equals:true}],
@@ -352,7 +385,7 @@ export async function queueNextDelivery(db: DB, objective: any, previous: Propos
   const id = randomUUID();
   const inserted = await db.query(`INSERT INTO planning_runs(id,objective_id,base_revision,trigger_key,fence,feedback)
     VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING`,[id,objective.id,objective.revision,
-    `incremental:${objective.revision}:${proof.runId}`,randomUUID(),JSON.stringify({incrementalAdvance:proof,
+    `incremental:${objective.revision}:${proof.runId}`,randomUUID(),JSON.stringify({sourceContractVersion:1,incrementalAdvance:proof,
       sourceOverrides:{[objective.request.workspaces[0]]:proof.sourceWorkspace}})]);
   if (!inserted.rowCount) return false;
   await db.query("UPDATE objectives SET status='replanning',reason=NULL,updated_at=now() WHERE id=$1",[objective.id]);
