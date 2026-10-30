@@ -29,8 +29,9 @@ beforeEach(async()=>{
  await pool.query(`UPDATE accounts SET provider='codex',model='test-model',models='["test-model"]',bridge_id='test-account',max_concurrency=4,allow_unknown=true`);
  config.bridgeHost='fixture';config.remoteExecution=true;
 });
-afterEach(()=>{vi.restoreAllMocks();config.bridgeHost='';config.remoteExecution=false;});
-afterAll(()=>pool.end());
+afterEach(async()=>{vi.restoreAllMocks();config.bridgeHost='';config.remoteExecution=false;
+ await pool.query("DELETE FROM settings WHERE id='model-policy'");});
+afterAll(async()=>{await pool.query("DELETE FROM settings WHERE id='model-policy'");await pool.end();});
 
 async function fixture(requestOverrides={}){
  const goalId=randomUUID(),request=objectiveSchema.parse({message:'Preserve three accepted source chains across the published baseline change.',

@@ -25,8 +25,9 @@ beforeEach(async()=>{
  await pool.query(`INSERT INTO accounts(id,label,provider,model,models,enabled,bridge_id,connection_status,max_concurrency,allow_unknown)
   VALUES($1,'Route fixture','qwen',$2,$3,true,$4,'connected',12,true)`,[accountId,target.model,JSON.stringify([target.model]),target.bridgeId]);
 });
-afterEach(()=>{policyState.current=null;vi.restoreAllMocks();delete process.env.AGENTOS_OPERATIONS_ACCESS_JSON;});
-afterAll(()=>pool.end());
+afterEach(async()=>{policyState.current=null;vi.restoreAllMocks();delete process.env.AGENTOS_OPERATIONS_ACCESS_JSON;
+ await pool.query("DELETE FROM settings WHERE id='model-policy'");});
+afterAll(async()=>{await pool.query("DELETE FROM settings WHERE id='model-policy'");await pool.end();});
 async function fixture(){
  const id=randomUUID(),request=objectiveSchema.parse({message:'Keep the original six accepted products and repair the remaining work.',
   project:'test',mode:'execute',workspaces:['test/base'],requirements:['Keep the original acceptance criteria.'],
