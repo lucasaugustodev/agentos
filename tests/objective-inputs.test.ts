@@ -11,6 +11,7 @@ import {accountBridge} from '../server/bridge.js';
 import {installObjectiveInputs,registerObjectiveInput,readObjectiveInputs,inputsForRequirements} from '../server/objective-inputs.js';
 import {executionInputManifest,runtimeInputs} from '../server/execution-inputs.js';
 import {planningInputContext} from '../server/planning-input-context.js';
+import {planningPreparationFixture} from './fixtures/planning-preparation.js';
 
 const auth={channel:'api-token' as const};
 const digest=(bytes:Buffer)=>createHash('sha256').update(bytes).digest('hex');
@@ -147,6 +148,7 @@ it('exposes registration only through authenticated API requests and returns met
 });
 
 it('supplies verified operator context to the real compact planner before choosing source paths',async()=>{
+  const preparation=planningPreparationFixture();
   const f=await fixture(),bytes=Buffer.from('Actual runtime source: bridge/runtime-runner.mjs. Use the registered protected release chain, not an invented pipeline.');
   const body=request({name:'runtime-source.txt',digest:digest(bytes),base64:bytes.toString('base64')});
   const registered=await registerObjectiveInput(f.objectiveId,body,auth);
@@ -154,7 +156,7 @@ it('supplies verified operator context to the real compact planner before choosi
   vi.spyOn(accountBridge,'request').mockImplementation(async(method,p:any)=>{
     if(method==='memory.search')return {items:[]};
     if(method==='worker.workspaces')return [{id:'test/base'}];
-    if(method==='worker.prepare')return {};
+    const inspection=preparation(method,p);if(inspection!==undefined)return inspection;
     if(method==='generate'){
       generated++;
       const message=JSON.parse(p.messages[0].content),entry=message.objectiveInputs.inputs[0];
@@ -212,13 +214,15 @@ it.each(['oversized','nul','secret'])('rejects %s summaries before registration'
 });
 
 it('delivers a receipt-bound summary to the real planner and records summary-only consumption',async()=>{
+  const preparation=planningPreparationFixture();
   const f=await fixture(),bytes=Buffer.from('full diagnostic data\n'.repeat(1000));
   const summary='Compare the exact-source GPU receipt before repeating this experiment. The full profile is an input for the worker; this is only its operator summary.';
   const body=request({name:'profile.txt',digest:digest(bytes),base64:bytes.toString('base64'),planningSummary:summary});
   const registered=await registerObjectiveInput(f.objectiveId,body,auth);
   await reconcilePlanning();const run=await claimPlanning();let generated=0;
   vi.spyOn(accountBridge,'request').mockImplementation(async(method,p:any)=>{
-    if(method==='memory.search')return {items:[]};if(method==='worker.workspaces')return [{id:'test/base'}];if(method==='worker.prepare')return {};
+    if(method==='memory.search')return {items:[]};if(method==='worker.workspaces')return [{id:'test/base'}];
+    const inspection=preparation(method,p);if(inspection!==undefined)return inspection;
     if(method==='generate'){
       generated++;
       const entry=JSON.parse(p.messages[0].content).objectiveInputs.inputs[0];

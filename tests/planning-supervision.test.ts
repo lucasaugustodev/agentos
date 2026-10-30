@@ -9,13 +9,16 @@ import {submitObjective,claimPlanning,applyPlannedResult,reconcilePlanning,Plann
 import {accountBridge} from '../server/bridge.js';
 import {config} from '../server/config.js';
 import {planningContractVersion} from '../server/planning-supervision.js';
+import {planningPreparationFixture} from './fixtures/planning-preparation.js';
 vi.mock('../bridge/model-policy.mjs',async original=>({...await original<any>(),readModelPolicy:vi.fn()}));
 const policy={version:1,mode:'glm-only',accountId:'agentos-api-00000000-0000-4000-8000-000000000001',bridgeId:'agentos:api:00000000-0000-4000-8000-000000000001',model:'glm-5.3-flash',requestLimit:6,sessionLimit:12} as const;
 let f:any;
+let preparation:ReturnType<typeof planningPreparationFixture>;
 const item=(id='req-1')=>({kind:'delivery' as const,requirementId:id,title:'Implementar e comprovar entrega',agentId:'engineering.backend.node',action:'Implementar integralmente o requisito preservando os controles e a candidata aceita.',verification:'Executar os controles originais e todos os negativos na mesma candidata acumulada.',
  sourceContract:{version:1 as const,required:[],preserve:[],noSourceReason:'Synthetic planner-recovery fixture exercises controller transitions without implementation source.'}});
 beforeAll(()=>migrate());
 beforeEach(async()=>{
+ preparation=planningPreparationFixture();
  vi.mocked(readModelPolicy).mockReturnValue(policy);
  await pool.query('TRUNCATE goals,agents,accounts,memories,events CASCADE');await seedRegistry();
  await pool.query("UPDATE accounts SET enabled=false");
@@ -34,8 +37,15 @@ beforeEach(async()=>{
 afterEach(()=>{vi.restoreAllMocks();config.bridgeHost='';config.remoteExecution=false;});
 afterAll(()=>pool.end());
 async function acceptAll(goal:string,revision:number){
- for(const t of (await pool.query('SELECT id FROM tasks WHERE goal_id=$1 AND plan_revision=$2',[goal,revision])).rows){
-  const run=randomUUID();await pool.query("INSERT INTO runs(id,task_id,attempt,state,fence,runtime,agent_version) VALUES($1,$2,1,'submitted',$3,'harness',1)",[run,t.id,randomUUID()]);
+ for(const t of (await pool.query('SELECT id,execution FROM tasks WHERE goal_id=$1 AND plan_revision=$2',[goal,revision])).rows){
+  const run=randomUUID(),fence=randomUUID(),contextId=randomUUID();
+  await pool.query("INSERT INTO runs(id,task_id,attempt,state,fence,runtime,agent_version) VALUES($1,$2,1,'submitted',$3,'harness',1)",[run,t.id,fence]);
+  // These synthetic acceptances are controller fixtures, but their source owner
+  // still needs the real frozen identity contract before preparing a new lot.
+  await pool.query('INSERT INTO contexts(id,run_id,manifest,content) VALUES($1,$2,$3,$4)',[contextId,run,
+    JSON.stringify({runIdentity:{goalId:goal,taskId:t.id,runId:run,runFence:fence},dependencyArtifacts:[]}),'Synthetic accepted source context']);
+  await pool.query('UPDATE runs SET context_id=$2 WHERE id=$1',[run,contextId]);
+  preparation.registerSource({goalId:goal,taskId:t.id,runId:run,fence,contextId,workspace:t.execution.workspace,sourceWorkspace:t.execution.sourceWorkspace});
   await pool.query("UPDATE tasks SET state='accepted',attempt_count=1 WHERE id=$1",[t.id]);
   await pool.query("INSERT INTO acceptances(id,task_id,run_id,passed,checks,reviewer) VALUES($1,$2,$3,true,'[]','synthetic-controller-test')",[randomUUID(),t.id,run]);
   await pool.query("INSERT INTO artifacts(id,run_id,name,mime,digest,size) VALUES($1,$2,'candidate.json','application/json',$3,2)",[randomUUID(),run,'a'.repeat(64)]);
@@ -43,7 +53,8 @@ async function acceptAll(goal:string,revision:number){
 }
 function bridge(generate:(params:any)=>Promise<any>){
  return vi.spyOn(accountBridge,'request').mockImplementation(async(method,p:any)=>{
-  if(method==='memory.search')return {items:[]};if(method==='worker.workspaces')return [{id:'test/base'}];if(method==='worker.prepare')return {};
+  if(method==='memory.search')return {items:[]};if(method==='worker.workspaces')return [{id:'test/base'}];
+  const inspection=preparation(method,p);if(inspection!==undefined)return inspection;
   if(method==='generate'){expect(p.accountId).toBe(policy.bridgeId);expect(p.model).toBe(policy.model);return generate(p);}
   throw Error('Unexpected RPC: '+method);
  });

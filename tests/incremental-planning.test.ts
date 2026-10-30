@@ -8,6 +8,7 @@ import { objectiveSchema,validatePlan } from '../server/objective-contracts.js';
 import { compileDelivery,bindDeliveryFeedback,incrementalEligible,verifiedBatch } from '../server/incremental-planning.js';
 import { submitObjective,feedbackObjective,claimPlanning,applyPlannedResult,reconcilePlanning,PlanningEngine } from '../server/planner.js';
 import { refreshGoal } from '../server/service.js';
+import {planningPreparationFixture} from './fixtures/planning-preparation.js';
 
 const request = () => objectiveSchema.parse({message:'Corrigir dois defeitos independentes e verificar a candidata acumulada.',project:'test',
   workspaces:['test/base'],mode:'execute',planningStrategy:'incremental',sourceContractVersion:1,requirements:['O endpoint deve persistir a alteração correta.','A interface deve exibir o progresso correto.'],idempotencyKey:randomUUID()});
@@ -260,7 +261,7 @@ it('resumes a fenced planning claim after executor loss without applying its sta
   expect((await pool.query('SELECT count(*) FROM tasks')).rows[0].count).toBe('2');
 });
 it('recovers a confirmed timeout with the small contract and reuses persisted output during preparation',async()=>{
-  let generated=0,prepared=0;
+  let generated=0,prepared=0;const preparation=planningPreparationFixture();
   vi.spyOn(accountBridge,'request').mockImplementation(async(method,p:any)=>{
     if(method==='memory.search')return {items:[]};
     if(method==='worker.workspaces')return [{id:'test/base'}];
@@ -269,7 +270,8 @@ it('recovers a confirmed timeout with the small contract and reuses persisted ou
       if(++generated===1)throw Object.assign(Error('confirmed'),{code:'PROVIDER_TIMEOUT'});
       return {message:{content:[{type:'text',text:JSON.stringify(decision())}]}};
     }
-    if(method==='worker.prepare'){if(++prepared===1)throw Object.assign(Error('busy'),{code:'SOURCE_BUSY'});return {};}
+    if(method==='worker.prepare'&&++prepared===1)throw Object.assign(Error('busy'),{code:'SOURCE_BUSY'});
+    const inspection=preparation(method,p);if(inspection!==undefined)return inspection;
     throw Error('ranking fallback');
   });
   await submitObjective(request());const engine=new PlanningEngine();
@@ -295,10 +297,10 @@ it('honors paused goals between lots',async()=>{
 });
 
 it('repairs the first invalid agent after nineteen transport failures without consuming semantic retries',async()=>{
-  let generated=0;
+  let generated=0;const preparation=planningPreparationFixture();
   vi.spyOn(accountBridge,'request').mockImplementation(async(method,p:any)=>{
     if(method==='memory.search')return {items:[]};if(method==='worker.workspaces')return [{id:'test/base'}];
-    if(method==='worker.prepare')return {};
+    const inspection=preparation(method,p);if(inspection!==undefined)return inspection;
     if(method==='generate'){
       const schema=JSON.parse(p.messages[0].content).schema;
       const deliverySchema=schema.anyOf[0];
