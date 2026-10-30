@@ -24,8 +24,8 @@ async function fixture(options:{missing?:boolean;regression?:boolean;legacy?:boo
   const goal=randomUUID(),task=randomUUID(),run=randomUUID(),fence=randomUUID();
   const execution={kind:'harness',workspace:'source-contract/otask',sourceWorkspace:'source-contract/base',...(!options.legacy?{sourceContract:contract}:{})};
   await pool.query("INSERT INTO goals(id,title,description,project,idempotency_key) VALUES($1::uuid,'Candidate','Source contract','source-contract',$1::text)",[goal]);
-  await pool.query(`INSERT INTO tasks(id,goal_id,key,title,agent_id,state,criteria,attempt_count,stage,execution)
-    VALUES($1,$2,'deliver','Deliver source','qa.backend','submitted',$3,1,'work',$4)`,[task,goal,
+  await pool.query(`INSERT INTO tasks(id,goal_id,key,title,description,agent_id,state,criteria,attempt_count,stage,execution)
+    VALUES($1,$2,'deliver','Deliver source','Deliver and retain canonical source','qa.backend','submitted',$3,1,'work',$4)`,[task,goal,
     JSON.stringify([{id:'report',type:'json_field',name:'delivery.json',field:'passed',equals:true,label:'Declared delivery'}]),JSON.stringify(execution)]);
   await pool.query("INSERT INTO runs(id,task_id,attempt,state,fence,runtime,agent_version) VALUES($1,$2,1,'submitted',$3,'harness',1)",[run,task,fence]);
   await artifact(run,'delivery.json',{passed:true});
