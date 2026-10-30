@@ -302,7 +302,7 @@ def coverage_requirements(raw):
  if not isinstance(raw,dict) or set(raw)!={'version','profile','candidateDigest','requiredDatabaseTests'}:raise ValueError('VALIDATION_COVERAGE_CONTRACT')
  if type(raw['version']) is not int or raw['version']!=1 or raw['profile']!='agentos.validate' or not isinstance(raw['candidateDigest'],str) or not re.fullmatch('[a-f0-9]{64}',raw['candidateDigest']):raise ValueError('VALIDATION_COVERAGE_CONTRACT')
  tests=raw['requiredDatabaseTests']
- if not isinstance(tests,list) or not 1<=len(tests)<=128:raise ValueError('VALIDATION_COVERAGE_OBLIGATIONS')
+ if not isinstance(tests,list) or not 1<=len(tests)<=256:raise ValueError('VALIDATION_COVERAGE_OBLIGATIONS')
  seen=set()
  for test in tests:
   if not isinstance(test,dict) or set(test)!={'file','name'}:raise ValueError('VALIDATION_COVERAGE_OBLIGATIONS')

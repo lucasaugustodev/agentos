@@ -128,3 +128,49 @@ print(json.dumps({'valid':guard.validation_complete(text,require_build=False,rep
   expect(completeness).toEqual({valid:true,extra:false});
   expect(hash(await readFile(reportPath))).toBe(proof.reportDigest);
 });
+
+function capacityFixture(count:number){
+  const requiredDatabaseTests=Array.from({length:count},(_,i)=>({file,name:'required behavior '+i}));
+  return {obligations:{...requirements(),requiredDatabaseTests},report:{success:true,numTotalTests:count,
+    numPassedTests:count,numFailedTests:0,testResults:[{name:path.join(build,file),status:'passed',
+      assertionResults:requiredDatabaseTests.map(t=>({fullName:t.name,status:'passed'}))}]}};
+}
+it.each([142,256])('binds every one of %i required cases without truncating the report or obligation digest',async count=>{
+  const f=capacityFixture(count),raw=await put(f.report),proof=(await evidence({validationCoverage:f.obligations})).result;
+  expect(proof.passed).toBe(true);expect(proof.coverage.requiredTests).toHaveLength(count);
+  expect(proof.coverage.requiredTests).toEqual(f.obligations.requiredDatabaseTests.map(t=>({...t,status:'passed'})));
+  expect(proof.coverage.obligationsDigest).toBe(hash(JSON.stringify(f.obligations.requiredDatabaseTests)));
+  expect(proof.reportDigest).toBe(hash(raw));expect(proof.coverage.candidateDigest).toBe(f.obligations.candidateDigest);
+});
+it.each(['missing','skipped'])('keeps the last of 256 obligations %s negative instead of truncating to the previous capacity',async kind=>{
+  const f=capacityFixture(256);
+  if(kind==='missing'){f.report.testResults[0].assertionResults.pop();f.report.numTotalTests--;}
+  else f.report.testResults[0].assertionResults[255].status='pending';
+  f.report.numPassedTests--;await put(f.report);
+  const proof=(await evidence({validationCoverage:f.obligations})).result;
+  expect(proof.passed).toBe(false);expect(proof.coverage.requiredTests).toHaveLength(256);
+  expect(proof.coverage.requiredTests[255]).toMatchObject({name:'required behavior 255',status:kind});
+});
+it.each(['duplicate','name','path'])('retains strict %s validation at the expanded obligation boundary',async kind=>{
+  const f=capacityFixture(256);await put(f.report);
+  if(kind==='duplicate')f.obligations.requiredDatabaseTests[255]={...f.obligations.requiredDatabaseTests[0]};
+  if(kind==='name')f.obligations.requiredDatabaseTests[255].name='x'.repeat(501);
+  if(kind==='path')f.obligations.requiredDatabaseTests[255].file='tests/../required-pg.test.ts';
+  expect((await evidence({validationCoverage:f.obligations})).error).toBe(kind==='duplicate'
+    ?'VALIDATION_COVERAGE_DUPLICATE_OBLIGATION':kind==='name'?'VALIDATION_COVERAGE_TEST_NAME':'VALIDATION_COVERAGE_TEST_PATH');
+});
+it('refuses 257 obligations before build preparation, database reads or validation process execution',async()=>{
+  const f=capacityFixture(257),input={occurrenceId:'a31365b7-3c7a-4f45-bbc2-54550ea4dc3d',
+    attemptId:'c9819046-5a7c-4bbe-b6c1-998b18e4980e',parameters:{workspace:'agentos/occapacity',validationCoverage:f.obligations},results:[]};
+  const code=`import importlib.util,io,json,pathlib,sys
+from unittest.mock import patch
+spec=importlib.util.spec_from_file_location('capacity_guard',sys.argv[1]);guard=importlib.util.module_from_spec(spec);spec.loader.exec_module(guard)
+guard.STATE=pathlib.Path(sys.argv[2])/'state';payload=sys.argv[3];sys.argv=['guard','validate'];sys.stdin=io.StringIO(payload)
+with patch.object(guard,'trusted_origin_module',return_value=None),patch.object(guard,'ensure_build_root') as build,patch.object(guard,'execute_validation') as execute,patch.object(guard.pathlib.Path,'read_text',side_effect=AssertionError('DATABASE_READ_BEFORE_COVERAGE')):
+ try:guard.main();result={'error':None}
+ except ValueError as error:result={'error':str(error)}
+ result.update(buildCalls=build.call_count,executionCalls=execute.call_count,receipts=len(list(guard.STATE.iterdir())))
+ print(json.dumps(result))`;
+  const result=await exec('python3',['-B','-c',code,guardPath,build,JSON.stringify(input)],{timeout:10_000,maxBuffer:1024*1024});
+  expect(JSON.parse(result.stdout)).toEqual({error:'VALIDATION_COVERAGE_OBLIGATIONS',buildCalls:0,executionCalls:0,receipts:0});
+});
