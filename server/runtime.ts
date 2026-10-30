@@ -21,6 +21,7 @@ import {stageArtifactInputBundle} from './artifact-input-bundle.js';
 import {inputFailureMetadata} from './input-failure.js';
 import {analyticalPrompt,analyticalPromptCharacterLimit,promptCheckpoint} from './analytical-prompt.js';
 import {workerValidationInstruction} from './worker-validation.js';
+import {prepareBoundRuntimeWorkspace,assertBoundRuntimePreparationCurrent} from './runtime-source-preparation.js';
 export {promptCheckpoint} from './analytical-prompt.js';
 
 export type RuntimeResult = {
@@ -69,7 +70,7 @@ async function executeRemoteHarness(input: RuntimeInput): Promise<RuntimeResult>
     throw new DomainError('RUNTIME_MEMORY_RESERVATION_INVALID','Reserva de memória divergente da execução.');
   if (input.task.execution.sourceWorkspace)
     try {
-      await accountBridge.request(
+      if(!await prepareBoundRuntimeWorkspace(input))await accountBridge.request(
         'worker.prepare',
         {
           sourceWorkspace: input.task.execution.sourceWorkspace,
@@ -94,6 +95,7 @@ async function executeRemoteHarness(input: RuntimeInput): Promise<RuntimeResult>
       await input.onEvent('INPUT_BUNDLE_PREPARED',{version:1,inputCount:inputs.length,
         totalBytes:inputs.reduce((n,a)=>n+Buffer.byteLength(a.base64,'base64'),0),digest:inputBundle.digest});
     }
+    await assertBoundRuntimePreparationCurrent(input);
   } catch(e:any) {
     // No worker.execute request has been sent. Persist this fact before the
     // outer worker records failure; recovery still inspects the actual unit.
