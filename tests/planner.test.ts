@@ -426,7 +426,7 @@ it('automatically replans rejected QA while retaining previously accepted branch
   await reconcilePlanning();
   const next = await claimPlanning();
   expect(next.feedback.sourceOverrides['test/base']).toContain('-check');
-  expect(next.feedback.artifacts).toHaveLength(1);
+  expect(next.feedback.artifacts.map((artifact:any)=>artifact.name).sort()).toEqual(['candidate.json','result.json']);
   const repair = plan();
   repair.approachChange = 'Reproduzir e corrigir o caso mínimo que reprovou a candidata.';
   repair.tasks = [

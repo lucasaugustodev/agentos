@@ -15,7 +15,7 @@ beforeEach(async()=>{
   await seedRegistry();
   await pool.query(`UPDATE accounts SET provider='codex',model='test-model',models='["test-model"]',bridge_id='test',max_concurrency=4,allow_unknown=true`);
 });
-afterEach(()=>{vi.restoreAllMocks();config.remoteExecution=false;});
+afterEach(()=>{vi.restoreAllMocks();config.remoteExecution=false;config.bridgeHost='';});
 afterAll(()=>pool.end());
 const request=()=>objectiveSchema.parse({message:'Deliver source and preserve the known original file.',project:'test',workspaces:['test/base'],mode:'execute',
   planningStrategy:'incremental',requirements:['A canonical kernel must exist and preserve the reference.'],idempotencyKey:randomUUID()});
