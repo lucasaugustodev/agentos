@@ -92,6 +92,8 @@ it('checks both proofs read-only while task/case readers would block the former 
 });
 
 it('hashes every direct/nested installer, configuration source and new preparer while legacy compatibility needs only existing files', async () => {
+  expect(backlogMigrationModules).toEqual(expect.arrayContaining(['server/manager-authority.ts','server/model-policy-sql.ts']));
+  expect(migrationModules).toContain('server/model-policy-sql.ts');
   const target = await mkdtemp(path.join(tmpdir(), 'agentos-backlog-schema-'));
   try {
     const files = [...new Set([...migrationModules, ...backlogMigrationModules])];
