@@ -386,7 +386,7 @@ it.each([
   ['generate', 'PROVIDER_TIMEOUT', 3, 'queued', false],
   ['generate', 'STOP_UNCONFIRMED', 1, 'failed', true],
   ['worker.prepare', 'STOP_UNCONFIRMED', 1, 'failed', true],
-])('distinguishes confirmed model failure from uncertain effects: %s %s attempt %s -> %s', async (phase, code, attempt, expectedState, interrupt) => {
+])('distinguishes confirmed model failure from uncertain effects [case %#]: %s %s attempt %s -> %s', async (phase, code, attempt, expectedState, interrupt) => {
   const controller = new AbortController();
   vi.spyOn(accountBridge, 'request').mockImplementation(async (method) => {
     if (method === phase) {

@@ -316,7 +316,7 @@ it.each([
  {decision_review_goal_id:null},{decision_review_stage:'work'},{goal_id:undefined},
  {has_live_run:true},{has_live_run:undefined},{state:'decided'},{state:'delegated'},
  {state:'waiting_evidence'},{current_run_state:'reconciling'},
-])('does not borrow historical review with unresolved identity or ownership: %j',guard=>{
+])('does not borrow historical review with unresolved identity or ownership [case %#]: %j',guard=>{
  const now=Date.parse('2026-10-17T03:51:28Z'),high={id:'high',state:'open',pending_dependencies:0,fresh_handoffs:6,current_run_state:'submitted'};
  const repair={id:'repair',task_id:'repair-task',goal_id:'goal',work_kind:'repair',state:'open',
   decision_run_id:'old-review',decision_review_id:'old-review',decision_review_goal_id:'goal',

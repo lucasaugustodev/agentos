@@ -82,7 +82,7 @@ it.each([
   [report(),{'protocol-tests.log':' \n\t'},'LOG'],
   [report(),{'test-source.mjs':''},'TEST_SOURCE'],
   [report(),{'test-source.mjs':' \n\t'},'TEST_SOURCE'],
-])('keeps required Muse execution evidence honest: %s',async(value,override,field)=>{
+])('keeps required Muse execution evidence honest [case %#]: %s',async(value,override,field)=>{
   const i=input();delivery(value,false,[],override);
   const result=await executeRuntime(i);
   expect(JSON.parse(result.artifacts.find(a=>a.name==='runtime-protocol-check.json')!.content.toString())).toMatchObject({verified:false,code:'MUSE_DELIVERY_INVALID_REPORT_'+field});

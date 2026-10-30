@@ -37,7 +37,7 @@ it('makes only the display projection JSONB-compatible and preserves valid Unico
 it.each([
   'aa🐍'+'x'.repeat(20),
   'x'.repeat(20)+'🐍'+'z'.repeat(5),
-])('normalizes a surrogate split by head or tail truncation after slicing',async raw=>{
+])('normalizes a surrogate split by head or tail truncation after slicing [case %#]',async raw=>{
   const preview=redact(raw,9);
   expect(preview).toContain('trecho omitido');
   expect(preview).toContain('�');

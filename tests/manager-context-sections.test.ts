@@ -193,7 +193,7 @@ it('does not generate any reference or store requirement when the complete obser
 
 it.each([{}, {version:1,goalId:id(1),sections:'a future literal constraint'},
  {version:99,futureConstraint:{taskId:id(3),instruction:'This unknown root must remain visible.'}}])(
- 'does not overwrite an unrecognized contextSectionDirectory root with its own protocol',directory=>{
+ 'does not overwrite an unrecognized contextSectionDirectory root with its own protocol [case %#]',directory=>{
  const source=fixture();source.operation.contextSectionDirectory=directory;const before=structuredClone(source);
  const result=projectManagerReview(source,prefix,0,150000,{goalId:id(1)}),out=decoded(result.description);
  expect(out.operation.contextSectionDirectory).toEqual(directory);
