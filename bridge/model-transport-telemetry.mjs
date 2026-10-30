@@ -1,12 +1,13 @@
 // Observations of the serialized request and transport only. Never content,
 // credentials, URLs, response headers or inferred provider compute timings.
+import {sanitizeProtocolTerminal} from './protocol-terminal-diagnostic.mjs';
 export const MODEL_TELEMETRY_VERSION = 1;
 export const MAX_MODEL_TELEMETRY_BYTES = 4096;
 const number = value => Number.isSafeInteger(value) && value >= 0 ? value : null;
 const token = value => typeof value === 'string' && /^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}$/.test(value) ? value : null;
 const code = value => typeof value === 'string' && /^[A-Z_]{3,60}$/.test(value) ? value : null;
 const noop = () => {};
-const empty = {headers:noop,chunk:noop,semantic:noop,usage:noop,bodyEnd:noop,finish:noop};
+const empty = {headers:noop,chunk:noop,semantic:noop,usage:noop,bodyEnd:noop,protocolTerminal:noop,finish:noop};
 
 export function createModelTransportTelemetry(serialized, observe,
   monotonicNow = () => performance.now()) {
@@ -48,7 +49,7 @@ export function createModelTransportTelemetry(serialized, observe,
     const times={fetchStartMs:start===null?null:0,headersMs:null,firstBodyMs:null,
       firstSemanticMs:null,lastSemanticMs:null,bodyEndMs:null,finishedMs:null};
     const counts={bodyBytes:0,chunks:0,characters:0,reasoningCharacters:0,toolCharacters:0,semanticCharacters:0};
-    let reported=null,status=null,format=null,finished=false,bodySeen=false,semanticSeen=false;
+    let reported=null,status=null,format=null,finished=false,bodySeen=false,semanticSeen=false,protocolTerminal=null;
     emit('MODEL_WIRE_REQUESTED',{...identity,wire:{...wire},timingOrigin:'fetch_start'});
     // All methods are observer-only and swallow clock/callback failures.
     const guard=operation=>(...args)=>{try{if(!finished)operation(...args);}catch{}};
@@ -72,11 +73,13 @@ export function createModelTransportTelemetry(serialized, observe,
           reasoningTokens:number(value.completion_tokens_details?.reasoning_tokens)};
       }),
       bodyEnd:guard(()=>{times.bodyEndMs=elapsed();}),
+      protocolTerminal:guard(value=>{protocolTerminal=sanitizeProtocolTerminal(value);}),
       finish:guard((outcome,errorCode)=>{
         if(!['success','error','cancelled','timeout','retry'].includes(outcome))return;
         times.finishedMs=elapsed();finished=true;
         emit('MODEL_TRANSPORT_FINISHED',{...identity,outcome,code:code(errorCode),httpStatus:status,bodyFormat:format,
-          timingOrigin:'fetch_start',timings:{...times},counters:{...counts},usage:reported});
+          timingOrigin:'fetch_start',timings:{...times},counters:{...counts},usage:reported,
+          ...(protocolTerminal?{protocolTerminal:{...protocolTerminal}}:{})});
       }),
     };
   }};

@@ -26,6 +26,25 @@ but no observed per-delta semantic timestamps. Failure or cancellation may leave
 body-end and other unobserved timestamps null. A retry outcome describes one
 finished transport attempt, not completion of the overall model request.
 
+An optional `protocolTerminal` object preserves schema version 1 and explains
+the parser's terminal decision using only whitelisted enums, booleans and
+integer counts. It distinguishes an unterminated frame tail, missing or invalid
+finish reason, finish/tool mismatch, missing or duplicate tool identity,
+missing tool name, invalid argument JSON or shape, and body interruption. It
+also records whether normal body EOF and `[DONE]` were actually observed.
+Cancellation does not imply EOF. An observed terminal marker is insufficient
+to accept incomplete arguments, and a valid terminal response without `[DONE]`
+remains accepted as before. The downstream SDK's `STREAM_CLOSED` error alone
+does not establish which condition the upstream parser rejected.
+
+`validation: accepted` means only that the model response passed its existing
+protocol checks; it grants no tool, retry, stop, task or delivery authority.
+The object contains no tool identifiers, names, arguments, body fragments or
+provider strings. Worker and cycle events preserve it with the request and
+attempt identity; the progress tracker does not treat it as liveness. Offline
+fixtures test both strict parsing and the parser-to-bridge-to-cycle-to-PostgreSQL
+event path in an isolated test database.
+
 Usage preserves the provider's reported input, output, total, cached-input and
 reasoning counters. Missing or invalid counters are null; the entire usage
 field is null when none was reported. These counters may omit reasoning tokens.

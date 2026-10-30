@@ -110,6 +110,8 @@ test('keepalive bytes and usage are not first/last semantic delta; idle timeout 
   const receipt=terminal(f.events)[0].payload;
   assert.equal(receipt.outcome,'timeout');assert.equal(receipt.code,'MODEL_IDLE_TIMEOUT');
   assert.equal(receipt.timings.firstBodyMs,40);assert.equal(receipt.timings.firstSemanticMs,null);assert.equal(receipt.timings.lastSemanticMs,null);assert.equal(receipt.timings.bodyEndMs,null);
+  assert.deepEqual(receipt.protocolTerminal,{version:1,format:'sse',validation:'interrupted',eofObserved:false,doneObserved:false,
+    finishReason:'missing',trailingBytes:0,toolCount:0,aborted:true});
   assert.equal(receipt.usage.outputTokens,0);assert.equal(receipt.usage.inputTokens,null);
   assert.equal(f.c.pending.size,0);
 });
@@ -125,6 +127,7 @@ test('cancellation receipt follows actual transport cleanup and cannot release a
   assert.equal(result.error.code,'CANCELLED');assert.equal(releases,1);
   const receipt=terminal(f.events)[0].payload;
   assert.equal(receipt.outcome,'cancelled');assert.equal(receipt.timings.firstSemanticMs,20);assert.equal(receipt.timings.lastSemanticMs,20);assert.equal(receipt.timings.bodyEndMs,null);assert.equal(receipt.timings.finishedMs,30);
+  assert.equal(receipt.protocolTerminal.aborted,true);assert.equal(receipt.protocolTerminal.eofObserved,false);
   assert.ok(!JSON.stringify(f.events).includes('private reasoning'));
 });
 

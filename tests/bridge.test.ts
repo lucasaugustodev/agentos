@@ -119,6 +119,25 @@ it('heartbeat and queued/request-start notifications do not extend inactivity or
   bridge.close();
 });
 
+it('terminal protocol diagnostics are forwarded but cannot renew inactivity or complete a worker', async () => {
+  vi.useFakeTimers();
+  const {bridge,child}=fixture(),onEvent=vi.fn();
+  const result=bridge.request('worker.execute',{}, {idleTimeout:100,onEvent}).catch(e=>e);
+  const {id}=JSON.parse(child.stdin.read().toString());
+  await vi.advanceTimersByTimeAsync(90);
+  const payload={requestId:'10000000-0000-4000-8000-000000000001',version:1,
+    protocolTerminal:{version:1,format:'sse',eofObserved:true,doneObserved:false,finishReason:'tool_calls',
+      validation:'accepted',trailingBytes:0,toolCount:1,aborted:false}};
+  child.stdout.write(JSON.stringify({id,event:{kind:'MODEL_TRANSPORT_FINISHED',payload}})+'\n');
+  expect(onEvent).toHaveBeenCalledWith('MODEL_TRANSPORT_FINISHED',payload);
+  expect(bridge.pending.size).toBe(1);
+  await vi.advanceTimersByTimeAsync(10);
+  expect(bridge.pending.get(id)?.cancelError?.code).toBe('RUNTIME_IDLE_TIMEOUT');
+  child.stdout.write(JSON.stringify({id,error:{code:'STOP_UNCONFIRMED',message:'Still uncertain'}})+'\n');
+  expect(await result).toMatchObject({code:'STOP_UNCONFIRMED'});
+  bridge.close();
+});
+
 it('late progress cannot renew the remote stop-confirmation deadline', async () => {
   vi.useFakeTimers();
   const {bridge,child}=fixture();

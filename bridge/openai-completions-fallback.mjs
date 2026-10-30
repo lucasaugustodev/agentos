@@ -6,6 +6,7 @@
 import { classifyProviderError } from './opencode-provider-error.mjs';
 import { semanticModelWatchdog, readAbortableModelBody, modelAbortFailure, MODEL_IDLE_TIMEOUT_MS } from './semantic-model-watchdog.mjs';
 import { createModelTransportTelemetry } from './model-transport-telemetry.mjs';
+import { diagnosticFinishReason, observeProtocolTerminal } from './protocol-terminal-diagnostic.mjs';
 
 export const RETRY_ATTEMPTS = 3;
 export const RETRY_BUDGET_MS = 30000;
@@ -55,7 +56,7 @@ export function toCompletionsMessages(systemPrompt, messages) {
 }
 
 /** OpenAI chat-completions response to an internal assistant message. */
-export function fromCompletionsResponse(data) {
+export function fromCompletionsResponse(data, diagnostic) {
   const choice = data?.choices?.[0];
   return buildMessage({
     text: choice?.message?.content ?? '',
@@ -66,30 +67,35 @@ export function fromCompletionsResponse(data) {
     })),
     finish: choice?.finish_reason,
     usage: data?.usage,
-  });
+  }, diagnostic);
 }
 
-function buildMessage({ text, thinking = '', thinkingPresent = false, calls, finish, usage }) {
+function buildMessage({ text, thinking = '', thinkingPresent = false, calls, finish, usage }, diagnostic) {
+  const observe = value => { try { Promise.resolve(diagnostic?.(value)).catch(() => {}); } catch {} };
+  const reject = (reason, code = 'MODEL_INCOMPLETE_RESPONSE') => {
+    observe(reason); throw failure(code);
+  };
   // No partial response may reach a tool executor. A transport EOF is not a
   // provider terminal marker; length also takes precedence over tool calls.
-  if (finish === 'length') throw failure('MODEL_OUTPUT_LIMIT');
-  if (!['stop','tool_calls'].includes(finish)) throw failure('MODEL_INCOMPLETE_RESPONSE');
-  if ((finish === 'tool_calls') !== (calls.length > 0)) throw failure('MODEL_INCOMPLETE_RESPONSE');
-  if (!calls.length && !text) throw failure('MISSING_MODEL_RESPONSE');
+  if (finish === 'length') reject('output_limit', 'MODEL_OUTPUT_LIMIT');
+  if (!['stop','tool_calls'].includes(finish)) reject(diagnosticFinishReason(finish) === 'missing' ? 'missing_finish' : 'invalid_finish');
+  if ((finish === 'tool_calls') !== (calls.length > 0)) reject('finish_tool_mismatch');
+  if (!calls.length && !text) reject('empty_message', 'MISSING_MODEL_RESPONSE');
   const content = [];
   if (thinking || thinkingPresent) content.push({type:'thinking',thinking});
   if (text) content.push({ type: 'text', text: String(text) });
   const ids = new Set();
   for (const call of calls) {
-    if (typeof call.id !== 'string' || !call.id || ids.has(call.id) ||
-        typeof call.name !== 'string' || !call.name) throw failure('MODEL_INCOMPLETE_RESPONSE');
+    if (typeof call.id !== 'string' || !call.id) reject('tool_id_missing');
+    if (ids.has(call.id)) reject('tool_id_duplicate');
+    if (typeof call.name !== 'string' || !call.name) reject('tool_name_missing');
     ids.add(call.id);
     let args;
-    try { args = JSON.parse(call.arguments); } catch { throw failure('MODEL_INCOMPLETE_RESPONSE'); }
-    if (!args || typeof args !== 'object' || Array.isArray(args)) throw failure('MODEL_INCOMPLETE_RESPONSE');
+    try { args = JSON.parse(call.arguments); } catch { reject('invalid_tool_json'); }
+    if (!args || typeof args !== 'object' || Array.isArray(args)) reject('invalid_tool_shape');
     content.push({ type: 'toolCall', id: call.id, name: call.name, arguments: args });
   }
-  return {
+  const message = {
     role: 'assistant',
     content,
     stopReason: content.some((b) => b.type === 'toolCall')
@@ -101,6 +107,8 @@ function buildMessage({ text, thinking = '', thinkingPresent = false, calls, fin
           totalTokens: usage.total_tokens ?? 0 }
       : null,
   };
+  observe('accepted');
+  return message;
 }
 
 /** Consume one chat-completions SSE body into the same internal message.
@@ -112,10 +120,11 @@ export async function readCompletionsStream(body, signal, onProgress, now = () =
   let chunks = 0, reportedAt = -Infinity, reportedSemantic = 0, semanticCharacters = 0;
   const calls = new Map();
   let buffer = '', text = '', thinking = '', thinkingPresent = false, finish, usage, bytes = 0, done = false, bodyObserved = false;
+  let eofObserved = false, validation = 'interrupted';
   const counters = () => ({characters:text.length, reasoningCharacters:thinking.length,
     toolCharacters:[...calls.values()].reduce((n,c)=>n+c.arguments.length,0),
     semanticCharacters, chunks, elapsedMs:now()-startedAt});
-  for await (const part of readAbortableModelBody(body, signal)) {
+  try { for await (const part of readAbortableModelBody(body, signal)) {
     telemetry?.chunk(part.byteLength);
     // Once any SSE body arrived, even an incomplete first JSON frame cannot be
     // replayed. This receipt is deliberately separate from semantic liveness:
@@ -124,7 +133,7 @@ export async function readCompletionsStream(body, signal, onProgress, now = () =
     const semanticBeforePart = semanticCharacters;
     chunks++;
     bytes += part.byteLength;
-    if (bytes > MAX_RESPONSE_BYTES) throw failure('MODEL_RESPONSE_TOO_LARGE');
+    if (bytes > MAX_RESPONSE_BYTES) { validation = 'response_too_large'; throw failure('MODEL_RESPONSE_TOO_LARGE'); }
     buffer += decoder.decode(part, { stream: true });
     let cut;
     while ((cut = buffer.indexOf('\n')) !== -1) {
@@ -133,10 +142,10 @@ export async function readCompletionsStream(body, signal, onProgress, now = () =
       if (!line.startsWith('data:')) continue;
       const payload = line.slice(5).trim();
       if (payload === '[DONE]') { done = true; continue; }
-      if (done) throw failure('MODEL_INCOMPLETE_RESPONSE');
+      if (done) { validation = 'data_after_done'; throw failure('MODEL_INCOMPLETE_RESPONSE'); }
       let event;
-      try { event = JSON.parse(payload); } catch { throw failure('MODEL_INCOMPLETE_RESPONSE'); }
-      if (event.error) throw failure('MODEL_REQUEST_FAILED');
+      try { event = JSON.parse(payload); } catch { validation = 'malformed_frame'; throw failure('MODEL_INCOMPLETE_RESPONSE'); }
+      if (event.error) { validation = 'provider_error'; throw failure('MODEL_REQUEST_FAILED'); }
       if (event.usage) { usage = event.usage; telemetry?.usage(usage); }
       const choice = event.choices?.[0];
       if (!choice) continue;
@@ -171,28 +180,43 @@ export async function readCompletionsStream(body, signal, onProgress, now = () =
       onProgress(counters());
     }
   }
+  eofObserved = true;
   telemetry?.bodyEnd();
   if (signal?.aborted) throw modelAbortFailure(signal);
-  if (buffer.trim()) throw failure('MODEL_INCOMPLETE_RESPONSE');
-  const message = buildMessage({ text, thinking, thinkingPresent, calls: [...calls.values()].sort((a, b) => a.index - b.index), finish, usage });
+  if (buffer.trim()) { validation = 'unterminated_tail'; throw failure('MODEL_INCOMPLETE_RESPONSE'); }
+  const message = buildMessage({ text, thinking, thinkingPresent, calls: [...calls.values()].sort((a, b) => a.index - b.index), finish, usage }, value => { validation = value; });
   onProgress?.({...counters(),done:true});
   return message;
+  } finally {
+    observeProtocolTerminal(telemetry, {version:1,format:'sse',eofObserved,doneObserved:done,
+      finishReason:diagnosticFinishReason(finish),trailingBytes:Buffer.byteLength(buffer,'utf8'),
+      toolCount:calls.size,validation,aborted:signal?.aborted===true});
+  }
 }
 
 async function readCompletionsJson(body, signal, onPartial, telemetry) {
-  const parts=[]; let bytes=0;
-  for await (const part of readAbortableModelBody(body,signal)) {
+  const parts=[]; let bytes=0, eofObserved=false, validation='interrupted', finish, toolCount=0;
+  try { for await (const part of readAbortableModelBody(body,signal)) {
     telemetry?.chunk(part.byteLength);
     if (part.byteLength) onPartial(); // An incomplete JSON body is never replayed.
     bytes += part.byteLength;
-    if (bytes > MAX_RESPONSE_BYTES) throw failure('MODEL_RESPONSE_TOO_LARGE');
+    if (bytes > MAX_RESPONSE_BYTES) { validation='response_too_large'; throw failure('MODEL_RESPONSE_TOO_LARGE'); }
     parts.push(part);
   }
+  eofObserved=true;
   telemetry?.bodyEnd();
-  const data=JSON.parse(Buffer.concat(parts).toString('utf8'));
+  let data;
+  try { data=JSON.parse(Buffer.concat(parts).toString('utf8')); }
+  catch(error) { validation='malformed_json'; throw error; }
+  finish=data?.choices?.[0]?.finish_reason;
+  toolCount=Array.isArray(data?.choices?.[0]?.message?.tool_calls)?data.choices[0].message.tool_calls.length:0;
   telemetry?.usage(data.usage);
   // JSON replies have no observable per-delta semantics; do not invent TTFT.
-  return fromCompletionsResponse(data);
+  return fromCompletionsResponse(data, value => { validation=value; });
+  } finally {
+    observeProtocolTerminal(telemetry, {version:1,format:'json',eofObserved,doneObserved:false,
+      finishReason:diagnosticFinishReason(finish),trailingBytes:0,toolCount,validation,aborted:signal?.aborted===true});
+  }
 }
 
 function typedFailure(failure) {
