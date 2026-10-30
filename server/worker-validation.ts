@@ -47,7 +47,7 @@ export async function registerWorkerValidationPolicy(goalId:string,raw:unknown,a
     await lock(db);
     const framework=await frameworkProjectAuthorization(db,goalId);
     if(policy.project!==framework.project) throw new DomainError('VALIDATION_PROJECT_UNREGISTERED','Projeto divergente.');
-    if(policy.enabled) await assertWorkerValidationOwner(db,goalId);
+    if(policy.enabled) await assertWorkerValidationRegistrationOwner(db,goalId);
     const registration={version:1,id:'worker-validation:'+goalId,registrationId:randomUUID(),goalId,
       policy,policyDigest:validationDigest(policy),channel};
     await event(db,'WORKER_VALIDATION_POLICY_REGISTERED',goalId,registration);
@@ -55,6 +55,25 @@ export async function registerWorkerValidationPolicy(goalId:string,raw:unknown,a
       [registration.id,JSON.stringify(registration)]);
     return registration;
   });
+}
+
+/** Registration configures future admissions only. It is not execution authority
+ * and cannot resume a goal or amend a run's immutable admission snapshot. The
+ * ordinary active-owner check below remains the execution/acceptance boundary. */
+async function assertWorkerValidationRegistrationOwner(db:DB,goalId:string) {
+  const row=(await db.query(`SELECT g.state,o.mode,
+    EXISTS(SELECT 1 FROM settings s WHERE s.id IN('management:'||g.id,'workforce:'||g.id) AND s.value->>'enabled'='true') manager,
+    (SELECT value->>'enabled' FROM settings WHERE id='autonomy:'||g.project) autonomy,
+    EXISTS(SELECT 1 FROM runs r JOIN tasks t ON t.id=r.task_id WHERE t.goal_id=g.id
+      AND (r.state IN('queued','running','cancelling','reconciling') OR EXISTS(SELECT 1 FROM leases l WHERE l.run_id=r.id)
+        OR EXISTS(SELECT 1 FROM settings h WHERE h.id='worker-validation-handoff:'||r.id AND h.value->>'state'='pending'))) live,
+    EXISTS(SELECT 1 FROM settings s WHERE s.id LIKE 'candidate-validation:%' AND s.value->>'goalId'=g.id::text
+      AND s.value->>'state' IN('proposed','freezing','frozen','running','uncertain')) validation_owner
+    FROM goals g LEFT JOIN objectives o ON o.id=g.id WHERE g.id=$1`,[goalId])).rows[0];
+  if(row?.state==='active')return assertWorkerValidationOwner(db,goalId);
+  const preparable=['planning','replanning','failed','planned'];
+  if(!row || !preparable.includes(row.state) || row.mode!=='execute' ||
+    row.autonomy==='false' || row.manager || row.live || row.validation_owner)throw Error('VALIDATION_RUNTIME_UNAUTHORIZED');
 }
 
 async function assertWorkerValidationOwner(db:DB,goalId:string,acceptedRunId?:string) {

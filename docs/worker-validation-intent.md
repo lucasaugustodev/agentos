@@ -38,6 +38,23 @@ unregistered setting is rejected. Registering/replacing policy cannot add this
 obligation to a run that already exists. Disabling or replacing a captured policy
 revokes that old request; it does not silently adopt new obligations.
 
+Future admissions may also be configured while the owning goal is `planning`,
+`replanning`, `failed` or `planned`, provided an existing objective has
+`mode=execute`. Its display status can lag behind the goal state after a stop;
+that projection is not admission authority. The same effective autonomy rule
+applies: an explicit `enabled=false` refuses registration; absence inherits the
+existing enabled default. Management/workforce ownership, live or reconciling
+runs, residual leases and unfinished/uncertain validator ownership still refuse
+this inactive registration path. Paused, cancelled and completed goals remain
+ineligible for it.
+
+This is only authenticated configuration for future admissions. It writes the
+policy and registration event under the admission lock, without activating the
+goal, dispatching a task or changing any existing snapshot. Runtime and acceptance
+verification keep their original active-owner checks and existing completed-run
+evidence exception. A failed goal must resume through the normal controller path
+before an attempt can use the policy for execution or acceptance.
+
 The schema migration changes the admission trigger and requires the normal
 reviewed schema preparation. Workers do not install DDL. Nothing backfills old
 snapshots, changes old criteria or rewrites historical acceptances.
