@@ -278,6 +278,19 @@ it('rechecks authority after RPC observation and again immediately before dispat
   await expect(assertBoundRuntimePreparationCurrent(f.input)).rejects.toMatchObject({code:'SOURCE_PREPARATION_AUTHORITY_CHANGED'});
 });
 
+it('does not recover a legacy bypass by deleting the bound field after preparation',async()=>{
+  const f=await fixture();await prepareBoundRuntimeWorkspace(f.input);
+  delete f.input.task.execution.sourcePreparation;
+  await expect(assertBoundRuntimePreparationCurrent(f.input)).rejects.toMatchObject({code:'SOURCE_PREPARATION_NOT_VERIFIED'});
+});
+
+it('invalidates the prior in-process receipt when a new preparation check fails',async()=>{
+  const f=await fixture();await prepareBoundRuntimeWorkspace(f.input);
+  f.rpc.mockResolvedValueOnce({exists:true});
+  await expect(prepareBoundRuntimeWorkspace(f.input)).rejects.toHaveProperty('code');
+  await expect(assertBoundRuntimePreparationCurrent(f.input)).rejects.toMatchObject({code:'SOURCE_PREPARATION_NOT_VERIFIED'});
+});
+
 it('refreshes stale observations after a slow preflight without a new clone and with no RPC under the admission lock',async()=>{
   const f=await fixture(1),clock=Date.now();let current=clock;
   vi.spyOn(Date,'now').mockImplementation(()=>current);

@@ -172,6 +172,7 @@ async function recapture(input:RuntimeInput,state:Prepared){
 /** Only absence of the frozen opt-in selects legacy preparation. Bound partial,
  * unknown or changed state is never retried through legacy or a new UUID. */
 export async function prepareBoundRuntimeWorkspace(input:RuntimeInput):Promise<boolean>{
+  prepared.delete(input);
   const liveHas=Object.hasOwn(input.task.execution??{},'sourcePreparation');
   const frozen=input.run.instruction_snapshot?.task;
   const frozenHas=Object.hasOwn(frozen?.execution??{},'sourcePreparation');
@@ -211,8 +212,10 @@ export async function prepareBoundRuntimeWorkspace(input:RuntimeInput):Promise<b
  * source is recopied: stale observations are refreshed read-only outside the
  * scheduler lock; the final lock phase performs metadata checks only. */
 export async function assertBoundRuntimePreparationCurrent(input:RuntimeInput):Promise<void>{
-  if(!Object.hasOwn(input.task.execution??{},'sourcePreparation'))return;
-  const state=prepared.get(input);requireProof(state,'SOURCE_PREPARATION_NOT_VERIFIED');
+  const state=prepared.get(input),present=Object.hasOwn(input.task.execution??{},'sourcePreparation'),
+    frozen=Object.hasOwn(input.run.instruction_snapshot?.task?.execution??{},'sourcePreparation');
+  if(!present&&!frozen&&!state)return;
+  requireProof(state&&present&&frozen,'SOURCE_PREPARATION_NOT_VERIFIED');
   if(!fresh(state!.verified.checkedAt)||(state!.stop&&!fresh(state!.stop.checkedAt))||
     (state!.admission&&!fresh(state!.admission.checkedAt))){
     const current=await capture(pool,input,state!.capture.request);requireProof(current.fingerprint===state!.capture.fingerprint);
