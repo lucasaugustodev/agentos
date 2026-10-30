@@ -1,6 +1,7 @@
 import { readModelPolicy, modelRouteAllowed } from '../bridge/model-policy.mjs';
 import { generationTiming } from './generation-timing.js';
 import { planningRecovery } from './planning-recovery.js';
+import {refreshQueuedPlanningFeedback} from './planning-feedback-refresh.js';
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { pool, tx, lock, event, type DB } from './db.js';
@@ -385,6 +386,8 @@ export async function claimPlanning() {
       WHERE p.state IN('queued','waiting_quota') AND p.next_attempt_at<=now() AND g.state NOT IN('paused','cancelled') AND NOT EXISTS(SELECT 1 FROM settings s WHERE s.id='workforce:'||o.id AND s.value->>'enabled'='true') ORDER BY p.created_at LIMIT 1 FOR UPDATE OF p`)
     ).rows[0];
     if (!run) return null;
+    const refreshedFeedback=await refreshQueuedPlanningFeedback(db,run.id);
+    if(refreshedFeedback)run.feedback=refreshedFeedback;
     const request = run.request as ObjectiveInput;
     if(run.feedback?.planningRecovery&&!(await db.query("SELECT 1 FROM settings WHERE id=$1 AND value->>'mode'='supervised'",['objective-review:'+run.objective_id])).rowCount){
       await db.query("UPDATE planning_runs SET state='failed',finished_at=now(),error='Revisão supervisionada desabilitada.' WHERE id=$1",[run.id]);
