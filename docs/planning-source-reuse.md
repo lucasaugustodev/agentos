@@ -1,9 +1,11 @@
 # Accepted source chain selection
 
-This module is an inactive, pure building block. It does not change the planner,
-prepare a workspace, apply a patch, issue model calls, or complete requirements.
-No production path calls it yet. `acceptance:false` and
+This module is the pure verifier used by the controller's accepted-source
+preparation flow. It does not itself change tasks, prepare a workspace, apply a
+patch, issue model calls, or complete requirements. `acceptance:false` and
 `finalVerificationRequired:true` remain explicit in every eligible proof.
+See [the planner integration](planning-source-preparation.md) for persistence,
+protected inspection, recovery and consumer binding.
 
 `proveAcceptedSourceChain` takes a bounded controller snapshot and canonical
 artifact/marker bytes with fresh physical-stop observations. It checks current
@@ -36,7 +38,7 @@ inventory status. The module does not apply patches or independently prove a
 patch's textual semantics. Those bytes cannot be supplied as worker-authored
 authority: the capture adapter must enforce reserved canonical artifact origin.
 
-The authority boundary is not implemented here. Before connecting this module:
+The authority boundary belongs to the adapter and controller. They must:
 
 - Capture the entire accepted cohort for one goal/revision/base scope, with a
   total count and explicit truncation flag. Select the latest acceptance using
@@ -78,6 +80,8 @@ Tests use synthetic source inventories and immutable identities, without a DB,
 provider or shell. They cover unchanged witnesses, linear multi-producer chains,
 branches and omitted contributors, artifact tampering, legacy/generation reuse,
 readonly/scope violations, current acceptance/attempt, physical stop freshness,
-and metadata changes between proof and later admission. End-to-end preparation,
-planner races and the protected copy receipt require later integration tests;
-this module alone does not demonstrate operational reuse or performance gains.
+and metadata changes between proof and later admission. Separate PostgreSQL
+tests cover planner races and durable intents; Python fixtures cover actual
+protected copies and receipts. These components still require a real deployed
+worker trial before claiming operational savings. A passing synthetic chain
+alone does not demonstrate a productivity gain.

@@ -21,6 +21,8 @@ import {readObjectiveInputs,inputsForRequirements} from './objective-inputs.js';
 import {planningInputContext,planningInputInstruction} from './planning-input-context.js';
 import {reconcileInheritedCancellation} from './objective-state-repair.js';
 import {reconcilePlanningFailures,verifyPlanningReviewEffects,planningReviewFallback,assertPlanningFeedbackCurrent} from './planning-supervision.js';
+import {preparePlanningSources,assertPreparedPlanningSources,planningSourceExecution,applyPreparedPlanningSources,
+  type PreparedPlanningSources} from './planning-source-preparation.js';
 
 export async function submitObjective(raw: unknown) {
   const request = objectiveSchema.parse(raw);
@@ -484,7 +486,7 @@ function executionSpec(id: string, revision: number, t: any, plan: ProposedPlan)
   };
 }
 
-export async function applyPlannedResult(run: any, plan: ProposedPlan) {
+export async function applyPlannedResult(run: any, plan: ProposedPlan, preparedSources:PreparedPlanningSources=new Map()) {
   return tx(async (db) => {
     await lock(db);
     const fresh = (
@@ -542,6 +544,7 @@ export async function applyPlannedResult(run: any, plan: ProposedPlan) {
         'Preserve literalmente os critérios explícitos do usuário.',
       );
     const revision = fresh.revision + 1;
+    await assertPreparedPlanningSources(db,run,plan,preparedSources);
     await db.query(
       'INSERT INTO plan_revisions(id,objective_id,revision,planning_run_id,plan,status) VALUES($1,$2,$3,$4,$5,$6)',
       [
@@ -577,8 +580,11 @@ export async function applyPlannedResult(run: any, plan: ProposedPlan) {
         const {mergeSupervisorInputs}=await import('./execution-inputs.js');
         const inputs=mergeSupervisorInputs(inputsForRequirements(operatorInputs,t.covers),
           await runtimeValidationRepairInputs(db,run.objective_id,replace,t.covers));
+        const spec=executionSpec(run.objective_id, revision, t, plan),preparedSource=preparedSources.get(t.baseWorkspace);
+        if(preparedSource&&!t.sourceTask)spec.sourceWorkspace=preparedSource.intent.request.workspace;
         const execution = {
-          ...executionSpec(run.objective_id, revision, t, plan),
+          ...spec,
+          ...planningSourceExecution(preparedSource,spec,randomUUID()),
           revisionFeedback: run.feedback,
           ...(inputs.length?{inputs}:{}),
         };
@@ -658,6 +664,7 @@ export async function applyPlannedResult(run: any, plan: ProposedPlan) {
       "UPDATE planning_runs SET state='completed',output=$2,error=NULL,finished_at=now() WHERE id=$1",
       [run.id, JSON.stringify(plan)],
     );
+    await applyPreparedPlanningSources(db,run,preparedSources);
     await event(db, 'PLAN_APPLIED', run.objective_id, {
       revision,
       mode: fresh.mode,
@@ -866,26 +873,8 @@ export class PlanningEngine {
         ).rowCount
       )
         throw new DomainError('STALE_PLAN', 'O executor do plano foi substituído.');
-      if (run.mode === 'execute') {
-        const bases = [...new Set(plan.tasks.map((t) => t.baseWorkspace))];
-        for (let i = 0; i < bases.length; i++)
-          await accountBridge.request(
-            'worker.prepare',
-            {
-              sourceWorkspace: run.feedback.sourceOverrides?.[bases[i]] ?? bases[i],
-              workspace:
-                bases[i].split('/')[0] +
-                '/o' +
-                run.objective_id.replaceAll('-', '').slice(0, 12) +
-                'r' +
-                (run.base_revision + 1) +
-                '-base-' +
-                i,
-            },
-            { signal, timeout: 180000 },
-          );
-      }
-      await applyPlannedResult(run, plan);
+      const preparedSources=run.mode==='execute'?await preparePlanningSources(run,plan,signal):new Map();
+      await applyPlannedResult(run, plan, preparedSources);
     } catch (e: any) {
       await tx(async (db) => {
         await lock(db);

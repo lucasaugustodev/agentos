@@ -173,7 +173,13 @@ export async function assembleContext(run: any, task: any, dependencies: any[]) 
           `[Memória ${m.id} v${m.version}; ${m.required ? 'obrigatória' : 'relevante'}; fonte ${m.source}]\n${m.title}\n${m.content}`,
       )
       .join('\n\n');
-  const fixedContext = [delivery.content,recoveryGuide].filter(Boolean);
+  const sourceReuse=task.execution?.sourceReuse;
+  const sourceReuseGuide=sourceReuse?.version===1
+    ? 'PREPARED BASELINE: the controller has already incorporated the exact artifacts listed in sourceReuse into this revision baseline. '+
+      'Keep their recovery reports for reference; do not reapply those incorporated patch IDs. New dependency patches still require normal integration. '+
+      'This source reuse does not accept any requirement or replace independent validation.\n'+JSON.stringify(sourceReuse)
+    : '';
+  const fixedContext = [delivery.content,recoveryGuide,sourceReuseGuide].filter(Boolean);
   let effectiveGuide='';
   const renderContent = (memories: typeof selected) => [memoryText(memories),...fixedContext].filter(Boolean).join('\n\n')+effectiveGuide;
   let content=renderContent(selected);
@@ -198,6 +204,7 @@ export async function assembleContext(run: any, task: any, dependencies: any[]) 
     dependencyArtifacts: dependencies,
     recoveryArtifacts:recovery.selected,
     recoveryArtifactAliases:recovery.aliases,
+    ...(sourceReuse?.version===1?{sourceReuse}:{}),
     estimatedTokens: Math.ceil(content.length / 4),
     tokenMethod: 'estimativa: caracteres / 4',
     generatedAt: new Date().toISOString(),
