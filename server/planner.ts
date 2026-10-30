@@ -3,6 +3,7 @@ import { generationTiming } from './generation-timing.js';
 import { planningRecovery } from './planning-recovery.js';
 import {refreshQueuedPlanningFeedback} from './planning-feedback-refresh.js';
 import {routeVerificationPlanningRecovery} from './verification-planning-recovery.js';
+import {planningRunFeedback} from './planning-run-feedback.js';
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { pool, tx, lock, event, type DB } from './db.js';
@@ -229,9 +230,8 @@ export async function reconcilePlanning() {
               AND ($2::text IS DISTINCT FROM 'manual' OR a.value->>'enabled'='true')`,
             [t.goal_id,t.recovery?.mode??null])).rowCount)continue;
         }
-        await queueFeedback(db, o.id, 'run:' + t.run_id, `${t.title}: ${t.summary ?? t.reason}`, [
-          t.id,
-        ]);
+        const feedback=await planningRunFeedback(db,t);
+        await queueFeedback(db,o.id,feedback.key,feedback.description,feedback.taskIds);
       }
       const pending = (
         await db.query(

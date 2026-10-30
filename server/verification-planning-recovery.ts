@@ -1,5 +1,6 @@
 import {randomUUID} from 'node:crypto';
 import {event,type DB} from './db.js';
+import {planningRunFeedback} from './planning-run-feedback.js';
 
 /** Called under the scheduler lock. The existing objective feedback owns this
  * material failure; recording evidence never reopens a goal or admits a writer. */
@@ -22,14 +23,14 @@ export async function routeVerificationPlanningRecovery(db:DB,taskId:string,runI
       AND NOT EXISTS(SELECT 1 FROM events e WHERE e.kind='CANCEL_REQUESTED' AND e.payload->>'runId'=r.id::text)
     FOR UPDATE OF t`,[taskId,runId??null])).rows[0];
   if(!row)return false;
-  const key='run:'+row.run_id;
+  const {key,description,taskIds}=await planningRunFeedback(db,row);
   const inserted=await db.query(`INSERT INTO objective_feedback(id,objective_id,trigger_key,description,task_ids)
     VALUES($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING RETURNING id`,[randomUUID(),row.goal_id,key,
-    `${row.title}: ${row.summary??row.reason}`,JSON.stringify([row.id])]);
+    description,JSON.stringify(taskIds)]);
   const feedbackId=inserted.rows[0]?.id??(await db.query(
     'SELECT id FROM objective_feedback WHERE objective_id=$1 AND trigger_key=$2',[row.goal_id,key])).rows[0]?.id;
   if(inserted.rowCount)await event(db,'PLANNING_FEEDBACK',row.goal_id,
-    {reason:`${row.title}: ${row.summary??row.reason}`,taskIds:[row.id]});
+    {reason:description,taskIds});
   if(!(await db.query(`SELECT 1 FROM events WHERE kind='VERIFICATION_PLANNING_ROUTED' AND entity_id=$1
     AND payload->>'sourceRunId'=$2`,[row.id,row.run_id])).rowCount)
     await event(db,'VERIFICATION_PLANNING_ROUTED',row.id,{goalId:row.goal_id,sourceRunId:row.run_id,
