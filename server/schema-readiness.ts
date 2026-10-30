@@ -15,6 +15,7 @@ export const migrationModules = [
   'server/cycles/store.ts',
   'server/task-instructions.ts',
   'server/runtime-lookup-indexes.ts',
+  'server/objective-model-route-schema.ts',
 ] as const;
 export const migrationReceiptKey = 'schema:migration-active';
 export const migrationAdvisoryLock = 4280101;

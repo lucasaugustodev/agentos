@@ -3,6 +3,7 @@ import {pool,tx,lock,event,type DB} from './db.js';
 import {accountBridge} from './bridge.js';
 import {readArtifact} from './service.js';
 import {assertSourceReplanCurrent,inspectSourceReplanCurrent} from './objective-source-replan.js';
+import {routedPlanningRequest} from './objective-model-route.js';
 import {DomainError} from './contracts.js';
 import {assertPlanningFeedbackCurrent} from './planning-supervision.js';
 import {captureSourceReuseAuthority,completeSourceReuseCapture,recaptureSourceReuseAuthority,
@@ -28,13 +29,15 @@ const failure=(code:string)=>new DomainError(code,'A origem preparada exige reco
 const target=(run:any,base:string,index:number)=>`${base.split('/')[0]}/o${run.objective_id.replaceAll('-','').slice(0,12)}r${run.base_revision+1}-base-${index}`;
 
 async function assertPlanOwner(db:DB,run:any,planDigest:string){
-  const row=(await db.query(`SELECT p.state,p.fence,p.base_revision,p.output,p.feedback,o.revision,o.mode,g.state goal_state
+  const row=(await db.query(`SELECT p.state,p.fence,p.base_revision,p.output,p.feedback,p.route_generation_id,o.revision,o.mode,g.state goal_state
     FROM planning_runs p JOIN objectives o ON o.id=p.objective_id JOIN goals g ON g.id=o.id WHERE p.id=$1 AND o.id=$2`,
     [run.id,run.objective_id])).rows[0];
   if(!row||row.state!=='running'||row.fence!==run.fence||row.base_revision!==run.base_revision||
     row.revision!==run.base_revision||row.mode!=='execute'||['paused','cancelled','completed'].includes(row.goal_state)||
     preparationHash(row.output)!==planDigest||preparationHash(row.feedback??{})!==preparationHash(run.feedback??{}))throw failure('STALE_PLAN');
   await assertPlanningFeedbackCurrent(db,run);
+  if((row.route_generation_id??null)!==(run.route_generation_id??null))throw failure('OBJECTIVE_MODEL_ROUTE_RUN_STALE');
+  await routedPlanningRequest(db,{...run,...row});
   await assertSourceReplanCurrent(db,run);
   const bases=[...new Set((row.output?.tasks??[]).map((task:any)=>task.baseWorkspace))] as string[];
   await assertPlanningSourcesIdle(db,run,bases.map(base=>run.feedback?.sourceOverrides?.[base]??base));

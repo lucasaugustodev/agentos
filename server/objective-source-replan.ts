@@ -12,6 +12,7 @@ import {accountBridge} from './bridge.js';
 import {readArtifact} from './service.js';
 import {runtimeCandidateDigest} from './operation-progress.js';
 import {preparationHash as hash} from './source-preparation-contract.js';
+import {currentObjectiveRouteGeneration} from './objective-model-route.js';
 
 const digest=z.string().regex(/^[a-f0-9]{64}$/),workspace=z.string().regex(/^agentos\/src[0-9a-f]{16}$/);
 const contribution=z.object({taskId:z.uuid(),runId:z.uuid(),acceptanceId:z.uuid(),
@@ -26,7 +27,8 @@ type Auth={channel:'api-token'|'operator-session'};
 type Inputs=ReturnType<typeof inputProjection>;
 type Source={workspace:string;candidateDigest:string;snapshotDigest:string;sourceGenerationKind:'snapshot'|'unmarked'};
 type Payload={version:1;feedbackId:string;goalId:string;request:Request;requestDigest:string;authChannel:Auth['channel'];
- inputs:Inputs;inputsDigest:string;publishedBaseline:any;source:Source;acceptance:false;finalVerificationRequired:true};
+ inputs:Inputs;inputsDigest:string;publishedBaseline:any;source:Source;acceptance:false;finalVerificationRequired:true;
+ routeGeneration?:{id:string;receiptDigest:string}|null};
 type Receipt={payload:Payload;receiptDigest:string};
 const fail=(code:string)=>new DomainError(code,'O replanejamento exige a publicação e todas as contribuições aceitas exatas, sem execução ou autoridade concorrente.');
 const sha=(v:Buffer)=>createHash('sha256').update(v).digest('hex');
@@ -147,17 +149,19 @@ export async function registerSourceReplanFeedback(goalId:string,raw:unknown,aut
   if((await db.query(`SELECT 1 FROM objective_feedback f WHERE objective_id=$1 AND source_replan IS NOT NULL
     AND NOT EXISTS(SELECT 1 FROM planning_runs p WHERE p.objective_id=f.objective_id AND p.feedback->'feedbackIds' ? f.id::text)`,[goalId])).rowCount)
    throw fail('SOURCE_REPLAN_OWNER_BUSY');
-  return {inputs:await capture(db,goalId,request)};});
+  return {inputs:await capture(db,goalId,request),routeGeneration:await currentObjectiveRouteGeneration(db,goalId)};});
  if(initial.old)return response(initial.old,true);
  const inputs=initial.inputs!;await inspectInputs(inputs);const observed=await observePublication(request);
  return tx(async db=>{await lock(db);const old=await prior(db);if(old)return response(old,true);
   if(!same(await capture(db,goalId,request),inputs))throw fail('SOURCE_REPLAN_CONTRIBUTIONS_CHANGED');
+  if(!same(await currentObjectiveRouteGeneration(db,goalId),initial.routeGeneration))throw fail('SOURCE_REPLAN_ROUTE_CHANGED');
   if(Date.now()-observed.checkedAt>60000)throw fail('SOURCE_REPLAN_OBSERVATION_STALE');
   if((await db.query(`SELECT 1 FROM objective_feedback f WHERE objective_id=$1 AND source_replan IS NOT NULL
     AND NOT EXISTS(SELECT 1 FROM planning_runs p WHERE p.objective_id=f.objective_id AND p.feedback->'feedbackIds' ? f.id::text)`,[goalId])).rowCount)
    throw fail('SOURCE_REPLAN_OWNER_BUSY');
   const feedbackId=randomUUID(),payload:Payload={version:1,feedbackId,goalId,request,requestDigest,authChannel:auth.channel,
-   inputs,inputsDigest:hash(inputs),publishedBaseline:observed.baseline,source:observed.source,acceptance:false,finalVerificationRequired:true};
+   inputs,inputsDigest:hash(inputs),publishedBaseline:observed.baseline,source:observed.source,acceptance:false,finalVerificationRequired:true,
+   routeGeneration:initial.routeGeneration};
   const receipt:Receipt={payload,receiptDigest:hash(payload)};
   await queueFeedback(db,goalId,request.idempotencyKey,request.description,[],{id:feedbackId,sourceReplan:receipt});
   await event(db,'OBJECTIVE_SOURCE_REPLAN_REQUESTED',goalId,{feedbackId,receiptDigest:receipt.receiptDigest,requestDigest,
@@ -173,12 +177,16 @@ export async function sourceReplanForFeedback(db:DB,goalId:string,pending:any[])
  const fresh=[];
  for(const row of rows)if(!(await db.query("SELECT 1 FROM planning_runs WHERE objective_id=$1 AND feedback->'feedbackIds' ? $2",[goalId,row.id])).rowCount)fresh.push(row);
  if(!fresh.length)return undefined;if(fresh.length!==1)throw fail('SOURCE_REPLAN_OWNER_BUSY');
- return verified(db,fresh[0]);
+ const receipt=await verified(db,fresh[0]);
+ if(!same(receipt.payload.routeGeneration??null,await currentObjectiveRouteGeneration(db,goalId)))throw fail('SOURCE_REPLAN_ROUTE_CHANGED');
+ return receipt;
 }
 export async function assertSourceReplanCurrent(db:DB,run:any){
  const ref=run.feedback?.sourceReplan;if(!ref)return;
  const row=(await db.query('SELECT * FROM objective_feedback WHERE id=$1 AND objective_id=$2',[ref.feedbackId,run.objective_id])).rows[0];
  const receipt=await verified(db,row),p=receipt.payload,s=p.request.sourceReplan;
+ if((p.routeGeneration?.id??null)!==(run.route_generation_id??null)||
+   !same(p.routeGeneration??null,await currentObjectiveRouteGeneration(db,run.objective_id)))throw fail('SOURCE_REPLAN_ROUTE_CHANGED');
  if(receipt.receiptDigest!==ref.receiptDigest||!run.feedback.feedbackIds?.includes(row.id)||run.base_revision!==s.expectedRevision||
    run.feedback.sourceOverrides?.[s.baseWorkspace]!==p.source.workspace||
    !same(run.feedback.sourceReplanInputs,p.inputs)||p.inputs.contributors.some(c=>c.artifacts

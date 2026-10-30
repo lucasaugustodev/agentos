@@ -7,6 +7,7 @@ import { installWorkforcePolicy } from './workforce-policy.js';
 import { migrateCycles } from './cycles/store.js';
 import { installTaskInstructions } from './task-instructions.js';
 import { installRuntimeLookupIndexes } from './runtime-lookup-indexes.js';
+import { installObjectiveModelRoutes } from './objective-model-route-schema.js';
 export const pool = new pg.Pool({
   connectionString: config.databaseUrl,
   max: 15,
@@ -174,6 +175,7 @@ INSERT INTO settings VALUES('remote-capacity','{"maxRuns":2,"memoryMiB":3600,"cp
     await installWorkforcePolicy(db);
     await installArtifactRecoveryPolicy(db);
     await migrateCycles(db);
+    await installObjectiveModelRoutes(db);
   });
   await installTaskInstructions(pool);
   await installRuntimeLookupIndexes(pool);

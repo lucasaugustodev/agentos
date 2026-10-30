@@ -13,6 +13,8 @@ import {registerSourceReplanFeedback,assertSourceReplanCurrent,inspectSourceRepl
 import {preparePlanningSources} from '../server/planning-source-preparation.js';
 import {preparationHash as hash} from '../server/source-preparation-contract.js';
 import {planningPreparationFixture} from './fixtures/planning-preparation.js';
+import * as modelPolicy from '../bridge/model-policy.mjs';
+import {objectiveModelRoute,registerObjectiveModelRoute} from '../server/objective-model-route.js';
 
 const sha=(v:string|Buffer)=>createHash('sha256').update(v).digest('hex');
 const auth={channel:'api-token' as const},base='agentos/src'+'1'.repeat(16);
@@ -30,10 +32,10 @@ beforeEach(async()=>{
 afterEach(()=>{vi.restoreAllMocks();config.bridgeHost='';config.remoteExecution=false;});
 afterAll(()=>pool.end());
 
-async function fixture(){
+async function fixture(requestOverrides={}){
  const goalId=randomUUID(),request=objectiveSchema.parse({message:'Preserve three accepted source chains across the published baseline change.',
   project:'agentos',workspaces:[base],mode:'execute',planningStrategy:'incremental',sourceContractVersion:1,
-  requirements:['Preserve every accepted contribution and independently verify it.'],idempotencyKey:goalId});
+  requirements:['Preserve every accepted contribution and independently verify it.'],idempotencyKey:goalId,...requestOverrides});
  const previous=compileDelivery(decision,request),priorPlanning=randomUUID();
  await pool.query("INSERT INTO goals(id,title,description,project,state,idempotency_key) VALUES($1::uuid,'Replan','Fixture','agentos','failed',$1::text)",[goalId]);
  await pool.query("INSERT INTO objectives(id,request,request_hash,mode,status,revision) VALUES($1,$2,$3,'execute','executing',2)",[goalId,JSON.stringify(request),hash(request)]);
@@ -129,6 +131,43 @@ it('pins exactly six current producers in three chains, creates a new plan and U
  expect((await pool.query("SELECT count(*)::int n FROM tasks WHERE goal_id=$1 AND state='accepted'",[f.goalId])).rows[0].n).toBe(9);
  expect((await pool.query('SELECT count(*)::int n FROM acceptances')).rows[0].n).toBe(9);
  await reconcilePlanning();expect((await pool.query('SELECT count(*)::int n FROM planning_runs WHERE objective_id=$1',[f.goalId])).rows[0].n).toBe(2);
+});
+
+it('uses an explicitly migrated planning generation for source replan while preserving all six accepted inputs and original history',async()=>{
+ const f=await fixture({plannerAccountId:'legacy',plannerModel:'glm-5.3-flash',allowedAccounts:['legacy']});
+ const id='agentos-api-00000000-0000-4000-8000-000000000042';
+ const policy={version:2 as const,mode:'exclusive-model' as const,accountId:id,bridgeId:'agentos:api:00000000-0000-4000-8000-000000000042',
+  model:'deepseek-v4-pro-0813' as const,requestLimit:6 as const,sessionLimit:12 as const};
+ const policySpy=vi.spyOn(modelPolicy,'readModelPolicy').mockReturnValue(policy);
+ await pool.query("INSERT INTO settings(id,value) VALUES('model-policy',$1) ON CONFLICT(id) DO UPDATE SET value=EXCLUDED.value",[JSON.stringify(policy)]);
+ await pool.query(`INSERT INTO accounts(id,label,provider,model,models,enabled,bridge_id,connection_status,max_concurrency,allow_unknown)
+  VALUES($1,'Route fixture','qwen',$2,$3,true,$4,'connected',12,true)`,[id,policy.model,JSON.stringify([policy.model]),policy.bridgeId]);
+ const state=await objectiveModelRoute(f.goalId);
+ const {expectedGoalId,expectedRevision,expectedRequestDigest,expectedPolicyDigest,expectedGenerationId}=state;
+ const route=await registerObjectiveModelRoute(f.goalId,{idempotencyKey:randomUUID(),expectedGoalId,expectedRevision,
+  expectedRequestDigest,expectedPolicyDigest,expectedGenerationId,reason:'Operator authorizes the new model route while preserving all source contributions.'},auth);
+ const receipt=await f.register(),queued=await f.plan();
+ expect(queued.route_generation_id).toBe(route.generationId);
+ const saved=(await pool.query('SELECT source_replan FROM objective_feedback WHERE id=$1',[receipt.feedbackId])).rows[0].source_replan;
+ expect(saved.payload.routeGeneration).toEqual({id:route.generationId,receiptDigest:route.receiptDigest});
+ expect(saved.payload.inputs.requestDigest).toBe(expectedRequestDigest);
+ const run=await claimPlanning();expect(run.model).toBe(policy.model);expect(run.request.allowedAccounts).toEqual([id]);
+ expect(run.feedback.sourceReplanInputs.contributors).toHaveLength(6);
+ const plan=compileDelivery(decision,run.request,f.previous,false,run.feedback.reports);
+ run.output=plan;await pool.query('UPDATE planning_runs SET output=$2 WHERE id=$1',[run.id,JSON.stringify(plan)]);
+ policySpy.mockReturnValue(null);
+ await expect(preparePlanningSources(run,plan,new AbortController().signal)).rejects.toMatchObject({code:'OBJECTIVE_MODEL_ROUTE_POLICY_CHANGED'});
+ expect(f.calls.filter(c=>c.method==='worker.prepare')).toHaveLength(0);
+ policySpy.mockReturnValue(policy);
+ const prepared=await preparePlanningSources(run,plan,new AbortController().signal);
+ policySpy.mockReturnValue(null);await expect(applyPlannedResult(run,plan,prepared)).rejects.toMatchObject({code:'OBJECTIVE_MODEL_ROUTE_POLICY_CHANGED'});
+ policySpy.mockReturnValue(policy);await applyPlannedResult(run,plan,prepared);
+ const tasks=(await pool.query('SELECT allowed_accounts FROM tasks WHERE goal_id=$1 AND plan_revision=3',[f.goalId])).rows;
+ expect(tasks.length).toBeGreaterThan(0);expect(tasks.every(t=>hash(t.allowed_accounts)===hash([id]))).toBe(true);
+ expect((await pool.query('SELECT request FROM objectives WHERE id=$1',[f.goalId])).rows[0].request).toEqual(f.request);
+ expect((await pool.query('SELECT instruction_snapshot FROM runs WHERE id=$1',[f.cancelledRun])).rows[0].instruction_snapshot).toEqual(f.frozen);
+ expect((await pool.query('SELECT count(*)::int n FROM acceptances')).rows[0].n).toBe(9);
+ await pool.query("DELETE FROM settings WHERE id='model-policy'");
 });
 
 it.each(['paused','cancelled','wrong-revision','missing-producer','historical-producer','acceptance','literal-lease','planner-owner','publication'] as const)
