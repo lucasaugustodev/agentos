@@ -82,7 +82,7 @@ class ValidatorProvenanceTests(unittest.TestCase):
         for action in ['validate','publish']:
             file = self.directory/(action+'.intent.json')
             self.js(file, {'action':action,'input':self.input,'base':str(self.base),
-                          **({'executor':self.executor_declaration} if hasattr(self,'executor_declaration') else {})})
+                          **({'executor':getattr(self,'publisher_declaration',self.executor_declaration) if action=='publish' else self.executor_declaration} if hasattr(self,'executor_declaration') else {})})
             os.utime(file, (time.time()-20, time.time()-20))
         self.js(self.directory/'validate.receipt.json', self.output)
         self.js(self.directory/'publish.receipt.json', {'ok':True,'output':self.record})
@@ -429,6 +429,78 @@ class ValidatorProvenanceTests(unittest.TestCase):
         self.assertEqual(proof['kind'],'operator_guard_receipts')
         self.assertEqual(before,{item.name:item.read_bytes() for item in destination.iterdir()})
         self.assertTrue(proof['publicationRef']['path'].startswith(str(destination)))
+
+    def mixed_executors(self):
+        first=self.register(self.staged_request())
+        report='{"testResults":[]}'
+        self.output['artifacts'].append({'name':'vitest-results.json','content':report})
+        self.validated.update(executorSha256=p.REVIEWED_SHA,testReportDigest=p.sha(report.encode()),validatedAt=time.time(),
+                              sourceCandidateDigest='a'*64,sourceManifestDigest='b'*64,buildInputManifestDigest='c'*64)
+        self.record.update(self.validated,publishedAt=time.time())
+        self.executor_declaration={'path':str(self.layout.control),'sha256':p.REVIEWED_SHA,
+                                  'sourceCommit':p.REVIEWED_COMMIT,'registration':first}
+        self.save_operator()
+        newer=self.reviewed+b'\n# separately reviewed publisher fixture\n';identity=p.sha(newer);commit='b'*40
+        self.addCleanup(patch.stopall)
+        patch.dict(p.REVIEWED_EXECUTORS,{identity:commit}).start()
+        patch.dict(p.REVIEWED_BUNDLES,{identity:{'sourceCommit':commit,
+          'files':{'agentos-release-action.py':identity,'candidate_origin.py':p.sha(self.helper)}}}).start()
+        folder=self.layout.control.parent/'reviewed-validator-bundles'/identity
+        self.put(folder/'agentos-release-action.py',newer);self.put(folder/'candidate_origin.py',self.helper)
+        request=self.request()|{'executorSha256':identity,'sourceCommit':commit}
+        second=self.register(request)
+        self.publisher_declaration={'path':str(self.layout.control),'sha256':identity,
+                                    'sourceCommit':commit,'registration':second}
+        self.record.update(publicationExecutor=copy.deepcopy(self.publisher_declaration),publishedAt=time.time())
+        self.save_operator()
+
+    def test_distinct_registered_publisher_preserves_original_validation_bytes(self):
+        self.mixed_executors()
+        before=(self.directory/'validate.receipt.json').read_bytes()
+        proof=p.publication(self.layout)
+        self.assertEqual(proof['validationExecutorSha256'],p.REVIEWED_SHA)
+        self.assertNotEqual(self.record['publicationExecutor']['sha256'],p.REVIEWED_SHA)
+        self.assertEqual(before,(self.directory/'validate.receipt.json').read_bytes())
+
+    def test_distinct_publisher_requires_its_exact_captured_active_registration(self):
+        self.mixed_executors()
+        original=copy.deepcopy(self.record['publicationExecutor'])
+        for value in [None,self.executor_declaration,{**original,'sha256':'f'*64},
+                      {**original,'registration':self.executor_declaration['registration']}]:
+            with self.subTest(value=value):
+                self.record['publicationExecutor']=value;self.save_operator()
+                with self.assertRaisesRegex(ValueError,'EXECUTOR_UNBOUND'):p.publication(self.layout)
+
+    def test_unreviewed_publisher_bundle_or_changed_registration_fails(self):
+        self.mixed_executors()
+        identity=self.publisher_declaration['sha256']
+        with patch.dict(p.REVIEWED_BUNDLES,{},clear=True):
+            with self.assertRaises(ValueError):p.publication(self.layout)
+        rid=self.publisher_declaration['registration']['registrationId']
+        path=self.layout.registry/(rid+'.json');raw=path.read_bytes()
+        self.put(path,raw+b' ')
+        with self.assertRaisesRegex(ValueError,'REGISTRATION_CHANGED'):p.publication(self.layout)
+
+    def test_publisher_cannot_precede_its_registration_or_use_superseded_authority(self):
+        self.mixed_executors()
+        self.record['publishedAt']=self.validated['validatedAt'];self.save_operator()
+        with self.assertRaisesRegex(ValueError,'EXECUTOR_UNBOUND'):p.publication(self.layout)
+        self.record['publishedAt']=time.time();self.publisher_declaration=self.executor_declaration
+        self.record['publicationExecutor']=self.executor_declaration;self.save_operator()
+        with self.assertRaisesRegex(ValueError,'EXECUTOR_SUPERSEDED'):p.publication(self.layout)
+
+    def test_publisher_transition_never_rebinds_candidate_source_or_test_evidence(self):
+        self.mixed_executors()
+        original=copy.deepcopy(self.record)
+        for key in ['digest','base','candidate','executorSha256','testReportDigest','validatedAt',
+                    'sourceCandidateDigest','sourceManifestDigest','buildInputManifestDigest']:
+            with self.subTest(key=key):
+                self.record=copy.deepcopy(original);self.record[key]='changed';self.save_operator()
+                with self.assertRaises(ValueError):p.publication(self.layout)
+        self.record=original;self.save_operator()
+        path=self.directory/'publish.intent.json';value=json.loads(path.read_bytes())
+        value['input']['parameters']['workspace']='agentos/ocother';self.js(path,value)
+        with self.assertRaisesRegex(ValueError,'INTENT_CHANGED'):p.publication(self.layout)
 
     def test_validation_root_is_traversable_under_restrictive_umask(self):
         request=self.staged_request();before=self.layout.validation_builds.parent.stat().st_mode
