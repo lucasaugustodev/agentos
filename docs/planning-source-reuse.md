@@ -20,6 +20,12 @@ catalog entry causes an explicit fallback. Readonly writes and changes outside
 the frozen write scope are rejected. All contributor artifact references remain
 in the proof; unchanged QA is not promoted into final requirement acceptance.
 
+An empty or null `writePaths` means no explicit path list, matching the planner's
+existing "files strictly necessary for this assigned module" contract. It does
+not grant new write authority. `readOnlySource:true` independently rejects every
+source change, including when that list is empty. A nonempty list is checked
+against the actual before/after inventory, including deletions.
+
 This selects an existing canonical tree, not a patch composer. Patch bytes must
 match their runtime-owned artifact record and agree with changed/unchanged
 inventory status. The module does not apply patches or independently prove a
@@ -32,6 +38,9 @@ The authority boundary is not implemented here. Before connecting this module:
   total count and explicit truncation flag. Select the latest acceptance using
   `created_at DESC,id DESC`; freeze run/context/instruction and artifact identity.
   Project only needed fields; no full prompts or multi-megabyte input bodies.
+  Proofs must be loaded only from trusted controller state, never model output or
+  an API-supplied proof. `proofDigest` is an integrity fingerprint, not a signature
+  or authentication mechanism; anyone able to replace a proof can recompute it.
 - Obtain marker bytes and protected ownership from a trusted runtime inspector.
   `snapshotDigest` means SHA256 of the actual marker bytes; a child's
   `sourceSnapshotDigest` binds the parent's exact generation. Never synthesize
