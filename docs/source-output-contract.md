@@ -66,3 +66,33 @@ Run the source contract planning suites on the isolated development server.
 Counterexamples cover excluded paths, the kernels/tools scope mismatch, dropped
 integration/QA obligations, report-only declarations, immutable admission, exact
 hash conflicts, legacy history and version adoption only on new planning runs.
+
+## Focused qualification, 2026-10-30
+
+The source-contract implementation was qualified together with the canonical
+candidate acceptance gate on the isolated development server, using only
+`agentos_test`, the legacy-then-current validation lock order, an empty inherited
+environment, the build UID and a private network. No production execution or
+publication was performed.
+
+At commit `7e6ad7e286e8dc0068a59b7727cdbebe31347fbd`, TypeScript compilation passed
+and seven complete suites passed: source-contract-planning,
+source-contract-planning-pg, incremental-planning, validation-target-planning,
+objective-inputs, planning-subtasks and planning-supervision (92 cases). The
+planner suite exposed one stale fixture expectation: preserving the canonical
+candidate now retains both `candidate.json` and `result.json`, rather than one
+artifact. The implementation did not change to accommodate that assertion.
+The report digest for that run is
+`c49681e98c07c0ed57976b0d47820f0bbf1b011e051eccb59b657acf3a45530a`.
+
+After correcting the fixture, commit
+`3e3958ee2910e68c35b118780610c6f8f72cf146` passed TypeScript compilation and all
+22 cases in planner plus source-contract-planning-pg. Thus the eight focused
+suites have passing coverage for 111 distinct cases across the two source-bound
+runs; this is not a claim of one complete CI run or live worker qualification.
+The final Vitest JSON digest is
+`0da376500104648e9a45f619d4bf4675d122f6aca703575a4c5d6fadda4a96c0`;
+the physical-stop receipt digest is
+`fb1eb977a10364c665364608099580074a42e74e5c1d22be88d897bc02c6eac8`.
+The receipt records exit 0, MainPID 0, inactive/dead state and no remaining cgroup.
+Raw execution reports remain outside this sanitized repository.
