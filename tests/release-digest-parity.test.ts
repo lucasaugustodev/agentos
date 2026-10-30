@@ -66,6 +66,12 @@ def fixture_authority():
     authority_checks.append('registered_bundle')
     return FixtureOrigin()
 guard.trusted_origin_module = fixture_authority
+def fixture_publication_executor(origin):
+    assert isinstance(origin, FixtureOrigin)
+    assert (control / 'current').resolve() == before
+    authority_checks.append('publication_executor')
+    return {'fixture': 'registered publisher'}
+guard.publication_executor = fixture_publication_executor
 guard.run = lambda args, **kw: effects.append(args) or ''
 guard.publish_source = lambda *_args: effects.append('publish_source')
 class Healthy:
@@ -134,7 +140,7 @@ it('keeps Python publication and Node adoption digests equal when generated cach
   const result = await python(publisher, baseline);
   expect(result).toMatchObject({ error: null, current: candidate, pending: true });
   expect(result.effects).toEqual([['systemctl', 'restart', 'agentos-api'], 'publish_source']);
-  expect(result.authorityChecks).toEqual(['registered_bundle', 'publication_origin']);
+  expect(result.authorityChecks).toEqual(['registered_bundle', 'publication_origin', 'publication_executor']);
 });
 
 it.each([
