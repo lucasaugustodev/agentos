@@ -16,7 +16,8 @@ const auth={channel:'api-token' as const};
 const digest=(bytes:Buffer)=>createHash('sha256').update(bytes).digest('hex');
 const decision={kind:'delivery',requirementId:'req-1',title:'Corrigir o consumidor de entrada',
   action:'Reproduzir o defeito e corrigir o consumidor preservando os controles originais.',
-  verification:'Reexecutar o contrato original e os negativos na candidata imutável.',agentId:'engineering.backend.node'};
+  verification:'Reexecutar o contrato original e os negativos na candidata imutável.',agentId:'engineering.backend.node',
+  sourceContract:{version:1,required:[],preserve:[],noSourceReason:'Synthetic immutable-input controller fixture records evidence without claiming source implementation.'}};
 beforeAll(async()=>{await migrate();await installObjectiveInputs();});
 beforeEach(async()=>{
   await pool.query('TRUNCATE goals,agents,accounts,memories,events CASCADE');
@@ -30,7 +31,7 @@ afterAll(()=>pool.end());
 
 async function fixture(){
   const input=objectiveSchema.parse({message:'Corrigir dois consumidores independentes e verificar o original.',project:'test',
-    workspaces:['test/base'],mode:'execute',planningStrategy:'incremental',
+    workspaces:['test/base'],mode:'execute',planningStrategy:'incremental',sourceContractVersion:1,
     requirements:['A entrada original precisa ser preservada.','O outro consumidor não deve receber contexto alheio.'],idempotencyKey:randomUUID()});
   const {objectiveId}=await submitObjective(input);
   const run=await claimPlanning(),plan=compileDelivery(decision,input);

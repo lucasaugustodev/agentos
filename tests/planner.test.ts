@@ -1,5 +1,5 @@
 import { beforeAll, beforeEach, afterEach, afterAll, it, expect, vi } from 'vitest';
-import { randomUUID } from 'node:crypto';
+import { createHash,randomUUID } from 'node:crypto';
 import { config } from '../server/config.js';
 import { pool, migrate } from '../server/db.js';
 import { seedRegistry } from '../server/registry.js';
@@ -115,6 +115,9 @@ afterAll(() => pool.end());
 async function finish(id: string, passed = true) {
   const r = await service.startRun(id, 'test');
   await service.writeArtifact(id, r.fence, 'result.json', JSON.stringify({ passed }));
+  // Explicit virtual empty-source runtime fixture, not real worker evidence.
+  const empty=createHash('sha256').update('[]').digest('hex');
+  await service.writeArtifact(id,r.fence,'candidate.json',JSON.stringify({baseDigest:empty,candidateDigest:empty,files:[],baseFiles:[]}));
   await service.completeRun(id, r.fence, 'Verified test fixture');
   return service.validateTask(r.task_id);
 }

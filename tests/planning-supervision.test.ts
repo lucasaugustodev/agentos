@@ -12,7 +12,8 @@ import {planningContractVersion} from '../server/planning-supervision.js';
 vi.mock('../bridge/model-policy.mjs',async original=>({...await original<any>(),readModelPolicy:vi.fn()}));
 const policy={version:1,mode:'glm-only',accountId:'agentos-api-00000000-0000-4000-8000-000000000001',bridgeId:'agentos:api:00000000-0000-4000-8000-000000000001',model:'glm-5.3-flash',requestLimit:6,sessionLimit:12} as const;
 let f:any;
-const item=(id='req-1')=>({kind:'delivery' as const,requirementId:id,title:'Implementar e comprovar entrega',agentId:'engineering.backend.node',action:'Implementar integralmente o requisito preservando os controles e a candidata aceita.',verification:'Executar os controles originais e todos os negativos na mesma candidata acumulada.'});
+const item=(id='req-1')=>({kind:'delivery' as const,requirementId:id,title:'Implementar e comprovar entrega',agentId:'engineering.backend.node',action:'Implementar integralmente o requisito preservando os controles e a candidata aceita.',verification:'Executar os controles originais e todos os negativos na mesma candidata acumulada.',
+ sourceContract:{version:1 as const,required:[],preserve:[],noSourceReason:'Synthetic planner-recovery fixture exercises controller transitions without implementation source.'}});
 beforeAll(()=>migrate());
 beforeEach(async()=>{
  vi.mocked(readModelPolicy).mockReturnValue(policy);
@@ -20,7 +21,7 @@ beforeEach(async()=>{
  await pool.query("UPDATE accounts SET enabled=false");
  await pool.query(`INSERT INTO accounts(id,label,provider,model,models,bridge_id,enabled,allow_unknown,max_concurrency) VALUES($1,'Synthetic GLM','openai',$2,$3,$4,true,true,12)`,[policy.accountId,policy.model,JSON.stringify([policy.model]),policy.bridgeId]);
  config.bridgeHost='fixture';config.remoteExecution=true;
- const input=objectiveSchema.parse({message:'Qualificar a recuperação do planner sem repetir trabalho aceito.',project:'test',workspaces:['test/base'],mode:'execute',requirements:['Corrigir e verificar o primeiro módulo.','Qualificar o segundo módulo integralmente.'],idempotencyKey:randomUUID()});
+ const input=objectiveSchema.parse({message:'Qualificar a recuperação do planner sem repetir trabalho aceito.',project:'test',workspaces:['test/base'],mode:'execute',sourceContractVersion:1,requirements:['Corrigir e verificar o primeiro módulo.','Qualificar o segundo módulo integralmente.'],idempotencyKey:randomUUID()});
  const {objectiveId:goal}=await submitObjective(input),initial=await claimPlanning();
  await applyPlannedResult(initial,compileDelivery(item(),input));
  await acceptAll(goal,1);await reconcilePlanning();const advance=await claimPlanning();

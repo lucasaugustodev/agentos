@@ -333,7 +333,7 @@ it('persists a child before its parent atomically and rejects cyclic or absent p
 
 it('compiles and advances a parallel incremental window with disjoint writePaths, integration and verification',async()=>{
   const input=objectiveSchema.parse({message:'Corrigir três módulos independentes com verificação acumulada.',project:'test',
-    workspaces:['test/base'],mode:'execute',planningStrategy:'incremental',
+    workspaces:['test/base'],mode:'execute',planningStrategy:'incremental',sourceContractVersion:1,
     requirements:['O módulo A deve rejeitar entradas nulas.','O módulo B deve preservar precisão decimal.','O módulo C deve registrar auditoria.'],
     idempotencyKey:randomUUID()});
   const agents=(await pool.query('SELECT * FROM agents')).rows;
@@ -380,6 +380,7 @@ it('rebinds unaccepted agentos objectives to the current published agentos-sourc
     workspaces:[staleSource],
     mode:'execute',
     planningStrategy:'incremental',
+    sourceContractVersion:1,
     requirements:['O módulo A deve rejeitar entradas nulas.','O módulo B deve preservar precisão decimal.'],
     idempotencyKey:randomUUID(),
   });
