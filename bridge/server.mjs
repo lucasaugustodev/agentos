@@ -747,6 +747,8 @@ async function dispatch(method, params, signal, emit) {
     return contextService(method, params);
   if (method === 'worker.workspaces') return workerWorkspaces();
   if (method === 'worker.prepare') return workspaceOperation({ ...params, action: 'prepare' });
+  if (['worker.inspectGeneration','worker.inspectPreparation','worker.inspectSourceBinding'].includes(method))
+    return workspaceInspection(method,params);
   if (method === 'worker.checkComposition') return workspaceOperation({ ...params, action: 'compose', dryRun: true });
   if (method === 'worker.storage') return workspaceOperation({ action: 'capacity' });
   if (method === 'worker.execute') {
@@ -842,4 +844,5 @@ process.stdin.on('end', () => {
   setTimeout(() => process.exit(0), 2000).unref();
 });
 import { workspaceOperation } from './workspaces.mjs';
+import { workspaceInspection } from './workspace-inspection.mjs';
 import { contextService } from './context-services.mjs';

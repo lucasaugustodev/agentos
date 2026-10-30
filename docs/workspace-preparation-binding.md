@@ -54,8 +54,12 @@ rejects normalization that would silently change the requested bytes. Legacy
 preparation still adds these entries.
 
 Before either destination rename, the manager writes and fsyncs a protected
-receipt at `DATA/workspace-preparations/<preparationIdentity>.json`. This reserves
-the identity durably. The marker references the binding and receipt digests.
+receipt at `DATA/workspace-preparations/<preparationIdentity>--<sha256(targetWorkspace)>.json`.
+The single filename reserves both identity and destination, even if a write is
+interrupted. Lookup by either key rejects a different binding before copying;
+there is no gap between two separately written indexes. Unsupported receipt
+layouts are rejected rather than silently migrated. The marker references the
+binding and receipt digests.
 Both marker and receipt are exclusive-create regular files with explicit `0444`
 modes, independent of umask. Baseline directories are private and baseline files
 are also `0444`. The newly copied source remains editable for later work.
@@ -66,6 +70,12 @@ inventory. The source must still match the request when replay is attempted.
 Reusing the UUID for another destination or source is rejected. Reusing the
 destination with another UUID is rejected. An existing modified destination is
 preserved, not reset.
+
+To inspect an already prepared destination after work has begun, use the
+read-only `worker.inspectPreparation` operation described in
+[source-binding-inspection.md](source-binding-inspection.md). It reports changed
+destination bytes without recopying them or requiring the original source to
+remain unchanged. It does not authorize a retry on its own.
 
 ## Receipt schema (version 1)
 

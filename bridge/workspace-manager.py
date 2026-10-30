@@ -225,8 +225,20 @@ def preparation_baseline_matches(baseline,expected):
     if source_hash(sources(baseline))!=expected:
         raise ValueError('PREPARATION_BASELINE_CHANGED')
 
-def replay_bound_preparation(target,baseline,receipt_path,binding):
-    state,_=read_preparation_json(target/'.agentos-snapshot.json',immutable=True)
+def preparation_receipt_path(receipts,binding):
+    # One durable filename reserves both identities, even if its write is
+    # interrupted. Two separately written indexes would have a partial gap.
+    ident=binding['preparationIdentity'];target=digest_key(binding['targetWorkspace'])
+    expected=receipts/(ident+'--'+target+'.json')
+    if next(receipts.glob('????????-????-????-????-????????????.json'),None) is not None:
+        raise ValueError('PREPARATION_RECEIPT_LAYOUT_UNSUPPORTED')
+    for pattern in [ident+'--*.json','*--'+target+'.json']:
+        for existing in receipts.glob(pattern):
+            if existing!=expected: raise ValueError('PREPARATION_BINDING_MISMATCH')
+    return expected
+
+def bound_preparation_metadata(target,baseline,receipt_path,binding):
+    state,marker_digest,marker_raw=read_preparation_json(target/'.agentos-snapshot.json',immutable=True,include_raw=True)
     receipt,_=read_preparation_json(receipt_path,immutable=True)
     body={key:value for key,value in receipt.items() if key!='receiptDigest'}
     expected_keys=set(binding)|{'bindingDigest','observedSourceDigest','sourceSnapshotDigest',
@@ -244,6 +256,11 @@ def replay_bound_preparation(target,baseline,receipt_path,binding):
                                       'bindingDigest':receipt['bindingDigest'],'receiptDigest':receipt['receiptDigest']}}):
         raise ValueError('PREPARATION_BINDING_MISMATCH')
     preparation_baseline_matches(baseline,expected)
+    return state,receipt,marker_digest,marker_raw
+
+def replay_bound_preparation(target,baseline,receipt_path,binding):
+    state,receipt,_,_=bound_preparation_metadata(target,baseline,receipt_path,binding)
+    expected=binding['expectedSourceDigest']
     if source_hash(sources(target))!=expected:
         raise ValueError('PREPARATION_TARGET_CHANGED')
     return {**state,'preparationReceipt':receipt}
@@ -256,9 +273,9 @@ def prepare_bound(params,binding):
     protected_preparation_directory(DATA)
     receipts=protected_preparation_directory(DATA/'workspace-preparations',create=True)
     baselines=protected_preparation_directory(DATA/'workspace-baselines',create=True)
-    receipt_path=receipts/(binding['preparationIdentity']+'.json')
     baseline=baselines/digest_key(target_id)
     with preparation_locks([target_id,source_id,'preparation:'+binding['preparationIdentity']],shared=[source_id]):
+        receipt_path=preparation_receipt_path(receipts,binding)
         if not source.is_dir(): raise ValueError('SOURCE_MISSING')
         preparation_source_matches(source,binding)
         if target.exists():
@@ -415,6 +432,66 @@ def source_binding_marker(marker,workspace_id):
 def source_binding_uuid(value):
     return isinstance(value,str) and re.fullmatch(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}',value) is not None
 
+def generation_projection(workspace_id,marker,marker_digest):
+    return {'workspace':workspace_id,'sourceWorkspace':marker['sourceWorkspace'],'baseDigest':marker['baseDigest'],
+            'snapshotDigest':marker_digest,'sourceSnapshotDigest':marker.get('sourceSnapshotDigest')}
+
+def inspect_generation(params):
+    workspace_id=params['workspace'];target=workspace(workspace_id)
+    protected_preparation_directory(DATA);protected_preparation_directory(target)
+    with preparation_locks([workspace_id]):
+        marker,marker_digest,marker_raw=read_preparation_json(target/'.agentos-snapshot.json',include_raw=True)
+        source_binding_marker(marker,workspace_id)
+        baseline=DATA/'workspace-baselines'/digest_key(workspace_id)
+        preparation_baseline_matches(baseline,marker['baseDigest'])
+        files=sources(target);candidate={'baseDigest':marker['baseDigest'],'candidateDigest':source_hash(files),
+            'files':[{'path':name,'sha256':hashlib.sha256(raw).hexdigest()} for name,raw in sorted(files.items())]}
+        if (read_preparation_json(target/'.agentos-snapshot.json')[1]!=marker_digest
+                or source_hash(sources(target))!=candidate['candidateDigest']):
+            raise ValueError('SOURCE_BINDING_OBSERVATION_CHANGED')
+        preparation_baseline_matches(baseline,marker['baseDigest'])
+        return {'version':1,'workspace':workspace_id,'generation':generation_projection(workspace_id,marker,marker_digest),
+                'markerBase64':base64.b64encode(marker_raw).decode('ascii'),'legacyParentGeneration':'sourceSnapshotDigest' not in marker,
+                'candidate':candidate,'checkedAt':datetime.datetime.now(datetime.timezone.utc).isoformat()}
+
+def inspect_preparation(params):
+    binding=preparation_binding(params)
+    if binding is None: raise ValueError('PREPARATION_BINDING_INVALID')
+    workspace_id=binding['targetWorkspace'];source_id=binding['sourceWorkspace'];target=workspace(workspace_id)
+    if (not isinstance(source_id,str) or not re.fullmatch(r'[a-z0-9_-]+/[a-z0-9_-]+',source_id)
+            or source_id==workspace_id or source_id.split('/')[0]!=workspace_id.split('/')[0]
+            or not target.name.startswith('o') or target.is_symlink()):
+        raise ValueError('INVALID_TARGET')
+    protected_preparation_directory(DATA)
+    protected_preparation_directory(target.parent)
+    with preparation_locks([workspace_id,'preparation:'+binding['preparationIdentity']]):
+        receipts=DATA/'workspace-preparations'
+        if receipts.exists(): protected_preparation_directory(receipts)
+        elif receipts.is_symlink(): raise ValueError('PREPARATION_DIRECTORY_UNPROTECTED')
+        receipt_path=preparation_receipt_path(receipts,binding)
+        baseline=DATA/'workspace-baselines'/digest_key(workspace_id)
+        if baseline.parent.exists() or baseline.parent.is_symlink(): protected_preparation_directory(baseline.parent)
+        present=[path.exists() or path.is_symlink() for path in [target,baseline,receipt_path]]
+        if not any(present):
+            return {'version':1,'exists':False,'confirmed':True,'workspace':workspace_id,
+                    'preparationIdentity':binding['preparationIdentity'],
+                    'checkedAt':datetime.datetime.now(datetime.timezone.utc).isoformat()}
+        if not all(present): raise ValueError('PREPARATION_PARTIAL_STATE')
+        protected_preparation_directory(target)
+        marker,receipt,marker_digest,marker_raw=bound_preparation_metadata(target,baseline,receipt_path,binding)
+        source_binding_marker(marker,workspace_id)
+        files=sources(target);candidate={'baseDigest':marker['baseDigest'],'candidateDigest':source_hash(files),
+            'files':[{'path':name,'sha256':hashlib.sha256(raw).hexdigest()} for name,raw in sorted(files.items())]}
+        repeated=bound_preparation_metadata(target,baseline,receipt_path,binding)
+        if (repeated!=(marker,receipt,marker_digest,marker_raw)
+                or source_hash(sources(target))!=candidate['candidateDigest']):
+            raise ValueError('SOURCE_BINDING_OBSERVATION_CHANGED')
+        return {'version':1,'exists':True,'workspace':workspace_id,'preparationReceipt':receipt,
+                'generation':generation_projection(workspace_id,marker,marker_digest),
+                'markerBase64':base64.b64encode(marker_raw).decode('ascii'),'candidate':candidate,
+                'destinationChanged':candidate['candidateDigest']!=binding['expectedSourceDigest'],
+                'checkedAt':datetime.datetime.now(datetime.timezone.utc).isoformat()}
+
 def inspect_source_binding(params):
     run_id=params['sourceBindingRunId'];workspace_id=params['workspace']
     if not source_binding_uuid(run_id): raise ValueError('SOURCE_BINDING_IDENTITY_INVALID')
@@ -496,6 +573,8 @@ if __name__=='__main__':
             result=compose(params,workspace,locks,sources,source_hash,DATA)
         elif action=='prepare': result=prepare(params)
         elif action=='inspect': result=inspect(params)
+        elif action=='inspect-generation': result=inspect_generation(params)
+        elif action=='inspect-preparation': result=inspect_preparation(params)
         elif action=='capacity': result=storage_capacity.capacity(ROOT,DATA)
         else: raise ValueError('INVALID_ACTION')
         print(json.dumps(result))

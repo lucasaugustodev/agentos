@@ -49,7 +49,7 @@ class BoundPreparationTests(unittest.TestCase):
                        'preparationIdentity':str(uuid.uuid4())}
         self.target = self.workspaces/self.params['workspace']
         self.baseline = self.data/'workspace-baselines'/manager.digest_key(self.params['workspace'])
-        self.receipt = self.data/'workspace-preparations'/(self.params['preparationIdentity']+'.json')
+        self.receipt = self.data/'workspace-preparations'/(self.params['preparationIdentity']+'--'+manager.digest_key(self.params['workspace'])+'.json')
 
     def tearDown(self):
         self.stack.close()
@@ -199,7 +199,7 @@ class BoundPreparationTests(unittest.TestCase):
     def test_destination_cannot_be_rebound_to_another_identity(self):
         manager.prepare(self.params)
         original=(self.target/'.agentos-snapshot.json').read_bytes()
-        self.rejected('PREPARATION_RECEIPT_MISSING',{**self.params,'preparationIdentity':str(uuid.uuid4())})
+        self.rejected('PREPARATION_BINDING_MISMATCH',{**self.params,'preparationIdentity':str(uuid.uuid4())})
         self.assertEqual((self.target/'.agentos-snapshot.json').read_bytes(),original)
 
     def test_modified_destination_refuses_replay_without_resetting_it(self):

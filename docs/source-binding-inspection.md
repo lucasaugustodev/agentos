@@ -97,3 +97,49 @@ locks to exercise sanitization, symlinks, changed fences/context, generation
 replacement, legacy fallback and concurrent mutation. The Node fixture checks
 both physical-stop observations and preserves the existing recovery contract.
 Their Vitest wrapper includes both fixtures in the normal release suite.
+
+## Typed account bridge operations
+
+The same source inspection is available through
+`worker.inspectSourceBinding({runId, workspace})`; it calls the existing physical
+stop verifier directly, with no shell or caller-selected executable. The typed
+controller wrapper is `inspectWorkerSourceBinding` in
+`server/workspace-inspection.ts`.
+
+Two additional read-only operations share the protected reader and workspace
+locks:
+
+- `worker.inspectGeneration({workspace})`, wrapped by
+  `inspectWorkspaceGeneration`, returns version, workspace, generation,
+  markerBase64, legacyParentGeneration, candidate inventory and checkedAt. It
+  requires no run, does not read a policy, and does not follow the parent. It
+  checks the protected baseline and rereads the marker and inventory. It does
+  not claim a physical stop for an unknown run; callers still establish current
+  controller ownership and absence of live actors.
+- `worker.inspectPreparation({workspace, sourceWorkspace, preparationIdentity,
+  expectedSourceDigest, expectedSourceSnapshotDigest})`, wrapped by
+  `inspectWorkspacePreparation`, validates the exact protected receipt, marker
+  and baseline. It returns version, exists=true, workspace, preparationReceipt,
+  markerBase64, generation, candidate inventory, destinationChanged and checkedAt.
+  It never calls prepare, alters the destination, or rereads the original source.
+
+Requests have closed schemas. Typed wrappers also validate reply identity,
+marker bytes/digest, inventory digest, canonical artifact descriptors, receipt
+hashes and freshness. They forward transport or reconciliation errors unchanged;
+they do not retry.
+
+Preparation absence is explicit: `{version:1, exists:false, confirmed:true,
+workspace, preparationIdentity, checkedAt}`. This is returned only while the
+workspace and preparation identity locks are held and the destination, baseline,
+and all receipts matching either identity are absent. A partial receipt,
+conflicting identity, orphan baseline or missing component of an existing
+preparation is an error, never confirmed absence. No automatic migration or
+repair of protected metadata is attempted.
+
+An unchanged clone has `destinationChanged=false`. A modified clone can still
+have a valid initial preparation receipt: inspection reports its current digest
+with `destinationChanged=true`, preserving work. First dispatch must require the
+unchanged clone. A retry additionally needs the owning controller to verify the
+frozen source binding, the previous attempt's admission identity, its confirmed
+stop and current ownership. This operation supplies evidence for that decision;
+it cannot authorize continuation or final acceptance by itself.
