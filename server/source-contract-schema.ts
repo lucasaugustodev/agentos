@@ -29,6 +29,11 @@ export const sourceContractSchema=z.object({version:z.literal(1),
       seen.add(entry.path);
     });
   }
+  for(const entry of contract.required){
+    const preserved=contract.preserve.find(other=>other.path===entry.path);
+    if(preserved&&(preserved.kind!==entry.kind||(preserved.sha256&&entry.sha256&&preserved.sha256!==entry.sha256)))
+      ctx.addIssue({code:'custom',path:['preserve'],message:'Required and preserved exact-path obligations conflict.'});
+  }
 });
 export type SourceContract=z.infer<typeof sourceContractSchema>;
 export type SourceContractEntry=z.infer<typeof sourceContractEntrySchema>;
@@ -41,7 +46,7 @@ export function sourcePathWithin(path:string,scope:string){
 /** Stable ordering only: normalization never fixes aliases or expands scope. */
 export function normalizeSourceContract(raw:unknown):SourceContract {
   const parsed=sourceContractSchema.parse(raw);
-  const ordered=(items:SourceContractEntry[])=>[...items].sort((a,b)=>a.path.localeCompare(b.path)||a.kind.localeCompare(b.kind));
+  const ordered=(items:SourceContractEntry[])=>[...items].sort((a,b)=>Buffer.compare(Buffer.from(a.path),Buffer.from(b.path))||a.kind.localeCompare(b.kind));
   return {...parsed,required:ordered(parsed.required),preserve:ordered(parsed.preserve)};
 }
 

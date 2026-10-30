@@ -28,7 +28,7 @@ const criterion = {
   equals: true,
 };
 function plan() {
-  return planSchema.parse({
+  const fixture=planSchema.parse({
     title: 'Entrega composta',
     summary: 'Duas frentes, integração e verificação independente.',
     requirements: [{ id: 'working', description: 'As duas funções devem passar seus testes.' }],
@@ -78,6 +78,11 @@ function plan() {
       },
     ],
   });
+  // This suite exercises orchestration using result.json, without source files.
+  fixture.sourceContractVersion=1;
+  for(const task of fixture.tasks)task.sourceContract={version:1,required:[],preserve:[],
+    noSourceReason:'Synthetic controller fixture emits only result.json; no implementation source is claimed by this test.'};
+  return fixture;
 }
 function request(extra = {}) {
   return objectiveSchema.parse({

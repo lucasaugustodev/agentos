@@ -21,14 +21,17 @@ beforeEach(async()=>{
 afterEach(()=>{vi.restoreAllMocks();config.remoteExecution=false;});
 afterAll(()=>pool.end());
 
-const request=()=>objectiveSchema.parse({message:'Produzir duas contribuições e validar a candidata certa.',project:'test',
-  workspaces:['test/base'],mode:'execute',planningStrategy:'incremental',requirements:['Preservar os controles ao implementar a transformação.','Publicar o resultado final verificado.'],idempotencyKey:randomUUID()});
+const request=(legacy=false)=>objectiveSchema.parse({message:'Produzir duas contribuições e validar a candidata certa.',project:'test',
+  workspaces:['test/base'],mode:'execute',planningStrategy:'incremental',...(!legacy?{sourceContractVersion:1}:{}),requirements:['Preservar os controles ao implementar a transformação.','Publicar o resultado final verificado.'],idempotencyKey:randomUUID()});
 const delivery=(key:string,dependsOn:string[]=[])=>({kind:'delivery' as const,key,dependsOn,requirementId:'req-1',
   title:'Entregar '+key,action:'Produzir a contribuição delimitada preservando todos os controles existentes.',
   verification:'Executar os controles discriminantes e registrar comandos, resultados e limitações.',
-  agentId:'engineering.backend.node',writePaths:['src/'+key]});
-const validation=(key='check',target='producer',dependsOn:string[]=[])=>({...delivery(key,dependsOn),
-  kind:'validation' as const,validationTargetKey:target,agentId:'qa.integration',writePaths:['evidence/check']});
+  agentId:'engineering.backend.node',writePaths:['src/'+key],sourceContract:{version:1 as const,
+    required:[{path:'src/'+key,kind:'directory' as const}],preserve:[]}});
+const validation=(key='check',target='producer',dependsOn:string[]=[])=>{
+  const {sourceContract,...base}=delivery(key,dependsOn);
+  return {...base,kind:'validation' as const,validationTargetKey:target,agentId:'qa.integration',writePaths:['evidence/check']};
+};
 const compile=(items:unknown[])=>compileDelivery({deliveries:items},request());
 async function persist(items:unknown[]){
   const input=request(),plan=compileDelivery({deliveries:items},input);
@@ -50,7 +53,7 @@ async function accept(taskId:string){
 
 it('requires semantic kind in every new generation while retaining legacy compiled plans',()=>{
   const agents=[{id:'engineering.backend.node',runtime:'harness'},{id:'qa.integration',runtime:'harness'}];
-  const {kind,...legacy}=delivery('producer');
+  const {kind,sourceContract,...legacy}=delivery('producer');
   for(const serial of [false,true]){
     const schema=deliveryDecisionSchema(agents,['req-1'],serial);
     expect(schema.safeParse(legacy).success).toBe(false);
@@ -61,7 +64,7 @@ it('requires semantic kind in every new generation while retaining legacy compil
   expect(schema.safeParse({deliveries:[legacy,validation()]}).success).toBe(false);
   expect(schema.safeParse({deliveries:[delivery('producer'),validation()]}).success).toBe(true);
   expect(schema.safeParse(validation()).success).toBe(false);
-  const stored=compileDelivery(legacy,request());
+  const stored=compileDelivery(legacy,request(true));
   expect(stored.tasks.map(task=>task.stage)).toEqual(['work','verify']);
   expect(planSchema.parse(stored)).toEqual(stored);
 });
@@ -69,7 +72,8 @@ it('requires semantic kind in every new generation while retaining legacy compil
 it('counterexample: an untyped baseline QA is no longer generated as parallel writable work',async()=>{
   const {kind:ignored,...producer}=delivery('producer');
   const {kind:ignoredAgain,validationTargetKey:ignoredTarget,...oldCheck}=validation();
-  const legacy=compile([producer,{...oldCheck,agentId:'qa.acceptance'}]);
+  const legacy=compile([producer,{...oldCheck,agentId:'qa.acceptance',sourceContract:{version:1,required:[],preserve:[],
+    noSourceReason:'Historical untyped diagnostic fixture records observations without source implementation.'}}]);
   expect(legacy.tasks.find(task=>task.key==='deliver-2')).toMatchObject({stage:'work',dependencies:[]});
   expect(legacy.tasks.find(task=>task.key==='deliver-2')?.sourceTask).toBeUndefined();
   const {tasks}=await persist([delivery('producer'),validation()]);
@@ -142,7 +146,8 @@ it('rejects absent, unknown, validation targets, cycles, mismatched requirements
 });
 
 it('allows research products without requiring source changes or granting validation writes',async()=>{
-  const {plan}=await persist([{...delivery('producer'),writePaths:undefined}, {...validation(),writePaths:['evidence','data']}]);
+  const {plan}=await persist([{...delivery('producer'),writePaths:undefined,sourceContract:{version:1,required:[],preserve:[],
+    noSourceReason:'This research task publishes analytical evidence and does not promise implementation source.'}}, {...validation(),writePaths:['evidence','data']}]);
   expect(plan.tasks.find(task=>task.stage==='work')?.writePaths).toEqual([]);
   expect(plan.tasks.find(task=>task.key==='integrate')?.writePaths).toEqual([]);
   expect(plan.tasks.find(task=>task.key==='validate-2')?.writePaths).toEqual(['evidence','data']);

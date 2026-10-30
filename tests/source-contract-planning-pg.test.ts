@@ -38,6 +38,7 @@ it('activates new planning without changing an existing objective request and fr
   expect(work.execution).toMatchObject({sourceContract,writePaths:['kernels/fused.py']});
   expect(work.description).toContain('code placed there cannot satisfy a required source output');
   expect(work.description).not.toContain('PostgreSQL e somente pelo request_validation');
+  config.remoteExecution=true;config.bridgeHost='synthetic-source-contract-bridge';
   const runs=await schedule();expect(runs).toHaveLength(1);
   const admitted=(await pool.query('SELECT instruction_snapshot FROM runs WHERE id=$1',[runs[0]])).rows[0].instruction_snapshot;
   expect(admitted.task.execution.sourceContract).toEqual(sourceContract);

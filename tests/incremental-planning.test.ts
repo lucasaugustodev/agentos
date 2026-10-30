@@ -10,9 +10,10 @@ import { submitObjective,feedbackObjective,claimPlanning,applyPlannedResult,reco
 import { refreshGoal } from '../server/service.js';
 
 const request = () => objectiveSchema.parse({message:'Corrigir dois defeitos independentes e verificar a candidata acumulada.',project:'test',
-  workspaces:['test/base'],mode:'execute',planningStrategy:'incremental',requirements:['O endpoint deve persistir a alteração correta.','A interface deve exibir o progresso correto.'],idempotencyKey:randomUUID()});
+  workspaces:['test/base'],mode:'execute',planningStrategy:'incremental',sourceContractVersion:1,requirements:['O endpoint deve persistir a alteração correta.','A interface deve exibir o progresso correto.'],idempotencyKey:randomUUID()});
 const decision = (requirementId='req-1') => ({kind:'delivery' as const,requirementId,title:'Corrigir persistência',action:'Reproduzir a falha de persistência e corrigir sua causa com teste discriminante.',
-  verification:'Executar regressão que falha na base e passa na candidata, preservando os demais controles.',agentId:'engineering.backend.node'});
+  verification:'Executar regressão que falha na base e passa na candidata, preservando os demais controles.',agentId:'engineering.backend.node',
+  sourceContract:{version:1 as const,required:[],preserve:[],noSourceReason:'Synthetic transition fixture emits diagnostic evidence without claiming a real source implementation.'}});
 beforeAll(()=>migrate());
 beforeEach(async()=>{
   await pool.query('TRUNCATE goals,agents,accounts,memories,events CASCADE');
