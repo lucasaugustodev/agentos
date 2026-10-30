@@ -98,6 +98,20 @@ async function fixture(requestOverrides={}){
  return {goalId,request,previous,body,producers,refs,add,cancelledTask,cancelledRun,frozen,baseline,publishedWorkspace,publicationSpy,bridgeSpy,calls,register,plan};
 }
 
+it('records source replan from protected operator receipts and preserves all accepted contributions and old attempts',async()=>{
+ const f=await fixture();
+ f.baseline.publicationProofRef='/var/lib/agentos-operator-releases/release-fixture/publish.receipt.json';
+ f.baseline.validationProofRef='/var/lib/agentos-operator-releases/release-fixture/validate.receipt.json';
+ const receipt=await f.register(),queued=await f.plan();
+ const saved=(await pool.query('SELECT source_replan FROM objective_feedback WHERE id=$1',[receipt.feedbackId])).rows[0].source_replan;
+ expect(saved.payload.publishedBaseline).toEqual(f.baseline);
+ expect(saved.payload.inputs.contributors).toHaveLength(6);
+ expect(queued.feedback.sourceReplan.receiptDigest).toBe(receipt.receiptDigest);
+ expect((await pool.query('SELECT count(*)::int n FROM acceptances')).rows[0].n).toBe(9);
+ expect((await pool.query('SELECT instruction_snapshot FROM runs WHERE id=$1',[f.cancelledRun])).rows[0].instruction_snapshot).toEqual(f.frozen);
+ expect((await f.register()).duplicate).toBe(true);
+});
+
 it('records one immutable feedback under concurrent replay and retains the receipt after revision/pause/publication changes',async()=>{
  const f=await fixture();const [a,b]=await Promise.all([f.register(),f.register()]);
  expect(a.feedbackId).toBe(b.feedbackId);expect([a.duplicate,b.duplicate].sort()).toEqual([false,true]);

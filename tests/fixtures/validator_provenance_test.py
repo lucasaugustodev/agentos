@@ -430,6 +430,20 @@ class ValidatorProvenanceTests(unittest.TestCase):
         self.assertEqual(before,{item.name:item.read_bytes() for item in destination.iterdir()})
         self.assertTrue(proof['publicationRef']['path'].startswith(str(destination)))
 
+    def test_protected_operator_root_never_admits_symlink_receipts_or_ancestors(self):
+        destination=self.layout.operator_records/'preserved'
+        shutil.copytree(self.directory,destination,copy_function=shutil.copy2)
+        self.assertTrue(self.directory.resolve().is_relative_to(self.root));shutil.rmtree(self.directory)
+        self.assertEqual(p.publication(self.layout)['kind'],'operator_guard_receipts')
+        receipt=destination/'validate.receipt.json';saved=destination/'saved-validation.json'
+        receipt.rename(saved);receipt.symlink_to(saved)
+        with self.assertRaisesRegex(ValueError,'UNPROTECTED'):p.publication(self.layout)
+        receipt.unlink();saved.rename(receipt)
+        moved=self.root/'outside-operator';destination.rename(moved)
+        destination.symlink_to(moved,target_is_directory=True)
+        with self.assertRaisesRegex(ValueError,'UNPROTECTED'):p.read(destination/'publish.receipt.json')
+        with self.assertRaisesRegex(ValueError,'PUBLISHED_SOURCE_MANIFEST_UNAVAILABLE'):p.publication(self.layout)
+
     def mixed_executors(self):
         first=self.register(self.staged_request())
         report='{"testResults":[]}'

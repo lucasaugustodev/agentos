@@ -39,13 +39,25 @@ export async function inspectPublishedBaseline() {
   });
 }
 
+function publishedProofReferences(publication: unknown, validation: unknown) {
+  if (typeof publication !== 'string' || typeof validation !== 'string') return false;
+  // These are references from inspect_baseline, never caller-selected files.
+  // The broker verifies protected ancestors/no symlinks, registered receipts,
+  // executor identity and bytes before returning them. This path check retains
+  // that boundary while accepting the canonical operator receipt layout.
+  const legacy = /^\/var\/lib\/agentos-build\/(?:[A-Za-z0-9_-][A-Za-z0-9_.-]*\/)*[A-Za-z0-9_-][A-Za-z0-9_.-]*\.json$/;
+  if (legacy.test(publication) && legacy.test(validation)) return true;
+  const operator = /^\/var\/lib\/agentos-operator-releases\/([A-Za-z0-9_-]+)\/publish\.receipt\.json$/.exec(publication);
+  return operator !== null && validation === `/var/lib/agentos-operator-releases/${operator[1]}/validate.receipt.json`;
+}
+
 /** Shared validation of the protected publication broker's response. */
 export function validatePublishedBaseline(value:any){
   const b=value?.baseline;
   if(!b||b.version!==1||!/^\/opt\/agentos\/releases\/managed-[0-9a-f-]{36}$/.test(b.release??'')||
     !/^[a-f0-9]{64}$/.test(b.releaseDigest??'')||!/^[a-f0-9]{64}$/.test(b.sourceManifestDigest??'')||
     b.sourceWorkspace!=='agentos/src'+b.releaseDigest.slice(0,16)||
-    !/^\/var\/lib\/agentos-build\//.test(b.publicationProofRef??'')||!/^\/var\/lib\/agentos-build\//.test(b.validationProofRef??'')||
+    !publishedProofReferences(b.publicationProofRef,b.validationProofRef)||
     !/^[a-f0-9]{64}$/.test(b.publicationProofDigest??'')||!/^[a-f0-9]{64}$/.test(b.validationProofDigest??'')||
     !/^\/var\/lib\/agentos\/releases\//.test(b.registeredReceiptRef??'')||
     !/^[a-f0-9]{64}$/.test(b.registeredReceiptDigest??'')||!/^[a-f0-9]{64}$/.test(b.registeredActionDigest??'')||
