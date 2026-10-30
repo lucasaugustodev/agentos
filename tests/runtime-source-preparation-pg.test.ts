@@ -68,10 +68,13 @@ async function fixture(prior=0,knownNotStarted=false,inputBytes=0){
     [taskId,goalId,JSON.stringify(execution),JSON.stringify(resources),prior+1]);
   const previous:any[]=[];
   for(let attempt=1;attempt<=prior;attempt++){
-    const id=randomUUID(),fence=randomUUID();
+    const id=randomUUID(),fence=randomUUID(),contextId=randomUUID();
     await pool.query("INSERT INTO runs(id,task_id,attempt,state,fence,runtime,agent_version,worker_id) VALUES($1,$2,$3,'failed',$4,'harness',1,'fixture-worker')",[id,taskId,attempt,fence]);
+    await pool.query("INSERT INTO contexts(id,run_id,manifest,content) VALUES($1,$2,$3,'Fixture')",[contextId,id,
+      JSON.stringify({runIdentity:{runId:id,runFence:fence,goalId,taskId}})]);
+    await pool.query('UPDATE runs SET context_id=$2 WHERE id=$1',[id,contextId]);
     if(knownNotStarted)await pool.query("INSERT INTO events(kind,entity_id,payload) VALUES('HARNESS_NOT_STARTED',$1,$2)",[taskId,JSON.stringify({runId:id,confirmed:true})]);
-    previous.push({id,fence});
+    previous.push({id,fence,contextId});
   }
   const runId=randomUUID(),runFence=randomUUID(),contextId=randomUUID();
   await pool.query("INSERT INTO runs(id,task_id,attempt,state,fence,runtime,agent_version,worker_id) VALUES($1,$2,$3,'running',$4,'harness',1,'fixture-worker')",[runId,taskId,prior+1,runFence]);
@@ -86,14 +89,23 @@ async function fixture(prior=0,knownNotStarted=false,inputBytes=0){
     state:knownNotStarted?'not_started':{state:'failed'},process:{unit:'agentos-run-'+previous.at(-1)?.id,
       stopped:true,mainPid:0,populated:false,activeState:'inactive'}});
   const inspectStop=vi.spyOn(continuation,'inspectStopped').mockImplementation(async()=>stop());
+  const admission=(run=previous.at(-1),changed=prior>0&&!knownNotStarted)=>{
+    const checked=inspection(request,changed);
+    return {...checked,exists:undefined,runId:run.id,checkedAt:new Date(Date.now()).toISOString(),
+      process:{unit:'agentos-run-'+run.id,stopped:true,mainPid:0,populated:false,activeState:'inactive'},
+      state:{runId:run.id,workspace:request.workspace,runtime:'harness',runFence:run.fence,stopped:true,state:'failed'},
+      admission:{authority:'runtime_operation_policy',goalId,taskId,runId:run.id,runFence:run.fence,
+        contextVersion:run.contextId,workspace:'/workspace',sourceSnapshotDigest:checked.generation.snapshotDigest,policyDigest:sha('protected policy')}};
+  };
   const missing=()=>({version:1,exists:false,confirmed:true,workspace:request.workspace,preparationIdentity:request.preparationIdentity,checkedAt:Date.now()});
   const rpc=vi.spyOn(accountBridge,'request').mockImplementation(async method=>{
     if(method==='worker.inspectPreparation')return inspection(request,prior>0&&!knownNotStarted);
+    if(method==='worker.inspectRetrySourceBinding')return admission();
     if(method==='worker.prepare')return {prepared:true};
     if(method==='worker.execute')return {summary:'Worker result',artifacts:[],evidence:{stopped:true}};
     throw Error('UNEXPECTED_RPC');
   });
-  return {input,request,intent,intentKey,rpc,inspectStop,previous,stop,missing,goalId,taskId,runId,planningRunId};
+  return {input,request,intent,intentKey,rpc,inspectStop,previous,stop,admission,missing,goalId,taskId,runId,planningRunId};
 }
 
 it('keeps legacy preparation entirely outside the new database and RPC path',async()=>{
@@ -133,7 +145,7 @@ it('retains a modified retry candidate after physical stop without ever calling 
   const f=await fixture(2);expect(await prepareBoundRuntimeWorkspace(f.input)).toBe(true);
   await assertBoundRuntimePreparationCurrent(f.input);
   expect(f.inspectStop).toHaveBeenCalledWith(f.previous[1].id,false);
-  expect(f.rpc.mock.calls.map(x=>x[0])).toEqual(['worker.inspectPreparation']);
+  expect(f.rpc.mock.calls.map(x=>x[0])).toEqual(['worker.inspectPreparation','worker.inspectRetrySourceBinding']);
 });
 
 it('permits missing retry creation only when every prior attempt has confirmed non-start and the predecessor is physically absent',async()=>{
@@ -141,6 +153,47 @@ it('permits missing retry creation only when every prior attempt has confirmed n
   expect(await prepareBoundRuntimeWorkspace(f.input)).toBe(true);
   expect(f.rpc.mock.calls.filter(x=>x[0]==='worker.prepare')).toHaveLength(1);
   expect(f.rpc.mock.calls[1][1]).toEqual(f.request);
+});
+
+it.each(['goalId','taskId','runId','runFence','contextVersion','sourceSnapshotDigest','missing-policy'])(
+  'rejects changed %s in the protected prior admission rather than trusting a preserved clone alone',async field=>{
+    const f=await fixture(1),value=f.admission();
+    if(field==='missing-policy')delete (value as any).admission;
+    else (value.admission as any)[field]=field==='sourceSnapshotDigest'?sha('another marker'):randomUUID();
+    f.rpc.mockImplementation(async method=>method==='worker.inspectPreparation'?inspection(f.request,true):value);
+    await expect(prepareBoundRuntimeWorkspace(f.input)).rejects.toMatchObject({code:'SOURCE_PREPARATION_RETRY_ADMISSION_INVALID'});
+    expect(f.rpc.mock.calls.some(x=>x[0]==='worker.prepare')).toBe(false);
+  },
+);
+
+it('checks the last real executor policy when a later failed preflight never started',async()=>{
+  const f=await fixture(2);
+  await pool.query("INSERT INTO events(kind,entity_id,payload) VALUES('HARNESS_NOT_STARTED',$1,$2)",
+    [f.taskId,JSON.stringify({runId:f.previous[1].id,confirmed:true})]);
+  f.inspectStop.mockResolvedValue({...f.stop(),state:'not_started'});
+  f.rpc.mockImplementation(async(method,params:any)=>{
+    if(method==='worker.inspectPreparation')return inspection(f.request,true);
+    expect(method).toBe('worker.inspectRetrySourceBinding');expect(params.runId).toBe(f.previous[0].id);
+    return f.admission(f.previous[0],true);
+  });
+  expect(await prepareBoundRuntimeWorkspace(f.input)).toBe(true);
+  await assertBoundRuntimePreparationCurrent(f.input);
+  expect(f.rpc.mock.calls.some(x=>x[0]==='worker.prepare')).toBe(false);
+});
+
+it('requires an unchanged existing clone when all prior attempts are proven not started',async()=>{
+  const f=await fixture(1,true);
+  expect(await prepareBoundRuntimeWorkspace(f.input)).toBe(true);
+  expect(f.rpc.mock.calls.map(x=>x[0])).toEqual(['worker.inspectPreparation']);
+  f.rpc.mockResolvedValueOnce(inspection(f.request,true));
+  await expect(prepareBoundRuntimeWorkspace(f.input)).rejects.toMatchObject({code:'SOURCE_PREPARATION_PROOF_INVALID'});
+  expect(f.rpc.mock.calls.some(x=>x[0]==='worker.prepare')).toBe(false);
+});
+
+it('does not substitute an ordinary stopped flag for confirmed physical non-start',async()=>{
+  const f=await fixture(1,true);f.inspectStop.mockResolvedValue({...f.stop(),state:{state:'failed'}});
+  await expect(prepareBoundRuntimeWorkspace(f.input)).rejects.toMatchObject({code:'SOURCE_PREPARATION_NONSTART_UNCONFIRMED'});
+  expect(f.rpc).not.toHaveBeenCalled();
 });
 
 it.each(['missing','partial','changed-first','unknown-absence'])(
@@ -218,17 +271,17 @@ it('refreshes stale observations after a slow preflight without a new clone and 
   vi.spyOn(Date,'now').mockImplementation(()=>current);
   f.inspectStop.mockImplementation(async()=>({...f.stop(),checkedAt:new Date(current).toISOString()}));
   f.rpc.mockImplementation(async method=>{
-    expect(method).toBe('worker.inspectPreparation');
+    expect(['worker.inspectPreparation','worker.inspectRetrySourceBinding']).toContain(method);
     const client=await pool.connect();
     try{
       const acquired=(await client.query('SELECT pg_try_advisory_lock(4280001) acquired')).rows[0].acquired;
       expect(acquired).toBe(true);if(acquired)await client.query('SELECT pg_advisory_unlock(4280001)');
     }finally{client.release();}
-    return inspection(f.request,true);
+    return method==='worker.inspectPreparation'?inspection(f.request,true):f.admission();
   });
   await prepareBoundRuntimeWorkspace(f.input);current+=61000;
   await assertBoundRuntimePreparationCurrent(f.input);
-  expect(f.rpc).toHaveBeenCalledTimes(2);expect(f.inspectStop).toHaveBeenCalledTimes(2);
+  expect(f.rpc).toHaveBeenCalledTimes(4);expect(f.inspectStop).toHaveBeenCalledTimes(2);
 });
 
 it('uses the bound preparation path through executeRuntime and preserves the stopped result contract',async()=>{

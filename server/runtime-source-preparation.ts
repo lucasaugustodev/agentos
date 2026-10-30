@@ -19,7 +19,7 @@ const same=(a:unknown,b:unknown)=>preparationHash(a)===preparationHash(b);
 const control=(e:any)=>Object.fromEntries(['kind','workspace','sourceWorkspace','baseWorkspace','sourcePreparation','sourceReuse'].map(k=>[k,e?.[k]??null]));
 const sqlControl=(e:string)=>`jsonb_build_object(${['kind','workspace','sourceWorkspace','baseWorkspace','sourcePreparation','sourceReuse'].map(k=>`'${k}',${e}->'${k}'`).join(',')})`;
 type Captured={fingerprint:string;previous:any[];request:SourcePreparationRequest};
-type Prepared={capture:Captured;verified:VerifiedSourcePreparation;stop:any|null;requireUnchanged:boolean};
+type Prepared={capture:Captured;verified:VerifiedSourcePreparation;stop:any|null;admission:any|null;requireUnchanged:boolean};
 const prepared=new WeakMap<RuntimeInput,Prepared>();
 
 /** One MVCC observation, projected to identity/contract metadata only. Large
@@ -42,7 +42,7 @@ async function capture(db:DB,input:RuntimeInput,request:SourcePreparationRequest
     (SELECT count(*)::int FROM runs WHERE task_id=t.id AND attempt<r.attempt) prior_count,
     (SELECT max(attempt) FROM runs WHERE task_id=t.id) latest_attempt,
     (SELECT jsonb_agg(jsonb_build_object('id',p.id,'task_id',p.task_id,'attempt',p.attempt,'fence',p.fence,
-      'state',p.state,'context_id',p.context_id,'checkpoint',jsonb_build_object('kind',p.checkpoint->'kind','sourceRunId',p.checkpoint->'sourceRunId'),
+      'state',p.state,'runtime',p.runtime,'context_id',p.context_id,'checkpoint',jsonb_build_object('kind',p.checkpoint->'kind','sourceRunId',p.checkpoint->'sourceRunId'),
       'instruction_snapshot',jsonb_build_object('schema',p.instruction_snapshot->'schema','task',jsonb_build_object(
         'id',p.instruction_snapshot#>'{task,id}','goal_id',p.instruction_snapshot#>'{task,goal_id}',
         'plan_revision',p.instruction_snapshot#>'{task,plan_revision}','execution',${sqlControl("(p.instruction_snapshot#>'{task,execution}')")})),
@@ -50,7 +50,7 @@ async function capture(db:DB,input:RuntimeInput,request:SourcePreparationRequest
         AND e.payload->>'runId'=p.id::text AND e.payload->>'confirmed'='true')
         AND NOT EXISTS(SELECT 1 FROM events e WHERE e.entity_id=t.id::text AND e.payload->>'runId'=p.id::text
           AND e.kind IN('HARNESS_STARTED','RUNTIME_STARTED','MODEL_REQUEST','MODEL_RESPONSE','TOOL_CALL','TOOL_RESULT','HARNESS_TOOL_EVENT')))
-      ORDER BY p.attempt DESC) FROM (SELECT id,task_id,attempt,fence,state,context_id,checkpoint,instruction_snapshot
+      ORDER BY p.attempt DESC) FROM (SELECT id,task_id,attempt,fence,state,runtime,context_id,checkpoint,instruction_snapshot
         FROM runs WHERE task_id=t.id AND attempt<r.attempt ORDER BY attempt DESC LIMIT 65) p) previous,
     (SELECT jsonb_agg(jsonb_build_object('key',s.id,'version',s.value->'version','state',s.value->'state',
       'planningRunId',s.value->'planningRunId','ownerFence',s.value->'ownerFence','goalId',s.value->'goalId','baseRevision',s.value->'baseRevision',
@@ -111,7 +111,7 @@ async function capture(db:DB,input:RuntimeInput,request:SourcePreparationRequest
   requireProof(row.prior_count<=64&&previous.length===row.prior_count&&row.prior_count===row.attempt-1,'SOURCE_PREPARATION_HISTORY_INCOMPLETE');
   for(let n=0;n<previous.length;n++){
     const p=previous[n],frozen=p.instruction_snapshot;
-    requireProof(p.task_id===input.task.id&&p.attempt===row.attempt-n-1&&terminal.has(p.state)&&frozen?.schema===1&&
+    requireProof(p.task_id===input.task.id&&p.attempt===row.attempt-n-1&&terminal.has(p.state)&&p.runtime==='harness'&&frozen?.schema===1&&
       frozen.task.id===input.task.id&&frozen.task.goal_id===input.task.goal_id&&frozen.task.plan_revision===row.plan_revision&&
       same(frozen.task.execution,row.frozen_execution),'SOURCE_PREPARATION_RETRY_BINDING_CHANGED');
   }
@@ -133,14 +133,39 @@ async function stopped(input:RuntimeInput,current:Captured){
   assertStopped(proof,previous,input.task);
   return proof;
 }
+async function retryAdmission(input:RuntimeInput,current:Captured,verified:VerifiedSourcePreparation){
+  // Later failed preflights may have no policy of their own. The last actual
+  // executor still owns the preserved edits; inspect that exact run, never an
+  // arbitrary historical receipt or the new attempt's not-started observation.
+  const previous=current.previous.find(p=>!p.known_not_started);if(!previous)return null;
+  const value=await accountBridge.request('worker.inspectRetrySourceBinding',
+    {runId:previous.id,workspace:current.request.workspace},{signal:input.signal,timeout:30000});
+  assertStopped(value,previous,input.task);
+  const a=value?.admission,g=value?.generation,s=value?.state,r=current.request;
+  requireProof(value.version===1&&value.workspace===r.workspace&&value.runId===previous.id&&
+    a?.authority==='runtime_operation_policy'&&a.goalId===input.task.goal_id&&a.taskId===input.task.id&&
+    a.runId===previous.id&&a.runFence===previous.fence&&a.contextVersion===previous.context_id&&uuid.safeParse(a.contextVersion).success&&
+    a.workspace==='/workspace'&&sha.safeParse(a.policyDigest).success&&a.sourceSnapshotDigest===verified.targetSnapshotDigest&&
+    g?.workspace===r.workspace&&g.sourceWorkspace===r.sourceWorkspace&&g.baseDigest===r.expectedSourceDigest&&
+    g.snapshotDigest===verified.targetSnapshotDigest&&g.sourceSnapshotDigest===r.expectedSourceSnapshotDigest&&
+    s?.runId===previous.id&&s.workspace===r.workspace&&s.runtime==='harness'&&s.runFence===previous.fence&&s.stopped===true&&
+    ['completed','failed','cancelled'].includes(s.state)&&fresh(value.checkedAt)&&
+    value.candidate?.baseDigest===r.expectedSourceDigest&&value.candidate?.candidateDigest===verified.currentCandidateDigest,
+    'SOURCE_PREPARATION_RETRY_ADMISSION_INVALID');
+  // Keep only identity and physical observation for the SQL-only recapture.
+  return {runId:value.runId,workspace:value.workspace,process:value.process,checkedAt:value.checkedAt,
+    policyDigest:a.policyDigest,sourceSnapshotDigest:a.sourceSnapshotDigest};
+}
 async function recapture(input:RuntimeInput,state:Prepared){
   if(input.signal.aborted)throw failure('CANCELLED');
   await tx(async db=>{
     await lock(db);
     const current=await capture(db,input,state.capture.request);
     requireProof(current.fingerprint===state.capture.fingerprint);
-    requireProof(fresh(state.verified.checkedAt)&&(!state.stop||fresh(state.stop.checkedAt)),'SOURCE_PREPARATION_INSPECTION_STALE');
+    requireProof(fresh(state.verified.checkedAt)&&(!state.stop||fresh(state.stop.checkedAt))&&
+      (!state.admission||fresh(state.admission.checkedAt)),'SOURCE_PREPARATION_INSPECTION_STALE');
     if(state.stop)assertStopped(state.stop,current.previous[0],input.task);
+    if(state.admission)assertStopped(state.admission,current.previous.find(p=>p.id===state.admission.runId),input.task);
   });
 }
 
@@ -159,18 +184,22 @@ export async function prepareBoundRuntimeWorkspace(input:RuntimeInput):Promise<b
   const request=parsed.data!;
   requireProof(request.workspace===input.task.execution.workspace&&request.sourceWorkspace===input.task.execution.sourceWorkspace);
   const captured=await capture(pool,input,request),stop=await stopped(input,captured);
-  let inspection=await inspect(request,input),requireUnchanged=captured.previous.length===0;
+  const neverStarted=captured.previous.length>0&&captured.previous.every(p=>p.known_not_started===true)&&
+    (stop?.state==='not_started'||stop?.notStarted===true);
+  if(captured.previous.length&&captured.previous.every(p=>p.known_not_started===true))
+    requireProof(neverStarted,'SOURCE_PREPARATION_NONSTART_UNCONFIRMED');
+  let inspection=await inspect(request,input),requireUnchanged=captured.previous.length===0||neverStarted;
   if(absent(request,inspection)){
     // A disappeared modified clone must not erase a prior attempt's effects.
     // Only fully evidenced non-start histories may create the original UUID.
-    requireProof(!captured.previous.length||(captured.previous.every(p=>p.known_not_started===true)&&
-      (stop?.state==='not_started'||stop?.notStarted===true)),'SOURCE_PREPARATION_RETRY_SOURCE_MISSING');
+    requireProof(!captured.previous.length||neverStarted,'SOURCE_PREPARATION_RETRY_SOURCE_MISSING');
     requireUnchanged=true;
     const current=await capture(pool,input,request);requireProof(current.fingerprint===captured.fingerprint);
     await accountBridge.request('worker.prepare',request,{signal:input.signal,timeout:180000});
     inspection=await inspect(request,input);
   }
-  const state:Prepared={capture:captured,verified:verifySourcePreparation(request,inspection,{requireUnchanged}),stop,requireUnchanged};
+  const verified=verifySourcePreparation(request,inspection,{requireUnchanged});
+  const state:Prepared={capture:captured,verified,stop,requireUnchanged,admission:await retryAdmission(input,captured,verified)};
   // Preparation can be long; refresh the predecessor's physical proof outside
   // the admission transaction instead of aging into a permanent retry loop.
   if(state.stop&&!fresh(state.stop.checkedAt))state.stop=await stopped(input,captured);
@@ -184,10 +213,12 @@ export async function prepareBoundRuntimeWorkspace(input:RuntimeInput):Promise<b
 export async function assertBoundRuntimePreparationCurrent(input:RuntimeInput):Promise<void>{
   if(!Object.hasOwn(input.task.execution??{},'sourcePreparation'))return;
   const state=prepared.get(input);requireProof(state,'SOURCE_PREPARATION_NOT_VERIFIED');
-  if(!fresh(state!.verified.checkedAt)||(state!.stop&&!fresh(state!.stop.checkedAt))){
+  if(!fresh(state!.verified.checkedAt)||(state!.stop&&!fresh(state!.stop.checkedAt))||
+    (state!.admission&&!fresh(state!.admission.checkedAt))){
     const current=await capture(pool,input,state!.capture.request);requireProof(current.fingerprint===state!.capture.fingerprint);
     state!.stop=await stopped(input,current);
     state!.verified=verifySourcePreparation(current.request,await inspect(current.request,input),{requireUnchanged:state!.requireUnchanged});
+    state!.admission=await retryAdmission(input,current,state!.verified);
   }
   await recapture(input,state!);
 }
