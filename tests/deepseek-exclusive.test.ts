@@ -86,7 +86,7 @@ it('maintenance, manager wake and route suggestions cannot rewrite an existing l
   expect(resolveSupervisedRoute(task,route,workforce,[account],[])).toEqual({ok:true,route,lane:'glm'});
   expect(resolveSupervisedRoute({...task,model:'glm-5.3-flash'},route,workforce,[account],[]))
     .toMatchObject({ok:false,code:'SUPERVISION_ROUTE_UNAVAILABLE'});
-  expect(resolveSupervisedRoute(task,route,workforce,[{...account,bridge_id:'unverified'}],[])).ok.toBe(false);
+  expect(resolveSupervisedRoute(task,route,workforce,[{...account,bridge_id:'unverified'}],[])).toMatchObject({ok:false});
 });
 it('twelve analytical/harness sessions share one SQL lane and concurrent thirteenth admission is refused',async()=>{
   const f=await fixture();await f.install();
