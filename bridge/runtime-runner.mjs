@@ -112,6 +112,7 @@ export async function runHarness(params, signal, generate, emit = () => {}) {
         memoryMiB,
         ...(memory.reservationId ? {memoryReservationId: memory.reservationId} : {}),
         deliveryContract: outputContract,
+        ...(params.sourceContract?{sourceContractVersion:1}:{}),
         state,
         at: new Date().toISOString(),
         ...extra,
@@ -566,6 +567,7 @@ export async function runHarness(params, signal, generate, emit = () => {}) {
       const candidate = await workspaceOperation({
         action: 'inspect',
         workspace: params.workspace,
+        ...(params.sourceContract?{includeBaseFiles:true}:{}),
       });
       if (params.readOnlySource && candidate.baseDigest !== candidate.candidateDigest)
         throw error('SOURCE_CHANGED_DURING_VALIDATION');

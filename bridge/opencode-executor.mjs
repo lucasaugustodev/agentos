@@ -113,6 +113,7 @@ async function executeOpenCode(params, signal, emit) {
       runId: params.runId, workspace: params.workspace, state, at: new Date().toISOString(),
       unit, runtime: 'opencode', model: MODEL, requests, toolCalls, usage,
       deliveryContract: outputContract, providerBackoff: providerWait, ...extra,
+      ...(params.sourceContract?{sourceContractVersion:1}:{}),
     });
     const pending = savePending.then(async () => {
       await writeFile(`${dir}/state.json.tmp`, bytes, { mode: 0o600 });
@@ -431,7 +432,8 @@ async function executeOpenCode(params, signal, emit) {
     }
     await finalizeRepairArtifacts({params, workspace, snapshot: repairSnapshot, stopped: true, artifacts, emit});
     if (managed) {
-      const candidate = await workspaceOperation({ action: 'inspect', workspace: params.workspace });
+      const candidate = await workspaceOperation({ action: 'inspect', workspace: params.workspace,
+        ...(params.sourceContract?{includeBaseFiles:true}:{}) });
       if (params.readOnlySource && candidate.baseDigest !== candidate.candidateDigest) throw failure('SOURCE_CHANGED_DURING_VALIDATION');
       const renamed = preserveRuntimeArtifactClaims(artifacts);
       if (renamed.length) emit('RUNTIME_ARTIFACT_CLAIMS_PRESERVED', { claims: renamed });

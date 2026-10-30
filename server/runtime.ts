@@ -122,6 +122,7 @@ async function executeRemoteHarness(input: RuntimeInput): Promise<RuntimeResult>
         accountId: input.account.bridge_id,
         model: input.task.model ?? input.account.model,
         deliveryContract,
+        ...(input.task.execution.sourceContract?{sourceContract:input.task.execution.sourceContract}:{}),
         composition,
         prompt: [
           input.task.title,

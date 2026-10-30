@@ -564,7 +564,10 @@ def inspect(params):
             except UnicodeDecodeError: raise ValueError('PATCH_BINARY_SOURCE')
             for line in difflib.unified_diff(a,b,fromfile='a/'+name if name in before else '/dev/null',tofile='b/'+name if name in after else '/dev/null'):
                 patch.append(line if line.endswith('\n') else line+'\n\\ No newline at end of file\n')
-        return {'baseDigest':source_hash(before),'candidateDigest':source_hash(after),'files':[{'path':k,'sha256':hashlib.sha256(v).hexdigest()} for k,v in sorted(after.items())],'patch':''.join(patch)}
+        result={'baseDigest':source_hash(before),'candidateDigest':source_hash(after),'files':[{'path':k,'sha256':hashlib.sha256(v).hexdigest()} for k,v in sorted(after.items())],'patch':''.join(patch)}
+        if params.get('includeBaseFiles') is True:
+            result['baseFiles']=[{'path':k,'sha256':hashlib.sha256(v).hexdigest()} for k,v in sorted(before.items())]
+        return result
 if __name__=='__main__':
     try:
         params=json.load(sys.stdin)

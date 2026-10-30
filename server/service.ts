@@ -767,6 +767,9 @@ export async function validateTask(taskId: string, reviewer?: string) {
   }> = [];
   if(ci.required) checks.push({id:'registered-ci',label:'CI registrado da candidata',type:'registered_ci',
     passed:ci.state==='passed',detail:ci.detail});
+  const {sourceOutputValidation}=await import('./source-output-validation.js');
+  const sourceOutput=await sourceOutputValidation(task,readArtifact);
+  if(sourceOutput)checks.push(sourceOutput);
   for (const c of task.criteria as Criterion[]) {
     let passed = false,
       detail = '';

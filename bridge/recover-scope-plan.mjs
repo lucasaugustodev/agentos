@@ -14,10 +14,11 @@ export async function recoverScopePlan(id,options={}){
   if(!(await inspect('agentos-run-'+id)).stopped)throw Error('STOP_UNCONFIRMED');
   const workspace=(options.workspaceRoot??'/srv/agentos/workspaces')+'/'+state.workspace;
   if(await realpath(workspace)!==workspace)throw Error('INVALID_WORKSPACE');
-  const before=await operation({action:'inspect',workspace:state.workspace});
+  const sourceInventory=state.sourceContractVersion===1?{includeBaseFiles:true}:{};
+  const before=await operation({action:'inspect',workspace:state.workspace,...sourceInventory});
   // The contract names one exact file. No guessing from prose or other files.
   const artifacts=await collectArtifacts({artifacts:[{name:'scope-plan.json',path:'evidence/scope-plan.json',mime:'application/json'}]},workspace);
-  const candidate=await operation({action:'inspect',workspace:state.workspace});
+  const candidate=await operation({action:'inspect',workspace:state.workspace,...sourceInventory});
   if(before.candidateDigest!==candidate.candidateDigest)throw Error('SOURCE_CHANGED_DURING_COLLECTION');
   for(const [name,content] of [['candidate.json',JSON.stringify({...candidate,patch:undefined})],['changes.patch',candidate.patch]]){
     const bytes=Buffer.from(content);artifacts.push({name,mime:name.endsWith('.json')?'application/json':'text/plain',
