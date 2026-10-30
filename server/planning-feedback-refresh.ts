@@ -12,7 +12,7 @@ export async function refreshQueuedPlanningFeedback(db:DB,planningRunId:string){
    FOR UPDATE OF p
  ) SELECT e.*,COALESCE((SELECT jsonb_agg(jsonb_build_object('id',f.id,'description',f.description)
      ORDER BY f.created_at,f.id) FROM objective_feedback f
-   WHERE f.objective_id=e.objective_id AND NOT(COALESCE(e.feedback->'feedbackIds','[]') ? f.id::text)
+   WHERE f.objective_id=e.objective_id AND f.source_replan IS NULL AND NOT(COALESCE(e.feedback->'feedbackIds','[]') ? f.id::text)
      AND NOT EXISTS(SELECT 1 FROM planning_runs consumed WHERE consumed.objective_id=f.objective_id
        AND consumed.state='completed' AND (consumed.feedback->'feedbackIds' ? f.id::text OR consumed.created_at>f.created_at))
  ),'[]'::jsonb) pending FROM eligible e`,[planningRunId])).rows[0];

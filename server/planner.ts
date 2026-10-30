@@ -4,6 +4,7 @@ import { planningRecovery } from './planning-recovery.js';
 import {refreshQueuedPlanningFeedback} from './planning-feedback-refresh.js';
 import {routeVerificationPlanningRecovery} from './verification-planning-recovery.js';
 import {planningRunFeedback} from './planning-run-feedback.js';
+import {sourceReplanForFeedback,assertSourceReplanCurrent} from './objective-source-replan.js';
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { pool, tx, lock, event, type DB } from './db.js';
@@ -127,6 +128,7 @@ export async function queueFeedback(
   key: string,
   description: string,
   taskIds: string[],
+  source?:{id:string;sourceReplan:unknown},
 ) {
   const o = (await db.query('SELECT * FROM objectives WHERE id=$1', [id])).rows[0];
   if (!o) throw new DomainError('OBJECTIVE_MISSING', 'Objetivo não encontrado.', 404);
@@ -142,8 +144,8 @@ export async function queueFeedback(
       'A chave de feedback já pertence a outro conteúdo.',
     );
   const inserted = await db.query(
-    'INSERT INTO objective_feedback(id,objective_id,trigger_key,description,task_ids) VALUES($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING',
-    [randomUUID(), id, key, description, JSON.stringify(taskIds)],
+    'INSERT INTO objective_feedback(id,objective_id,trigger_key,description,task_ids,source_replan) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING',
+    [source?.id??randomUUID(), id, key, description, JSON.stringify(taskIds),source?JSON.stringify(source.sourceReplan):null],
   );
   if (!inserted.rowCount) return false;
   await event(db, 'PLANNING_FEEDBACK', id, { reason: description, taskIds });
@@ -267,6 +269,7 @@ export async function reconcilePlanning() {
             AND (consumed.feedback->'feedbackIds' ? f.id::text OR consumed.created_at>f.created_at))
         ORDER BY f.created_at`,[o.id,pending.map(p=>p.id)])).rows;
       pending.push(...stranded);
+      const sourceReplan=await sourceReplanForFeedback(db,o.id,pending);
       const affected = (
         await db.query(
           "SELECT id FROM tasks WHERE goal_id=$1 AND state NOT IN('accepted','cancelled','superseded')",
@@ -365,16 +368,29 @@ export async function reconcilePlanning() {
         if(!artifacts.some(a=>a.id===artifact.id))artifacts.push(artifact);
       if (repairInput && !artifacts.some(a=>a.id===repairInput.id))
         artifacts.push({id:repairInput.id,name:repairInput.name,digest:repairInput.digest});
+      if(sourceReplan){
+        const pinned=sourceReplan.payload;
+        sourceOverrides[pinned.request.sourceReplan.baseWorkspace]=pinned.source.workspace;
+        // Immutable canonical inputs, never a claim that the published source
+        // already contains the accepted contributions from another baseline.
+        for(const c of pinned.inputs.contributors)for(const a of c.artifacts)
+          if(['candidate.json','changes.patch'].includes(a.name)&&!artifacts.some(x=>x.id===a.id))
+            artifacts.push({id:a.id,name:a.name,digest:a.digest});
+      }
       const feedback = {
         sourceContractVersion:1,
         acceptedCount,
         feedbackIds: pending.map((p) => p.id),
         reports: [...pending.map((p) => p.description),...(partialDeliveries.length?
-          ['Accepted branch inputs preserved for composition, not proof of complete requirement acceptance. Reuse their canonical patches and verify compatibility; do not discard contributions or redo accepted work. Start from the accumulated sourceOverride, compose all relevant branch patches in dependency order, then independent QA of the entire requirement. Branches: '+JSON.stringify(partialDeliveries)]:[])],
+          ['Accepted branch inputs preserved for composition, not proof of complete requirement acceptance. Reuse their canonical patches and verify compatibility; do not discard contributions or redo accepted work. Start from the accumulated sourceOverride, compose all relevant branch patches in dependency order, then independent QA of the entire requirement. Branches: '+JSON.stringify(partialDeliveries)]:[]),
+          ...(sourceReplan?['Authenticated replan from the pinned published root. Every listed canonical patch is INPUT from the prior baseline, not incorporated source. Preserve all contributions in dependency order, explicitly resolve cross-baseline conflicts, and independently verify the original requirements. Do not reapply historical revisions. Inputs: '+JSON.stringify(sourceReplan.payload.inputs.contributors.map(c=>({taskId:c.taskId,runId:c.runId,sourceWorkspace:c.execution.sourceWorkspace,workspace:c.execution.workspace,dependencies:c.dependencyTaskIds,artifacts:c.artifacts.filter(a=>['candidate.json','changes.patch'].includes(a.name))})))]:[])],
         replaceTaskIds: affected,
         sourceOverrides,
         artifacts,
         partialDeliveries,
+        ...(sourceReplan?{sourceReplan:{feedbackId:sourceReplan.payload.feedbackId,receiptDigest:sourceReplan.receiptDigest},
+          sourceReplanInputs:sourceReplan.payload.inputs,
+          sourceReplanInstruction:'Authenticated replan from the pinned published root. All canonical accepted patches are INPUTS from the prior baseline, not incorporated source. Preserve every listed contribution in dependency order, explicitly resolve cross-baseline conflicts, and independently verify the complete original requirements. Historical revisions remain evidence and must not be applied twice.'}:{}),
       };
       await db.query(
         'INSERT INTO planning_runs(id,objective_id,base_revision,trigger_key,fence,feedback) VALUES($1,$2,$3,$4,$5,$6)',
@@ -404,6 +420,13 @@ export async function claimPlanning() {
     if (!run) return null;
     const refreshedFeedback=await refreshQueuedPlanningFeedback(db,run.id);
     if(refreshedFeedback)run.feedback=refreshedFeedback;
+    try{await assertSourceReplanCurrent(db,run);}catch(error:any){
+      await db.query("UPDATE planning_runs SET state='failed',finished_at=now(),error=$2 WHERE id=$1",[run.id,error.code??'SOURCE_REPLAN_RECEIPT_INVALID']);
+      await db.query("UPDATE objectives SET status='waiting_external',reason=$2 WHERE id=$1",[run.objective_id,error.code??'SOURCE_REPLAN_RECEIPT_INVALID']);
+      await event(db,'PLANNING_BLOCKED',run.objective_id,{planningRunId:run.id,reason:error.code??'SOURCE_REPLAN_RECEIPT_INVALID',
+        recovery:{category:'external',retry:false},acceptance:false});
+      return null;
+    }
     const request = effectivePlanningRequest(run.request as ObjectiveInput,run.feedback);
     if(run.feedback?.planningRecovery&&!(await db.query("SELECT 1 FROM settings WHERE id=$1 AND value->>'mode'='supervised'",['objective-review:'+run.objective_id])).rowCount){
       await db.query("UPDATE planning_runs SET state='failed',finished_at=now(),error='Revisão supervisionada desabilitada.' WHERE id=$1",[run.id]);

@@ -28,6 +28,7 @@ import { chatEngine, listChats, newChat, chatDetail } from './chat.js';
 import type { WorkerEngine } from './worker.js';
 import { submitObjective, objectiveDetail, feedbackObjective } from './planner.js';
 import {registerObjectiveInput} from './objective-inputs.js';
+import {registerSourceReplanFeedback} from './objective-source-replan.js';
 import {registerWorkerValidationPolicy} from './worker-validation.js';
 import {configureObjectiveReview,objectiveReviews,requestObjectiveReview} from './objective-review.js';
 import {reconcileInheritedCancellation} from './objective-state-repair.js';
@@ -177,6 +178,11 @@ export function makeApp(engine?: WorkerEngine) {
     ...(await goalDetail((req.params as any).id)),
   }));
   app.post('/api/objectives/:id/feedback', async (req) => {
+    if((req.body as any)?.sourceReplan!==undefined){
+      const bearer=(req.headers.authorization??'').replace(/^Bearer /,'');
+      return registerSourceReplanFeedback(z.uuid().parse((req.params as any).id),req.body,
+        {channel:bearer&&equal(bearer,config.apiToken)?'api-token':'operator-session'});
+    }
     const b = z
       .object({
         idempotencyKey: z.string().min(8).max(160),

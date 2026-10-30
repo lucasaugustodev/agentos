@@ -146,6 +146,17 @@ CREATE TABLE IF NOT EXISTS plan_revisions (
 CREATE TABLE IF NOT EXISTS objective_feedback (
  id uuid PRIMARY KEY, objective_id uuid NOT NULL REFERENCES objectives(id), trigger_key text NOT NULL,
  description text NOT NULL, task_ids jsonb NOT NULL DEFAULT '[]', created_at timestamptz NOT NULL DEFAULT now(), UNIQUE(objective_id,trigger_key));
+ALTER TABLE objective_feedback ADD COLUMN IF NOT EXISTS source_replan jsonb;
+CREATE OR REPLACE FUNCTION agentos_source_replan_feedback_immutable() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+ IF OLD.source_replan IS NOT NULL OR (TG_OP='UPDATE' AND NEW.source_replan IS NOT NULL) THEN
+  RAISE EXCEPTION 'SOURCE_REPLAN_RECEIPT_IMMUTABLE';
+ END IF;
+ IF TG_OP='DELETE' THEN RETURN OLD; ELSE RETURN NEW; END IF;
+END $$;
+DROP TRIGGER IF EXISTS agentos_source_replan_feedback_immutable ON objective_feedback;
+CREATE TRIGGER agentos_source_replan_feedback_immutable BEFORE UPDATE OR DELETE ON objective_feedback
+ FOR EACH ROW EXECUTE FUNCTION agentos_source_replan_feedback_immutable();
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS plan_revision int;
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS stage text;
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS covers jsonb NOT NULL DEFAULT '[]';

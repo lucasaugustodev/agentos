@@ -2,6 +2,7 @@ import {randomUUID} from 'node:crypto';
 import {pool,tx,lock,event,type DB} from './db.js';
 import {accountBridge} from './bridge.js';
 import {readArtifact} from './service.js';
+import {assertSourceReplanCurrent,inspectSourceReplanCurrent} from './objective-source-replan.js';
 import {DomainError} from './contracts.js';
 import {assertPlanningFeedbackCurrent} from './planning-supervision.js';
 import {captureSourceReuseAuthority,completeSourceReuseCapture,recaptureSourceReuseAuthority,
@@ -34,6 +35,7 @@ async function assertPlanOwner(db:DB,run:any,planDigest:string){
     row.revision!==run.base_revision||row.mode!=='execute'||['paused','cancelled','completed'].includes(row.goal_state)||
     preparationHash(row.output)!==planDigest||preparationHash(row.feedback??{})!==preparationHash(run.feedback??{}))throw failure('STALE_PLAN');
   await assertPlanningFeedbackCurrent(db,run);
+  await assertSourceReplanCurrent(db,run);
   const bases=[...new Set((row.output?.tasks??[]).map((task:any)=>task.baseWorkspace))] as string[];
   await assertPlanningSourcesIdle(db,run,bases.map(base=>run.feedback?.sourceOverrides?.[base]??base));
 }
@@ -87,6 +89,7 @@ async function mark(run:any,index:number,state:Intent['state'],extra:Partial<Int
  * retries only inspect/reconcile that same UUID and exact source generation.
  * A transport timeout never permits legacy preparation or another origin. */
 export async function preparePlanningSources(run:any,plan:ProposedPlan,signal:AbortSignal):Promise<PreparedPlanningSources>{
+  const sourceReplan=await inspectSourceReplanCurrent(run);
   const request:WorkspaceInspectionRequest=(method,params,options)=>accountBridge.request(method,params,{...options,signal});
   const prepared=new Map<string,PreparedPlanningSource>(),bases=[...new Set(plan.tasks.map(t=>t.baseWorkspace))];
   const planDigest=preparationHash(plan);
@@ -129,6 +132,8 @@ export async function preparePlanningSources(run:any,plan:ProposedPlan,signal:Ab
     if(!intent){
       const capture=await captureExplicitSourceAuthority(pool,run,base);
       const observed=await observeExplicitSource(capture,request),preparationIdentity=randomUUID(),selected=observed.proof.selectedSource;
+      if(sourceReplan&&(capture.authority!=='published_root'||preparationHash(selected)!==preparationHash(sourceReplan.payload.source)))
+        throw failure('SOURCE_REPLAN_PUBLICATION_CHANGED');
       const preparation:SourcePreparationRequest={workspace:destination+'-p'+preparationIdentity.replaceAll('-',''),
         sourceWorkspace:selected.workspace,preparationIdentity,expectedSourceDigest:selected.candidateDigest,
         expectedSourceSnapshotDigest:selected.snapshotDigest,
@@ -192,6 +197,12 @@ export async function preparePlanningSources(run:any,plan:ProposedPlan,signal:Ab
 /** Called inside the planner's existing admission transaction, before any task
  * is inserted. No filesystem or provider I/O; application shares its commit. */
 export async function assertPreparedPlanningSources(db:DB,run:any,plan:ProposedPlan,sources:PreparedPlanningSources){
+  const replan=await assertSourceReplanCurrent(db,run);
+  if(replan){
+    const source=sources.get(replan.payload.request.sourceReplan.baseWorkspace);
+    if(!source||source.intent.kind!=='explicit_source'||source.intent.capture.authority!=='published_root'||
+      preparationHash(source.intent.proof.selectedSource)!==preparationHash(replan.payload.source))throw failure('SOURCE_REPLAN_PREPARATION_REQUIRED');
+  }
   const stored=(await db.query("SELECT value FROM settings WHERE id LIKE $1",[`planning-source-preparation:${run.id}:%`])).rows;
   if(stored.length!==sources.size)throw failure('SOURCE_PREPARATION_REQUIRED');
   if(stored.length)await assertPlanOwner(db,run,preparationHash(plan));

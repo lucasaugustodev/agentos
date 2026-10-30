@@ -40,11 +40,11 @@ const projection=(expression:string)=>`jsonb_build_object('workspace',${expressi
  * cohort by the very projection whose completeness is being checked.
  * The fast path does not detoast/hash instruction_snapshot: the enabled immutable
  * admission trigger plus unchanged run identity preserves the captured bytes. */
-function captureSql(frozen:boolean){return `WITH scope_tasks AS MATERIALIZED (
+function captureSql(frozen:boolean,inputsOnly=false){return `WITH scope_tasks AS MATERIALIZED (
  SELECT t.id,t.goal_id,t.state,t.stage,t.plan_revision,t.attempt_count,t.execution,m.workspace,m.base_workspace,
    m.task_id metadata_id,m.goal_id metadata_goal,m.version metadata_version,m.execution_type,m.inputs_valid
  FROM tasks t LEFT JOIN task_execution_metadata m ON m.task_id=t.id
- WHERE t.goal_id=$1 AND t.plan_revision=$2 AND t.state='accepted' AND t.stage IN('work','integrate','verify')
+ WHERE t.goal_id=$1 AND t.plan_revision=$2 AND t.state='accepted' AND t.stage IN(${inputsOnly?"'work','integrate'":"'work','integrate','verify'"})
    AND (m.base_workspace=$3 OR m.task_id IS NULL OR m.version<>1 OR m.goal_id<>t.goal_id OR m.base_workspace IS NULL)
 ), cohort AS MATERIALIZED (SELECT * FROM scope_tasks ORDER BY id LIMIT 65),
  active AS MATERIALIZED (
@@ -94,12 +94,12 @@ function captureSql(frozen:boolean){return `WITH scope_tasks AS MATERIALIZED (
    AND tgenabled IN('O','A') AND NOT tgisinternal AND tgfoid=to_regprocedure('public.agentos_instruction_snapshot()')))
  value FROM goals g JOIN objectives o ON o.id=g.id WHERE g.id=$1`;}
 
-async function capture(db:DB,scope:SourceReuseScope,prior?:SourceReuseCapture):Promise<SourceReuseCaptureResult>{
+async function capture(db:DB,scope:SourceReuseScope,prior?:SourceReuseCapture,inputsOnly=false):Promise<SourceReuseCaptureResult>{
  try{
   check(scopeSchema.safeParse(scope).success,'INVALID_SCOPE');
-  const value=(await db.query(captureSql(!prior),[scope.goalId,scope.revision,scope.baseWorkspace])).rows[0]?.value;
+  const value=(await db.query(captureSql(!prior,inputsOnly),[scope.goalId,scope.revision,scope.baseWorkspace])).rows[0]?.value;
   check(value&&value.goalId===scope.goalId&&value.revision===scope.revision&&value.mode==='execute'&&
-    ['active','replanning'].includes(value.goalState),'PLANNING_AUTHORITY_CHANGED');
+    (inputsOnly?['active','replanning','failed']:['active','replanning']).includes(value.goalState),'PLANNING_AUTHORITY_CHANGED');
   check(value.immutableSnapshotTrigger===true,'IMMUTABLE_SNAPSHOT_REQUIRED');
   check(value.unknownOwnership===false,'OWNERSHIP_METADATA_MISSING');
   check(value.total<=64&&value.total===value.rows.length,'COHORT_BOUND');
@@ -160,6 +160,11 @@ async function capture(db:DB,scope:SourceReuseScope,prior?:SourceReuseCapture):P
 /** Read-only, single-statement capture; caller supplies a trusted controller DB.
  * Do not call with projections supplied by a worker or a model. */
 export const captureSourceReuseAuthority=(db:DB,scope:SourceReuseScope)=>capture(db,scope);
+
+/** Canonical artifacts for an authenticated new plan, not authority to reuse a
+ * workspace or claim incorporation. Failed objectives may supply immutable
+ * inputs; their old attempts and physical generations are never reopened. */
+export const captureSourceReplanInputs=(db:DB,scope:SourceReuseScope)=>capture(db,scope,undefined,true);
 
 /** Intended under the planner admission lock. SQL only: no artifact/SSH/filesystem
  * reads, source hashing, queue or acceptance mutation. The existing immutable

@@ -39,6 +39,23 @@ export async function inspectPublishedBaseline() {
   });
 }
 
+/** Shared validation of the protected publication broker's response. */
+export function validatePublishedBaseline(value:any){
+  const b=value?.baseline;
+  if(!b||b.version!==1||!/^\/opt\/agentos\/releases\/managed-[0-9a-f-]{36}$/.test(b.release??'')||
+    !/^[a-f0-9]{64}$/.test(b.releaseDigest??'')||!/^[a-f0-9]{64}$/.test(b.sourceManifestDigest??'')||
+    b.sourceWorkspace!=='agentos/src'+b.releaseDigest.slice(0,16)||
+    !/^\/var\/lib\/agentos-build\//.test(b.publicationProofRef??'')||!/^\/var\/lib\/agentos-build\//.test(b.validationProofRef??'')||
+    !/^[a-f0-9]{64}$/.test(b.publicationProofDigest??'')||!/^[a-f0-9]{64}$/.test(b.validationProofDigest??'')||
+    !/^\/var\/lib\/agentos\/releases\//.test(b.registeredReceiptRef??'')||
+    !/^[a-f0-9]{64}$/.test(b.registeredReceiptDigest??'')||!/^[a-f0-9]{64}$/.test(b.registeredActionDigest??'')||
+    !b.sourceManifestHashes||digest(b.sourceManifestHashes)!==b.sourceManifestDigest||
+    !b.generatedReleaseHashes||Object.entries(b.generatedReleaseHashes).some(([name,hash]:any)=>!name.startsWith('dist/')||!/^[a-f0-9]{64}$/.test(hash))||
+    digest({...b.sourceManifestHashes,...b.generatedReleaseHashes})!==b.workspaceManifestDigest)
+    throw fail('REBASE_PUBLISHED_BASE_UNAVAILABLE');
+  return b;
+}
+
 export async function installPublishedRebase(db: DB = pool) {
   await db.query(`CREATE OR REPLACE FUNCTION agentos_published_rebase_owned(target uuid) RETURNS boolean
       LANGUAGE sql STABLE AS $$ SELECT EXISTS(SELECT 1 FROM settings s WHERE s.id LIKE 'published-rebase:%'
@@ -198,18 +215,7 @@ export async function requestPublishedRebase(goalId: string, managerRunId: strin
       const candidateProof=await candidate(db,req,proof);
       const criteriaDigest=digest(current.task.criteria), dependencyDigest=digest(current.dependencies);
       const {project,authorization}=current.authorization;
-      const pinnedBaseline=baseline?.baseline;
-      if(!pinnedBaseline||pinnedBaseline.version!==1||!/^\/opt\/agentos\/releases\/managed-[0-9a-f-]{36}$/.test(pinnedBaseline.release??'')||
-        !/^[a-f0-9]{64}$/.test(pinnedBaseline.releaseDigest??'')||!/^[a-f0-9]{64}$/.test(pinnedBaseline.sourceManifestDigest??'')||
-        pinnedBaseline.sourceWorkspace!=='agentos/src'+pinnedBaseline.releaseDigest.slice(0,16)||
-        !/^\/var\/lib\/agentos-build\//.test(pinnedBaseline.publicationProofRef??'')||!/^\/var\/lib\/agentos-build\//.test(pinnedBaseline.validationProofRef??'')||
-        !/^[a-f0-9]{64}$/.test(pinnedBaseline.publicationProofDigest??'')||!/^[a-f0-9]{64}$/.test(pinnedBaseline.validationProofDigest??'')||
-        !/^\/var\/lib\/agentos\/releases\//.test(pinnedBaseline.registeredReceiptRef??'')||
-        !/^[a-f0-9]{64}$/.test(pinnedBaseline.registeredReceiptDigest??'')||!/^[a-f0-9]{64}$/.test(pinnedBaseline.registeredActionDigest??'')||
-        !pinnedBaseline.sourceManifestHashes||digest(pinnedBaseline.sourceManifestHashes)!==pinnedBaseline.sourceManifestDigest||
-        !pinnedBaseline.generatedReleaseHashes||Object.entries(pinnedBaseline.generatedReleaseHashes).some(([name,hash]:any)=>!name.startsWith('dist/')||!/^[a-f0-9]{64}$/.test(hash))||
-        digest({...pinnedBaseline.sourceManifestHashes,...pinnedBaseline.generatedReleaseHashes})!==pinnedBaseline.workspaceManifestDigest)
-        throw fail('REBASE_PUBLISHED_BASE_UNAVAILABLE');
+      const pinnedBaseline=validatePublishedBaseline(baseline);
       if(req.baseline.expectedDigest&&req.baseline.expectedDigest!==pinnedBaseline.releaseDigest)throw fail('REBASE_PUBLISHED_BASE_CHANGED');
       if(current.task.execution?.sourceWorkspace===pinnedBaseline.sourceWorkspace ||
         current.task.execution?.publishedRebase?.publishedBaselineDigest===pinnedBaseline.releaseDigest)
