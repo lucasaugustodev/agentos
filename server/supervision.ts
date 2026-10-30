@@ -36,6 +36,7 @@ import { requestProgressReplan, hasUnchangedBlockedRetry } from './retry-progres
 import { backlogInstruction } from './backlog.js';
 import { glmRepairInstruction, glmRepairCriteria, glmRepairHandoff } from './glm-repair.js';
 import { protocolReportDiagnostic } from '../bridge/protocol-report-contract.mjs';
+import {migrationTableLocks} from './migration-table-locks.js';
 import { managerContextVersion, projectManagerReview } from './manager-context.js';
 import { selectManagerFocus,selectManagerCaseWindow,managerFocusServiceHistory } from './manager-focus.js';
 import {bootstrapRequiredMaterialDecision} from './management-material-decision.js';
@@ -91,7 +92,7 @@ Use capacidade disponível para subproblemas diferentes que desbloqueiam a entre
 
 export async function installSupervision() {
   await installManagerContextSections(pool);
-  await pool.query(`CREATE TABLE IF NOT EXISTS supervision_cases(
+  await pool.query(migrationTableLocks(['accounts','goals','outbox','runs','settings','supervision_cases','supervisor_jobs','tasks'])+`CREATE TABLE IF NOT EXISTS supervision_cases(
     id uuid PRIMARY KEY,goal_id uuid REFERENCES goals(id),task_id uuid REFERENCES tasks(id),source_run_id uuid REFERENCES runs(id),
     state text NOT NULL DEFAULT 'open',reason text NOT NULL,evidence jsonb NOT NULL,decision jsonb,decision_run_id uuid REFERENCES runs(id),
     support_task_id uuid REFERENCES tasks(id),applied_attempt integer,created_at timestamptz DEFAULT now(),updated_at timestamptz DEFAULT now(),
