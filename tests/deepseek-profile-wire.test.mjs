@@ -56,7 +56,7 @@ for(const [effort,expected] of [['low','high'],['high','high'],['xhigh','max']])
   assert.ok(!JSON.stringify(events).includes('private input'));assert.ok(!JSON.stringify(events).includes('fixture-only'));
 });
 
-test('planner budget remains 8192 and explicit disabled thinking omits effort and Z.ai options',async t=>{
+test('explicit disabled thinking preserves the requested budget and omits effort and Z.ai options',async t=>{
   await configured(t);let wire;
   await openAICompletionsFallback({fetch:async(_url,options)=>{wire=JSON.parse(options.body);return reply();}})
     .streamSimple({id:policy.model,baseUrl:'https://fixture.invalid/v1',...operatorModelProfile(policy.bridgeId,policy.model)},

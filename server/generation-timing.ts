@@ -8,3 +8,11 @@ export function generationTiming(accountId: string, model: string) {
   const deepseek=policy?.version===2&&modelRouteAllowed(accountId,model,policy);
   return { requestTimeoutMs: glm ? 720000 : 240000, timeout: glm ? 900000 : 240000, reasoning: glm ? 'low' : deepseek ? 'high' : 'medium' };
 }
+
+/** Planner-only output allowance: the selected route exhausted 8192 tokens in
+ * reasoning before producing JSON. Other roles and legacy profiles stay fixed. */
+export function planningGenerationSettings(accountId:string,model:string,incremental:boolean) {
+  const timing=generationTiming(accountId,model),policy=readModelPolicy();
+  return {...timing,maxOutputTokens:policy?.version===2&&modelRouteAllowed(accountId,model,policy)
+    ? 32768 : incremental ? 8192 : 12000};
+}

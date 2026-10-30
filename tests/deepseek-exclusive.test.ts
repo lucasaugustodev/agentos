@@ -8,7 +8,7 @@ import {seedRegistry} from '../server/registry.js';
 import {chooseWorkforceRoute,workforceCapacityReason} from '../server/workforce-policy.js';
 import {exclusiveModelPolicySql} from '../server/model-policy-sql.js';
 import {managerAuthoritySql} from '../server/manager-authority.js';
-import {generationTiming} from '../server/generation-timing.js';
+import {generationTiming,planningGenerationSettings} from '../server/generation-timing.js';
 import {managementRoutes} from '../server/management.js';
 import {resolveSupervisedRoute} from '../server/supervised-route.js';
 import {claimPlanning,submitObjective} from '../server/planner.js';
@@ -55,6 +55,11 @@ it('routes every new role to exact v2 policy while keeping explicit restrictions
   expect(chooseWorkforceRoute({},[{...account,quota:{ordinaryUsageAllowed:false}}],workforce)).toBeNull();
   expect(generationTiming(policy.bridgeId,policy.model)).toEqual({requestTimeoutMs:240000,timeout:240000,reasoning:'high'});
   expect(generationTiming(policy.bridgeId,'other').reasoning).toBe('medium');
+  for(const incremental of [true,false])expect(planningGenerationSettings(policy.bridgeId,policy.model,incremental))
+    .toEqual({requestTimeoutMs:240000,timeout:240000,reasoning:'high',maxOutputTokens:32768});
+  expect(planningGenerationSettings('agentos:api:00000000-0000-4000-8000-000000000001','glm-5.3-flash',true))
+    .toEqual({requestTimeoutMs:720000,timeout:900000,reasoning:'low',maxOutputTokens:8192});
+  expect(planningGenerationSettings('unverified',policy.model,false).maxOutputTokens).toBe(12000);
   const active=Array.from({length:12},()=>({state:'running',account_id:policy.accountId,model:policy.model}));
   expect(workforceCapacityReason({account_id:policy.accountId,model:policy.model},active,workforce)).toBe('WORKFORCE_GLM_CAPACITY');
 });
