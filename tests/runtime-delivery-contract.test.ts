@@ -52,6 +52,19 @@ it('derives delivery from the immutable run snapshot rather than changed live cr
   await executeRuntime(i);
   expect((request.mock.calls[0][1] as any).deliveryContract).toEqual(taskDeliveryContract(criteria));
 });
+it('transports the frozen requirement outcome report as a mandatory artifact without granting acceptance',async()=>{
+  const gate={id:'outcomes',type:'requirement_outcomes',version:2,name:'requirement-outcomes.json',label:'Product outcomes',
+    requirements:[{id:'product',observables:[{id:'result',name:'result.json',authority:'current_run',type:'artifact',description:'Actual product evidence'}],externalDependencies:[]}]};
+  const i=input([gate]);i.run.instruction_snapshot={schema:1,task:structuredClone(i.task)};
+  i.task.criteria=[];
+  const request=stoppedBridge(),result=await executeRuntime(i);
+  const contract=(request.mock.calls[0][1] as any).deliveryContract;
+  expect(contract.artifacts.filter((a:any)=>a.name==='requirement-outcomes.json')).toEqual([
+    {name:'requirement-outcomes.json',path:'evidence/requirement-outcomes.json',mime:'application/json'}]);
+  expect(contract.artifacts.some((a:any)=>a.name==='candidate.json')).toBe(false);
+  expect(result).toMatchObject({artifacts:[]});
+  expect(()=>taskDeliveryContract([{...gate,name:'../requirement-outcomes.json'}])).toThrow('TASK_DELIVERY_CONTRACT');
+});
 it('leaves controller generated artifacts out of the worker contract without changing acceptance criteria', async () => {
   const i = input(['candidate.json', 'changes.patch', 'runtime-protocol-check.json'].map(name => ({ type: 'artifact', name })));
   const request = stoppedBridge(); await executeRuntime(i);

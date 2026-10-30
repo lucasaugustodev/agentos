@@ -10,7 +10,7 @@ export function taskDeliveryContract(criteria = []) {
   if (!Array.isArray(criteria) || criteria.length > 30) throw failure();
   const artifacts = [];
   for (const criterion of criteria) {
-    if (!criterion || !['artifact', 'json_field'].includes(criterion.type)) continue;
+    if (!criterion || !['artifact', 'json_field', 'requirement_outcomes'].includes(criterion.type)) continue;
     const name = criterion.name;
     if (typeof name !== 'string' || !validName.test(name)) throw failure();
     if (controllerNames.has(name) || artifacts.some((item) => item.name === name)) continue;

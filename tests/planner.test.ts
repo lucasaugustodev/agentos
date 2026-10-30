@@ -95,6 +95,12 @@ function request(extra = {}) {
     ...extra,
   });
 }
+// Only fresh model outputs use v2; manually applied legacy plans stay v1.
+function generatedPlan() {
+  return {...plan(),completionContractVersion:2,requirementContracts:[{id:'working',
+    observables:[{id:'result',name:'result.json',authority:'current_run',type:'artifact',
+      description:'Synthetic controller fixture output; not an external measurement'}]}]};
+}
 beforeAll(async () => {
   await migrate();
 });
@@ -235,7 +241,7 @@ it('never creates tasks or prepares workspaces for planning-only requests', asyn
     if (method === 'memory.search') return { items: [] };
     if (method === 'worker.workspaces') return [{ id: 'test/base' }];
     if (method === 'generate')
-      return { message: { content: [{ type: 'text', text: JSON.stringify(plan()) }] } };
+      return { message: { content: [{ type: 'text', text: JSON.stringify(generatedPlan()) }] } };
     throw Error('Expected fallback or forbidden mutation: ' + method);
   });
   const { objectiveId } = await submitObjective(request({ mode: 'plan' }));
@@ -346,7 +352,7 @@ it('reuses a validated proposal when workspace preparation must wait', async () 
     if (method === 'worker.workspaces') return [{ id: 'test/base' }];
     if (method === 'generate') {
       generations++;
-      return { message: { content: [{ type: 'text', text: JSON.stringify(plan()) }] } };
+      return { message: { content: [{ type: 'text', text: JSON.stringify(generatedPlan()) }] } };
     }
     if (method === 'worker.prepare') {
       if (++prepares === 1) throw Object.assign(Error('busy'), { code: 'SOURCE_BUSY' });
@@ -375,7 +381,7 @@ it('recovers a confirmed generation timeout without creating duplicate work', as
     if (method === 'worker.workspaces') return [{ id: 'test/base' }];
     if (method === 'generate') {
       if (++generations === 1) throw Object.assign(Error('confirmed timeout'), { code: 'PROVIDER_TIMEOUT' });
-      return { message: { content: [{ type: 'text', text: JSON.stringify(plan()) }] } };
+      return { message: { content: [{ type: 'text', text: JSON.stringify(generatedPlan()) }] } };
     }
     const prepared=preparation(method,params);if(prepared!==undefined)return prepared;
     throw Error('ranking fallback');
@@ -408,7 +414,7 @@ it.each([
     }
     if (method === 'memory.search') return { items: [] };
     if (method === 'worker.workspaces') return [{ id: 'test/base' }];
-    if (method === 'generate') return { message: { content: [{ type: 'text', text: JSON.stringify(plan()) }] } };
+    if (method === 'generate') return { message: { content: [{ type: 'text', text: JSON.stringify(generatedPlan()) }] } };
     const prepared=preparation(method,params);if(prepared!==undefined)return prepared;
     throw Error('ranking fallback');
   });

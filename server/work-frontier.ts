@@ -3,6 +3,7 @@ import { requireRunCriteriaMetadataReady, runCriteriaMetadataColumns,
   checkedRunCriteriaMetadata } from './run-criteria-metadata.js';
 import type { DB } from './db.js';
 import { checkedExecutionMetadata, executionMetadataColumns } from './task-execution-metadata.js';
+import {acceptedRequirementOutcomes,resolveRequirementOutcomes,type RequirementOutcomeProof} from './requirement-outcomes.js';
 
 const live = new Set(['queued', 'running', 'cancelling', 'reconciling']);
 const retired = new Set(['cancelled', 'superseded']);
@@ -16,6 +17,7 @@ export type FrontierNode = {
   accepted: boolean; live: boolean; auxiliary?: boolean; reason?: string | null;
   runId?: string | null; attempt?: number; receipt?: string | null;
   failedCriteria?: string[]; covers?: string[];
+  planRevision?:number;requirementOutcomes?:RequirementOutcomeProof|null;
 };
 export type FrontierRequirement = { id: string; description: string };
 
@@ -24,6 +26,7 @@ export type FrontierRequirement = { id: string; description: string };
 export function projectWorkFrontier(
   boundary: { kind: 'objective' | 'occurrence'; id: string; version?: number },
   nodes: FrontierNode[], requirements: FrontierRequirement[] = [],
+  completionContractVersion?:2,
 ) {
   const active = nodes.filter(n => !retired.has(n.state));
   const byId = new Map(active.map(n => [n.id, n]));
@@ -41,7 +44,7 @@ export function projectWorkFrontier(
       criteria:n.criteria.map(c => ({...c,state:accepted(n) ? 'accepted' :
         n.failedCriteria?.includes(c.id) ? 'failed' : 'unproven'})) };
   });
-  const requirementEntries = requirements.map(r => {
+  const requirementEntries = completionContractVersion===2?resolveRequirementOutcomes(requirements,active):requirements.map(r => {
     const owners = deliveries.filter(n => n.covers?.includes(r.id));
     return {...r,taskIds:owners.map(n=>n.id),state:owners.length && owners.every(accepted) ? 'accepted' :
       !owners.length ? 'unplanned' : 'pending'};
@@ -61,7 +64,10 @@ export function projectWorkFrontier(
   };
   const complete = obligations.length>0 && obligations.every(c=>c.accepted) &&
     requirementEntries.every(r=>r.state==='accepted');
-  const next = complete ? 'acceptance_ready' : requirementEntries.some(r=>r.state==='unplanned') || !deliveries.length ?
+  const externalWait=completionContractVersion===2&&requirementEntries.some(r=>r.state==='externally_blocked')&&
+    requirementEntries.every(r=>['accepted','externally_blocked'].includes(r.state))&&
+    !counts.ready&&!counts.executing&&!counts.blocked&&!counts.waitingCapacity&&!counts.needsSupervision;
+  const next = complete ? 'acceptance_ready' : externalWait?'await_external_dependency':requirementEntries.some(r=>r.state==='unplanned') || !deliveries.length ?
     'planning_gap' : rootBlockers.length ? 'supervise_blockers' : counts.ready ? 'dispatch_ready' :
     counts.executing ? 'prepare_independent_work' : counts.waitingCapacity ? 'await_capacity' : 'planning_gap';
   return {version:1,boundary,counts,next,complete,requirements:requirementEntries,entries,
@@ -119,7 +125,8 @@ export function objectiveFrontierNodes(tasks:any[], runs:any[], acceptances:any[
     const isLive = runs.some(r=>r.task_id===t.id && live.has(r.state)) || live.has(t.state);
     const frozenCriteria=run?.accepted_criteria ?? run?.instruction_snapshot?.task?.criteria;
     const sameCriteria=!frozenCriteria || JSON.stringify(frozenCriteria)===JSON.stringify(t.criteria);
-    return {id:t.id,title:t.title,state:t.state,stage:t.stage,
+    return {id:t.id,title:t.title,state:t.state,stage:t.stage,planRevision:t.plan_revision,
+      requirementOutcomes:acceptance?.passed===true&&run?acceptedRequirementOutcomes(t.criteria??[],acceptance.checks??[],run.id,artifacts,run.fence):null,
       scope:t.execution?.baseWorkspace ?? t.execution?.workspace ?? 'objective',
       dependencies:dependencies.filter(d=>d.task_id===t.id).map(d=>d.depends_on),criteria:t.criteria ?? [],
       accepted:t.state==='accepted' && run?.state==='submitted' && run.attempt===t.attempt_count &&
@@ -154,7 +161,7 @@ export function occurrenceFrontier(occurrence:any, steps:any[], attempts:any[], 
 
 /** This snapshot is metadata only; execution and acceptance remain with their controllers. */
 export async function readObjectiveFrontierTasks(db:DB,goalId:string) {
-  return checkedExecutionMetadata((await db.query(`SELECT t.id,t.title,t.state,t.stage,t.criteria,t.covers,t.attempt_count,t.reason,
+  return checkedExecutionMetadata((await db.query(`SELECT t.id,t.title,t.state,t.stage,t.criteria,t.covers,t.attempt_count,t.reason,t.plan_revision,
     ${executionMetadataColumns},
     CASE WHEN NOT metadata.execution_present THEN NULL ELSE jsonb_build_object(
       'baseWorkspace',control."baseWorkspace",'workspace',control.workspace,
@@ -170,7 +177,7 @@ export async function readObjectiveFrontier(db:DB,goalId:string) {
   const tasks=await readObjectiveFrontierTasks(db,goalId);
   // Progress needs the current attempt and any older uncertain actor, never
   // historical prompts, provider payloads or base64 inputs from every attempt.
-  const runs=checkedRunCriteriaMetadata((await db.query(`SELECT r.id,r.task_id,r.attempt,r.state,
+  const runs=checkedRunCriteriaMetadata((await db.query(`SELECT r.id,r.task_id,r.attempt,r.state,r.fence,
     ${runCriteriaMetadataColumns},
     CASE WHEN t.state='accepted' AND r.state='submitted' AND r.attempt=t.attempt_count
       THEN criteria_metadata.criteria END accepted_criteria
@@ -180,8 +187,8 @@ export async function readObjectiveFrontier(db:DB,goalId:string) {
     AND (r.attempt=t.attempt_count OR r.state IN('queued','running','cancelling','reconciling'))`,[goalId])).rows);
   const acceptances=(await db.query('SELECT id,task_id,run_id,passed,checks,created_at FROM acceptances WHERE run_id=ANY($1::uuid[])',[runs.map(run=>run.id)])).rows;
   const dependencies=(await db.query('SELECT d.* FROM dependencies d JOIN tasks t ON t.id=d.task_id WHERE t.goal_id=$1',[goalId])).rows;
-  const artifacts=(await db.query('SELECT a.run_id,a.name,a.digest FROM artifacts a JOIN runs r ON r.id=a.run_id JOIN tasks t ON t.id=r.task_id WHERE t.goal_id=$1 AND r.attempt=t.attempt_count',[goalId])).rows;
+  const artifacts=(await db.query('SELECT a.id,a.run_id,a.name,a.digest,a.size FROM artifacts a JOIN runs r ON r.id=a.run_id JOIN tasks t ON t.id=r.task_id WHERE t.goal_id=$1 AND r.attempt=t.attempt_count',[goalId])).rows;
   const plan=(await db.query('SELECT revision,plan FROM plan_revisions WHERE objective_id=$1 ORDER BY revision DESC LIMIT 1',[goalId])).rows[0];
   return projectWorkFrontier({kind:'objective',id:goalId,version:plan?.revision},
-    objectiveFrontierNodes(tasks,runs,acceptances,dependencies,artifacts),plan?.plan.requirements ?? []);
+    objectiveFrontierNodes(tasks,runs,acceptances,dependencies,artifacts),plan?.plan.requirements ?? [],plan?.plan.completionContractVersion);
 }

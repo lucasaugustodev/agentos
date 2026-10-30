@@ -3,7 +3,8 @@ import { randomUUID, timingSafeEqual } from 'node:crypto';
 import { mkdir, writeFile, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { pool, tx, event, lock, type DB } from './db.js';
-import { objectiveFrontierNodes, projectWorkFrontier } from './work-frontier.js';
+import { objectiveFrontierNodes, projectWorkFrontier, readObjectiveFrontier } from './work-frontier.js';
+import {verifyRequirementOutcomes,readOutcomeInputs,type RequirementOutcomeProof} from './requirement-outcomes.js';
 import { config } from './config.js';
 import {
   goalSchema,
@@ -180,6 +181,13 @@ export async function refreshGoal(db: DB, id: string) {
   if (state === 'completed') {
     const latest = (await db.query('SELECT plan FROM plan_revisions WHERE objective_id=$1 ORDER BY revision DESC LIMIT 1',[id])).rows[0]?.plan;
     if (latest?.incremental?.pendingRequirementIds?.length) state = 'active';
+    if(latest?.completionContractVersion===2){
+      const frontier=await readObjectiveFrontier(db,id);
+      if(!frontier.complete)state='active';
+      await db.query(`UPDATE objectives SET reason=$2,updated_at=now() WHERE id=$1
+        AND reason IS DISTINCT FROM $2 AND EXISTS(SELECT 1 FROM goals g WHERE g.id=$1 AND g.state NOT IN('paused','cancelled'))`,
+        [id,frontier.next==='await_external_dependency'?'REQUIREMENTS_EXTERNALLY_BLOCKED':null]);
+    }
     // Same supersede rule as the planner advance: feedback a later completed
     // plan could already see cannot veto completion forever (legacy zombies
     // attached only to terminally failed planning runs never get consumed).
@@ -762,6 +770,9 @@ export async function validateTask(taskId: string, reviewer?: string) {
     throw new DomainError('NOT_SUBMITTED', 'A tarefa ainda não está pronta para validação.');
   const run = { id: task.run_id, fence: task.run_fence };
   const artifacts = task.artifacts;
+  const outcomeInputs=task.criteria.some((c:any)=>c.type==='requirement_outcomes'&&
+    c.requirements?.some((r:any)=>r.externalDependencies?.length||r.observables?.some((o:any)=>o.authority==='objective_input')))
+    ?await readOutcomeInputs(pool,task.goal_id):[];
   const checks: Array<{
     id: string;
     label: string;
@@ -769,6 +780,7 @@ export async function validateTask(taskId: string, reviewer?: string) {
     passed: boolean;
     detail: string;
     evidence?: ReturnType<typeof verifyRepairSourceProof> & { patchArtifactId: string; reportArtifactId: string };
+    requirementOutcomes?:RequirementOutcomeProof;
   }> = [];
   if(ci.required) checks.push({id:'registered-ci',label:'CI registrado da candidata',type:'registered_ci',
     passed:ci.state==='passed',detail:ci.detail});
@@ -779,9 +791,17 @@ export async function validateTask(taskId: string, reviewer?: string) {
     let passed = false,
       detail = '';
     let evidence: typeof checks[number]['evidence'];
+    let requirementOutcomes:RequirementOutcomeProof|undefined;
     if (c.type === 'review') {
       passed = !!reviewer;
       detail = reviewer ? 'Revisão atestada por ' + reviewer : 'Aguardando revisão do critério.';
+    } else if(c.type==='requirement_outcomes'){
+      try{
+        requirementOutcomes=await verifyRequirementOutcomes(c,task,readArtifact,outcomeInputs);
+        passed=true;detail='Relatório de resultados validado. Aceite da subentrega não conclui requisitos parciais ou dependências externas.';
+      }catch(error:any){
+        detail=/^REQUIREMENT_[A-Z_]+$/.test(error?.message??'')?error.message:'REQUIREMENT_OUTCOME_INVALID';
+      }
     } else if (c.type === 'repair_source_proof') {
       try {
         if (c.version !== 1 || c.name !== 'repair-report.json' || c.patch !== 'implementation.patch')
@@ -817,7 +837,8 @@ export async function validateTask(taskId: string, reviewer?: string) {
         }
       } else detail = 'Artefato obrigatório ausente.';
     }
-    checks.push({ id: c.id, label: c.label, type: c.type, passed, detail, ...(evidence ? { evidence } : {}) });
+    checks.push({ id: c.id, label: c.label, type: c.type, passed, detail, ...(evidence ? { evidence } : {}),
+      ...(requirementOutcomes?{requirementOutcomes}:{}) });
   }
   const passed = checks.every((c) => c.passed);
   return tx(async (db) => {
@@ -1200,7 +1221,7 @@ export async function goalDetail(id: string) {
   ).rows;
   const runs = (
     await pool.query(
-      `SELECT r.id,r.task_id,r.attempt,r.state,r.worker_id,r.account_id,r.runtime,r.agent_version,
+      `SELECT r.id,r.task_id,r.attempt,r.fence,r.state,r.worker_id,r.account_id,r.runtime,r.agent_version,
        r.parent_task_id,r.agent_role,r.agent_level,
        r.created_at,r.started_at,r.finished_at,r.heartbeat_at,r.context_id,r.summary,r.error_code,r.usage,r.checkpoint,r.model,
        r.instruction_snapshot->'task'->'criteria' accepted_criteria
@@ -1216,7 +1237,7 @@ export async function goalDetail(id: string) {
   ).rows;
   const objective =
     (await pool.query('SELECT * FROM objectives WHERE id=$1', [id])).rows[0] ?? null;
-  const frontierArtifacts=(await pool.query(`SELECT a.run_id,a.name,a.digest FROM artifacts a
+  const frontierArtifacts=(await pool.query(`SELECT a.id,a.run_id,a.name,a.digest,a.size FROM artifacts a
     JOIN runs r ON r.id=a.run_id JOIN tasks t ON t.id=r.task_id
     WHERE t.goal_id=$1 AND r.attempt=t.attempt_count`,[id])).rows;
   const revisions = objective
@@ -1240,13 +1261,13 @@ export async function goalDetail(id: string) {
     tasks: tasks.filter((t) => t.state !== 'superseded'),
     retiredTasks: tasks.filter((t) => t.state === 'superseded'),
     dependencies,
-    runs:runs.map(({accepted_criteria,...run})=>run),
+    runs:runs.map(({fence,accepted_criteria,...run})=>run),
     acceptances,
     objective,
     revisions,
     planning,
     frontier:projectWorkFrontier({kind:'objective',id,version:revisions[0]?.revision},
-      objectiveFrontierNodes(tasks,runs,acceptances,dependencies,frontierArtifacts),revisions[0]?.plan.requirements ?? []),
+      objectiveFrontierNodes(tasks,runs,acceptances,dependencies,frontierArtifacts),revisions[0]?.plan.requirements ?? [],revisions[0]?.plan.completionContractVersion),
     planningAttempts: objective
       ? (
           await pool.query(

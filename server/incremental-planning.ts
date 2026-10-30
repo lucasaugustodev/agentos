@@ -3,7 +3,8 @@ import { randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { DomainError } from './contracts.js';
 import { event, type DB } from './db.js';
-import { planSchema, type ObjectiveInput, type ProposedPlan } from './objective-contracts.js';
+import { planSchema,bindRequirementOutcomeContracts, type ObjectiveInput, type ProposedPlan } from './objective-contracts.js';
+import {requirementContractsSchema,readRequirementResolution,type RequirementResolution} from './requirement-outcomes.js';
 import {isAttemptLocalWriteScope} from './attempt-local-write-scope.js';
 import {sourceContractSchema,normalizeSourceContract,combineSourceContracts,sourcePathWithin,type SourceContract} from './source-contract-schema.js';
 
@@ -36,6 +37,7 @@ const singleDeliveryFields = {
 export const nextDeliveryItemSchema = z.object(singleDeliveryFields).strict();
 
 export const nextDeliverySchema = z.object({
+  requirementContracts:requirementContractsSchema.optional(),
   kind: singleDeliveryFields.kind,
   validationTargetKey: singleDeliveryFields.validationTargetKey,
   key: singleDeliveryFields.key,
@@ -50,7 +52,7 @@ export const nextDeliverySchema = z.object({
   deliveries: z.array(nextDeliveryItemSchema).min(1).max(6).optional(),
 }).strict();
 
-export function deliveryDecisionSchema(agents: {id:string;runtime:string}[],eligible?:string[],serial=false,sourceContractVersion?:1) {
+export function deliveryDecisionSchema(agents: {id:string;runtime:string}[],eligible?:string[],serial=false,sourceContractVersion?:1,completionVersion?:2) {
   const ids = [...new Set(agents.filter(a=>a.runtime==='harness'&&a.id!=='qa.integration').map(a=>a.id))];
   if (!ids.length) throw new DomainError('SCOPE_MISSING','Nenhum agente de execução disponível.');
   const agentEnum = z.enum(ids as [string,...string[]]);
@@ -58,12 +60,13 @@ export function deliveryDecisionSchema(agents: {id:string;runtime:string}[],elig
   const delivery=nextDeliveryItemSchema.extend({kind:z.literal('delivery'),
     validationTargetKey:z.never().optional(),agentId:agentEnum,requirementId,
     sourceContract:sourceContractVersion===1?sourceContractSchema:singleDeliveryFields.sourceContract});
-  if(serial)return delivery;
+  const contracts=completionVersion===2?{requirementContracts:requirementContractsSchema}:{};
+  if(serial)return delivery.extend(contracts);
   const validation=nextDeliveryItemSchema.extend({kind:z.literal('validation'),
     validationTargetKey:singleDeliveryFields.validationTargetKey.unwrap(),
     agentId:z.literal('qa.integration'),requirementId,sourceContract:z.never().optional()});
   const item=z.discriminatedUnion('kind',[delivery,validation]);
-  return z.union([delivery,z.object({deliveries:z.array(item).min(1).max(6)}).strict()]);
+  return z.union([delivery.extend(contracts),z.object({...contracts,deliveries:z.array(item).min(1).max(6)}).strict()]);
 }
 
 function invalid(violation:string,message:string,detail:Record<string,unknown>={}):never{
@@ -82,8 +85,13 @@ export function incrementalEligible(request: ObjectiveInput, previous?: Proposed
     request.requirements.every(r => r.length >= 5) && !previous);
 }
 
-export function deliveryFrontier(request: ObjectiveInput, previous?: ProposedPlan, advance = false) {
+export function deliveryFrontier(request: ObjectiveInput, previous?: ProposedPlan, advance = false,resolution?:RequirementResolution) {
   const requirements = previous?.requirements ?? request.requirements.map((description, i) => ({id: `req-${i+1}`, description}));
+  if(request.completionContractVersion===2||previous?.completionContractVersion===2){
+    const completed=previous?.completionContractVersion===2?(resolution?.completedRequirementIds??[]):[];
+    const blocked=advance&&previous?.completionContractVersion===2?(resolution?.blockedRequirementIds??[]):[];
+    return {requirements,completed,eligible:requirements.map(r=>r.id).filter(id=>!completed.includes(id)&&!blocked.includes(id))};
+  }
   const prior = previous?.incremental;
   const priorSelected = selectedRequirementIds(prior);
   const completed = prior ? [...prior.completedRequirementIds, ...(advance ? priorSelected : [])] : [];
@@ -91,11 +99,12 @@ export function deliveryFrontier(request: ObjectiveInput, previous?: ProposedPla
   return { requirements, completed, eligible };
 }
 
-export function compileDelivery(raw: unknown, request: ObjectiveInput, previous?: ProposedPlan, advance = false, reports: string[] = []) {
+export function compileDelivery(raw: unknown, request: ObjectiveInput, previous?: ProposedPlan, advance = false, reports: string[] = [],resolution?:RequirementResolution) {
   const parsed = nextDeliverySchema.parse(raw);
   if(parsed.deliveries&&Object.keys(singleDeliveryFields).some(key=>(parsed as any)[key]!==undefined))
     invalid('AMBIGUOUS_DECISION','Use uma entrega única ou deliveries; não misture os dois formatos.');
-  const items = parsed.deliveries?.length ? parsed.deliveries : [nextDeliveryItemSchema.parse(raw)];
+  const {requirementContracts:requestedContracts,...single}=parsed;
+  const items = parsed.deliveries?.length ? parsed.deliveries : [nextDeliveryItemSchema.parse(single)];
   const sourceContractVersion=request.sourceContractVersion??previous?.sourceContractVersion;
   if(!sourceContractVersion&&items.some(item=>item.sourceContract))
     invalid('SOURCE_CONTRACT_VERSION_REQUIRED','Um contrato de fonte exige planejamento com a versão explícita.');
@@ -116,7 +125,9 @@ export function compileDelivery(raw: unknown, request: ObjectiveInput, previous?
     try{return {sourceContract:combineSourceContracts(contracts as SourceContract[])};}
     catch{invalid('SOURCE_CONTRACT_CONFLICT','As contribuições têm obrigações de fonte conflitantes.');}
   };
-  const { requirements, completed, eligible } = deliveryFrontier(request, previous, advance);
+  const { requirements, completed, eligible } = deliveryFrontier(request, previous, advance,resolution);
+  const finish=(plan:ProposedPlan)=>bindDeliveryFeedback(bindRequirementOutcomeContracts({...plan,
+    ...(requestedContracts?{requirementContracts:requestedContracts}:{})},request,previous),reports);
   const selectedIds = [...new Set(items.filter(i=>i.kind!=='validation').map(i => i.requirementId))];
   if (items.some(i=>!eligible.includes(i.requirementId)))
     invalid('INELIGIBLE_REQUIREMENT','Selecione somente requisitos elegíveis.',{eligible,received:items.map(i=>i.requirementId)});
@@ -181,7 +192,7 @@ export function compileDelivery(raw: unknown, request: ObjectiveInput, previous?
         criteria:[{id:'verified',label:'Verificação independente da candidata',type:'json_field',name:'verification.json',field:'passed',equals:true}],
       }],
     });
-    return bindDeliveryFeedback(plan,reports);
+    return finish(plan);
   }
   const seenPaths: { idx: number; path: string }[] = [];
   const deliveries=keyed.filter(item=>item.kind==='delivery');
@@ -301,7 +312,7 @@ export function compileDelivery(raw: unknown, request: ObjectiveInput, previous?
       },
     ],
   });
-  return bindDeliveryFeedback(plan,reports);
+  return finish(plan);
 }
 
 function deliveryFeedbackText(reports: string[] = []) {
@@ -378,14 +389,19 @@ export async function verifiedBatch(db: DB, goalId: string, revision: number) {
 }
 
 export async function queueNextDelivery(db: DB, objective: any, previous: ProposedPlan) {
-  if (!previous.incremental?.pendingRequirementIds.length) return false;
+  if (!previous.incremental || (!previous.incremental.pendingRequirementIds.length&&previous.completionContractVersion!==2)) return false;
+  if(previous.completionContractVersion===2&&!(await db.query(`SELECT 1 FROM objectives o JOIN goals g ON g.id=o.id
+    WHERE o.id=$1 AND o.revision=$2 AND o.mode='execute' AND g.state='active'`,[objective.id,objective.revision])).rowCount)return false;
   if ((await db.query("SELECT 1 FROM planning_runs WHERE objective_id=$1 AND state IN('queued','running','waiting_quota')",[objective.id])).rowCount) return false;
   const proof = await verifiedBatch(db, objective.id, objective.revision);
   if (!proof) return false;
+  const resolution=previous.completionContractVersion===2?await readRequirementResolution(db,objective.id,objective.revision):undefined;
+  if(resolution&&!deliveryFrontier(objective.request,previous,true,resolution).eligible.length)return false;
   const id = randomUUID();
   const inserted = await db.query(`INSERT INTO planning_runs(id,objective_id,base_revision,trigger_key,fence,feedback)
     VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING`,[id,objective.id,objective.revision,
     `incremental:${objective.revision}:${proof.runId}`,randomUUID(),JSON.stringify({sourceContractVersion:1,incrementalAdvance:proof,
+      ...(resolution?{completionContractVersion:2,requirementResolution:resolution}:{}),
       sourceOverrides:{[objective.request.workspaces[0]]:proof.sourceWorkspace}})]);
   if (!inserted.rowCount) return false;
   await db.query("UPDATE objectives SET status='replanning',reason=NULL,updated_at=now() WHERE id=$1",[objective.id]);
@@ -404,7 +420,12 @@ export async function assertIncrementalAuthority(db: DB, run: any, plan: Propose
   if (feedback && plan.tasks.some(t=>!t.description.endsWith(feedback)))
     throw new DomainError('REQUIRED_CONTEXT','A revisão não pode omitir o feedback persistido dos executores e do QA.');
   const advance = !!run.feedback?.incrementalAdvance;
-  const { completed, eligible } = deliveryFrontier(run.request, previous, advance);
+  const resolution=run.feedback?.requirementResolution;
+  if(previous?.completionContractVersion===2){
+    const current=await readRequirementResolution(db,run.objective_id,run.base_revision);
+    if(!resolution||!isDeepStrictEqual(current,resolution))throw new DomainError('STALE_PLAN','Resultados por requisito mudaram desde o planejamento.');
+  }
+  const { completed, eligible } = deliveryFrontier(run.request, previous, advance,resolution);
   const selectedIds = selectedRequirementIds(plan.incremental);
   const expectedPending = plan.requirements.map(r => r.id).filter(id => !completed.includes(id) && !selectedIds.includes(id));
   if (!selectedIds.length || new Set(selectedIds).size !== selectedIds.length ||

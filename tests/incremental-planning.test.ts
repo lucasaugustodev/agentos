@@ -15,6 +15,7 @@ const request = () => objectiveSchema.parse({message:'Corrigir dois defeitos ind
 const decision = (requirementId='req-1') => ({kind:'delivery' as const,requirementId,title:'Corrigir persistência',action:'Reproduzir a falha de persistência e corrigir sua causa com teste discriminante.',
   verification:'Executar regressão que falha na base e passa na candidata, preservando os demais controles.',agentId:'engineering.backend.node',
   sourceContract:{version:1 as const,required:[],preserve:[],noSourceReason:'Synthetic transition fixture emits diagnostic evidence without claiming a real source implementation.'}});
+const generatedContracts=['req-1','req-2'].map(id=>({id,observables:[{id:'observable',name:id+'-result.json',authority:'current_run',type:'artifact',description:'Synthetic fixture product evidence for the original requirement'}]}));
 beforeAll(()=>migrate());
 beforeEach(async()=>{
   await pool.query('TRUNCATE goals,agents,accounts,memories,events CASCADE');
@@ -268,7 +269,7 @@ it('recovers a confirmed timeout with the small contract and reuses persisted ou
     if(method==='generate'){
       expect(p.maxOutputTokens).toBe(8192);expect(JSON.parse(p.messages[0].content)).not.toHaveProperty('previousPlan');
       if(++generated===1)throw Object.assign(Error('confirmed'),{code:'PROVIDER_TIMEOUT'});
-      return {message:{content:[{type:'text',text:JSON.stringify(decision())}]}};
+      return {message:{content:[{type:'text',text:JSON.stringify({...decision(),requirementContracts:generatedContracts})}]}};
     }
     if(method==='worker.prepare'&&++prepared===1)throw Object.assign(Error('busy'),{code:'SOURCE_BUSY'});
     const inspection=preparation(method,p);if(inspection!==undefined)return inspection;
@@ -306,7 +307,7 @@ it('repairs the first invalid agent after nineteen transport failures without co
       const deliverySchema=schema.anyOf[0];
       expect(deliverySchema.properties.agentId.enum).toContain('engineering.backend.node');
       expect(deliverySchema.properties.agentId.enum).not.toContain('engineering.backend.nodejs');
-      return {message:{content:[{type:'text',text:JSON.stringify({...decision(),agentId:++generated===1?'engineering.backend.nodejs':'engineering.backend.node'})}]}};
+      return {message:{content:[{type:'text',text:JSON.stringify({...decision(),requirementContracts:generatedContracts,agentId:++generated===1?'engineering.backend.nodejs':'engineering.backend.node'})}]}};
     }
     throw Error('ranking fallback');
   });

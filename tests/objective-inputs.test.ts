@@ -19,6 +19,7 @@ const decision={kind:'delivery',requirementId:'req-1',title:'Corrigir o consumid
   action:'Reproduzir o defeito e corrigir o consumidor preservando os controles originais.',
   verification:'Reexecutar o contrato original e os negativos na candidata imutável.',agentId:'engineering.backend.node',
   sourceContract:{version:1,required:[],preserve:[],noSourceReason:'Synthetic immutable-input controller fixture records evidence without claiming source implementation.'}};
+const generatedContracts=['req-1','req-2'].map(id=>({id,observables:[{id:'observable',name:id+'-result.json',authority:'current_run',type:'artifact',description:'Synthetic fixture product evidence for the original requirement'}]}));
 beforeAll(async()=>{await migrate();await installObjectiveInputs();});
 beforeEach(async()=>{
   await pool.query('TRUNCATE goals,agents,accounts,memories,events CASCADE');
@@ -242,7 +243,7 @@ it('supplies verified operator context to the real compact planner before choosi
       const message=JSON.parse(p.messages[0].content),entry=message.objectiveInputs.inputs[0];
       expect(entry).toMatchObject({id:registered.inputId,digest:body.digest,content:bytes.toString()});
       expect(p.system).toContain('not authorization');expect(p.system).toContain('bounded investigation');
-      return {message:{content:[{type:'text',text:JSON.stringify(decision)}]}};
+      return {message:{content:[{type:'text',text:JSON.stringify({...decision,requirementContracts:generatedContracts})}]}};
     }
     throw Error('ranking fallback');
   });
@@ -308,7 +309,7 @@ it('delivers a receipt-bound summary to the real planner and records summary-onl
       const entry=JSON.parse(p.messages[0].content).objectiveInputs.inputs[0];
       expect(entry).toMatchObject({id:registered.inputId,digest:body.digest,summary,originalContentRead:false,omitted:'per-input-budget'});
       expect(entry).not.toHaveProperty('content');expect(p.system).toContain('not as the full document');
-      return {message:{content:[{type:'text',text:JSON.stringify(decision)}]}};
+      return {message:{content:[{type:'text',text:JSON.stringify({...decision,requirementContracts:generatedContracts})}]}};
     }
     throw Error('ranking fallback');
   });

@@ -59,7 +59,8 @@ function bridge(generate:(params:any)=>Promise<any>){
   throw Error('Unexpected RPC: '+method);
  });
 }
-const response=(value:any)=>({message:{content:[{type:'text',text:JSON.stringify(value)}]}});
+const response=(value:any)=>({message:{content:[{type:'text',text:JSON.stringify({...value,
+ requirementContracts:['req-1','req-2'].map(id=>({id,observables:[{id:'result',name:id+'-result.json',authority:'current_run',type:'artifact',description:'Synthetic supervisor fixture product evidence'}]}))})}]}});
 it('reconciles the existing failed identity once, retaining attempts, source/QA proof and accepted tasks',async()=>{
  const before=(await pool.query('SELECT id,state,execution,criteria FROM tasks WHERE goal_id=$1 ORDER BY id',[f.goal])).rows;
  await reconcilePlanning();await reconcilePlanning();
@@ -74,7 +75,11 @@ it('reconciles the existing failed identity once, retaining attempts, source/QA 
 it('lets the GLM supervisor apply a corrected multi-task proposal, then verifies effect only after independent batch acceptance',async()=>{
  await reconcilePlanning();
  bridge(async p=>{
-  const message=JSON.parse(p.messages[0].content);expect(message.eligible).toEqual(['req-2']);expect(message.planningSupervision.mode).toBe('supervised');
+  const message=JSON.parse(p.messages[0].content);
+  // A v1 subdelivery remains accepted, but cannot manufacture a v2 outcome.
+  expect(message.eligible).toEqual(['req-1','req-2']);expect(message.completed).toEqual([]);
+  expect(message.completionMigration.requirementCompletion).toBe('unproven_without_v2_outcomes');
+  expect(message.planningSupervision.mode).toBe('supervised');
   return response({deliveries:[{...item('req-2'),key:'a',writePaths:['src/a.ts']},{...item('req-2'),key:'b',dependsOn:['a'],writePaths:['src/b.ts']}]});
  });
  const engine=new PlanningEngine();await engine.execute(await claimPlanning(),new AbortController().signal);
@@ -97,7 +102,7 @@ it('escalates one invalid supervised proposal to a complete serial fallback, wit
  await reconcilePlanning();let calls=0;
  bridge(async p=>{
   const message=JSON.parse(p.messages[0].content);
-  if(++calls===1)return response({...item('req-1')});
+  if(++calls===1)return response({...item('invented')});
   expect(message.planningSupervision.mode).toBe('serial');expect(message.schema.properties).not.toHaveProperty('deliveries');
   return response(item('req-2'));
  });
