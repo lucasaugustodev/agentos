@@ -399,15 +399,14 @@ async function generate(params, signal, emit, admission) {
     if (glmModelProfile(account.id,params.model).reasoning)
       provider = openAICompletionsFallback();
   }
+  // One identity before admission binds the gate and transport observations.
+  const requestId = typeof params.requestId === 'string' &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(params.requestId)
+    ? params.requestId : randomUUID();
   return withAccountRequestGate(
-    params,
+    {...params,requestId},
     signal,
     async (requestSignal) => {
-      // The worker announces this identity before admission. Direct generate
-      // calls get a private identity too; provider payloads cannot replace it.
-      const requestId = typeof params.requestId === 'string' &&
-        /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(params.requestId)
-        ? params.requestId : randomUUID();
       const stream = provider.streamSimple(
         model,
         { systemPrompt: params.system ?? '', messages: params.messages, tools: params.tools ?? [] },
@@ -417,6 +416,7 @@ async function generate(params, signal, emit, admission) {
           reasoning: params.reasoning ?? 'low',
           transport: 'sse',
           maxTokens: params.maxOutputTokens ?? 4096,
+          onTelemetry: (kind,payload) => emit(kind,{...payload,requestId}),
           onProgress: progress => emit('MODEL_STREAM_PROGRESS', {
             requestId,
             characters: progress.characters,
