@@ -18,6 +18,7 @@ broker = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(broker)
 p = broker.provenance
 from validation_coverage import verified_coverage
+NATIVE_BUNDLES = copy.deepcopy(p.REVIEWED_BUNDLES)
 
 
 class ValidatorProvenanceTests(unittest.TestCase):
@@ -359,6 +360,26 @@ class ValidatorProvenanceTests(unittest.TestCase):
         self.assertEqual(self.layout.active.resolve(),before)
         self.assertEqual(record['bundleManifest'],p.REVIEWED_BUNDLES[p.REVIEWED_SHA]['files'])
         self.assertEqual(p.active_registration(self.layout,for_execution=True),pointer)
+
+    def test_current_capacity_bundle_registers_exact_bytes_without_rewriting_publication_or_replaying_ci(self):
+        guard=(ROOT/'scripts/agentos-release-action.py').read_bytes();identity=p.sha(guard)
+        bundle=NATIVE_BUNDLES[identity]
+        self.assertEqual(bundle['files'],{'agentos-release-action.py':identity,'candidate_origin.py':p.sha(self.helper)})
+        self.assertEqual(bundle['sourceCommit'],'d65e4801eef3412b7ff234fbf81c618acd512373')
+        folder=self.layout.control.parent/'reviewed-validator-bundles'/identity
+        self.put(folder/'agentos-release-action.py',guard);self.put(folder/'candidate_origin.py',self.helper)
+        before={x.name:x.read_bytes() for x in self.directory.iterdir()};active=self.layout.active.resolve()
+        with patch.dict(p.REVIEWED_BUNDLES,{identity:bundle}):
+            request=self.request()|{'executorSha256':identity,'sourceCommit':bundle['sourceCommit']}
+            pointer=self.register(request)
+            self.assertEqual(self.layout.control.read_bytes(),guard)
+            self.assertEqual(p.active_registration(self.layout,for_execution=True),pointer)
+            self.assertEqual(self.register(request),pointer)
+            record=p.registration_record(self.layout,pointer)
+            self.assertEqual(record['sourceKind'],'reviewed_public_source')
+            self.assertEqual(record['bundleManifest'],bundle['files'])
+        self.assertEqual(self.layout.active.resolve(),active)
+        self.assertEqual({x.name:x.read_bytes() for x in self.directory.iterdir()},before)
 
     def test_unreviewed_hash_wrong_commit_and_free_source_path_are_rejected(self):
         for field,value in [('executorSha256','f'*64),('sourceCommit','f'*40),('sourcePath','/tmp/untrusted')]:

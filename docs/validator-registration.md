@@ -15,6 +15,16 @@ guard SHA256 `39843bdbde81e84b5093ed6667484378d1f4444c66aa33424b52d28b45b0cc44`
 and origin-module SHA256
 `742212cdc76a1404418ad9fa0b57215d377eea4433f77bc2cd29eed9e2a27e6f`.
 
+The capacity bundle from commit `d65e4801eef3412b7ff234fbf81c618acd512373`
+has guard SHA256 `cf4351977a994457dd0b74da8449c05597479ba4410e3015e499d7359d094383`.
+Its only guard change raises the native operator coverage limit from 128 to 256
+exact `(file, fullName)` obligations. The origin module is unchanged. Larger
+lists, duplicates, invalid names and paths remain rejected; no list is truncated.
+This does not change the separate worker-admission policy limit of 128.
+Register the new bundle through the procedure below, preserving previous
+registration and failed-attempt receipts. Releases must include this registrar
+identity before they consume a publication produced by the new executor.
+
 `scripts/validator_provenance.py inspect` reads the active immutable publication.
 It accepts two explicit formats, without manufacturing historical sidecars:
 
