@@ -60,6 +60,7 @@ export function fromCompletionsResponse(data) {
   return buildMessage({
     text: choice?.message?.content ?? '',
     thinking: choice?.message?.reasoning_content ?? '',
+    thinkingPresent: typeof choice?.message?.reasoning_content === 'string',
     calls: (choice?.message?.tool_calls ?? []).map((c, index) => ({
       index, id: c.id, name: c.function?.name, arguments: c.function?.arguments,
     })),
@@ -68,7 +69,7 @@ export function fromCompletionsResponse(data) {
   });
 }
 
-function buildMessage({ text, thinking = '', calls, finish, usage }) {
+function buildMessage({ text, thinking = '', thinkingPresent = false, calls, finish, usage }) {
   // No partial response may reach a tool executor. A transport EOF is not a
   // provider terminal marker; length also takes precedence over tool calls.
   if (finish === 'length') throw failure('MODEL_OUTPUT_LIMIT');
@@ -76,7 +77,7 @@ function buildMessage({ text, thinking = '', calls, finish, usage }) {
   if ((finish === 'tool_calls') !== (calls.length > 0)) throw failure('MODEL_INCOMPLETE_RESPONSE');
   if (!calls.length && !text) throw failure('MISSING_MODEL_RESPONSE');
   const content = [];
-  if (thinking) content.push({type:'thinking',thinking});
+  if (thinking || thinkingPresent) content.push({type:'thinking',thinking});
   if (text) content.push({ type: 'text', text: String(text) });
   const ids = new Set();
   for (const call of calls) {
@@ -110,7 +111,7 @@ export async function readCompletionsStream(body, signal, onProgress, now = () =
   const startedAt = now();
   let chunks = 0, reportedAt = -Infinity, reportedSemantic = 0, semanticCharacters = 0;
   const calls = new Map();
-  let buffer = '', text = '', thinking = '', finish, usage, bytes = 0, done = false, bodyObserved = false;
+  let buffer = '', text = '', thinking = '', thinkingPresent = false, finish, usage, bytes = 0, done = false, bodyObserved = false;
   const counters = () => ({characters:text.length, reasoningCharacters:thinking.length,
     toolCharacters:[...calls.values()].reduce((n,c)=>n+c.arguments.length,0),
     semanticCharacters, chunks, elapsedMs:now()-startedAt});
@@ -142,7 +143,7 @@ export async function readCompletionsStream(body, signal, onProgress, now = () =
       if (choice.finish_reason) finish = choice.finish_reason;
       const delta = choice.delta ?? {};
       let added = 0;
-      if (typeof delta.reasoning_content === 'string') { thinking += delta.reasoning_content; added += delta.reasoning_content.length; }
+      if (typeof delta.reasoning_content === 'string') { thinkingPresent = true; thinking += delta.reasoning_content; added += delta.reasoning_content.length; }
       if (typeof delta.content === 'string') { text += delta.content; added += delta.content.length; }
       for (const call of delta.tool_calls ?? []) {
         const index = call.index ?? calls.size;
@@ -173,7 +174,7 @@ export async function readCompletionsStream(body, signal, onProgress, now = () =
   telemetry?.bodyEnd();
   if (signal?.aborted) throw modelAbortFailure(signal);
   if (buffer.trim()) throw failure('MODEL_INCOMPLETE_RESPONSE');
-  const message = buildMessage({ text, thinking, calls: [...calls.values()].sort((a, b) => a.index - b.index), finish, usage });
+  const message = buildMessage({ text, thinking, thinkingPresent, calls: [...calls.values()].sort((a, b) => a.index - b.index), finish, usage });
   onProgress?.({...counters(),done:true});
   return message;
 }

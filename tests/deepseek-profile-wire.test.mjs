@@ -4,7 +4,7 @@ import {mkdtemp,writeFile,rm} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {validateModelPolicy,assertModelRoute} from '../bridge/model-policy.mjs';
 import {operatorModelProfile,workerModelSettings} from '../bridge/operator-model-profile.mjs';
-import {openAICompletionsFallback,toCompletionsMessages,fromCompletionsResponse} from '../bridge/openai-completions-fallback.mjs';
+import {openAICompletionsFallback,toCompletionsMessages,fromCompletionsResponse,readCompletionsStream} from '../bridge/openai-completions-fallback.mjs';
 import {toGeneration,completion} from '../bridge/runtime-gateway.mjs';
 import {openCodeRoute,openCodeCompletionPayload} from '../bridge/opencode-executor.mjs';
 import {withAccountRequestGate,GLM_ACCOUNT} from '../bridge/gated-generation.mjs';
@@ -66,7 +66,7 @@ test('planner budget remains 8192 and explicit disabled thinking omits effort an
 
 test('all assistant reasoning survives both directions and subsequent tool turns byte-for-byte',async t=>{
   await configured(t);
-  const reason1=' reasoning α\n'.repeat(1200),reason2='tool reasoning é\n'.repeat(1200);
+  const reason1=' reasoning Î±\n'.repeat(1200),reason2='tool reasoning Ã©\n'.repeat(1200);
   const normal=fromCompletionsResponse({choices:[{message:{content:'previous answer',reasoning_content:reason1},finish_reason:'stop'}]});
   const tool=fromCompletionsResponse({choices:[{message:{reasoning_content:reason2,tool_calls:[{id:'call1',function:{name:'read',arguments:'{"path":"fixture"}'}}]},finish_reason:'tool_calls'}]});
   const history=[completion(normal,policy.model)[0].choices[0].delta,completion(tool,policy.model)[0].choices[0].delta,
@@ -79,6 +79,18 @@ test('all assistant reasoning survives both directions and subsequent tool turns
   const scoped=openCodeCompletionPayload(payload,{accountId:policy.bridgeId,model:policy.model});
   assert.deepEqual(scoped.messages,rebuilt);assert.deepEqual(scoped.thinking,{type:'enabled'});
   assert.equal(scoped.max_tokens,32768);assert.equal(scoped.max_completion_tokens,undefined);assert.equal(scoped.reasoning_effort,'low');
+});
+
+test('explicit empty reasoning is preserved and absence is never fabricated',async()=>{
+  const json=fromCompletionsResponse({choices:[{message:{content:'ok',reasoning_content:''},finish_reason:'stop'}]});
+  const stream=await readCompletionsStream({async *[Symbol.asyncIterator](){yield Buffer.from('data: '+JSON.stringify({choices:[{delta:{content:'ok',reasoning_content:''},finish_reason:'stop'}]})+'\n\n');}});
+  for(const message of [json,stream]){
+    const wire=completion(message,policy.model)[0].choices[0].delta;
+    const input=toGeneration({messages:[wire]},{accountId:'unconfigured',model:policy.model});
+    assert.equal(toCompletionsMessages('',input.messages)[0].reasoning_content,'');
+  }
+  const absent=fromCompletionsResponse({choices:[{message:{content:'ok'},finish_reason:'stop'}]});
+  assert.equal(Object.hasOwn(completion(absent,policy.model)[0].choices[0].delta,'reasoning_content'),false);
 });
 
 test('mixed valid calls share six permits and cancellation retains an owned permit until body unwinds',async t=>{

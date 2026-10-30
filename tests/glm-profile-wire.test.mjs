@@ -1,9 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { glmModelProfile } from '../bridge/glm-model-profile.mjs';
-// Use the installed provider adapter with a local fake HTTP response, not a
-// second implementation of its serializer. No real credential or network.
-const { openAICompletionsApi } = await import('/opt/deepseek-harness/app/node_modules/@earendil-works/pi-ai/dist/api/openai-completions.lazy.js');
+// Exercise the inspected adapter actually selected by bridge/server.mjs.
+// No optional SDK, real credential or network is needed.
+import { openAICompletionsFallback } from '../bridge/openai-completions-fallback.mjs';
 const account = 'agentos:api:00000000-0000-4000-8000-000000000001';
 for (const [reasoning, expected] of [['low', 'low'], ['medium', 'high'], ['xhigh', 'max']]) {
   test(`GLM wire format preserves ${reasoning} effort and bounded output`, async () => {
@@ -20,7 +20,7 @@ for (const [reasoning, expected] of [['low', 'low'], ['medium', 'high'], ['xhigh
       return new Response(chunks.map(c => 'data: ' + JSON.stringify(c) + '\n\n').join('') + 'data: [DONE]\n\n',
         { headers: { 'content-type': 'text/event-stream' } });
     };
-    const result = await openAICompletionsApi().streamSimple(model,
+    const result = await openAICompletionsFallback({fetch}).streamSimple(model,
       { systemPrompt: 'fixture', messages: [{ role: 'user', content: 'fixture', timestamp: Date.now() }] },
       { apiKey: 'fixture', fetch, reasoning, maxTokens: 12000 }).result();
     assert.equal(result.stopReason, 'stop');
