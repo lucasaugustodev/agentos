@@ -34,12 +34,12 @@ test('v2 selects exactly one operator-owned API pair; model names grant no profi
   assert.throws(()=>assertModelRoute('unverified',policy.model),/MODEL_POLICY_GLM_ONLY/);
   assert.deepEqual(operatorModelProfile('unverified',policy.model),{});
   assert.deepEqual(workerModelSettings('unverified',policy.model),{reasoning:'high',maxOutputTokens:8192});
-  assert.deepEqual(workerModelSettings(policy.bridgeId,policy.model),{reasoning:'low',maxOutputTokens:32768});
+  assert.deepEqual(workerModelSettings(policy.bridgeId,policy.model),{reasoning:'high',maxOutputTokens:32768});
   assert.deepEqual(openCodeRoute({accountId:policy.accountId,model:policy.model}),{accountId:policy.bridgeId,model:policy.model});
   assert.throws(()=>openCodeRoute({accountId:GLM_ACCOUNT,model:'glm-5.3-flash'}),/INVALID_ROUTE/);
 });
 
-for(const [effort,expected] of [['low','low'],['medium','high'],['xhigh','max']])test(`DeepSeek actual serialized wire ${effort} and telemetry use its thinking contract`,async t=>{
+for(const [effort,expected] of [['low','high'],['high','high'],['xhigh','max']])test(`DeepSeek actual serialized wire ${effort} and telemetry use its thinking contract`,async t=>{
   await configured(t);let wire;const events=[];
   const input=toGeneration({max_tokens:1,reasoning_effort:'off',messages:[{role:'user',content:'private input'}]},
     {accountId:policy.bridgeId,model:policy.model,reasoning:effort});
@@ -78,7 +78,7 @@ test('all assistant reasoning survives both directions and subsequent tool turns
   const payload={model:policy.model,messages:rebuilt,tools:[{type:'function',function:{name:'read'}}],max_completion_tokens:1,thinking:{type:'disabled',clear_thinking:true}};
   const scoped=openCodeCompletionPayload(payload,{accountId:policy.bridgeId,model:policy.model});
   assert.deepEqual(scoped.messages,rebuilt);assert.deepEqual(scoped.thinking,{type:'enabled'});
-  assert.equal(scoped.max_tokens,32768);assert.equal(scoped.max_completion_tokens,undefined);assert.equal(scoped.reasoning_effort,'low');
+  assert.equal(scoped.max_tokens,32768);assert.equal(scoped.max_completion_tokens,undefined);assert.equal(scoped.reasoning_effort,'high');
 });
 
 test('explicit empty reasoning is preserved and absence is never fabricated',async()=>{

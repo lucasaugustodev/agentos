@@ -14,9 +14,11 @@ Create a new authorized occurrence for a new experiment. The historical five-gam
 GLM admission command explicitly refuses a policy mismatch before any effect.
 
 The selected DeepSeek route uses the inspected OpenAI-compatible transport:
-thinking enabled, low reasoning, 32768 worker output tokens and 8192 planner
+thinking enabled, high reasoning, 32768 worker output tokens and 8192 planner
 output tokens. Planner deadlines retain their existing non-GLM values. DeepSeek
-does not receive Z.ai's `clear_thinking` field. Full `reasoning_content` survives
+does not receive Z.ai's `clear_thinking` field. The selected aggregator route
+advertises high/max effort; low/minimal requests map to high rather than assuming
+the native API's low capability. Full `reasoning_content` survives
 assistant tool and ordinary turns; telemetry reports actual serialized options
 without prompt, credential or reasoning bytes. Protocol reference:
 https://api-docs.deepseek.com/guides/thinking_mode/

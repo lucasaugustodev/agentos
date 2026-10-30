@@ -252,7 +252,7 @@ export function openAICompletionsFallback({ fetch: fetchImpl = fetch, random = M
           ...(model.compat?.thinkingFormat === 'deepseek' ? {
             thinking:{type:options.reasoning === 'off' ? 'disabled' : 'enabled'},
             ...(options.reasoning === 'off' ? {} : {
-              reasoning_effort:model.thinkingLevelMap?.[options.reasoning ?? 'low'] ?? 'low',
+              reasoning_effort:model.thinkingLevelMap?.[options.reasoning ?? 'high'] ?? 'high',
             }),
           } : {}),
           ...(tools?.length ? { tools: tools.map((t) => ({ type: 'function', function: t })) } : {}),

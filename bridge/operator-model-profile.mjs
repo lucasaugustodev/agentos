@@ -10,13 +10,15 @@ export function operatorModelProfile(accountId, modelId, policy = readModelPolic
       thinkingFormat: 'deepseek', supportsReasoningEffort: true,
       maxTokensField: 'max_tokens', supportsStore: false, supportsDeveloperRole: false,
     },
-    thinkingLevelMap: { off: null, minimal: 'low', low: 'low', medium: 'high', high: 'high', xhigh: 'max' },
+    // This operator route advertises high/max, unlike the native DeepSeek API.
+    thinkingLevelMap: { off: null, minimal: 'high', low: 'high', medium: 'high', high: 'high', xhigh: 'max' },
   };
   return glmModelProfile(accountId, modelId);
 }
 
 export function workerModelSettings(accountId, modelId) {
-  return operatorModelProfile(accountId, modelId).reasoning
-    ? { reasoning: 'low', maxOutputTokens: 32768 }
+  const profile=operatorModelProfile(accountId, modelId);
+  return profile.reasoning
+    ? { reasoning: profile.compat.thinkingFormat === 'deepseek' ? 'high' : 'low', maxOutputTokens: 32768 }
     : { reasoning: 'high', maxOutputTokens: 8192 };
 }

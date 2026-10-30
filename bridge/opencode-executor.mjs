@@ -78,7 +78,7 @@ export function openCodeCompletionPayload(payload, route) {
   const profile=operatorModelProfile(route.accountId,route.model);
   if (profile.compat?.thinkingFormat!=='deepseek') return payload;
   const {max_completion_tokens, ...rest}=payload;
-  return {...rest,max_tokens:32768,thinking:{type:'enabled'},reasoning_effort:'low'};
+  return {...rest,max_tokens:32768,thinking:{type:'enabled'},reasoning_effort:'high'};
 }
 
 export async function runOpenCode(params, signal, emit = () => {}) {
@@ -101,6 +101,7 @@ async function executeOpenCode(params, signal, emit) {
       writePaths.some((item) => !['qa-protocol/', 'evidence/'].includes(item))) throw failure('INVALID_WRITE_SCOPE');
   const route=openCodeRoute(params);
   const {accountId:ACCOUNT,model:MODEL}=route;
+  const deepseek=operatorModelProfile(ACCOUNT,MODEL).compat?.thinkingFormat==='deepseek';
   const memory = openCodeMemory(params);
   const account = JSON.parse(await readFile('/var/lib/agentos-bridge/accounts.json', 'utf8'))
     .find((item) => item.id === ACCOUNT);
@@ -202,11 +203,11 @@ async function executeOpenCode(params, signal, emit) {
         permission: { task: 'deny', question: 'deny', webfetch: 'deny', websearch: 'deny', skill: 'deny' } } },
       provider: { agentos: { npm: '@ai-sdk/openai-compatible', name: 'AgentOS scoped gateway',
         options: { baseURL: 'http://127.0.0.1:17820/v1', apiKey: 'no-provider-secret' },
-        models: { [MODEL]: { name: MODEL, tool_call: true, reasoning: true, attachment: true,
-          modalities: { input: ['text', 'image'], output: ['text'] },
+        models: { [MODEL]: { name: MODEL, tool_call: true, reasoning: true, attachment: !deepseek,
+          modalities: { input: deepseek ? ['text'] : ['text', 'image'], output: ['text'] },
           interleaved: { field: 'reasoning_content' }, limit: { context: 1048576, output: 32768 },
-          options: { reasoningEffort: 'low' }, variants: {
-            low: { reasoningEffort: 'low' }, high: { reasoningEffort: 'high' }, max: { reasoningEffort: 'max' },
+          options: { reasoningEffort: deepseek ? 'high' : 'low' }, variants: {
+            low: { reasoningEffort: deepseek ? 'high' : 'low' }, high: { reasoningEffort: 'high' }, max: { reasoningEffort: 'max' },
           } } } } },
     }));
     const exampleArtifacts = params.deliveryContract?.artifacts?.length
@@ -215,7 +216,7 @@ async function executeOpenCode(params, signal, emit) {
     await writeFile(`${home}/prompt.txt`, `${params.prompt}${sourceInputs.instruction}\n\nContext manifest and shared memory: /home/agent/context.json\nInputs: /home/agent/inputs/\nImplement and test the scoped work in /workspace. Source files are mounted read-only; write only under ${writePaths.join(', ')} and use data/ for temporary test state. Routine errors are work to fix within this scope, not grounds to stop. No external network or production files are available. Browser library if needed: /opt/agentos-runtime/node_modules/playwright/index.mjs. Save real evidence in /workspace/evidence. Final response MUST be only JSON {"summary":"what actually changed and was tested, including limitations","artifacts":${JSON.stringify(exampleArtifacts)}}. Paths must be real files relative to /workspace. Do not claim independent acceptance. Do not use reserved artifact names candidate.json or changes.patch; the controller generates these.` + museTaskDeliveryInstruction(params.deliveryContract));
     await appendFile(`${home}/prompt.txt`, deliveryManifestInstructionFor(outputContract));
     if (repairSnapshot) await appendFile(`${home}/prompt.txt`, repairFinalizationInstruction);
-    if (params.testFile) await appendFile(`${home}/prompt.txt`, '\n\nContrato da suíte atribuída: ' + protocolReportRepairInstruction('', params.testFile));
+    if (params.testFile) await appendFile(`${home}/prompt.txt`, '\n\nContrato da suÃ­te atribuÃ­da: ' + protocolReportRepairInstruction('', params.testFile));
     gateway = createServer(async (req, res) => {
       modelOperations++;
       const requestController = new AbortController();

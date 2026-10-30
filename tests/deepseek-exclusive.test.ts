@@ -41,14 +41,14 @@ async function fixture(limit=12){
   const install=()=>pool.query("INSERT INTO settings(id,value) VALUES('model-policy',$1) ON CONFLICT(id) DO UPDATE SET value=excluded.value",[JSON.stringify(policy)]);
   return {goal,workforce,task,run,install};
 }
-it('routes every new role to exact v2 policy while keeping explicit restrictions and low planner profile',()=>{
+it('routes every new role to exact v2 policy while keeping explicit restrictions and explicit high planner profile',()=>{
   const account={id:policy.accountId,bridge_id:policy.bridgeId,models:[policy.model],enabled:true,allow_unknown:true,provider:'openai'};
   const workforce:any={enabled:true,glmAccountId:'old-account',glmTarget:12,workerAccounts:[],coordinatorAccountId:'old-account',coordinatorModel:'glm-5.3-flash'};
   for(const stage of ['coordinate','plan','work','integrate','verify'])expect(chooseWorkforceRoute({stage},[account],workforce))
     .toEqual({accountId:policy.accountId,model:policy.model});
   expect(chooseWorkforceRoute({allowed_accounts:['old-account']},[account],workforce)).toBeNull();
   expect(chooseWorkforceRoute({},[{...account,quota:{ordinaryUsageAllowed:false}}],workforce)).toBeNull();
-  expect(generationTiming(policy.bridgeId,policy.model)).toEqual({requestTimeoutMs:240000,timeout:240000,reasoning:'low'});
+  expect(generationTiming(policy.bridgeId,policy.model)).toEqual({requestTimeoutMs:240000,timeout:240000,reasoning:'high'});
   expect(generationTiming(policy.bridgeId,'other').reasoning).toBe('medium');
   const active=Array.from({length:12},()=>({state:'running',account_id:policy.accountId,model:policy.model}));
   expect(workforceCapacityReason({account_id:policy.accountId,model:policy.model},active,workforce)).toBe('WORKFORCE_GLM_CAPACITY');
