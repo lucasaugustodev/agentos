@@ -25,6 +25,10 @@ existing "files strictly necessary for this assigned module" contract. It does
 not grant new write authority. `readOnlySource:true` independently rejects every
 source change, including when that list is empty. A nonempty list is checked
 against the actual before/after inventory, including deletions.
+Directory scopes such as `src/` retain their original spelling in the frozen
+contract and only drop the final slash when comparing source paths. QA scopes
+such as `evidence/` and `data/` are valid scope metadata but remain excluded from
+the canonical source inventory. Traversal, absolute paths and aliases are rejected.
 
 This selects an existing canonical tree, not a patch composer. Patch bytes must
 match their runtime-owned artifact record and agree with changed/unchanged

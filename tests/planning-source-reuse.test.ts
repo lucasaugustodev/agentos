@@ -166,6 +166,21 @@ it('uses frozen write scopes and never confuses an accepted report with source w
   expect(f.prove()).toEqual({eligible:false,reason:'WRITE_SCOPE_VIOLATION'});
 });
 
+it('accepts canonical directory scopes and readonly attempt-local QA paths without adding them to source',()=>{
+  const f=fixture(),p=f.add(null,files('a')),q=f.add(p,files('a'),true);
+  p.execution.writePaths=['src/'];p.frozenExecution.writePaths=['src/'];
+  q.execution.writePaths=['evidence/','data/','qa-protocol/'];q.frozenExecution.writePaths=clone(q.execution.writePaths);
+  expect(accepted(f).selectedSource.taskId).toBe(p.taskId);
+  expect(f.manifest(q).files.map((x:{path:string})=>x.path)).toEqual(['src/code.ts']);
+  p.execution.writePaths=[];p.frozenExecution.writePaths=[];
+  expect(accepted(f).selectedSource.taskId).toBe(p.taskId);
+});
+
+it.each(['../src/','/src/','src//','src/../','src\\code','./src/','.git/','assets/'])('does not normalize unsafe scope %s into authority',scope=>{
+  const f=fixture(),p=f.add(null,files('a'));p.execution.writePaths=[scope];p.frozenExecution.writePaths=[scope];
+  expect(f.prove()).toEqual({eligible:false,reason:'INVALID_SNAPSHOT'});
+});
+
 it.each(['liveRunCount','activeLeaseCount'] as const)('rejects occupied source with %s',key=>{
   const f=fixture(),c=f.add(null,files('a'));c[key]=1;
   expect(f.prove()).toEqual({eligible:false,reason:'LIVE_OR_UNCERTAIN_SOURCE'});

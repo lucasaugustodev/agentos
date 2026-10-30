@@ -13,10 +13,15 @@ const sourcePath=(p:string)=>p.length>0&&p.length<=500&&!p.includes('\\')&&!p.in
   !p.startsWith('/')&&!p.endsWith('.log')&&!p.endsWith('.pyc')&&
   p.split('/').every(x=>x!==''&&x!=='.'&&x!=='..'&&!forbidden.has(x)&&!x.startsWith('.env'));
 const file=z.object({path:z.string().refine(sourcePath),sha256:hash}).strict();
+// A write scope is not a source inventory path. Existing plans allow a trailing
+// slash and attempt-local evidence/data scopes, which never enter the inventory.
+const writeScope=z.string().min(1).max(200)
+  .regex(/^(?![/\\])(?!.*\.\.)(?!.*\\)(?!\.git(?:\/|$))(?!node_modules(?:\/|$))(?!assets(?:\/|$))[a-zA-Z0-9._/-]+$/)
+  .refine(p=>!p.includes('//')&&!p.split('/').includes('.'));
 const artifact=z.object({id,runId:id,name:z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$/),digest:hash,
   size:z.number().int().min(0).max(8*1024*1024)}).strict();
 const execution=z.object({workspace,sourceWorkspace:workspace,baseWorkspace:workspace,
-  readOnlySource:z.boolean(),writePaths:z.array(z.string().refine(sourcePath)).max(128).nullable()}).strict();
+  readOnlySource:z.boolean(),writePaths:z.array(writeScope).max(128).nullable()}).strict();
 const generation=z.object({workspace,sourceWorkspace:workspace,baseDigest:hash,snapshotDigest:hash,
   sourceSnapshotDigest:hash.nullable()}).strict();
 const contributor=z.object({taskId:id,goalId:id,project:z.string().regex(/^[a-z0-9_-]+$/),revision:z.number().int().positive(),
@@ -147,7 +152,8 @@ export function proveAcceptedSourceChain(input:unknown,evidence:SourceReuseEvide
     const patch=patches.get(c.taskId)!;
     if((paths.length===0)!==(patch.length===0)||!Buffer.from(patch.toString('utf8')).equals(patch))return skip('PATCH_STATE_MISMATCH');
     if(c.execution.readOnlySource&&paths.length)return skip('READ_ONLY_SOURCE_CHANGED');
-    if(c.execution.writePaths?.length&&paths.some(p=>!c.execution.writePaths!.some(scope=>p===scope||p.startsWith(scope+'/'))))return skip('WRITE_SCOPE_VIOLATION');
+    if(c.execution.writePaths?.length&&paths.some(p=>!c.execution.writePaths!.some(scope=>{
+      const prefix=scope.replace(/\/$/,'');return p===prefix||p.startsWith(prefix+'/');})))return skip('WRITE_SCOPE_VIOLATION');
     if(paths.length)changed.add(c.taskId);
   }
   const ancestors=new Map<string,Set<string>>();
