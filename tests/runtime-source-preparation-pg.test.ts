@@ -181,6 +181,18 @@ it('checks the last real executor policy when a later failed preflight never sta
   expect(f.rpc.mock.calls.some(x=>x[0]==='worker.prepare')).toBe(false);
 });
 
+it.each(['candidate','generation','state'])(
+  'rejects a retry inspection with changed %s despite a matching admission policy',async field=>{
+    const f=await fixture(1),value=f.admission();
+    if(field==='candidate')value.candidate.candidateDigest=sha('another current tree');
+    if(field==='generation')value.generation.sourceSnapshotDigest=sha('another parent');
+    if(field==='state')value.state.runFence=randomUUID();
+    f.rpc.mockImplementation(async method=>method==='worker.inspectPreparation'?inspection(f.request,true):value);
+    await expect(prepareBoundRuntimeWorkspace(f.input)).rejects.toMatchObject({code:'SOURCE_PREPARATION_RETRY_ADMISSION_INVALID'});
+    expect(f.rpc.mock.calls.some(x=>x[0]==='worker.prepare')).toBe(false);
+  },
+);
+
 it('requires an unchanged existing clone when all prior attempts are proven not started',async()=>{
   const f=await fixture(1,true);
   expect(await prepareBoundRuntimeWorkspace(f.input)).toBe(true);
