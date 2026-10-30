@@ -37,7 +37,7 @@ export async function modelPolicyQuiet(db:DB){
     (SELECT count(*)::int FROM opencode_jobs WHERE state IS DISTINCT FROM 'finished') native_jobs,
     (SELECT count(*)::int FROM supervisor_jobs WHERE state IS DISTINCT FROM 'completed') supervisor_jobs,
     (SELECT count(*)::int FROM agentos_queue.job WHERE state='active') queue_active,
-    (SELECT count(*)::int FROM leases) leases`).rows[0];
+    (SELECT count(*)::int FROM leases) leases`)).rows[0];
   requireValue(counts&&Object.values(counts).every(value=>Number.isSafeInteger(value)&&value===0),'MODEL_POLICY_NOT_QUIET');
   return counts;
 }
