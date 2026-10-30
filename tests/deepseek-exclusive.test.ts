@@ -9,6 +9,7 @@ import {chooseWorkforceRoute,workforceCapacityReason} from '../server/workforce-
 import {exclusiveModelPolicySql} from '../server/model-policy-sql.js';
 import {managerAuthoritySql} from '../server/manager-authority.js';
 import {generationTiming} from '../server/generation-timing.js';
+import {managementRoutes} from '../server/management.js';
 
 const policy={version:2,mode:'exclusive-model',accountId:'agentos-api-11111111-2222-4333-8444-555555555555',
   bridgeId:'agentos:api:11111111-2222-4333-8444-555555555555',model:'deepseek-v4-pro-0813',requestLimit:6,sessionLimit:12};
@@ -64,6 +65,21 @@ it('SQL rejects malformed v2 authority and a model rename never grants manager a
   expect((await check()).rows[0].allowed).toBe(true);
   await pool.query("UPDATE settings SET value=jsonb_set(value,'{coordinatorModel}','\"renamed-privileged\"') WHERE id=$1",['workforce:'+f.goal]);
   expect((await check()).rows[0].allowed).toBe(false);
+});
+it('maintenance, manager wake and route suggestions cannot rewrite an existing legacy binding',()=>{
+  const account={id:policy.accountId,bridge_id:policy.bridgeId,models:[policy.model],enabled:true,allow_unknown:true,provider:'openai'};
+  const workforce:any={enabled:true,glmAccountId:policy.accountId,glmTarget:12,workerAccounts:[policy.accountId],coordinatorAccountId:policy.accountId,coordinatorModel:policy.model};
+  for(const old of [{account_id:'old-account',model:'glm-5.3-flash'},
+    {account_id:policy.accountId,model:'glm-5.3-flash'},
+    {account_id:'old-account',model:policy.model}])for(const allowed_accounts of [[],[policy.accountId]]){
+    const task={id:randomUUID(),stage:'coordinate',...old,allowed_accounts,execution:{kind:'harness',workforceLane:'glm'}};
+    const frozen=JSON.stringify(task);
+    expect(chooseWorkforceRoute(task,[account],workforce)).toBeNull();
+    expect(managementRoutes({...task,stage:'work'},[account],workforce)).toEqual([]);
+    expect(JSON.stringify(task)).toBe(frozen);
+  }
+  const current={id:randomUUID(),account_id:policy.accountId,model:policy.model,execution:{kind:'harness'}};
+  expect(chooseWorkforceRoute(current,[account],workforce)).toEqual({accountId:policy.accountId,model:policy.model});
 });
 it('twelve analytical/harness sessions share one SQL lane and concurrent thirteenth admission is refused',async()=>{
   const f=await fixture();await f.install();

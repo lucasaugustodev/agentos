@@ -129,7 +129,12 @@ export async function installManagement() {
 /** Explicit capability candidates, not credentials or the entire account catalog. */
 export function managementRoutes(task: any, accounts: any[], policy: any) {
   if (!task.execution || !['harness', 'opencode'].includes(task.execution.kind)) return [];
-  const lanes = readModelPolicy() || task.execution.kind === 'opencode' ? ['glm'] :
+  const exclusive=readModelPolicy();
+  // Check the original binding before the candidate loop substitutes accounts.
+  if (exclusive?.version===2 && task.id &&
+      ((task.account_id!=null&&task.account_id!==exclusive.accountId)||
+       (task.model!=null&&task.model!==exclusive.model))) return [];
+  const lanes = exclusive || task.execution.kind === 'opencode' ? ['glm'] :
     [...(policy.glmHarnessEnabled === true ? ['glm'] : []), 'muse', 'luna', 'kimi', 'qwen'];
   const routes: any[] = [];
   for (const lane of lanes)

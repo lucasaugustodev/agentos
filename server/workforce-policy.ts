@@ -80,6 +80,11 @@ export function chooseWorkforceRoute(
   if (!policy?.enabled) return null;
   const exclusive = readModelPolicy();
   if (exclusive) {
+    // v2 is an installation for new occurrences, not permission to rewrite an
+    // existing task's selected account/model during maintenance or recovery.
+    if (exclusive.version === 2 && task.id &&
+        ((task.account_id != null && task.account_id !== exclusive.accountId) ||
+         (task.model != null && task.model !== exclusive.model))) return null;
     const a = accounts.find(a => a.enabled && a.id === exclusive.accountId && a.bridge_id === exclusive.bridgeId);
     if (!a || !supportsAccountExecution(a, task.execution) || !a.models?.includes(exclusive.model)) return null;
     if (task.allowed_accounts?.length && !task.allowed_accounts.includes(a.id)) return null;
