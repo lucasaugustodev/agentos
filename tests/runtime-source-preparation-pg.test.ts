@@ -63,8 +63,8 @@ async function fixture(prior=0,knownNotStarted=false,inputBytes=0){
   await pool.query("INSERT INTO objectives(id,request,request_hash,mode,status,revision) VALUES($1,'{}','fixture','execute','executing',2)",[goalId]);
   await pool.query("INSERT INTO planning_runs(id,objective_id,base_revision,trigger_key,state,fence,output) VALUES($1,$2,1,'fixture','completed',$3,'{}')",[planningRunId,goalId,planFence]);
   await pool.query('INSERT INTO settings(id,value) VALUES($1,$2)',[intentKey,JSON.stringify(intent)]);
-  await pool.query(`INSERT INTO tasks(id,goal_id,key,title,description,agent_id,state,stage,criteria,execution,resources,attempt_count,plan_revision,runtime)
-    VALUES($1,$2,'consumer','Bound task','Execute the supplied task.','qa.backend','running','work','[]',$3,$4,$5,2,'harness')`,
+  await pool.query(`INSERT INTO tasks(id,goal_id,key,title,description,agent_id,state,stage,criteria,execution,resources,attempt_count,plan_revision)
+    VALUES($1,$2,'consumer','Bound task','Execute the supplied task.','qa.backend','running','work','[]',$3,$4,$5,2)`,
     [taskId,goalId,JSON.stringify(execution),JSON.stringify(resources),prior+1]);
   const previous:any[]=[];
   for(let attempt=1;attempt<=prior;attempt++){
