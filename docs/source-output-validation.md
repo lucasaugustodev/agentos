@@ -34,4 +34,3 @@ It refuses multiple envelopes and any object outside that fence, including an
 unfinished later answer; it never selects the last balanced example as evidence.
 Workers can use the existing run-bound delivery manifest to recover real output
 without depending on their final prose. Neither packaging path grants acceptance.
-
