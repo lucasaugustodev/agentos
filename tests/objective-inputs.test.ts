@@ -95,6 +95,86 @@ it('rejects conflicting content for an existing request identity',async()=>{
   await expect(registerObjectiveInput(f.objectiveId,{...body,digest:digest(bytes),base64:bytes.toString('base64')},auth)).rejects.toMatchObject({code:'IDEMPOTENCY_CONFLICT'});
 });
 
+it('accepts a twenty-first operator input without replacing the first twenty immutable receipts',async()=>{
+  const f=await fixture();
+  for(let i=0;i<20;i++)await registerObjectiveInput(f.objectiveId,request({requestReplan:false}),auth);
+  const before=(await pool.query('SELECT * FROM objective_inputs WHERE goal_id=$1 ORDER BY created_at,id',[f.objectiveId])).rows;
+  const added=await registerObjectiveInput(f.objectiveId,request({requestReplan:false}),auth);
+  const after=(await pool.query('SELECT * FROM objective_inputs WHERE goal_id=$1 ORDER BY created_at,id',[f.objectiveId])).rows;
+  expect(after).toHaveLength(21);expect(after.slice(0,20)).toEqual(before);
+  const inputs=await readObjectiveInputs(pool,f.objectiveId);
+  expect(inputs).toHaveLength(21);expect(inputs[20].id).toBe(added.inputId);
+});
+
+it('rejects a thirty-third input without side effects and preserves replay at capacity after revision changes',async()=>{
+  const f=await fixture(),bodies=Array.from({length:32},()=>request({requestReplan:false}));
+  for(const body of bodies)await registerObjectiveInput(f.objectiveId,body,auth);
+  const snapshot=async()=>({
+    inputs:(await pool.query('SELECT * FROM objective_inputs WHERE goal_id=$1 ORDER BY id',[f.objectiveId])).rows,
+    events:(await pool.query('SELECT * FROM events ORDER BY id')).rows,
+    feedback:(await pool.query('SELECT * FROM objective_feedback WHERE objective_id=$1 ORDER BY id',[f.objectiveId])).rows,
+    objective:(await pool.query('SELECT * FROM objectives WHERE id=$1',[f.objectiveId])).rows,
+    tasks:(await pool.query('SELECT * FROM tasks WHERE goal_id=$1 ORDER BY id',[f.objectiveId])).rows,
+    planning:(await pool.query('SELECT * FROM planning_runs WHERE objective_id=$1 ORDER BY id',[f.objectiveId])).rows,
+  });
+  const before=await snapshot();
+  await expect(registerObjectiveInput(f.objectiveId,request(),auth)).rejects.toMatchObject({code:'OBJECTIVE_INPUT_LIMIT'});
+  expect(await snapshot()).toEqual(before);
+  expect(await readObjectiveInputs(pool,f.objectiveId)).toHaveLength(32);
+  await pool.query('UPDATE objectives SET revision=2 WHERE id=$1',[f.objectiveId]);
+  const replay=await registerObjectiveInput(f.objectiveId,bodies[0],auth);
+  expect(replay.duplicate).toBe(true);
+  expect((await pool.query('SELECT * FROM objective_inputs WHERE goal_id=$1 ORDER BY id',[f.objectiveId])).rows).toEqual(before.inputs);
+});
+
+it('admits exactly one of two concurrent registrations competing for the thirty-second slot',async()=>{
+  const f=await fixture();
+  for(let i=0;i<31;i++)await registerObjectiveInput(f.objectiveId,request({requestReplan:false}),auth);
+  const bodies=[request(),request()];
+  const results=await Promise.allSettled(bodies.map(body=>registerObjectiveInput(f.objectiveId,body,auth)));
+  expect(results.filter(result=>result.status==='fulfilled')).toHaveLength(1);
+  const rejected=results.find(result=>result.status==='rejected');
+  expect(rejected).toMatchObject({status:'rejected',reason:{code:'OBJECTIVE_INPUT_LIMIT'}});
+  const failed=bodies[results.findIndex(result=>result.status==='rejected')];
+  expect(await readObjectiveInputs(pool,f.objectiveId)).toHaveLength(32);
+  expect((await pool.query("SELECT count(*)::int n FROM events WHERE entity_id=$1 AND kind='OBJECTIVE_INPUT_REGISTERED'",[f.objectiveId])).rows[0].n).toBe(32);
+  expect((await pool.query('SELECT count(*)::int n FROM objective_feedback WHERE objective_id=$1',[f.objectiveId])).rows[0].n).toBe(1);
+  expect((await pool.query('SELECT 1 FROM objective_inputs WHERE goal_id=$1 AND request_id=$2',[f.objectiveId,failed.requestId])).rowCount).toBe(0);
+});
+
+it('transports thirty-two full-size inputs without expanding the planner content or summary budget',async()=>{
+  const f=await fixture(),bytes=Buffer.alloc(65536,120),summary='Verified operator evidence to inspect: '.padEnd(3000,'x');
+  for(let i=0;i<32;i++)await registerObjectiveInput(f.objectiveId,request({name:`evidence-${i}.txt`,
+    digest:digest(bytes),base64:bytes.toString('base64'),planningSummary:summary,requestReplan:i===31}),auth);
+  const inputs=await readObjectiveInputs(pool,f.objectiveId),selected=inputsForRequirements(inputs,['req-1']);
+  expect(selected).toHaveLength(32);expect(inputsForRequirements(inputs,['req-2'])).toEqual([]);
+  const transported=await runtimeInputs({execution:{inputs:selected}},{executionInputs:executionInputManifest(selected)},async()=>{throw Error('NO_ARTIFACT_IO_EXPECTED');});
+  expect(transported).toEqual(selected);
+  expect(transported.reduce((total,input)=>total+Buffer.byteLength(input.base64,'base64'),0)).toBe(2*1024*1024);
+  const projected=planningInputContext(inputs,['req-1']);
+  expect(projected).toMatchObject({inventoryComplete:true,contentComplete:false,contentCharacters:0,summaryCharacters:12000,contextCharacters:12000});
+  expect(projected.inputs).toHaveLength(32);
+  expect(projected.inputs.filter(input=>'summary' in input)).toHaveLength(4);
+  expect(projected.inputs.filter(input=>'summaryOmitted' in input)).toHaveLength(28);
+  expect(projected.inputs.every(input=>'omitted' in input&&input.omitted==='per-input-budget')).toBe(true);
+  expect(projected.inputs.some(input=>'content' in input)).toBe(false);
+  await reconcilePlanning();const planning=await claimPlanning();
+  await applyPlannedResult(planning,compileDelivery(decision,f.input,f.plan,false,planning.feedback.reports));
+  const tasks=(await pool.query('SELECT stage,execution,criteria FROM tasks WHERE goal_id=$1 AND plan_revision=2 ORDER BY stage',[f.objectiveId])).rows;
+  expect(tasks.map(task=>task.stage).sort()).toEqual(['verify','work']);
+  for(const task of tasks){expect(task.execution.inputs).toEqual(selected);expect(task.criteria[0].equals).toBe(true);}
+});
+
+it('fails closed instead of truncating when the stored objective input count exceeds thirty-two',async()=>{
+  const f=await fixture();
+  for(let i=0;i<32;i++)await registerObjectiveInput(f.objectiveId,request({requestReplan:false}),auth);
+  // Test-only corruption: no trigger is disabled and production has no such write path.
+  await pool.query(`INSERT INTO objective_inputs(id,goal_id,request_id,request_digest,payload,receipt_digest)
+    SELECT $1,goal_id,$2,request_digest,payload,receipt_digest FROM objective_inputs WHERE goal_id=$3 LIMIT 1`,
+    [randomUUID(),randomUUID(),f.objectiveId]);
+  await expect(readObjectiveInputs(pool,f.objectiveId)).rejects.toMatchObject({code:'OBJECTIVE_INPUT_LIMIT'});
+});
+
 it.each(['wrong-digest','noncanonical-base64','too-large','unknown-requirement','duplicate-requirement','stale-revision','unsafe-name'])('rejects %s without storing bytes or feedback',async kind=>{
   const f=await fixture();let body=request();
   if(kind==='wrong-digest')body.digest='0'.repeat(64);

@@ -8,6 +8,7 @@ import {queueFeedback} from './planner.js';
 
 const digest=z.string().regex(/^[a-f0-9]{64}$/);
 const requirement=z.string().regex(/^[a-z0-9_-]{1,50}$/);
+const objectiveInputLimit=32;
 export const objectiveInputSchema=z.object({
   requestId:z.uuid(),expectedRevision:z.number().int().nonnegative(),
   name:z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,100}$/)
@@ -102,8 +103,8 @@ export async function registerObjectiveInput(goalId:string,raw:unknown,auth:Auth
     const requirements=(await db.query('SELECT plan->\'requirements\' requirements FROM plan_revisions WHERE objective_id=$1 ORDER BY revision DESC LIMIT 1',[goalId])).rows[0]?.requirements;
     if(!requirements||request.requirementIds.some(id=>!requirements.some((r:any)=>r.id===id)))
       throw failure('OBJECTIVE_INPUT_REQUIREMENTS','A entrada deve apontar para requisitos existentes.');
-    if(Number((await db.query('SELECT count(*) n FROM objective_inputs WHERE goal_id=$1',[goalId])).rows[0].n)>=20)
-      throw failure('OBJECTIVE_INPUT_LIMIT','Objetivo já possui vinte entradas de operador.');
+    if(Number((await db.query('SELECT count(*) n FROM objective_inputs WHERE goal_id=$1',[goalId])).rows[0].n)>=objectiveInputLimit)
+      throw failure('OBJECTIVE_INPUT_LIMIT',`Objetivo já possui ${objectiveInputLimit} entradas de operador.`);
     const id=randomUUID(),payload={version:1,id,goalId,name:request.name,digest:request.digest,
       size:Buffer.byteLength(request.base64,'base64'),requirementIds:request.requirementIds,
       authChannel:auth.channel,requestReplan:request.requestReplan,request};
@@ -125,8 +126,8 @@ export async function registerObjectiveInput(goalId:string,raw:unknown,auth:Auth
 /** Called while applying a new plan, before attempts/instructions are frozen. */
 export async function readObjectiveInputs(db:DB,goalId:string){
   if(!(await db.query("SELECT to_regclass('public.objective_inputs') name")).rows[0]?.name)return [];
-  const rows=(await db.query('SELECT * FROM objective_inputs WHERE goal_id=$1 ORDER BY created_at,id LIMIT 21',[goalId])).rows;
-  if(rows.length>20)throw failure('OBJECTIVE_INPUT_LIMIT','Entradas excedem o contrato.');
+  const rows=(await db.query('SELECT * FROM objective_inputs WHERE goal_id=$1 ORDER BY created_at,id LIMIT $2',[goalId,objectiveInputLimit+1])).rows;
+  if(rows.length>objectiveInputLimit)throw failure('OBJECTIVE_INPUT_LIMIT','Entradas excedem o contrato.');
   const result=[];
   for(const row of rows)result.push(await verifiedRow(db,row));
   return result;
