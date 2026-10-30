@@ -120,6 +120,14 @@ it('rejects post-registration policy/request drift at the execution boundary',as
  await pool.query('UPDATE objectives SET request=$2 WHERE id=$1',[f.id,JSON.stringify(f.request)]);
  policyState.current=null;await expect(routedPlanningRequest(pool,run)).rejects.toMatchObject({code:'OBJECTIVE_MODEL_ROUTE_POLICY_CHANGED'});
 });
+it('refuses a paused or stale planning generation before another model call',async()=>{
+ const f=await fixture();await f.register();const run=await newRun(f.id);
+ await pool.query("UPDATE goals SET state='paused' WHERE id=$1",[f.id]);
+ await expect(routedPlanningRequest(pool,run)).rejects.toMatchObject({code:'OBJECTIVE_MODEL_ROUTE_STATE'});
+ await pool.query("UPDATE goals SET state='active' WHERE id=$1",[f.id]);
+ await pool.query('UPDATE objectives SET revision=3 WHERE id=$1',[f.id]);
+ await expect(routedPlanningRequest(pool,run)).rejects.toMatchObject({code:'OBJECTIVE_MODEL_ROUTE_TARGET_CHANGED'});
+});
 it('requires operator authentication and does not grant operations-only credentials the mutation',async()=>{
  const f=await fixture(),app=makeApp(),url='/api/objectives/'+f.id+'/model-route',serviceToken='fixture-operations-only-token';
  process.env.AGENTOS_OPERATIONS_ACCESS_JSON=JSON.stringify([{id:'fixture-service',tokenSha256:operationHash(serviceToken),goalIds:[f.id],projects:[],scopes:['observe']}]);

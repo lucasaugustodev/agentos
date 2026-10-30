@@ -130,9 +130,11 @@ export async function routedPlanningRequest(db:DB,run:any):Promise<ObjectiveInpu
  const o=await objective(db,run.objective_id),current=await latest(db,run.objective_id);
  if((run.route_generation_id??null)!==(current?.id??null))throw fail('OBJECTIVE_MODEL_ROUTE_RUN_STALE');
  if(!current)return effectivePlanningRequest(o.request,run.feedback);
+ if(!['active','failed','replanning'].includes(o.goal_state))throw fail('OBJECTIVE_MODEL_ROUTE_STATE');
  const p=await verify(db,current),activePolicy=await policy(db);
  if(p.originalRequestDigest!==o.original_digest||!same(p.originalRequest,o.request)||!same(p.policy,activePolicy)||
-   o.revision< p.request.expectedRevision)throw fail('OBJECTIVE_MODEL_ROUTE_TARGET_CHANGED');
+   o.revision<p.request.expectedRevision||run.base_revision!==undefined&&run.base_revision!==o.revision)
+  throw fail('OBJECTIVE_MODEL_ROUTE_TARGET_CHANGED');
  return effectivePlanningRequest(p.effectiveRequest,run.feedback);
 }
 export async function currentObjectiveRouteGeneration(db:DB,goalId:string){
