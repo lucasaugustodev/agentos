@@ -48,6 +48,14 @@ Throwing/rejecting observers or failed telemetry clocks cannot change provider
 results, retry decisions or gate ownership. Telemetry is best-effort: an absent
 receipt is not proof that no provider effect occurred.
 
+Analytical runtime calls also forward bridge events, including each generation
+inside a manager review. The synchronous bridge callback queues async observer
+writes in order and flushes them before returning that generation's result or
+error. A rejected observer does not suppress later observations or retry the
+model. Manager read/completion notifications remain a separate awaited channel;
+transport events are not re-emitted through that channel. These observations do
+not change delivery parsing, acceptance, request limits or remote stop evidence.
+
 Offline regression tests use mocked transports and clocks. They verify the
 effective GLM thinking/effort/output transformation, gate identity, keepalive
 separation, success/error/retry/cancellation, cleanup ordering, unavailable
