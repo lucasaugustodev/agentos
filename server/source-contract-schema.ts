@@ -70,24 +70,36 @@ export function combineSourceContracts(contracts:SourceContract[]):SourceContrac
     ...(!required.length?{noSourceReason:'This candidate has only explicitly declared report-only contributions; source delivery is not claimed.'}:{})});
 }
 
+/** Scope failures retain their actionable cause at compiler/validator boundaries.
+ * They must never be converted into permission to discard a preserve entry. */
+export class SourceCompositionScopeError extends Error {
+  constructor(readonly violation:'WRITE_SCOPE_INVALID'|'WRITE_SCOPE_CONFLICT',readonly writePath:string,
+    readonly contributorIndex:number,readonly conflictContributorIndex?:number){
+    super('SOURCE_CONTRACT_CONFLICT');
+  }
+}
+
 /** A peer preserves another producer's output only in its own branch. At a
  * common-base integration that unpinned obligation transfers to the output's
  * exclusive owner. Own preservation, explicit hashes and unowned source stay
  * protected. Partial directory exceptions cannot be represented by this schema. */
 export function composeSourceContracts(contributors:Array<{contract:SourceContract;writePaths:string[]}>):SourceContract {
   const conflict=():never=>{throw Error('SOURCE_CONTRACT_CONFLICT');};
-  const owners=contributors.map(({contract,writePaths})=>({contract:normalizeSourceContract(contract),
+  const owners=contributors.map(({contract,writePaths},index)=>({contract:normalizeSourceContract(contract),
     scopes:writePaths.filter(scope=>!isAttemptLocalWriteScope(scope)).map(scope=>{
       const path=scope.endsWith('/')?scope.slice(0,-1):scope;
-      if(!sourceContractPathSchema.safeParse(path).success)conflict();
+      if(!sourceContractPathSchema.safeParse(path).success)
+        throw new SourceCompositionScopeError('WRITE_SCOPE_INVALID',scope,index);
       return path;
     })}));
   for(let index=0;index<owners.length;index++){
     const owner=owners[index];
     for(const entry of owner.contract.required)
       if(!owner.scopes.some(scope=>sourcePathWithin(entry.path,scope)))conflict();
-    for(const other of owners.slice(index+1))
-      if(owner.scopes.some(a=>other.scopes.some(b=>sourcePathWithin(a,b)||sourcePathWithin(b,a))))conflict();
+    for(let otherIndex=index+1;otherIndex<owners.length;otherIndex++){
+      const overlap=owners[otherIndex].scopes.find(b=>owner.scopes.some(a=>sourcePathWithin(a,b)||sourcePathWithin(b,a)));
+      if(overlap!==undefined)throw new SourceCompositionScopeError('WRITE_SCOPE_CONFLICT',overlap,otherIndex,index);
+    }
   }
   const contains=(a:SourceContractEntry,b:SourceContractEntry)=>a.path===b.path||
     (a.kind==='directory'&&sourcePathWithin(b.path,a.path));

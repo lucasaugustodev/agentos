@@ -2,7 +2,7 @@ import { z } from 'zod';
 import { taskSchema, criterionSchema, DomainError } from './contracts.js';
 import {isAttemptLocalWriteScope} from './attempt-local-write-scope.js';
 import {requirementContractsSchema,requirementOutcomesCriterionSchema,requirementOutcomeCriterion} from './requirement-outcomes.js';
-import {sourceContractSchema,normalizeSourceContract,combineSourceContracts,composeSourceContracts,sourcePathWithin,type SourceContract} from './source-contract-schema.js';
+import {sourceContractSchema,normalizeSourceContract,combineSourceContracts,composeSourceContracts,SourceCompositionScopeError,sourcePathWithin,type SourceContract} from './source-contract-schema.js';
 const artifactName = z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,100}$/);
 const planCriterion = z.discriminatedUnion('type', [
   criterionSchema.options[0].extend({ name: artifactName }),
@@ -242,7 +242,13 @@ export function validatePlan(
         try{expected=t.stage==='integrate'
           ?composeSourceContracts(contributors.map(other=>({contract:other!.sourceContract!,writePaths:other!.writePaths})))
           :combineSourceContracts(contributors.map(other=>other!.sourceContract!));}
-        catch{fail('Obrigações de fonte conflitantes.',{violation:'SOURCE_CONTRACT_CONFLICT',task:t.key});}
+        catch(error){
+          if(error instanceof SourceCompositionScopeError)
+            fail(error.violation==='WRITE_SCOPE_CONFLICT'?'Entregas paralelas no mesmo lote exigem writePaths disjuntos.':'Escopo de escrita inválido.',
+              {violation:error.violation,task:contributors[error.contributorIndex]!.key,
+                ...(error.conflictContributorIndex!==undefined?{conflictTask:contributors[error.conflictContributorIndex]!.key}:{}),writePath:error.writePath});
+          fail('Obrigações de fonte conflitantes.',{violation:'SOURCE_CONTRACT_CONFLICT',task:t.key});
+        }
         if(!sourceContractsInclude(contract,expected!))
           fail('Integração e QA precisam conservar as obrigações da candidata.',{violation:'SOURCE_CONTRACT_OBLIGATION_DROPPED',task:t.key});
       }

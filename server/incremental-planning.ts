@@ -6,7 +6,7 @@ import { event, type DB } from './db.js';
 import { planSchema,bindRequirementOutcomeContracts, type ObjectiveInput, type ProposedPlan } from './objective-contracts.js';
 import {requirementContractsSchema,readRequirementResolution,type RequirementResolution} from './requirement-outcomes.js';
 import {isAttemptLocalWriteScope} from './attempt-local-write-scope.js';
-import {sourceContractSchema,normalizeSourceContract,combineSourceContracts,composeSourceContracts,sourcePathWithin,type SourceContract} from './source-contract-schema.js';
+import {sourceContractSchema,normalizeSourceContract,combineSourceContracts,composeSourceContracts,SourceCompositionScopeError,sourcePathWithin,type SourceContract} from './source-contract-schema.js';
 
 // Semantic choices only. IDs, dependencies, runtime envelopes and receipt
 // formats are controller-owned. Inspired by Ruflo's action/precondition split;
@@ -128,7 +128,13 @@ export function compileDelivery(raw: unknown, request: ObjectiveInput, previous?
   const composed=(contributors:Array<{sourceContract?:SourceContract;writePaths?:string[]}>)=>{
     if(sourceContractVersion!==1)return {};
     try{return {sourceContract:composeSourceContracts(contributors.map(item=>({contract:item.sourceContract!,writePaths:item.writePaths??[]})))};}
-    catch{invalid('SOURCE_CONTRACT_CONFLICT','As contribuições têm obrigações de fonte conflitantes.');}
+    catch(error){
+      if(error instanceof SourceCompositionScopeError)
+        invalid(error.violation,error.violation==='WRITE_SCOPE_CONFLICT'
+          ?'Subtarefas precisam de escopos de escrita disjuntos.':'Escopo de escrita inválido.',
+          {writePath:error.writePath,contributorIndex:error.contributorIndex,conflictContributorIndex:error.conflictContributorIndex});
+      invalid('SOURCE_CONTRACT_CONFLICT','As contribuições têm obrigações de fonte conflitantes.');
+    }
   };
   const { requirements, completed, eligible } = deliveryFrontier(request, previous, advance,resolution);
   const finish=(plan:ProposedPlan)=>bindDeliveryFeedback(bindRequirementOutcomeContracts({...plan,

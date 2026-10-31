@@ -3,7 +3,7 @@ import {expect,it} from 'vitest';
 import {compileDelivery} from '../server/incremental-planning.js';
 import {objectiveSchema,validatePlan} from '../server/objective-contracts.js';
 import {verifySourceOutputCandidate} from '../server/source-output-validation.js';
-import {composeSourceContracts,type SourceContract} from '../server/source-contract-schema.js';
+import {composeSourceContracts,SourceCompositionScopeError,type SourceContract} from '../server/source-contract-schema.js';
 
 const hash=(value:string|Buffer)=>createHash('sha256').update(value).digest('hex');
 const file=(path:string,sha256?:string)=>({path,kind:'file' as const,...(sha256?{sha256}:{})});
@@ -115,6 +115,23 @@ it.each(['same-scope','parent-scope','unowned-output','unsafe-scope'])('rejects 
   if(mode==='unowned-output')owners[1].writePaths=['src/elsewhere.ts'];
   if(mode==='unsafe-scope')owners[1].writePaths=['src//'];
   expect(()=>composeSourceContracts(owners)).toThrow('SOURCE_CONTRACT_CONFLICT');
+});
+
+it('retains actionable owner and path diagnostics when raw-plan scopes overlap',()=>{
+  const plan=compileDelivery({deliveries:[producer('a','b'),producer('b','a')]},request);
+  plan.tasks.find(t=>t.key==='deliver-2')!.writePaths.push('src/a.ts');
+  expect(()=>validatePlan(plan,request,agents,[])).toThrowError(expect.objectContaining({detail:{
+    violation:'WRITE_SCOPE_CONFLICT',task:'deliver-2',conflictTask:'deliver-1',writePath:'src/a.ts'}}));
+});
+
+it('refuses forbidden scopes at compilation and preserves exact composition diagnostics',()=>{
+  const owners=fixtureOwners();owners[1].writePaths.push('data/.git/config');
+  expect(()=>composeSourceContracts(owners)).toThrowError(expect.objectContaining({
+    violation:'WRITE_SCOPE_INVALID',writePath:'data/.git/config',contributorIndex:1}));
+  expect(()=>composeSourceContracts(owners)).toThrowError(SourceCompositionScopeError);
+  const b=producer('b','a');b.writePaths.push('data/.git/config');
+  expect(()=>compileDelivery({deliveries:[producer('a','b'),b]},request)).toThrowError(expect.objectContaining({
+    detail:expect.objectContaining({violation:'WRITE_SCOPE_INVALID',writePath:'data/.git/config',contributorIndex:1})}));
 });
 
 it.each(['preserved-parent','required-parent','kind-mismatch'])('rejects %s directory ambiguity without weakening its other descendants',mode=>{

@@ -100,7 +100,12 @@ it('never treats source folders with similar names, aliases or forbidden paths a
    {...part('b'),writePaths:[source+'/child','evidence/x'],sourceContract:reportOnly} ]},input)).toThrowError(expect.objectContaining({detail:expect.objectContaining({violation:'WRITE_SCOPE_CONFLICT'})}));
  for(const value of ['evidence/../server','evidence/./x','evidence//x'])
   expect(()=>compileDelivery({deliveries:[part('a'),{...part('b'),writePaths:[value]}]},input)).toThrow();
- const forbidden=compileDelivery({deliveries:[part('a'),{...part('b'),writePaths:['data/.git/config'],sourceContract:reportOnly}]},input);
+ expect(()=>compileDelivery({deliveries:[part('a'),{...part('b'),writePaths:['data/.git/config'],sourceContract:reportOnly}]},input))
+  .toThrowError(expect.objectContaining({detail:expect.objectContaining({violation:'WRITE_SCOPE_INVALID',writePath:'data/.git/config'})}));
+ // Compilation refuses this path before it can become an integration scope.
+ // A forged raw plan must still be refused independently at admission.
+ const forbidden=compileDelivery({deliveries:[part('a'),{...part('b'),writePaths:['data/local'],sourceContract:reportOnly}]},input);
+ forbidden.tasks.find(t=>t.key==='deliver-2')!.writePaths=['data/.git/config'];
  const agents=(await pool.query('SELECT * FROM agents')).rows;
  expect(()=>validatePlan(forbidden,input,agents,[])).toThrowError(expect.objectContaining({detail:expect.objectContaining({writePath:'data/.git/config'})}));
 });
