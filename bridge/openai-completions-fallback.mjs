@@ -3,10 +3,11 @@
 // wire format in the opposite direction; the two must stay symmetric.
 // Only typed availability evidence leaves this module: an upstream body never
 // becomes an error message, an event or an artifact.
-import { classifyProviderError } from './opencode-provider-error.mjs';
+import { classifyProviderError,retryAfterSeconds } from './opencode-provider-error.mjs';
 import { semanticModelWatchdog, readAbortableModelBody, modelAbortFailure, MODEL_IDLE_TIMEOUT_MS } from './semantic-model-watchdog.mjs';
 import { createModelTransportTelemetry } from './model-transport-telemetry.mjs';
 import { diagnosticFinishReason, observeProtocolTerminal } from './protocol-terminal-diagnostic.mjs';
+import {transportFailureReason,markModelTransportFailure} from './model-transport-failure.mjs';
 
 export const RETRY_ATTEMPTS = 3;
 export const RETRY_BUDGET_MS = 30000;
@@ -307,7 +308,11 @@ export function openAICompletionsFallback({ fetch: fetchImpl = fetch, random = M
                 : await readCompletionsJson(response.body,watchdog.signal,()=>{partial=true;},telemetry);
               successful=true;return result;
             }
-            throw typedFailure(await classifyProviderError(response));
+            const classified=await classifyProviderError(response,{now:now()});
+            // Keep the provider's wait as typed availability data. Never turn
+            // an exhausted local retry budget into permission to retry early.
+            if(response.status>=500)classified.retryAfterSeconds=retryAfterSeconds(response.headers.get('retry-after'),now());
+            throw typedFailure(classified);
           } catch (error) {
             observedError=error?.code;
             // Caller cancellation/gate loss has precedence over a racing idle timer.
@@ -319,17 +324,19 @@ export function openAICompletionsFallback({ fetch: fetchImpl = fetch, random = M
                 'MODEL_INCOMPLETE_RESPONSE'].includes(error.code) ? error.code : 'MODEL_INCOMPLETE_RESPONSE';
               const delay = backoffDelay(attempt,null,random);
               if (partial || last || code === 'MODEL_OUTPUT_LIMIT' || code === 'MODEL_RESPONSE_TOO_LARGE' || now()+delay>deadline)
-                throw failure(code);
+                throw markModelTransportFailure(failure(code),partial?null:transportFailureReason(error));
               retry={attempt:attempt+1,code,delayMs:delay};
             } else if (response) {
               const retryable = error.code === 'RATE_LIMIT' || error.status >= 500;
-              if (!retryable || last) throw error;
+              const transientStatus=[500,502,503,504].includes(error.status)&&
+                (!response.headers.has('retry-after')||error.retryAfterSeconds===0);
+              if (!retryable || last) throw markModelTransportFailure(error,transientStatus?'provider_unavailable':null);
               const delay=backoffDelay(attempt,error.retryAfterSeconds,random);
-              if (now()+delay>deadline) throw error;
+              if (now()+delay>deadline) throw markModelTransportFailure(error,transientStatus?'provider_unavailable':null);
               retry={attempt:attempt+1,code:error.code,status:error.status,delayMs:delay};
             } else {
               const delay=backoffDelay(attempt,null,random);
-              if(last || now()+delay>deadline) throw failure('MODEL_REQUEST_FAILED');
+              if(last || now()+delay>deadline) throw markModelTransportFailure(failure('MODEL_REQUEST_FAILED'),transportFailureReason(error));
               retry={attempt:attempt+1,code:'MODEL_REQUEST_FAILED',delayMs:delay};
             }
           } finally {

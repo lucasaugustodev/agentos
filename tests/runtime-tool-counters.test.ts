@@ -13,6 +13,6 @@ it('runs actual harness counter integration through the standard Node test runne
   expect(result.error).toBeUndefined();
   expect(result.signal).toBeNull();
   expect(result.status,result.stdout+'\n'+result.stderr).toBe(0);
-  for(const line of ['# tests 3','# pass 3','# fail 0','# cancelled 0','# skipped 0','# todo 0'])
+  for(const line of ['# tests 11','# pass 11','# fail 0','# cancelled 0','# skipped 0','# todo 0'])
     expect(result.stdout.split(/\r?\n/)).toContain(line);
 });

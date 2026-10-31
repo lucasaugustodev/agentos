@@ -24,6 +24,7 @@ import { deliveryContract, extractPromptJsonFields, prepareDeliveryManifest, col
 import {analyzePollTrace} from './runtime-progress.mjs';
 import {inspectRuntimeProgress,checkpointRuntimeProgress} from './inspect-runtime-progress.mjs';
 import {captureRuntimeHandoff,runtimeHandoffInstruction} from './runtime-handoff.mjs';
+import {modelTransportFailure,generationObserver} from './model-transport-failure.mjs';
 import {harnessMemory} from './runtime-memory.mjs';
 import {stopUnit} from './process-stop.mjs';
 import {inspectUnitExit} from './unit-exit.mjs';
@@ -154,6 +155,10 @@ export async function runHarness(params, signal, generate, emit = () => {}) {
   // Only a cheap in-memory hint runs on tool events. Authoritative inspection
   // happens at the next generation boundary, while no new tool can be issued.
   const progressRows=[];
+  // Count identities, not just totals: an orphan result cannot conceal an
+  // unfinished tool. Malformed/duplicate identities disable this proof.
+  const pendingTransportTools=new Set(), completedTransportTools=new Set();
+  let transportToolTraceComplete=true;
   let progressSequence=0,progressProbeDue=false,progressCheckpoint=null;
   let handoffAt=0,handoffDigest=null;
   const checkpointHandoff=async()=>{
@@ -166,6 +171,7 @@ export async function runHarness(params, signal, generate, emit = () => {}) {
     const channel = bufferedModelChannel(res, signal);
     const requestId = randomUUID();
     let requestSequence;
+    let generationAttempts=0;
     // GLM uses a semantic-idle watchdog in its actual provider transport,
     // after admission. Queuing and a progressing stream do not spend a fixed
     // wall-clock generation deadline; caller cancellation still owns the run.
@@ -219,23 +225,42 @@ export async function runHarness(params, signal, generate, emit = () => {}) {
       // Own admission here as well: an older long-lived bridge can load this
       // runtime while retaining its original ungated generate callback. Newer
       // bridges recognize the private symbol and do not acquire twice.
-      const result = await withAccountRequestGate(
-        gatedRequest ? { ...input, runId: params.runId } : input,
-        requestTimeout ? AbortSignal.any([channel.signal, requestTimeout]) : channel.signal,
-        (requestSignal) => generate(input, requestSignal, GLM_REQUEST_ADMITTED),
-        emit,
-      );
+      const generationSignal=requestTimeout?AbortSignal.any([channel.signal,requestTimeout]):channel.signal;
+      let result;
+      for(let generationAttempt=1;;generationAttempt++){
+        generationAttempts=generationAttempt;
+        const generationInput={...input,generationAttempt};
+        try {
+          result=await withAccountRequestGate(
+            gatedRequest ? { ...generationInput, runId: params.runId } : generationInput,
+            generationSignal,
+            (requestSignal) => generate(generationInput, requestSignal, GLM_REQUEST_ADMITTED),
+            generationObserver(emit,{requestId,generationAttempt}),
+          );
+          break;
+        } catch(e) {
+          // Each rejected generation has fully unwound its transport and gate.
+          // Nothing but keepalive comments has reached the SDK; earlier tools
+          // are settled. Retry this immutable generation, never the tool loop.
+          const reason=modelTransportFailure(e);
+          if(!reason||generationAttempt>=3||generationSignal.aborted||
+            !transportToolTraceComplete||pendingTransportTools.size!==0)throw e;
+          emit('MODEL_GENERATION_RETRY',{requestId,requests:requestSequence,generationAttempt,
+            reason,delayMs:750*generationAttempt,responseDelivered:false});
+          await delay(750*generationAttempt,undefined,{signal:generationSignal});
+        }
+      }
       for (const k of ['input', 'output', 'cacheRead', 'cacheWrite', 'totalTokens'])
         usage[k] += result.message.usage?.[k] ?? 0;
       emit('MODEL_RESPONSE', {
-        requestId, requests: requestSequence,
+        requestId, requests: requestSequence,generationAttempt:generationAttempts,
         stopReason: result.message.stopReason,
         tokens: result.message.usage?.totalTokens ?? null,
       });
       channel.finish(completion(result.message, params.model));
     } catch (e) {
       gatewayError = channel.failureCode(requestTimeout?.aborted ? requestTimeout.reason : e);
-      emit('MODEL_ERROR', { requestId, requests: requestSequence, code: gatewayError });
+      emit('MODEL_ERROR', { requestId, requests: requestSequence,generationAttempt:generationAttempts,code: gatewayError });
       channel.fail(gatewayError);
       // A broken provider call must not leave an apparently running, idle agent loop.
       fail(error(gatewayError));
@@ -462,6 +487,17 @@ export async function runHarness(params, signal, generate, emit = () => {}) {
       void guidance.observe([m.params?.messageId],m.params).catch(() => emit('RUNTIME_GUIDANCE_OBSERVATION_FAILED', {runId:params.runId}));
     if (m.method === 'session.event') {
       const e = m.params.event;
+      if(e?.type==='tool/call'){
+        const id=e.data?.callId;
+        if(typeof id!=='string'||!id||pendingTransportTools.has(id)||completedTransportTools.has(id))transportToolTraceComplete=false;
+        else pendingTransportTools.add(id);
+      }
+      if(e?.type==='tool/result'){
+        const id=e.data?.message?.source?.callId,blocks=e.data?.message?.content;
+        if(typeof id!=='string'||!pendingTransportTools.has(id)||!Array.isArray(blocks)||
+          blocks.filter(b=>b?.type==='tool-result'&&b.toolCallId===id).length!==1)transportToolTraceComplete=false;
+        else {pendingTransportTools.delete(id);completedTransportTools.add(id);}
+      }
       rememberHarnessToolCall(e, observedToolCalls);
       if(['tool/call','tool/result','agent/inbox/spliced','turn/end'].includes(e?.type)) {
         progressRows.push({...e,seq:++progressSequence,time:Date.now()});

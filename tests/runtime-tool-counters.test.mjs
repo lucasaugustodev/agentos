@@ -9,6 +9,10 @@ import {fileURLToPath} from 'node:url';
 import path from 'node:path';
 import * as termination from '../bridge/harness-termination.mjs';
 import * as failures from '../bridge/runtime-tool-failure.mjs';
+import * as transportFailures from '../bridge/model-transport-failure.mjs';
+import * as modelChannel from '../bridge/runtime-model-channel.mjs';
+import * as modelGateway from '../bridge/runtime-gateway.mjs';
+import {openAICompletionsFallback} from '../bridge/openai-completions-fallback.mjs';
 
 const runnerUrl=new URL('../bridge/runtime-runner.mjs',import.meta.url);
 const forbidden=()=>{throw Error('UNEXPECTED_EXTERNAL_OPERATION');};
@@ -19,8 +23,12 @@ const counters=value=>({toolCalls:value.toolCalls,toolResults:value.toolResults,
 
 // Run the actual runner and its readline/session handler. Only system, storage,
 // model and collection boundaries are replaced; no tool-counting logic is copied.
-async function runFixture(events,{reason={kind:'completed'},noise=[]}={}){
+async function runFixture(events,{reason={kind:'completed'},noise=[],generationFailures,unmarked=false,cancelBackoff=false,adapterFailure=false,lateHeaders=false,partialBody=false,providerWait}={}){
   const runId=randomUUID(),receiptId=randomUUID(),emitted=[],saved=[],writes=new Map();
+  const controller=new AbortController();
+  let gatewayHandler,generations=0,gateActive=0,gateAdmissions=0,fetches=0;
+  const wire=[];
+  const providerBodies=[];
   const child=new EventEmitter();child.stdout=new PassThrough();child.stderr=new PassThrough();
   const frame=value=>child.stdout.write(JSON.stringify(value)+'\n');
   const event=value=>frame({method:'session.event',params:{sessionId:runId,event:value}});
@@ -41,9 +49,19 @@ async function runFixture(events,{reason={kind:'completed'},noise=[]}={}){
           else if(value==='rpc')frame({id:999,method:'session.event',params:{sessionId:runId,event:call('rpc')}});
         }
         for(const value of events)event(value);
-        event({type:'assistant/message',data:{message:{content:[{type:'text',text:JSON.stringify({summary:'Fixture result',artifacts:[]})}]}}});
-        event({type:'turn/end',data:{reason}});
-        frame({method:'session.status',params:{sessionId:runId,status:'idle'}});
+        const finish=()=>{
+          event({type:'assistant/message',data:{message:{content:[{type:'text',text:JSON.stringify({summary:'Fixture result',artifacts:[]})}]}}});
+          event({type:'turn/end',data:{reason}});
+          frame({method:'session.status',params:{sessionId:runId,status:'idle'}});
+        };
+        if(generationFailures!==undefined){
+          const req=Object.assign((async function*(){yield JSON.stringify({messages:[{role:'user',content:'fixture'}]});})(),
+            {method:'POST',url:'/v1/chat/completions'});
+          const res=Object.assign(new EventEmitter(),{headersSent:false,writableEnded:false,destroyed:false,
+            writeHead(){this.headersSent=true;},flushHeaders(){},write(s){wire.push(s);},
+            end(s){wire.push(s);this.writableEnded=true;}});
+          void gatewayHandler(req,res).then(()=>{if(wire.some(s=>s.includes('[DONE]')))finish();});
+        } else finish();
       });
       done();
     },
@@ -60,18 +78,24 @@ async function runFixture(events,{reason={kind:'completed'},noise=[]}={}){
   };
   const gateway=Object.assign(new EventEmitter(),{listen(_socket,ready){ready();},closeAllConnections(){},close(){}});
   const modules={
-    './model-policy.mjs':{assertModelRoute(){},usesSharedRequestGate:()=>false},
-    './operator-model-profile.mjs':{workerModelSettings:forbidden},
+    './model-policy.mjs':{assertModelRoute(){},usesSharedRequestGate:()=>generationFailures!==undefined},
+    './operator-model-profile.mjs':{workerModelSettings:()=>({reasoning:'high'})},
     './runtime-guidance.mjs':{createRuntimeGuidanceServer:forbidden},
     './sandbox-localhost.mjs':{prepareSandboxLocalhost:async()=>({mount:[]})},
     './repair-finalizer.mjs':{prepareRepairFinalization:async()=>null,finalizeRepairArtifacts:async()=>{},repairFinalizationInstruction:()=>''},
-    'node:child_process':{spawn:()=>child},'node:http':{createServer:()=>gateway},
+    'node:child_process':{spawn:()=>child},'node:http':{createServer:handler=>{gatewayHandler=handler;return gateway;}},
     'node:readline':{createInterface},'node:fs/promises':io,'node:crypto':{createHash,randomUUID},
-    './gated-generation.mjs':{GLM_REQUEST_ADMITTED:Symbol(),withAccountRequestGate:forbidden},
+    './gated-generation.mjs':{GLM_REQUEST_ADMITTED:Symbol(),withAccountRequestGate:async(input,signal,operation)=>{
+      assert.equal(gateActive,0);signal.throwIfAborted();gateAdmissions++;gateActive++;
+      try{return await operation(signal);}finally{gateActive--;}
+    }},
     'node:path':{default:path},'node:url':{fileURLToPath},
-    'node:timers/promises':{setTimeout:()=>new Promise(()=>{})},
-    './runtime-gateway.mjs':{toGeneration:forbidden,completion:forbidden},
-    './runtime-model-channel.mjs':{bufferedModelChannel:forbidden,WORKER_MODEL_TIMEOUT_MS:60000},
+    'node:timers/promises':{setTimeout:async(ms,_value,options)=>{
+      if(ms===750||ms===1500&&options){if(cancelBackoff)controller.abort();options?.signal.throwIfAborted();return;}
+      return new Promise(()=>{});
+    }},
+    './runtime-gateway.mjs':{toGeneration:()=>({accountId:'fixture',model:'fixture',messages:[]}),completion:modelGateway.completion},
+    './runtime-model-channel.mjs':modelChannel,
     './workspaces.mjs':{workspaceOperation:forbidden},
     './source-inputs.mjs':{materializeSourceInputs:()=>({inputs:[],telemetry:{materialized:false},instruction:''})},
     './artifact-input-bundle.mjs':{hydrateArtifactInputBundle:async value=>value,referencedInputLimitBytes:1024},
@@ -87,6 +111,7 @@ async function runFixture(events,{reason={kind:'completed'},noise=[]}={}){
     './process-stop.mjs':{stopUnit:async(_unit,ended)=>{assert.equal(ended(),true);return {stopped:true};}},
     './unit-exit.mjs':{inspectUnitExit:async()=>null},
     './harness-termination.mjs':termination,'./runtime-tool-failure.mjs':failures,
+    './model-transport-failure.mjs':transportFailures,
   };
   // Node's synchronous module hooks need no experimental VM flags. Hooks only
   // replace this fixture runner's imports, and are removed after each attempt.
@@ -114,7 +139,37 @@ async function runFixture(events,{reason={kind:'completed'},noise=[]}={}){
   try{
     const {runHarness}=await import(fixtureUrl.href);
     value=await runHarness({runId,workspace:'fixture/counters',accountId:'fixture',model:'fixture',
-      prompt:'Counter fixture without a provider call.',context:{}},new AbortController().signal,forbidden,
+      ...(generationFailures!==undefined?{runFence:randomUUID(),contextVersion:randomUUID()}:{}),
+      prompt:'Counter fixture without a provider call.',context:{}},controller.signal,async input=>{
+        generations++;assert.equal(gateActive,1);
+        assert.equal(input.generationAttempt,generations);
+        assert.ok(wire.every(s=>s.startsWith(':')),'Only transport comments may precede a validated completion');
+        if(adapterFailure){
+          let clock=0;
+          return openAICompletionsFallback({now:()=>clock,fetch:async(_url,request)=>{
+            providerBodies.push(JSON.parse(request.body));
+            fetches++;if(lateHeaders)clock=251485;
+            if(partialBody){
+              let part=0;
+              return new Response(new ReadableStream({pull(c){
+                if(part++===0)c.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'));
+                else c.error(Object.assign(new TypeError('network reset'),{cause:{code:'UND_ERR_SOCKET'}}));
+              }}),{headers:{'content-type':'text/event-stream'}});
+            }
+            if(adapterFailure==='once'&&generations>1)return new Response(JSON.stringify({choices:[{message:{content:'complete'},finish_reason:'stop'}]}),
+              {headers:{'content-type':'application/json'}});
+            return new Response('',{status:providerWait?503:502,headers:{'retry-after':providerWait==='date'
+              ?new Date(clock+600000).toUTCString():providerWait??'0'}});
+          }}).streamSimple({id:'fixture',baseUrl:'https://provider.invalid/v1'},
+            {messages:[]},{apiKey:'fixture',onTelemetry:transportFailures.generationObserver(
+              (kind,payload)=>emitted.push({kind,payload}),input)}).result().then(message=>({message}));
+        }
+        if(generations<=generationFailures){
+          const e=Object.assign(Error('MODEL_INCOMPLETE_RESPONSE'),{code:'MODEL_INCOMPLETE_RESPONSE'});
+          throw unmarked?e:transportFailures.markModelTransportFailure(e,'connection_interrupted');
+        }
+        return {message:{content:[{type:'text',text:'valid final response'}],stopReason:'stop'}};
+      },
       (kind,payload)=>emitted.push({kind,payload}));
   }
   catch(e){error=e;}
@@ -122,7 +177,8 @@ async function runFixture(events,{reason={kind:'completed'},noise=[]}={}){
   assert.deepEqual(saved.slice(0,2).map(s=>s.state),['starting','running']);
   assert.equal(saved.at(-1).stopped,true);
   assert.equal(emitted.filter(e=>e.kind==='HARNESS_STOPPED').length,1);
-  return {value,error,saved,emitted,writes};
+  assert.equal(gateActive,0);
+  return {value,error,saved,emitted,writes,wire,generations,gateAdmissions,fetches,providerBodies};
 }
 
 test('51 completed tool calls remain 51 calls while the activity counter retains all 102 events',async()=>{
@@ -153,4 +209,64 @@ test('a failed turn persists partial tool counters without treating missing resu
   assert.deepEqual(counters(state),{toolCalls:3,toolResults:1,toolEvents:4});
   assert.deepEqual(counters(f.emitted.filter(e=>e.kind==='HARNESS_TOOL_EVENT').at(-1).payload),
     {toolCalls:3,toolResults:1,toolEvents:4});
+});
+
+test('retries only a buffered generation while retaining all earlier tools and releasing each gate',async()=>{
+  const f=await runFixture([call('a'),result('a')],{generationFailures:1});
+  assert.equal(f.error,undefined);assert.equal(f.generations,2);assert.equal(f.gateAdmissions,2);
+  assert.equal(f.value.evidence.toolCalls,1);assert.equal(f.value.evidence.toolResults,1);
+  assert.equal(f.emitted.filter(e=>e.kind==='MODEL_GENERATION_RETRY').length,1);
+  assert.equal(f.emitted.filter(e=>e.kind==='RUNTIME_TRANSPORT_INTERRUPTED').length,0);
+  assert.equal(f.wire.filter(s=>s.includes('[DONE]')).length,1);
+});
+test('exhausted generation retries preserve the ordinary terminal failure without delivering tool output',async()=>{
+  const f=await runFixture([call('a'),result('a')],{generationFailures:99});
+  assert.equal(f.error.code,'MODEL_INCOMPLETE_RESPONSE');assert.equal(f.generations,3);assert.equal(f.gateAdmissions,3);
+  assert.equal(f.emitted.filter(e=>e.kind==='MODEL_ERROR').length,1);
+  assert.equal(f.saved.at(-1).stopped,true);
+  assert.equal(f.wire.some(s=>s.includes('[DONE]')),false);
+});
+test('neither a generic stream error nor an unsettled tool can authorize replay',async()=>{
+  for(const options of [{unmarked:true},{}]){
+    const f=await runFixture(options.unmarked?[]:[call('unfinished'),result('unrelated')],{generationFailures:99,...options});
+    assert.equal(f.generations,1);assert.equal(f.error.code,'MODEL_INCOMPLETE_RESPONSE');
+    assert.equal(f.emitted.filter(e=>e.kind==='RUNTIME_TRANSPORT_INTERRUPTED').length,0);
+  }
+});
+test('caller cancellation during retry backoff prevents another admission and continuation proof',async()=>{
+  const f=await runFixture([],{generationFailures:99,cancelBackoff:true});
+  assert.equal(f.generations,1);assert.equal(f.gateAdmissions,1);assert.equal(f.error.code,'CANCELLED');
+  assert.equal(f.emitted.filter(e=>e.kind==='RUNTIME_TRANSPORT_INTERRUPTED').length,0);
+});
+test('real adapter retries remain bounded at nine fast fetches or three late-502 fetches across three gated generations',async()=>{
+  for(const lateHeaders of [false,true]){
+    const f=await runFixture([],{generationFailures:99,adapterFailure:true,lateHeaders});
+    assert.equal(f.error.code,'MODEL_REQUEST_FAILED');assert.equal(f.generations,3);assert.equal(f.gateAdmissions,3);
+    assert.equal(f.fetches,lateHeaders?3:9);
+    assert.equal(f.wire.some(s=>s.includes('[DONE]')),false);
+  }
+});
+test('logical request plus generation and HTTP attempt preserve late failure then success without changing provider body',async()=>{
+  const f=await runFixture([call('prior'),result('prior')],{generationFailures:1,adapterFailure:'once',lateHeaders:true});
+  assert.equal(f.error,undefined);assert.equal(f.generations,2);assert.equal(f.fetches,2);
+  const terminal=f.emitted.filter(e=>e.kind==='MODEL_TRANSPORT_FINISHED').map(e=>e.payload);
+  assert.deepEqual(terminal.map(p=>[p.generationAttempt,p.attempt,p.outcome]),[[1,1,'error'],[2,1,'success']]);
+  assert.equal(terminal[0].requestId,terminal[1].requestId);
+  assert.deepEqual(f.providerBodies[0],f.providerBodies[1]);
+  assert.equal(Object.hasOwn(f.providerBodies[0],'generationAttempt'),false);
+  assert.equal(Object.hasOwn(f.providerBodies[0],'requestId'),false);
+  assert.equal(f.value.evidence.toolCalls,1);assert.equal(f.gateAdmissions,2);
+});
+test('a partial provider body never authorizes outer generation retry even after a proven connection reset',async()=>{
+  const f=await runFixture([],{generationFailures:99,adapterFailure:true,partialBody:true});
+  assert.equal(f.error.code,'MODEL_INCOMPLETE_RESPONSE');assert.equal(f.generations,1);assert.equal(f.fetches,1);
+  assert.equal(f.gateAdmissions,1);assert.equal(f.emitted.filter(e=>e.kind==='MODEL_GENERATION_RETRY').length,0);
+  assert.equal(f.wire.some(s=>s.includes('[DONE]')),false);
+});
+test('the gateway never replaces a late 503 Retry-After with its shorter generation backoff',async()=>{
+  for(const providerWait of ['600','date']){
+    const f=await runFixture([],{generationFailures:99,adapterFailure:true,lateHeaders:true,providerWait});
+    assert.equal(f.error.code,'MODEL_REQUEST_FAILED');assert.equal(f.generations,1);assert.equal(f.fetches,1);
+    assert.equal(f.gateAdmissions,1);assert.equal(f.emitted.filter(e=>e.kind==='MODEL_GENERATION_RETRY').length,0);
+  }
 });
