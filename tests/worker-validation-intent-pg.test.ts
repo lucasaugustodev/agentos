@@ -1,6 +1,7 @@
 import {afterAll,beforeAll,beforeEach,expect,it,vi} from 'vitest';
 import {createHash,randomUUID} from 'node:crypto';
 import {setTimeout as delay} from 'node:timers/promises';
+import {readFile} from 'node:fs/promises';
 import {pool,migrate} from '../server/db.js';
 import {seedRegistry} from '../server/registry.js';
 import {installManagement} from '../server/management.js';
@@ -12,6 +13,7 @@ import {registerWorkerValidationPolicy,validationDigest,canonicalValidationValue
 import {readPendingValidations} from '../server/validation-identity.js';
 
 const sha=(bytes:Buffer|string)=>createHash('sha256').update(bytes).digest('hex');
+const managedExecutor='cf4351977a994457dd0b74da8449c05597479ba4410e3015e499d7359d094383';
 const required=[{file:'tests/transaction-pg.test.ts',name:'transaction rejects a stale writer'}];
 const policy={version:1,enabled:true,project:'agentos',profile:'agentos.validate',stages:['verify'],required:true,requiredDatabaseTests:required};
 let f:any;
@@ -46,10 +48,11 @@ const handoff=async()=>(await pool.query('SELECT value FROM settings WHERE id=$1
 const inspect=async()=>({runId:f.run,workspace:'agentos/oworkerfixture',checkedAt:new Date().toISOString(),
   candidate:{candidateDigest:f.candidateDigest},process:{unit:'agentos-run-'+f.run,stopped:true,mainPid:0,populated:false,activeState:'inactive'}});
 const stored=async(id:string)=>(await pool.query('SELECT value FROM settings WHERE id=$1',['candidate-validation:'+id])).rows[0]?.value;
-async function completed() {
+async function completed(passed=true) {
   await reconcileWorkerValidationIntents(inspect);const h=await handoff();expect(h.state).toBe('reserved');
   const dispatch=async(mode:string,request:any)=>({actionId:request.actionId,candidateDigest:request.candidateDigest,requestDigest:validationDigest(request),
-    ...(mode==='freeze'?{state:'frozen',frozenWorkspace:'agentos/ocvfixture'}:{state:'completed',passed:true,code:'VALIDATION_PASSED',
+    ...(mode==='freeze'?{state:'frozen',frozenWorkspace:'agentos/ocvfixture'}:{state:'completed',passed,code:passed?'VALIDATION_PASSED':'VALIDATION_CHECKS_FAILED',
+      registeredActionSha:managedExecutor,
       resultDigest:'e'.repeat(64),publishedBaselineDigest:'f'.repeat(64),registeredReceiptSha:'a'.repeat(64)})});
   await reconcileCandidateValidations(dispatch,inspect);await reconcileCandidateValidations(dispatch,inspect);
   return stored(h.actionId);
@@ -114,6 +117,50 @@ it('reserves one existing CI owner for duplicate handoff without manager identit
   expect((await pool.query("SELECT count(*)::int n FROM settings WHERE id LIKE 'candidate-validation:%'")).rows[0].n).toBe(1);
   expect((await pool.query('SELECT count(*)::int n FROM management_actions')).rows[0].n).toBe(0);
   expect((await run()).instruction_snapshot).toEqual(before);
+});
+it('publishes a reviewed managed executor failure and queues repair without accepting or rerunning the producer',async()=>{
+  const provenance=(await readFile(new URL('../scripts/validator_provenance.py',import.meta.url),'utf8')).replace(/\r\n/g,'\n');
+  expect(provenance).toContain(`'${managedExecutor}': {\n        'sourceCommit':'d65e4801eef3412b7ff234fbf81c618acd512373'`);
+  await admit();
+  await pool.query("INSERT INTO objectives(id,request,request_hash,mode,status) VALUES($1,'{}','fixture','execute','executing')",[f.goal]);
+  const snapshot=(await run()).instruction_snapshot;
+  const artifacts=(await pool.query('SELECT id,digest FROM artifacts WHERE run_id=$1 ORDER BY id',[f.run])).rows;
+  const job=await completed(false);
+  await publish(job,null,{registeredActionSha:managedExecutor,validatedReleaseDigest:null});
+  const evidence=(await pool.query('SELECT value FROM settings WHERE id=$1',['candidate-validation-evidence:'+job.actionId])).rows[0].value;
+  expect(evidence).toMatchObject({state:'published',body:{authority:{registeredActionSha:managedExecutor,
+    outcome:{passed:false,code:'VALIDATION_CHECKS_FAILED'},validatedReleaseDigest:null,acceptance:false}}});
+  expect(await readPendingValidations()).toEqual([{id:f.task}]);
+  expect(await workerValidationGate(pool,f.run)).toMatchObject({state:'failed',detail:'VALIDATION_CHECKS_FAILED'});
+  const result=await validateTask(f.task);
+  expect(result).toMatchObject({passed:false,duplicate:false});
+  expect((await validateTask(f.task))).toMatchObject({passed:false,duplicate:true});
+  expect((await pool.query('SELECT passed FROM acceptances WHERE run_id=$1',[f.run])).rows).toEqual([{passed:false}]);
+  const feedback=(await pool.query('SELECT description,task_ids FROM objective_feedback WHERE objective_id=$1',[f.goal])).rows;
+  expect(feedback).toHaveLength(1);
+  expect(feedback[0].description).toContain('VALIDATION_CHECKS_FAILED');
+  expect(feedback[0].description).toContain(job.actionId);
+  expect(feedback[0].task_ids).toEqual([f.task]);
+  const inputs=await runtimeValidationRepairInputs(pool,f.goal,[f.task],['requirement-a']);
+  expect(inputs.map((i:any)=>i.name)).toEqual(['ci-receipt.json','validation.log','ci-diagnostic-scope.json']);
+  expect((await pool.query('SELECT state,attempt_count FROM tasks WHERE id=$1',[f.task])).rows[0]).toEqual({state:'submitted',attempt_count:1});
+  expect((await run()).instruction_snapshot).toEqual(snapshot);
+  expect((await pool.query('SELECT id,digest FROM artifacts WHERE run_id=$1 ORDER BY id',[f.run])).rows).toEqual(artifacts);
+});
+it.each(['extra-field','candidate','outcome','receipt','log-bytes'])(
+  'keeps managed executor evidence pending when %s is malformed or unbound',async(mode)=>{
+  await admit();const job=await completed(false);
+  const body=exported(job,null,{registeredActionSha:managedExecutor,validatedReleaseDigest:null});
+  if(mode==='extra-field')(body.authority as any).unregistered=true;
+  if(mode==='candidate')body.authority.producer.candidateDigest='0'.repeat(64);
+  if(mode==='outcome')body.authority.outcome.passed=true;
+  if(mode==='receipt')body.receiptDigest='0'.repeat(64);
+  if(mode==='log-bytes')body.inputs[1].base64=Buffer.from('invented log').toString('base64');
+  await reconcileCandidateValidationEvidence(async()=>body);
+  expect(await workerValidationGate(pool,f.run)).toMatchObject({state:'pending',detail:'REGISTERED_CI_EVIDENCE_PENDING'});
+  const evidence=(await pool.query('SELECT value FROM settings WHERE id=$1',['candidate-validation-evidence:'+job.actionId])).rows[0].value;
+  expect(evidence.state).toBe('reconciling');expect(evidence.body).toBeUndefined();
+  expect((await pool.query('SELECT count(*)::int n FROM acceptances WHERE run_id=$1',[f.run])).rows[0].n).toBe(0);
 });
 it.each(['missing','command','profile'])('rejects %s intent without granting worker execution authority',async(mode)=>{
   await admit({omitIntent:mode==='missing',intent:{version:1,profile:mode==='profile'?'arbitrary':'agentos.validate',

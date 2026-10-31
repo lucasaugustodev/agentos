@@ -30,6 +30,9 @@ const canonical = (v: any): any =>
 const digest = (v: any) => sha(JSON.stringify(canonical(v)));
 const registeredShas = ['e66fcf513aaa513ff2216d87556fb5dba771597dc933ca4b4b38573d8842d5b5',
   '02a92158a4084a1aeb3b4c55998b6740d90428f80acb06a225730a1423ba9c26',
+  // Reviewed managed bundle d65e4801; verified_execution_registration checks
+  // its immutable registration and source archives before exporting evidence.
+  'cf4351977a994457dd0b74da8449c05597479ba4410e3015e499d7359d094383',
   '39843bdbde81e84b5093ed6667484378d1f4444c66aa33424b52d28b45b0cc44'] as const;
 const key = (id: string) => 'candidate-validation-evidence:' + id;
 const uuid = z.uuid(),
