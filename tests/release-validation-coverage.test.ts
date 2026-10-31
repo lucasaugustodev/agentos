@@ -135,7 +135,7 @@ function capacityFixture(count:number){
     numPassedTests:count,numFailedTests:0,testResults:[{name:path.join(build,file),status:'passed',
       assertionResults:requiredDatabaseTests.map(t=>({fullName:t.name,status:'passed'}))}]}};
 }
-it.each([142,256])('binds every one of %i required cases without truncating the report or obligation digest',async count=>{
+it.each([142,256,319,512])('binds every one of %i required cases without truncating the report or obligation digest',async count=>{
   const f=capacityFixture(count),raw=await put(f.report),proof=(await evidence({validationCoverage:f.obligations})).result;
   expect(proof.passed).toBe(true);expect(proof.coverage.requiredTests).toHaveLength(count);
   expect(proof.coverage.requiredTests).toEqual(f.obligations.requiredDatabaseTests.map(t=>({...t,status:'passed'})));
@@ -159,8 +159,26 @@ it.each(['duplicate','name','path'])('retains strict %s validation at the expand
   expect((await evidence({validationCoverage:f.obligations})).error).toBe(kind==='duplicate'
     ?'VALIDATION_COVERAGE_DUPLICATE_OBLIGATION':kind==='name'?'VALIDATION_COVERAGE_TEST_NAME':'VALIDATION_COVERAGE_TEST_PATH');
 });
-it('refuses 257 obligations before build preparation, database reads or validation process execution',async()=>{
-  const f=capacityFixture(257),input={occurrenceId:'a31365b7-3c7a-4f45-bbc2-54550ea4dc3d',
+it.each(['missing','skipped'])('keeps obligation 512 %s negative without truncating the newly admitted tail',async kind=>{
+  const f=capacityFixture(512);
+  if(kind==='missing'){f.report.testResults[0].assertionResults.pop();f.report.numTotalTests--;}
+  else f.report.testResults[0].assertionResults[511].status='pending';
+  f.report.numPassedTests--;await put(f.report);
+  const proof=(await evidence({validationCoverage:f.obligations})).result;
+  expect(proof.passed).toBe(false);expect(proof.coverage.requiredTests).toHaveLength(512);
+  expect(proof.coverage.requiredTests[511]).toMatchObject({name:'required behavior 511',status:kind});
+  expect(proof.coverage.obligationsDigest).toBe(hash(JSON.stringify(f.obligations.requiredDatabaseTests)));
+});
+it.each(['duplicate','name','path'])('validates %s in obligation 512 instead of trusting the extended tail',async kind=>{
+  const f=capacityFixture(512);await put(f.report);
+  if(kind==='duplicate')f.obligations.requiredDatabaseTests[511]={...f.obligations.requiredDatabaseTests[0]};
+  if(kind==='name')f.obligations.requiredDatabaseTests[511].name='x'.repeat(501);
+  if(kind==='path')f.obligations.requiredDatabaseTests[511].file='tests/../required-pg.test.ts';
+  expect((await evidence({validationCoverage:f.obligations})).error).toBe(kind==='duplicate'
+    ?'VALIDATION_COVERAGE_DUPLICATE_OBLIGATION':kind==='name'?'VALIDATION_COVERAGE_TEST_NAME':'VALIDATION_COVERAGE_TEST_PATH');
+});
+it('refuses 513 obligations before build preparation, database reads or validation process execution',async()=>{
+  const f=capacityFixture(513),input={occurrenceId:'a31365b7-3c7a-4f45-bbc2-54550ea4dc3d',
     attemptId:'c9819046-5a7c-4bbe-b6c1-998b18e4980e',parameters:{workspace:'agentos/occapacity',validationCoverage:f.obligations},results:[]};
   const code=`import importlib.util,io,json,pathlib,sys
 from unittest.mock import patch

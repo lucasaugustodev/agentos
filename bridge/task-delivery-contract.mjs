@@ -10,11 +10,15 @@ export function taskDeliveryContract(criteria = []) {
   if (!Array.isArray(criteria) || criteria.length > 30) throw failure();
   const artifacts = [];
   for (const criterion of criteria) {
-    if (!criterion || !['artifact', 'json_field', 'requirement_outcomes'].includes(criterion.type)) continue;
-    const name = criterion.name;
+    if (!criterion || !['artifact', 'json_field', 'requirement_outcomes', 'candidate_readiness','candidate_ci'].includes(criterion.type)) continue;
+    if(['candidate_readiness','candidate_ci'].includes(criterion.type)&&(!Array.isArray(criterion.localArtifacts)||criterion.localArtifacts.length>20))throw failure();
+    const names=criterion.type==='candidate_readiness'?[criterion.name,...criterion.localArtifacts,'validation-intent.json']:
+      criterion.type==='candidate_ci'?[criterion.name,...criterion.localArtifacts]:[criterion.name];
+    for(const name of names){
     if (typeof name !== 'string' || !validName.test(name)) throw failure();
     if (controllerNames.has(name) || artifacts.some((item) => item.name === name)) continue;
     artifacts.push({ name, path: 'evidence/' + name, mime: mimeFor(name) });
+    }
   }
   return { version: 1, artifacts };
 }

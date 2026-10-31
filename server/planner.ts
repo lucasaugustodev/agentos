@@ -27,6 +27,7 @@ import {
 import {normalizeSourceContract,sourceContractInstruction} from './source-contract-schema.js';
 import { planningContext } from './planning-context.js';
 import { incrementalEligible, deliveryFrontier, deliveryDecisionSchema, compileDelivery, bindDeliveryFeedback, queueNextDelivery, assertIncrementalAuthority } from './incremental-planning.js';
+import {bindCandidateReadinessPlan,verifyBoundCandidateReadinessPlan} from './candidate-readiness.js';
 import {readObjectiveInputs,inputsForRequirements} from './objective-inputs.js';
 import {planningInputContext,planningInputInstruction} from './planning-input-context.js';
 import {reconcileInheritedCancellation} from './objective-state-repair.js';
@@ -548,6 +549,7 @@ function executionSpec(id: string, revision: number, t: any, plan: ProposedPlan)
 export async function applyPlannedResult(run: any, plan: ProposedPlan, preparedSources:PreparedPlanningSources=new Map()) {
   return tx(async (db) => {
     await lock(db);
+    await verifyBoundCandidateReadinessPlan(db,run.objective_id,plan);
     const fresh = (
       await db.query(
         'SELECT p.state,p.fence,p.feedback,p.route_generation_id,o.revision,o.request,o.mode,g.state goal_state FROM planning_runs p JOIN objectives o ON o.id=p.objective_id JOIN goals g ON g.id=o.id WHERE p.id=$1',
@@ -944,6 +946,7 @@ export class PlanningEngine {
           deliveryFrontier(run.request,previous,!!run.feedback?.incrementalAdvance,run.feedback?.requirementResolution).eligible,
           run.feedback?.planningRecovery?.mode==='serial',run.request.sourceContractVersion,run.request.completionContractVersion).parse(rawDecision) : rawDecision;
         plan = incremental ? compileDelivery(decision, run.request, previous, !!run.feedback?.incrementalAdvance, run.feedback?.reports,run.feedback?.requirementResolution) : bindRequirementOutcomeContracts(planSchema.parse(decision),run.request,previous);
+        plan = await tx(async db=>{await lock(db);return bindCandidateReadinessPlan(db,run.objective_id,plan);});
         validatePlan(plan, run.request, context.agents, accounts, previous?.requirements);
         await pool.query(
           "UPDATE planning_runs SET output=$3 WHERE id=$1 AND fence=$2 AND state='running'",
@@ -954,6 +957,7 @@ export class PlanningEngine {
       if (JSON.stringify(boundPlan) !== JSON.stringify(plan))
         await pool.query("UPDATE planning_runs SET output=$3 WHERE id=$1 AND fence=$2 AND state='running'",[run.id,run.fence,JSON.stringify(boundPlan)]);
       plan = boundPlan;
+      await tx(async db=>{await lock(db);await verifyBoundCandidateReadinessPlan(db,run.objective_id,plan);});
       validatePlan(plan, run.request, context.agents, accounts, previous?.requirements);
       // Prepare one immutable logical baseline per source before creating runnable tasks.
       if (

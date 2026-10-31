@@ -141,11 +141,44 @@ export async function verifyWorkerValidationAuthority(db:DB,value:any,mode:'curr
     throw Error('VALIDATION_BINDING_STALE');
   const proof=await workerValidationAuthority(db,run,mode);
   if(validationDigest(proof.authority)!==validationDigest(value.request.runtimeAuthority)) throw Error('VALIDATION_AUTHORITY_UNBOUND');
+  if(mode==='current'){
+    const {readCandidateReadinessProof}=await import('./candidate-readiness.js');
+    const readiness=await readCandidateReadinessProof(db,run.id);
+    if(readiness){
+      const handoff=(await db.query('SELECT value FROM settings WHERE id=$1',['worker-validation-handoff:'+run.id])).rows[0]?.value;
+      if(handoff?.version!==2||handoff.actionId!==value.actionId||validationDigest(readiness)!==validationDigest(handoff.readiness))
+        throw Error('READINESS_HANDOFF_CHANGED');
+    }
+  }
   return run;
 }
 
 /** Rendered only for admissions carrying this contract version; no live prompt is rewritten. */
 export function workerValidationInstruction(run:any) {
+  if(run.instruction_snapshot?.candidateCiAdmission){
+    if(run.instruction_snapshot.task?.stage!=='verify'||run.instruction_snapshot.workerValidation)
+      throw new DomainError('READINESS_QA_ADMISSION_UNBOUND','Invalid inherited CI admission.');
+    return 'INHERITED CANONICAL CI: This read-only QA admission has controller-verified CI for its exact accepted source in context.candidateReadinessQa. '+
+      'Inspect that evidence and its complete required coverage. Execute every prescribed local control independently and publish its own actual evidence plus verification.json. '+
+      'Do not repeat unavailable database setup, claim inherited tests ran locally, request another validation, or fabricate receipts. '+
+      'Keep source unchanged; a different candidate invalidates inherited CI. verification.passed is false for any local failure, missing coverage or source mismatch. '+
+      'Acceptance still verifies both inherited CI and local evidence against the frozen admission.';
+  }
+  if(run.instruction_snapshot?.workerValidationContract===2){
+    const frozen=run.instruction_snapshot.candidateReadiness;
+    if(!frozen?.registration||!frozen?.criterion||!run.instruction_snapshot.workerValidation)
+      throw new DomainError('READINESS_ADMISSION_UNBOUND','Invalid readiness admission.');
+    return 'REGISTERED CI HANDOFF V2: This future admission separates local candidate readiness from acceptance. '+
+      'Execute every local control below and publish its real evidence. Do not execute the registered_ci controls here, provision PostgreSQL, patch system tools, or claim CI already passed. '+
+      'Write evidence/integration-readiness.json exactly with {version:1,state:"ready_for_ci",localChecks:[{id,status:"passed",name,digest}],'+
+      'controllerChecks:{profile:"agentos.validate",status:"pending_controller_ci",obligationsDigest:'+JSON.stringify(frozen.criterion.obligationsDigest)+
+      ',tests:'+JSON.stringify(frozen.registration.requiredDatabaseTests)+'},blockingFailures:[],limitations:[]}. '+
+      'Local digests are SHA256 of actual submitted bytes; every registered local obligation must appear. If a local check failed, report the real failure; do not produce ready_for_ci. '+
+      'Publish every local artifact and validation-intent.json with exactly {version:1,profile:"agentos.validate",reason:"Explain the required registered candidate CI in at least 20 characters"}. '+
+      'Finish the attempt so the controller can confirm physical stop, validate readiness and run registered CI on this exact candidate. '+
+      'Readiness is not passed:true and grants no acceptance. candidate.json/changes.patch are controller outputs; never fabricate them. '+
+      'The existing controller CI protocol remains version 1. Independent QA follows verified CI. Registered obligations: '+JSON.stringify(frozen.registration.contract.obligations);
+  }
   if(run.instruction_snapshot?.workerValidationContract!==1 || run.instruction_snapshot.task?.stage==='coordinate') return '';
   if(run.instruction_snapshot.workerValidation) return 'REGISTERED CI HANDOFF: request_validation is a manager action, not a worker tool. After local checks, write evidence/validation-intent.json with exactly {"version":1,"profile":"agentos.validate","reason":"Explain required candidate CI in at least 20 characters"} and include {"name":"validation-intent.json","path":"evidence/validation-intent.json","mime":"application/json"} in your final artifacts alongside the normal delivery artifacts. candidate.json is produced by the runtime; never list or forge that reserved artifact. Finish the attempt; the controller confirms stop, binds this candidate and runs the registered isolated CI. Do not access controller databases, credentials or start the validator yourself. Local passed:true is not registered CI proof. Report unavailable database coverage honestly; the controller keeps acceptance pending until canonical CI evidence exists.';
   return 'REGISTERED CI CAPABILITY: request_validation is a manager action and is not available as a worker tool. This attempt has no registered worker CI policy. Execute only available checks, report unavailable database tests and coverage as limitations, and never claim they ran or invent CI receipts.';
@@ -203,8 +236,11 @@ export async function workerValidationCommitIdentity(db:DB,runId:string) {
       encode(sha256(convert_to(j.value::text,'UTF8')),'hex') job_digest,
       encode(sha256(convert_to((e.value-'body')::text,'UTF8')),'hex') evidence_identity,
       encode(sha256(convert_to((e.value#>'{body,authority}')::text,'UTF8')),'hex') evidence_authority,
+      encode(sha256(convert_to((r.instruction_snapshot->'candidateReadiness')::text,'UTF8')),'hex') readiness_snapshot,
+      encode(sha256(convert_to(rm.value::text,'UTF8')),'hex') readiness_current,
       encode(sha256(convert_to(COALESCE(c.manifest->'dependencyArtifacts','[]'::jsonb)::text,'UTF8')),'hex') dependencies_digest
     FROM runs r LEFT JOIN settings p ON p.id='worker-validation:'||$2::text
+      LEFT JOIN settings rm ON r.instruction_snapshot->>'workerValidationContract'='2' AND rm.id='candidate-readiness:'||$2::text
       LEFT JOIN settings h ON h.id='worker-validation-handoff:'||r.id
       LEFT JOIN settings j ON j.id='candidate-validation:'||(h.value->>'actionId')
       LEFT JOIN settings e ON e.id='candidate-validation-evidence:'||(h.value->>'actionId')

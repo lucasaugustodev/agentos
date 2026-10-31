@@ -92,3 +92,32 @@ it('does not erase an immediate transport failure when the ordinary admission ti
   await engine.tick();
   expect(engine.transportRecoveryError).toBeNull();expect(engine.lastError).toBeNull();
 });
+
+it('waits for the admitted candidate validation before closing worker infrastructure',async()=>{
+  let release!:()=>void;
+  const owner=new Promise<void>(resolve=>{release=resolve;});
+  engine.candidateValidationSync=owner;
+  let stopped=false;
+  const stopping=engine.stop().then(()=>{stopped=true;});
+  try {
+    await Promise.resolve();expect(engine.stopped).toBe(true);
+    expect(io.bossStop).not.toHaveBeenCalled();expect(stopped).toBe(false);
+    await engine.tick();expect(io.schedule).not.toHaveBeenCalled();
+    release();await stopping;expect(stopped).toBe(true);
+    expect(io.bossStop).toHaveBeenCalledOnce();
+  } finally { release();await stopping;engine.candidateValidationSync=null; }
+});
+
+it('a candidate shutdown timeout preserves the pending owner and refuses false quiet',async()=>{
+  vi.useFakeTimers();let release!:()=>void;
+  const owner=new Promise<void>(resolve=>{release=resolve;});
+  engine.candidateValidationSync=owner;
+  const stopping=engine.stop();
+  const rejected=expect(stopping).rejects.toThrow('CANDIDATE_VALIDATION_STOP_UNCONFIRMED');
+  try {
+    await vi.advanceTimersByTimeAsync(10000);await rejected;
+    expect(engine.candidateValidationSync).toBe(owner);
+    expect(engine.stopped).toBe(true);expect(io.bossStop).not.toHaveBeenCalled();
+    await engine.tick();expect(io.schedule).not.toHaveBeenCalled();
+  } finally {release();await owner;engine.candidateValidationSync=null;vi.useRealTimers();}
+});

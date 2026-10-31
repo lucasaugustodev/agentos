@@ -365,7 +365,8 @@ class ValidatorProvenanceTests(unittest.TestCase):
         guard=(ROOT/'scripts/agentos-release-action.py').read_bytes();identity=p.sha(guard)
         bundle=NATIVE_BUNDLES[identity]
         self.assertEqual(bundle['files'],{'agentos-release-action.py':identity,'candidate_origin.py':p.sha(self.helper)})
-        self.assertEqual(bundle['sourceCommit'],'d65e4801eef3412b7ff234fbf81c618acd512373')
+        self.assertEqual(identity,'d57894cd6a39d65940d753d8118829a69ccfd599e183bf05324bca73444171f2')
+        self.assertEqual(bundle['sourceCommit'],'397ce79c00aa3552f5d851b8a1b6e9f8687a7870')
         folder=self.layout.control.parent/'reviewed-validator-bundles'/identity
         self.put(folder/'agentos-release-action.py',guard);self.put(folder/'candidate_origin.py',self.helper)
         before={x.name:x.read_bytes() for x in self.directory.iterdir()};active=self.layout.active.resolve()
@@ -380,6 +381,37 @@ class ValidatorProvenanceTests(unittest.TestCase):
             self.assertEqual(record['bundleManifest'],bundle['files'])
         self.assertEqual(self.layout.active.resolve(),active)
         self.assertEqual({x.name:x.read_bytes() for x in self.directory.iterdir()},before)
+
+    def test_previous_capacity_registration_remains_verifiable_after_512_bundle_is_added(self):
+        previous='cf4351977a994457dd0b74da8449c05597479ba4410e3015e499d7359d094383'
+        bundle=NATIVE_BUNDLES[previous]
+        self.assertEqual(bundle['sourceCommit'],'d65e4801eef3412b7ff234fbf81c618acd512373')
+        self.assertEqual(bundle['files'],{'agentos-release-action.py':previous,
+            'candidate_origin.py':'742212cdc76a1404418ad9fa0b57215d377eea4433f77bc2cd29eed9e2a27e6f'})
+        current=(ROOT/'scripts/agentos-release-action.py').read_bytes()
+        old=current.replace(b'1<=len(tests)<=512',b'1<=len(tests)<=256')
+        self.assertEqual(p.sha(old),previous)
+        target=p.sha(current)
+        with patch.dict(p.REVIEWED_BUNDLES,NATIVE_BUNDLES):
+            for identity,raw in [(previous,old),(target,current)]:
+                folder=self.layout.control.parent/'reviewed-validator-bundles'/identity
+                self.put(folder/'agentos-release-action.py',raw)
+                self.put(folder/'candidate_origin.py',self.helper)
+            old_request=self.request()|{'executorSha256':previous,'sourceCommit':bundle['sourceCommit']}
+            old_pointer=self.register(old_request)
+            record_path=self.layout.registry/(old_pointer['registrationId']+'.json')
+            original=record_path.read_bytes()
+            # Staging the 512 bundle alone grants no execution authority.
+            self.assertEqual(p.active_registration(self.layout,for_execution=True),old_pointer)
+            self.assertEqual(self.layout.control.read_bytes(),old)
+            new_request=self.request()|{'executorSha256':target,'sourceCommit':NATIVE_BUNDLES[target]['sourceCommit']}
+            new_pointer=self.register(new_request)
+            self.assertEqual(p.registration_record(self.layout,old_pointer)['executorSha256'],previous)
+            self.assertEqual(record_path.read_bytes(),original)
+            self.assertEqual(p.active_registration(self.layout,for_execution=True),new_pointer)
+            with self.assertRaisesRegex(ValueError,'VALIDATOR_REGISTRATION_SUPERSEDED'):
+                self.register(old_request)
+            self.assertEqual(p.active_registration(self.layout,for_execution=True),new_pointer)
 
     def test_unreviewed_hash_wrong_commit_and_free_source_path_are_rejected(self):
         for field,value in [('executorSha256','f'*64),('sourceCommit','f'*40),('sourcePath','/tmp/untrusted')]:

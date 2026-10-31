@@ -32,6 +32,7 @@ import {registerTaskRetryGuidance} from './task-retry-guidance.js';
 import {registerSourceReplanFeedback} from './objective-source-replan.js';
 import {objectiveModelRoute,registerObjectiveModelRoute} from './objective-model-route.js';
 import {registerWorkerValidationPolicy} from './worker-validation.js';
+import {registerCandidateReadinessMap} from './candidate-readiness.js';
 import {configureObjectiveReview,objectiveReviews,requestObjectiveReview} from './objective-review.js';
 import {reconcileInheritedCancellation} from './objective-state-repair.js';
 import { cycleRoutes } from './cycles/routes.js';
@@ -160,6 +161,11 @@ export function makeApp(engine?: WorkerEngine) {
   app.post('/api/objectives/:id/validation-policy',async req=>{
     const bearer=(req.headers.authorization??'').replace(/^Bearer /,'');
     return registerWorkerValidationPolicy(z.uuid().parse((req.params as any).id),req.body,
+      {channel:bearer&&equal(bearer,config.apiToken)?'api-token':'operator-session'});
+  });
+  app.post('/api/objectives/:id/candidate-readiness',async req=>{
+    const bearer=(req.headers.authorization??'').replace(/^Bearer /,'');
+    return registerCandidateReadinessMap(z.uuid().parse((req.params as any).id),req.body,
       {channel:bearer&&equal(bearer,config.apiToken)?'api-token':'operator-session'});
   });
   app.get('/api/objectives/:id/reviews',async req=>objectiveReviews(z.uuid().parse((req.params as any).id)));

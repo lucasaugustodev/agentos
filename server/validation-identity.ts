@@ -15,6 +15,8 @@ const inputsSql = (filter: string) => `
     SELECT t.id,t.goal_id,t.title,t.state,t.criteria,t.attempt_count,t.instruction_revision_id,t.stage,t.covers,
       r.id run_id,r.fence run_fence,r.attempt run_attempt,r.state run_state,
       NULLIF(r.instruction_snapshot->'workerValidation','null'::jsonb) worker_validation,
+      CASE WHEN r.instruction_snapshot->>'workerValidationContract'='2' THEN r.instruction_snapshot->'candidateReadiness' END candidate_readiness,
+      r.instruction_snapshot->'candidateCiAdmission' candidate_ci,
       CASE WHEN COALESCE(t.execution ? 'sourceContract',false) OR
         COALESCE((r.instruction_snapshot#>'{task,execution}') ? 'sourceContract',false)
         THEN jsonb_build_object('schema',r.instruction_snapshot->'schema',
@@ -36,12 +38,20 @@ const inputsSql = (filter: string) => `
       FROM artifacts a WHERE a.run_id=t.run_id AND a.name<>'task-instructions-history.json'
     )a ON true
   ), validation_inputs AS (
-    SELECT m.*,jsonb_build_object('version',$1::text,'reviewer',$2::text,
+    SELECT m.*,jsonb_build_object('version',CASE WHEN m.candidate_readiness IS NULL AND m.candidate_ci IS NULL THEN $1::text ELSE 'deterministic-contract/candidate-readiness-v1' END,'reviewer',$2::text,
       'reviewAttested',$3::boolean,'taskId',m.id,'goalId',m.goal_id,
       'runId',m.run_id,'fence',m.run_fence,'attempt',m.run_attempt,
       'contract',jsonb_build_object('criteria',m.criteria,'revision',m.instruction_revision_id,
         'stage',m.stage,'covers',m.covers),'artifacts',m.artifacts)
       ||CASE WHEN m.source_output IS NULL THEN '{}'::jsonb ELSE jsonb_build_object('sourceOutput',m.source_output) END
+      ||CASE WHEN m.candidate_ci IS NULL THEN '{}'::jsonb ELSE jsonb_build_object('candidateCi',
+        jsonb_build_object('snapshot',m.candidate_ci,'currentMap',rm.value,'currentPolicy',qp.value)) END
+      ||CASE WHEN m.candidate_readiness IS NULL THEN '{}'::jsonb ELSE jsonb_build_object('candidateReadiness',
+        jsonb_build_object('snapshot',m.candidate_readiness,'current',rm.value,
+          'registered',EXISTS(SELECT 1 FROM events re WHERE re.kind='CANDIDATE_READINESS_MAP_REGISTERED'
+            AND re.entity_id=m.goal_id::text AND re.payload=rm.value),
+          'planBound',EXISTS(SELECT 1 FROM events re WHERE re.kind='CANDIDATE_READINESS_PLAN_BOUND'
+            AND re.entity_id=m.goal_id::text AND re.payload->'criterion'=m.candidate_readiness->'criterion'))) END
       ||CASE WHEN m.worker_validation IS NULL THEN '{}'::jsonb ELSE jsonb_build_object('workerValidation',
         jsonb_build_object('policy',m.worker_validation,'currentPolicy',p.value,'handoff',h.value,
           'state',j.value->'state','result',j.value->'result','code',j.value->'code',
@@ -49,6 +59,8 @@ const inputsSql = (filter: string) => `
         END validation_input
     FROM manifests m
     LEFT JOIN settings p ON m.worker_validation IS NOT NULL AND p.id='worker-validation:'||m.goal_id
+    LEFT JOIN settings rm ON (m.candidate_readiness IS NOT NULL OR m.candidate_ci IS NOT NULL) AND rm.id='candidate-readiness:'||m.goal_id
+    LEFT JOIN settings qp ON m.candidate_ci IS NOT NULL AND qp.id='worker-validation:'||m.goal_id
     LEFT JOIN settings h ON m.worker_validation IS NOT NULL AND h.id='worker-validation-handoff:'||m.run_id
     LEFT JOIN settings j ON j.id='candidate-validation:'||(h.value->>'actionId')
     LEFT JOIN settings e ON e.id='candidate-validation-evidence:'||(h.value->>'actionId')

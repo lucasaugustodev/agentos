@@ -6,6 +6,7 @@ import { requireRunCriteriaMetadataReady } from './run-criteria-metadata.js';
 import { requireTaskPanelMetadataReady } from './task-panel-metadata.js';
 import { seedRegistry } from './registry.js';
 import { WorkerEngine } from './worker.js';
+import { requestConfirmedShutdown } from './candidate-validation-lifecycle.js';
 import { makeApp } from './app.js';
 import { syncAccounts } from './accounts.js';
 import { accountBridge } from './bridge.js';
@@ -64,5 +65,11 @@ async function close() {
   await pool.end();
   process.exit(0);
 }
-process.on('SIGINT', () => void close());
-process.on('SIGTERM', () => void close());
+function requestClose() {
+  void requestConfirmedShutdown(close, () => {
+    console.error('SHUTDOWN_UNCONFIRMED: execution ownership remains reserved.');
+    process.exitCode = 1;
+  });
+}
+process.on('SIGINT', requestClose);
+process.on('SIGTERM', requestClose);

@@ -8,6 +8,7 @@ import {objectiveSchema} from '../server/objective-contracts.js';
 import {makeApp} from '../server/app.js';
 import {config} from '../server/config.js';
 import {cancelTask} from '../server/service.js';
+import {DomainError} from '../server/contracts.js';
 import {installObjectiveReview,configureObjectiveReview,recordObjectiveLoop,objectiveReviews,ObjectiveReviewEngine} from '../server/objective-review.js';
 vi.mock('../bridge/model-policy.mjs',async importOriginal=>({...await importOriginal<any>(),readModelPolicy:vi.fn()}));
 
@@ -191,4 +192,55 @@ it('does not create a second supervisor for workforce-owned objectives and prote
     expect((await app.inject({method:'POST',url,payload:{mode:'supervised'}})).statusCode).toBe(401);
     expect((await app.inject({method:'POST',url,payload:{mode:'supervised'},headers:{authorization:'Bearer '+config.apiToken}})).statusCode).toBe(200);
   }finally{await app.close();}
+});
+
+const privateDiagnosticSentinel='PRIVATE_MODEL_BODY_do_not_persist';
+async function diagnostic(){
+  return (await pool.query("SELECT payload FROM events WHERE kind='OBJECTIVE_REVIEW_ATTEMPT_FAILED' AND entity_id=$1 ORDER BY id DESC LIMIT 1",[f.goal])).rows[0]?.payload;
+}
+it.each([
+  ['extract_response',{message:{content:null}},'REVIEW_RESPONSE_INVALID'],
+  ['parse_decision',{message:{content:[{type:'text',text:privateDiagnosticSentinel}]}},'REVIEW_JSON_INVALID'],
+  ['validate_decision',{message:{content:[{type:'text',text:JSON.stringify({kind:'invalid',secret:privateDiagnosticSentinel})}]}},'REVIEW_SCHEMA_INVALID'],
+  ['validate_evidence',{message:{content:[{type:'text',text:JSON.stringify({kind:'continue',evidenceDigest:'0'.repeat(64),reason:'Keep the original task unchanged.'})}]}},'REVIEW_EVIDENCE_CHANGED'],
+] as const)('records the exact %s boundary without retaining model output or changing retry behavior',async(phase,response,code)=>{
+  await configureObjectiveReview(f.goal,{mode:'supervised'});await record();
+  const dispatch=vi.fn(async()=>response);engine=new ObjectiveReviewEngine(dispatch);await engine.tick();
+  await vi.waitFor(async()=>expect(await diagnostic()).toMatchObject({phase,code,responseReceived:true,modelResultRecorded:true}),{timeout:5000});
+  const row=await current(),d=await diagnostic();
+  expect(row).toMatchObject({state:'queued',error_code:'REVIEW_RETRY_PENDING',generation_attempt:1,decision:null,action_intent:null});
+  expect(d).toEqual({version:1,reviewId:row.id,runId:f.runId,generationFence:row.generation_fence,generationAttempt:1,
+    phase,code,responseReceived:true,modelResultRecorded:true,retryAfterSeconds:60,stopAuthority:false});
+  expect(+new Date(row.next_attempt_at)-+new Date(row.updated_at)).toBe(60000);
+  const events=(await pool.query("SELECT kind,payload FROM events WHERE entity_id=$1 AND kind LIKE 'OBJECTIVE_REVIEW_%' ORDER BY id",[f.goal])).rows;
+  expect(events.map(e=>e.kind).slice(-3)).toEqual(['OBJECTIVE_REVIEW_STARTED','OBJECTIVE_REVIEW_MODEL_RESULT','OBJECTIVE_REVIEW_ATTEMPT_FAILED']);
+  expect(JSON.stringify(events)).not.toContain(privateDiagnosticSentinel);
+  await engine.tick();expect(dispatch).toHaveBeenCalledTimes(1);
+  expect((await pool.query('SELECT state FROM runs WHERE id=$1',[f.runId])).rows[0].state).toBe('running');
+  expect((await pool.query('SELECT 1 FROM acceptances WHERE run_id=$1',[f.runId])).rowCount).toBe(0);
+});
+it.each(['typed','untrusted'] as const)('records a %s dispatch error using only controller-owned codes and the generation fence',async(kind)=>{
+  await configureObjectiveReview(f.goal,{mode:'supervised'});await record();
+  const error=kind==='typed'?new DomainError('STOP_UNCONFIRMED',privateDiagnosticSentinel):
+    Object.assign(Error(privateDiagnosticSentinel),{code:privateDiagnosticSentinel,headers:{authorization:privateDiagnosticSentinel}});
+  const dispatch=vi.fn(async()=>{throw error;});engine=new ObjectiveReviewEngine(dispatch);await engine.tick();
+  await vi.waitFor(async()=>expect(await diagnostic()).toMatchObject({phase:'model_request',code:kind==='typed'?'STOP_UNCONFIRMED':'REVIEW_GENERATION_FAILED',
+    responseReceived:false,modelResultRecorded:false}),{timeout:5000});
+  const row=await current(),d=await diagnostic();
+  const started=(await pool.query("SELECT payload FROM events WHERE kind='OBJECTIVE_REVIEW_STARTED' AND entity_id=$1",[f.goal])).rows[0].payload;
+  expect(started).toMatchObject({reviewId:row.id,generationFence:d.generationFence,generationAttempt:1});
+  expect((await pool.query("SELECT 1 FROM events WHERE kind='OBJECTIVE_REVIEW_MODEL_RESULT' AND entity_id=$1",[f.goal])).rowCount).toBe(0);
+  expect(JSON.stringify(d)).not.toContain(privateDiagnosticSentinel);
+  await engine.tick();expect(dispatch).toHaveBeenCalledTimes(1);
+});
+it('does not attribute a late failure to a superseding generation or requeue its owner',async()=>{
+  await configureObjectiveReview(f.goal,{mode:'supervised'});await record();
+  let reject!:(reason:unknown)=>void;
+  const pending=new Promise((_,r)=>{reject=r;});
+  engine=new ObjectiveReviewEngine(vi.fn(async()=>pending));await engine.tick();await until('generating');
+  const row=await current(),newFence=randomUUID();
+  await pool.query("UPDATE objective_review_signals SET generation_fence=$2,generation_attempt=2 WHERE id=$1",[row.id,newFence]);
+  reject(Error(privateDiagnosticSentinel));await engine.close();engine=undefined;
+  expect(await diagnostic()).toBeUndefined();
+  expect(await current()).toMatchObject({state:'generating',generation_fence:newFence,generation_attempt:2,error_code:null});
 });
