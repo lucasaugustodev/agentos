@@ -25,6 +25,19 @@ Register the new bundle through the procedure below, preserving previous
 registration and failed-attempt receipts. Releases must include this registrar
 identity before they consume a publication produced by the new executor.
 
+The 512-obligation bundle is commit `397ce79c00aa3552f5d851b8a1b6e9f8687a7870`,
+guard SHA256 `d57894cd6a39d65940d753d8118829a69ccfd599e183bf05324bca73444171f2`.
+It changes only the native coverage bound from 256 to 512; the origin module,
+obligation identities, digest, duplicate rejection and worker-policy bound stay
+unchanged. The 319-obligation workload and the 512 boundary are checked without
+truncation. A 513-entry request is refused before build, database or process work.
+Previous executor registrations remain valid historical evidence. Registering
+this bundle activates it: staging alone is not execution authority. An older
+consumer without this exact bundle identity will refuse new CI, so coordinate
+registration and adoption through a protected maintenance transition rather than
+temporarily permitting unknown executors. Failed attempts retain their original
+receipts and require a new attempt identity after this capacity change.
+
 `scripts/validator_provenance.py inspect` reads the active immutable publication.
 It accepts two explicit formats, without manufacturing historical sidecars:
 

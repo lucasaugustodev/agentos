@@ -26,6 +26,13 @@ HISTORICAL_EXECUTORS = {REVIEWED_SHA: REVIEWED_COMMIT}
 # Only complete reviewed bundles are admissible for new execution. Historical
 # scripts remain identifiable without becoming eligible for re-registration.
 REVIEWED_BUNDLES = {
+    'd57894cd6a39d65940d753d8118829a69ccfd599e183bf05324bca73444171f2': {
+        'sourceCommit':'397ce79c00aa3552f5d851b8a1b6e9f8687a7870',
+        'files':{
+            'agentos-release-action.py':'d57894cd6a39d65940d753d8118829a69ccfd599e183bf05324bca73444171f2',
+            'candidate_origin.py':'742212cdc76a1404418ad9fa0b57215d377eea4433f77bc2cd29eed9e2a27e6f',
+        },
+    },
     'cf4351977a994457dd0b74da8449c05597479ba4410e3015e499d7359d094383': {
         'sourceCommit':'d65e4801eef3412b7ff234fbf81c618acd512373',
         'files':{
