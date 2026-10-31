@@ -34,6 +34,15 @@ only to an exact file and must come from an authoritative known reference.
 file bytes; directory preservation covers its original inventoried descendants.
 Importing an absent reference therefore uses `required`, not `preserve`.
 
+At a join or integration, a producer's unpinned preservation of a peer's exact
+declared output applies to its own branch, not to the combined candidate. The
+controller transfers that obligation only to an exclusive owner whose literal
+write scope contains the output. The owner's own preserves, explicit hashes and
+all unowned preserves remain binding. Overlapping ownership and partial directory
+exceptions are rejected; the contract cannot express subtracting one file from a
+preserved directory. Producer validators retain their original contract, while
+final QA inherits the composed integration contract.
+
 Report-only work uses `required:[]`, an explicit `preserve` array, and
 `noSourceReason` of at least 20 characters. A contract with required source
 cannot also claim report-only output. This forces an explicit semantic choice;

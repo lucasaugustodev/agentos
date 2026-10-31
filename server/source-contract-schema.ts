@@ -1,4 +1,5 @@
 import {z} from 'zod';
+import {isAttemptLocalWriteScope} from './attempt-local-write-scope.js';
 
 /** Exact workspace-relative source paths. No aliases, globs or attempt-local
  * evidence are authority for the canonical candidate inventory. */
@@ -67,6 +68,39 @@ export function combineSourceContracts(contracts:SourceContract[]):SourceContrac
   const required=combine('required');
   return normalizeSourceContract({version:1,required,preserve:combine('preserve'),
     ...(!required.length?{noSourceReason:'This candidate has only explicitly declared report-only contributions; source delivery is not claimed.'}:{})});
+}
+
+/** A peer preserves another producer's output only in its own branch. At a
+ * common-base integration that unpinned obligation transfers to the output's
+ * exclusive owner. Own preservation, explicit hashes and unowned source stay
+ * protected. Partial directory exceptions cannot be represented by this schema. */
+export function composeSourceContracts(contributors:Array<{contract:SourceContract;writePaths:string[]}>):SourceContract {
+  const conflict=():never=>{throw Error('SOURCE_CONTRACT_CONFLICT');};
+  const owners=contributors.map(({contract,writePaths})=>({contract:normalizeSourceContract(contract),
+    scopes:writePaths.filter(scope=>!isAttemptLocalWriteScope(scope)).map(scope=>{
+      const path=scope.endsWith('/')?scope.slice(0,-1):scope;
+      if(!sourceContractPathSchema.safeParse(path).success)conflict();
+      return path;
+    })}));
+  for(let index=0;index<owners.length;index++){
+    const owner=owners[index];
+    for(const entry of owner.contract.required)
+      if(!owner.scopes.some(scope=>sourcePathWithin(entry.path,scope)))conflict();
+    for(const other of owners.slice(index+1))
+      if(owner.scopes.some(a=>other.scopes.some(b=>sourcePathWithin(a,b)||sourcePathWithin(b,a))))conflict();
+  }
+  const contains=(a:SourceContractEntry,b:SourceContractEntry)=>a.path===b.path||
+    (a.kind==='directory'&&sourcePathWithin(b.path,a.path));
+  const contracts=owners.map((owner,index)=>({...owner.contract,preserve:owner.contract.preserve.filter(entry=>{
+    const outputs=owners.flatMap((other,otherIndex)=>otherIndex===index?[]:other.contract.required)
+      .filter(output=>contains(entry,output)||contains(output,entry));
+    if(!outputs.length)return true;
+    if(outputs.length!==1||outputs[0].path!==entry.path||outputs[0].kind!==entry.kind)conflict();
+    // An explicit preservation hash is immutable authority, not a branch-local
+    // ownership hint. combineSourceContracts still rejects conflicting hashes.
+    return entry.sha256!==undefined;
+  })}));
+  return combineSourceContracts(contracts);
 }
 
 export function sourceContractInstruction(contract:SourceContract){

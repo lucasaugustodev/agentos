@@ -2,7 +2,7 @@ import { z } from 'zod';
 import { taskSchema, criterionSchema, DomainError } from './contracts.js';
 import {isAttemptLocalWriteScope} from './attempt-local-write-scope.js';
 import {requirementContractsSchema,requirementOutcomesCriterionSchema,requirementOutcomeCriterion} from './requirement-outcomes.js';
-import {sourceContractSchema,normalizeSourceContract,combineSourceContracts,sourcePathWithin,type SourceContract} from './source-contract-schema.js';
+import {sourceContractSchema,normalizeSourceContract,combineSourceContracts,composeSourceContracts,sourcePathWithin,type SourceContract} from './source-contract-schema.js';
 const artifactName = z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,100}$/);
 const planCriterion = z.discriminatedUnion('type', [
   criterionSchema.options[0].extend({ name: artifactName }),
@@ -239,7 +239,9 @@ export function validatePlan(
         if(contributors.some(other=>!other!.sourceContract))
           fail('Dependência sem contrato de fonte.',{violation:'SOURCE_CONTRACT_REQUIRED',task:t.key});
         let expected:SourceContract;
-        try{expected=combineSourceContracts(contributors.map(other=>other!.sourceContract!));}
+        try{expected=t.stage==='integrate'
+          ?composeSourceContracts(contributors.map(other=>({contract:other!.sourceContract!,writePaths:other!.writePaths})))
+          :combineSourceContracts(contributors.map(other=>other!.sourceContract!));}
         catch{fail('Obrigações de fonte conflitantes.',{violation:'SOURCE_CONTRACT_CONFLICT',task:t.key});}
         if(!sourceContractsInclude(contract,expected!))
           fail('Integração e QA precisam conservar as obrigações da candidata.',{violation:'SOURCE_CONTRACT_OBLIGATION_DROPPED',task:t.key});

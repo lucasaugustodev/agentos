@@ -6,7 +6,7 @@ import { event, type DB } from './db.js';
 import { planSchema,bindRequirementOutcomeContracts, type ObjectiveInput, type ProposedPlan } from './objective-contracts.js';
 import {requirementContractsSchema,readRequirementResolution,type RequirementResolution} from './requirement-outcomes.js';
 import {isAttemptLocalWriteScope} from './attempt-local-write-scope.js';
-import {sourceContractSchema,normalizeSourceContract,combineSourceContracts,sourcePathWithin,type SourceContract} from './source-contract-schema.js';
+import {sourceContractSchema,normalizeSourceContract,combineSourceContracts,composeSourceContracts,sourcePathWithin,type SourceContract} from './source-contract-schema.js';
 
 // Semantic choices only. IDs, dependencies, runtime envelopes and receipt
 // formats are controller-owned. Inspired by Ruflo's action/precondition split;
@@ -123,6 +123,11 @@ export function compileDelivery(raw: unknown, request: ObjectiveInput, previous?
   const combined=(contracts:Array<SourceContract|undefined>)=>{
     if(sourceContractVersion!==1)return {};
     try{return {sourceContract:combineSourceContracts(contracts as SourceContract[])};}
+    catch{invalid('SOURCE_CONTRACT_CONFLICT','As contribuições têm obrigações de fonte conflitantes.');}
+  };
+  const composed=(contributors:Array<{sourceContract?:SourceContract;writePaths?:string[]}>)=>{
+    if(sourceContractVersion!==1)return {};
+    try{return {sourceContract:composeSourceContracts(contributors.map(item=>({contract:item.sourceContract!,writePaths:item.writePaths??[]})))};}
     catch{invalid('SOURCE_CONTRACT_CONFLICT','As contribuições têm obrigações de fonte conflitantes.');}
   };
   const { requirements, completed, eligible } = deliveryFrontier(request, previous, advance,resolution);
@@ -247,7 +252,7 @@ export function compileDelivery(raw: unknown, request: ObjectiveInput, previous?
         agentId:'engineering.integration',stage:'integrate',baseWorkspace:request.workspaces[0],
         dependencies:parents.map(p=>taskKey(p.partKey)),covers:[...new Set(parents.map(p=>p.requirementId))],
         writePaths:[...new Set(parents.flatMap(p=>p.writePaths??[]))],
-        ...combined(parents.map(parent=>parent.sourceContract)),
+        ...composed(parents),
         description:`Integre os patches canônicos das dependências ${parents.map(p=>taskKey(p.partKey)).join(', ')} na ordem indicada sobre a base comum. Preserve todas as pré-imagens e os lotes anteriores. Esta preparação fornece insumos à subtarefa ${item.partKey}; não conclui nenhum requisito. Execute os controles das dependências: ${parents.map(p=>p.verification).join(' | ')}. Registre evidence/delivery.json, passed:true somente se todos passarem.`,
         criteria:[{id:'joined',label:'Insumos integrados e verificados',type:'json_field',name:'delivery.json',field:'passed',equals:true}]});
     }
@@ -293,7 +298,7 @@ export function compileDelivery(raw: unknown, request: ObjectiveInput, previous?
         dependencies: workTasks.map(w => w.key),
         covers: selectedIds,
         writePaths: combinedWritePaths,
-        ...combined(deliveries.map(item=>item.sourceContract)),
+        ...composed(deliveries),
         description: `Aplique os patches canônicos (changes.patch em /home/agent/inputs) das tarefas aceitas deste lote (${workTasks.map(w => w.key).join(', ')}) sobre a base comum na ordem indicada sem omitir nenhuma alteração. Cada patch de uma subtarefa dependente é o delta da sua própria fonte já integrada; não substitua a base por uma branch parcial.\nRequisitos completos que o conjunto deve satisfazer: ${JSON.stringify(requirements.filter(r=>selectedIds.includes(r.id)))}\nExecute os controles combinados: ${combinedVerification}\nPreserve todas as entregas dos lotes anteriores e registre o resultado real da integração em evidence/delivery.json com passed:true somente após comprovar os requisitos inteiros e todos os controles combinados.`,
         criteria: [{id:'integrated',label:'Patches integrados e controles combinados executados',type:'json_field',name:'delivery.json',field:'passed',equals:true}],
       },
@@ -305,7 +310,7 @@ export function compileDelivery(raw: unknown, request: ObjectiveInput, previous?
         baseWorkspace: request.workspaces[0],
         sourceTask: 'integrate',
         dependencies: ['integrate',...validationTasks.map(task=>task.key)],
-        ...combined(deliveries.map(item=>item.sourceContract)),
+        ...composed(deliveries),
         covers,
         description: `Verifique independentemente a candidata integrada imutável e repita os controles combinados: ${combinedVerification}\nComprove os requisitos COMPLETOS: ${JSON.stringify(requirements.filter(r=>selectedIds.includes(r.id)))}. Aceites parciais das subtarefas não comprovam a entrega conjunta.\n${pending.length ? 'Este aceite cobre apenas a janela selecionada, não encerra o objetivo. Verifique também regressões das entregas anteriores.' : 'Esta é a verificação final: comprove TODOS os requisitos do objetivo na mesma candidata acumulada, incluindo os lotes anteriores.'}\nInspecione evidências reais, registre comandos e resultados em evidence/verification.json. passed deve ser false se houver falhas, critérios não verificados ou evidência ausente. Não repare a candidata.`,
         criteria: [{id:'verified',label:'Verificação independente da candidata',type:'json_field',name:'verification.json',field:'passed',equals:true}],
