@@ -59,6 +59,25 @@ measured from entry into the gate helper. Historical callers without a valid
 request UUID retain their previous run-level events; no identity is invented
 after admission. Attempt numbers distinguish transport retries within a request.
 
+Buffered worker generations retain one logical `requestId`. A privately
+classified connection failure or HTTP 500/502/503/504 may repeat the generation
+at most twice before the ordinary terminal failure path. `generationAttempt`
+distinguishes these three generations; transport `attempt` remains the HTTP
+attempt within each one. `MODEL_GENERATION_RETRY` preserves each failed
+generation before the next admission. Each generation releases and reacquires
+the shared gate; the global limit remains six concurrent requests. This permits
+at most nine fast HTTP fetches (three per generation), or three fetches when a
+late 502 already exhausted the adapter's 30-second retry budget. Provider bodies
+and headers do not carry these observation fields. GLM retains its semantic
+idle watchdog; a progressing first generation gains no new wall-clock cutoff.
+The existing no-replay barrier after any provider body bytes remains in force,
+including incomplete frames and keepalives. No retry can publish a partial response, replay earlier tools, ignore caller
+cancellation, or proceed with unresolved tool identities. Exhaustion still
+uses the existing task recovery path; task-level continuation is not introduced.
+An outstanding positive `Retry-After` on a server error forbids the outer
+generation retry. The typed wait is preserved, including HTTP-date values;
+it is never shortened to the gateway's local backoff.
+
 No prompts, messages, tool names, arguments, results, raw provider errors, URLs,
 headers or credentials are emitted. Each transport payload is capped at4096
 bytes before the bridge attaches its fixed-size request UUID. Events carry

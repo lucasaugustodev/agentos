@@ -23,6 +23,7 @@ import { withAccountRequestGate } from './gated-generation.mjs';
 import { museLogin, museSnapshot } from './muse-accounts.mjs';
 import { resolveGenerationAccount } from './generation-account.mjs';
 import { openAICompletionsFallback } from './openai-completions-fallback.mjs';
+import {generationObserver} from './model-transport-failure.mjs';
 
 const DSH = '/opt/deepseek-harness/app/node_modules';
 const DATA = process.env.AGENTOS_BRIDGE_DATA || '/var/lib/agentos-bridge';
@@ -405,6 +406,7 @@ async function generate(params, signal, emit, admission) {
   const requestId = typeof params.requestId === 'string' &&
     /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(params.requestId)
     ? params.requestId : randomUUID();
+  const observe=generationObserver(emit,{requestId,generationAttempt:params.generationAttempt});
   return withAccountRequestGate(
     {...params,requestId},
     signal,
@@ -418,9 +420,8 @@ async function generate(params, signal, emit, admission) {
           reasoning: params.reasoning ?? 'low',
           transport: 'sse',
           maxTokens: params.maxOutputTokens ?? 4096,
-          onTelemetry: (kind,payload) => emit(kind,{...payload,requestId}),
-          onProgress: progress => emit('MODEL_STREAM_PROGRESS', {
-            requestId,
+          onTelemetry: observe,
+          onProgress: progress => observe('MODEL_STREAM_PROGRESS', {
             characters: progress.characters,
             reasoningCharacters: progress.reasoningCharacters,
             toolCharacters: progress.toolCharacters,
@@ -429,8 +430,8 @@ async function generate(params, signal, emit, admission) {
             elapsedMs: progress.elapsedMs,
             done: progress.done === true,
           }),
-          onRetry: retry => emit('MODEL_REQUEST_RETRY', { ...retry, requestId }),
-          onFailure: failure => emit('MODEL_REQUEST_DIAGNOSTIC', { ...failure, requestId }),
+          onRetry: retry => observe('MODEL_REQUEST_RETRY', retry),
+          onFailure: failure => observe('MODEL_REQUEST_DIAGNOSTIC', failure),
         },
       );
       const result = await stream.result();
@@ -441,7 +442,7 @@ async function generate(params, signal, emit, admission) {
         throw Error(result.errorMessage ?? result.stopReason);
       return { message: result, accountId: account.id, model: params.model };
     },
-    emit,
+    observe,
     undefined,
     admission,
   );
