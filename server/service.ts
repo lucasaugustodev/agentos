@@ -25,6 +25,8 @@ import { readPreparedNativeAdmission, validateNativeAdmission, consumeNativeAdmi
 import { verifyRepairSourceProof } from './repair-proof.js';
 import { readValidationSnapshot, validationReceiptId } from './validation-identity.js';
 import {assertVerificationAdmissionProgress} from './verification-progress.js';
+import {recordCandidateReadinessAdmission,readCandidateReadinessProof} from './candidate-readiness.js';
+import {recordCandidateReadinessQaAdmission,readCandidateReadinessQaProof,candidateReadinessQaCommitIdentity} from './candidate-readiness-qa.js';
 import {routeVerificationPlanningRecovery} from './verification-planning-recovery.js';
 import {sourceContractPlanningFailure} from './source-output-validation.js';
 export async function createGoal(raw: unknown, isDemo = false) {
@@ -552,6 +554,8 @@ export async function schedule(service?:'agentos-opencode',inspect=inspectPrepar
       }
       const id = randomUUID(),
         fence = randomUUID();
+      await recordCandidateReadinessAdmission(db,t,id,fence);
+      await recordCandidateReadinessQaAdmission(db,t,id,fence);
       if(prepared)await consumeNativeAdmission(db,prepared,id);
       await db.query(
         'INSERT INTO runs(id,task_id,attempt,fence,account_id,runtime,agent_version,checkpoint,parent_task_id,agent_role,agent_level) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)',
@@ -585,6 +589,15 @@ export async function schedule(service?:'agentos-opencode',inspect=inspectPrepar
       } catch(e:any) {
         await db.query('ROLLBACK TO SAVEPOINT task_admission');
         const code=e?.code==='P0001'?e.message:e?.code;
+        if(/^READINESS_/.test(code??'')){
+          const waiting=code==='READINESS_CONSUMER_NOT_READY';
+          await db.query('UPDATE tasks SET state=$2,reason=$3,updated_at=now() WHERE id=$1',
+            [t.id,waiting?'waiting_resource':'recovery_blocked',waiting?'Aguardando adocao comprovada do consumidor CI; rechecagem automatica.':
+              'Contrato de prontidao CI requer correcao por registro autenticado: '+code+'. Evidencias preservadas.']);
+          await event(db,'RUN_ADMISSION_BLOCKED',t.id,{code,goalId:t.goal_id,instructionRevisionId:t.instruction_revision_id,
+            owner:waiting?'consumer-readiness':'authenticated-controller-configuration',preserved:true});
+          continue;
+        }
         if(/^TRANSPORT_RETRY_/.test(code??'')){
           await db.query("UPDATE tasks SET state='recovery_blocked',reason=$2,updated_at=now() WHERE id=$1",
             [t.id,'Retomada técnica requer supervisão: '+code+'. Trabalho preservado.']);
@@ -769,6 +782,21 @@ export async function validateTask(taskId: string, reviewer?: string) {
   const {verifiedWorkerValidationGate,workerValidationCommitIdentity,validationDigest}=await import('./worker-validation.js');
   const proof=task.validation_input.workerValidation?await verifiedWorkerValidationGate(pool,task.run_id):null;
   const ci:import('./worker-validation.js').WorkerValidationGate=proof?.gate??{required:false,state:'legacy',detail:''};
+  const hasCandidateQa=task.criteria.some((c:any)=>c.type==='candidate_ci')||!!task.validation_input.candidateCi?.snapshot;
+  if(task.validation_input.candidateCi?.snapshot&&!task.criteria.some((c:any)=>c.type==='candidate_ci'))
+    throw new DomainError('STATE_CHANGED','The frozen independent QA criterion was removed; historical evidence was preserved.');
+  const qaIdentity=hasCandidateQa?await candidateReadinessQaCommitIdentity(pool,task.run_id):null;
+  let qaPassed=false,qaDetail='';
+  if(hasCandidateQa){
+    try{
+      if(!await readCandidateReadinessQaProof(pool,task.run_id))throw Error('READINESS_QA_ADMISSION_UNBOUND');
+      qaPassed=true;qaDetail='Independent local evidence and the canonical CI of the unchanged accepted candidate are verified.';
+    }catch(error:any){qaDetail=/^READINESS_[A-Z_]+$/.test(error?.code??error?.message??'')?error.code??error.message:'READINESS_QA_EVIDENCE_INVALID';}
+    if(validationDigest(await candidateReadinessQaCommitIdentity(pool,task.run_id))!==validationDigest(qaIdentity))
+      throw new DomainError('STATE_CHANGED','The accepted source or inherited CI changed during evidence reading.');
+    if(task.receipt_match&&task.accepted_passed&&!qaPassed)
+      throw new DomainError('STATE_CHANGED','The historical acceptance was preserved; inherited CI no longer authorizes this verification.');
+  }
   if(ci.state==='pending') return {passed:false,pending:true,checks:[{id:'registered-ci',label:'CI registrado da candidata',
     type:'registered_ci',passed:false,detail:ci.detail}],duplicate:false};
   if(task.receipt_match && ci.required && ci.state!=='passed' && task.accepted_passed)
@@ -804,6 +832,15 @@ export async function validateTask(taskId: string, reviewer?: string) {
     if (c.type === 'review') {
       passed = !!reviewer;
       detail = reviewer ? 'Revisão atestada por ' + reviewer : 'Aguardando revisão do critério.';
+    } else if(c.type==='candidate_ci'){
+      passed=qaPassed;detail=qaDetail;
+    } else if(c.type==='candidate_readiness'){
+      try{
+        const readiness=await readCandidateReadinessProof(pool,task.run_id);
+        if(!readiness)throw new Error('READINESS_ADMISSION_UNBOUND');
+        passed=ci.required&&ci.state==='passed';
+        detail=passed?'Local readiness and the exact registered candidate CI are verified. Independent QA remains required.':'READINESS_REGISTERED_CI_REQUIRED';
+      }catch(error:any){detail=/^READINESS_[A-Z_]+$/.test(error?.code??error?.message??'')?error.code??error.message:'READINESS_EVIDENCE_INVALID';}
     } else if(c.type==='requirement_outcomes'){
       try{
         requirementOutcomes=await verifyRequirementOutcomes(c,task,readArtifact,outcomeInputs);
@@ -858,6 +895,8 @@ export async function validateTask(taskId: string, reviewer?: string) {
       throw new DomainError('STATE_CHANGED', 'A tentativa, contrato ou evidência mudou durante a validação.');
     if(proof && validationDigest(await workerValidationCommitIdentity(db,fresh.run_id))!==validationDigest(proof.identity))
       throw new DomainError('STATE_CHANGED','A autoridade ou evidência de CI mudou durante a validação.');
+    if(hasCandidateQa&&validationDigest(await candidateReadinessQaCommitIdentity(db,fresh.run_id))!==validationDigest(qaIdentity))
+      throw new DomainError('STATE_CHANGED','The accepted source, local QA or inherited CI changed during verification.');
     // Another validator may have completed while this call was reading bytes.
     if (fresh.receipt_match)
       return { passed: fresh.accepted_passed!, checks: fresh.accepted_checks!, duplicate: true };

@@ -60,12 +60,22 @@ export async function installTaskInstructions(db: DB) {
     ALTER TABLE tasks ADD COLUMN IF NOT EXISTS instruction_revision_id uuid REFERENCES task_instruction_revisions(id);
     ALTER TABLE runs ADD COLUMN IF NOT EXISTS instruction_snapshot jsonb;
     CREATE OR REPLACE FUNCTION agentos_instruction_snapshot() RETURNS trigger LANGUAGE plpgsql AS $$
-    DECLARE t tasks; r task_instruction_revisions; item jsonb; prior jsonb; entries jsonb='[]'; bytes bytea; total bigint=0; ci jsonb; BEGIN
+    DECLARE t tasks; r task_instruction_revisions; item jsonb; prior jsonb; entries jsonb='[]'; bytes bytea; total bigint=0; ci jsonb; readiness jsonb; planned jsonb; BEGIN
       IF TG_OP='UPDATE' THEN
         IF NEW.instruction_snapshot IS DISTINCT FROM OLD.instruction_snapshot THEN RAISE EXCEPTION 'INSTRUCTION_SNAPSHOT_IMMUTABLE'; END IF; RETURN NEW;
       END IF;
       PERFORM pg_advisory_xact_lock(4280001);
       SELECT * INTO STRICT t FROM tasks WHERE id=NEW.task_id FOR UPDATE;
+      SELECT item.value INTO planned FROM plan_revisions p
+        CROSS JOIN LATERAL jsonb_array_elements(p.plan->'tasks') item(value)
+        WHERE p.objective_id=t.goal_id AND p.revision=t.plan_revision AND p.status='applied'
+          AND 'r'||p.revision::text||'-'||(item.value->>'key')=t.key;
+      IF EXISTS(SELECT 1 FROM jsonb_array_elements(t.criteria||COALESCE(planned->'criteria','[]'::jsonb)) c
+        WHERE c->>'type' IN('candidate_readiness','candidate_ci')) THEN
+        IF planned IS NULL OR t.criteria IS DISTINCT FROM planned->'criteria'
+          OR t.covers IS DISTINCT FROM planned->'covers' OR t.stage IS DISTINCT FROM planned->>'stage'
+          THEN RAISE EXCEPTION 'READINESS_PLAN_TASK_UNBOUND'; END IF;
+      END IF;
       IF t.instruction_revision_id IS NOT NULL THEN
         SELECT * INTO STRICT r FROM task_instruction_revisions WHERE id=t.instruction_revision_id AND task_id=t.id AND goal_id=t.goal_id;
         IF r.rendered IS DISTINCT FROM t.description THEN RAISE EXCEPTION 'TASK_INSTRUCTIONS_CHANGED'; END IF;
@@ -102,6 +112,34 @@ export async function installTaskInstructions(db: DB) {
       IF ci IS NOT NULL AND NOT EXISTS(SELECT 1 FROM events WHERE kind='WORKER_VALIDATION_POLICY_REGISTERED'
         AND entity_id=t.goal_id::text AND payload=ci) THEN RAISE EXCEPTION 'VALIDATION_POLICY_UNREGISTERED'; END IF;
       NEW.instruction_snapshot:=NEW.instruction_snapshot||jsonb_build_object('workerValidationContract',1,'workerValidation',ci);
+      IF EXISTS(SELECT 1 FROM jsonb_array_elements(t.criteria) c WHERE c->>'type'='candidate_readiness') THEN
+        SELECT payload->'proof' INTO readiness FROM events
+          WHERE kind='CANDIDATE_READINESS_ADMISSION_AUTHORIZED' AND entity_id=t.id::text
+          AND payload->>'runId'=NEW.id::text AND payload->>'fence'=NEW.fence::text
+          AND payload->>'attempt'=NEW.attempt::text
+          AND payload->>'transactionId'=pg_current_xact_id()::text ORDER BY id DESC LIMIT 1;
+        IF readiness IS NULL OR ci IS NULL OR t.stage<>'integrate' OR t.execution->>'kind'<>'harness'
+          OR readiness#>>'{registration,policyRegistrationId}' IS DISTINCT FROM ci->>'registrationId'
+          OR readiness#>>'{registration,policyDigest}' IS DISTINCT FROM ci->>'policyDigest'
+          OR t.criteria IS DISTINCT FROM jsonb_build_array(readiness->'criterion')
+          OR NOT EXISTS(SELECT 1 FROM settings WHERE id='candidate-readiness:'||t.goal_id AND value=readiness->'registration')
+          OR NOT EXISTS(SELECT 1 FROM events WHERE kind='CANDIDATE_READINESS_MAP_REGISTERED'
+            AND entity_id=t.goal_id::text AND payload=readiness->'registration')
+          THEN RAISE EXCEPTION 'READINESS_ADMISSION_UNBOUND'; END IF;
+        NEW.instruction_snapshot:=NEW.instruction_snapshot||jsonb_build_object('workerValidationContract',2,'candidateReadiness',readiness);
+      END IF;
+      IF EXISTS(SELECT 1 FROM jsonb_array_elements(t.criteria) c WHERE c->>'type'='candidate_ci') THEN
+        SELECT payload->'proof' INTO readiness FROM events
+          WHERE kind='CANDIDATE_CI_ADMISSION_AUTHORIZED' AND entity_id=t.id::text
+          AND payload->>'runId'=NEW.id::text AND payload->>'fence'=NEW.fence::text
+          AND payload->>'attempt'=NEW.attempt::text
+          AND payload->>'transactionId'=pg_current_xact_id()::text ORDER BY id DESC LIMIT 1;
+        IF readiness IS NULL OR ci IS NOT NULL OR t.stage<>'verify' OR t.execution->>'kind'<>'harness'
+          OR t.execution->>'readOnlySource' IS DISTINCT FROM 'true'
+          OR NOT(t.criteria @> jsonb_build_array(readiness->'criterion'))
+          THEN RAISE EXCEPTION 'READINESS_QA_ADMISSION_UNBOUND'; END IF;
+        NEW.instruction_snapshot:=NEW.instruction_snapshot||jsonb_build_object('candidateCiAdmission',readiness);
+      END IF;
       RETURN NEW; END $$;
     DROP TRIGGER IF EXISTS agentos_instruction_snapshot ON runs;
     CREATE TRIGGER agentos_instruction_snapshot BEFORE INSERT OR UPDATE OF instruction_snapshot ON runs FOR EACH ROW EXECUTE FUNCTION agentos_instruction_snapshot();

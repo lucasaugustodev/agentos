@@ -1,5 +1,7 @@
 import { z } from 'zod';
 import {requirementOutcomesCriterionSchema} from './requirement-outcomes.js';
+import {candidateReadinessCriterionSchema} from './candidate-readiness-contract.js';
+import {candidateCiCriterionSchema} from './candidate-readiness-qa-contract.js';
 export const criterionSchema = z.discriminatedUnion('type', [
   z.object({
     id: z.string().min(1),
@@ -24,7 +26,7 @@ export const repairSourceProofCriterionSchema = z.object({
   version: z.literal(1), name: z.literal('repair-report.json'), patch: z.literal('implementation.patch'),
 });
 export const taskCriterionSchema = z.discriminatedUnion('type', [
-  ...criterionSchema.options, repairSourceProofCriterionSchema, requirementOutcomesCriterionSchema,
+  ...criterionSchema.options, repairSourceProofCriterionSchema, requirementOutcomesCriterionSchema, candidateReadinessCriterionSchema, candidateCiCriterionSchema,
 ]);
 export const taskSchema = z.object({
   key: z.string().regex(/^[a-z0-9_-]{1,80}$/),

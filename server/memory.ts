@@ -11,6 +11,7 @@ import {analyticalPrompt,fitManagerOptionalMemory} from './analytical-prompt.js'
 import { managerInlineMemoryHashes } from './manager-context.js';
 import { instructionTask, instructionEvidence } from './task-instructions.js';
 import {prepareRetryGuidanceContext,persistRetryGuidanceBinding} from './task-retry-guidance.js';
+import {prepareCandidateReadinessQaContext} from './candidate-readiness-qa.js';
 import { backlogDeliveryContext } from './backlog-handoffs.js';
 import { effectiveSourceManifest } from './effective-source-manifest.js';
 import {resolvedInputSelection,assertResolvedInputSelection} from './resolved-input-selection.js';
@@ -266,6 +267,12 @@ export async function assembleContext(run: any, task: any, dependencies: any[]) 
       manifest.estimatedTokens=Math.ceil(content.length/4);
     }
     const retryGuidance=await prepareRetryGuidanceContext(db,run,task,id);
+    const candidateQa=await prepareCandidateReadinessQaContext(db,run,task);
+    if(candidateQa){
+      Object.assign(manifest,{candidateReadinessQa:candidateQa.manifest});
+      fixedContext.push(candidateQa.text);content=renderContent(selected);
+      manifest.estimatedTokens=Math.ceil(content.length/4);
+    }
     if(retryGuidance){
       Object.assign(manifest,{retryGuidance:retryGuidance.binding});
       fixedContext.push(retryGuidance.text);

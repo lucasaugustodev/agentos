@@ -1,4 +1,6 @@
 import { z } from 'zod';
+import {candidateReadinessCriterionSchema} from './candidate-readiness-contract.js';
+import {candidateCiCriterionSchema} from './candidate-readiness-qa-contract.js';
 import { taskSchema, criterionSchema, DomainError } from './contracts.js';
 import {isAttemptLocalWriteScope} from './attempt-local-write-scope.js';
 import {requirementContractsSchema,requirementOutcomesCriterionSchema,requirementOutcomeCriterion} from './requirement-outcomes.js';
@@ -8,6 +10,8 @@ const planCriterion = z.discriminatedUnion('type', [
   criterionSchema.options[0].extend({ name: artifactName }),
   criterionSchema.options[1].extend({ name: artifactName }),
   requirementOutcomesCriterionSchema,
+  candidateReadinessCriterionSchema,
+  candidateCiCriterionSchema,
 ]);
 export const workspaceId = z
   .string()

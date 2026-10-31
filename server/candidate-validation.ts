@@ -9,7 +9,8 @@ import { assertStopped, inspectStopped } from './continuation.js';
 import { readArtifact } from './service.js';
 import { runtimeCandidateDigest } from './operation-progress.js';
 import { readDeliverySourceIdentity, sourceIdentityFrozen } from './delivery-source-resolution.js';
-import {workerValidationAuthority,verifyWorkerValidationAuthority,readWorkerValidationIdentity} from './worker-validation.js';
+import {workerValidationAuthority,verifyWorkerValidationAuthority,readWorkerValidationIdentity,validationDigest} from './worker-validation.js';
+import {readCandidateReadinessProof} from './candidate-readiness.js';
 
 const owned = ['proposed', 'freezing', 'frozen', 'running', 'uncertain'];
 const sha = (bytes: Buffer | string) => createHash('sha256').update(bytes).digest('hex');
@@ -296,9 +297,10 @@ export async function reconcileWorkerValidationIntents(inspect=inspectStopped) {
       AND COALESCE((h.value->>'nextProbeAt')::timestamptz,'epoch')<now()
     ORDER BY r.finished_at,r.id LIMIT 20`)).rows;
   for(const row of rows) {
-    let proof:any,observationError:string|undefined;
+    let proof:any,readinessObserved:any,observationError:string|undefined;
     try {
       const raw=await runtimeProposal(pool,row.id);
+      readinessObserved=raw.readiness;
       const target=await candidateTargetBinding(pool,raw.goalId,raw.value);
       try {
         proof=await inspect(row.id,target.task.execution.kind==='opencode');
@@ -313,6 +315,10 @@ export async function reconcileWorkerValidationIntents(inspect=inspectStopped) {
       let receipt:any={version:1,runId:row.id,state:'pending'};
       try {
         const raw=await runtimeProposal(db,row.id),value=raw.value;
+        if(raw.readiness){
+          if(validationDigest(raw.readiness)!==validationDigest(readinessObserved))throw Error('READINESS_HANDOFF_CHANGED');
+          receipt={...receipt,version:2,readiness:raw.readiness};
+        }
         const target=await candidateTargetBinding(db,raw.goalId,value);
         const existing=(await db.query(`SELECT value FROM settings WHERE id LIKE 'candidate-validation:%'
           AND value->>'runId'=$1 ORDER BY id LIMIT 2`,[row.id])).rows;
@@ -356,11 +362,12 @@ async function runtimeProposal(db:DB,runId:string) {
   if(!run || run.state!=='submitted' || run.task_state!=='submitted' || run.attempt!==run.attempt_count || !run.finished_at)
     throw Error('VALIDATION_BINDING_STALE');
   const {authority,reason}=await workerValidationAuthority(db,run);
+  const readiness=await readCandidateReadinessProof(db,runId);
   const refs=(await db.query("SELECT id,digest FROM artifacts WHERE run_id=$1 AND name='candidate.json' ORDER BY id LIMIT 2",[runId])).rows;
   if(refs.length!==1) throw Error('VALIDATION_ARTIFACT_CHANGED');
   const candidate=await readArtifact(refs[0].id),candidateDigest=runtimeCandidateDigest(candidate.bytes,refs[0].digest);
   if(!candidateDigest) throw Error('VALIDATION_CANDIDATE_CHANGED');
-  return {authority,goalId:run.goal_id,value:candidateValidationSchema.parse({kind:'request_validation',
+  return {authority,readiness,goalId:run.goal_id,value:candidateValidationSchema.parse({kind:'request_validation',
     taskId:run.task_id,expectedAttempt:run.attempt,runId:run.id,runFence:run.fence,contextVersion:run.context_id,
     candidateArtifactId:refs[0].id,candidateArtifactDigest:refs[0].digest,candidateDigest,reason})};
 }
