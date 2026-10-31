@@ -16,6 +16,8 @@ import {effectiveSourceManifest} from '../server/effective-source-manifest.js';
 import {resolvedInputSelection,assertResolvedInputSelection} from '../server/resolved-input-selection.js';
 import {observeInputFailure} from '../server/input-failure-observation.js';
 import {bindCompositionInputs} from '../bridge/composition-inputs.mjs';
+import {recoverTransportTasks,transportRetryAdmission,admitTransportRetry,transportInputProjection} from '../server/transport-task-recovery.js';
+import {event} from '../server/db.js';
 
 const sha=(s:string)=>createHash('sha256').update(s).digest('hex');
 const task=async(id:string)=>(await pool.query('SELECT * FROM tasks WHERE id=$1',[id])).rows[0];
@@ -126,6 +128,47 @@ async function pipeline(f:any){
   const context=await assembleContext(r,t,dependencies),inputs=await runtimeInputs(t,context.manifest,readArtifact);
   return {r,t,dependencies,context,inputs,composition:patchComposition(t,context.manifest,inputs)};
 }
+it.each(['ordinary','target-and-history'])('transport retry recomputes %s resolved/effective sources without reintroducing replaced patches',async kind=>{
+  const f=kind==='ordinary'?await prepared():await mixedHistoricalTargets(1);
+  if(kind==='target-and-history'){
+    const newer=await run(f.a.id);
+    await publish(newer,{'implementation.patch':'--- a/src/app.js\n+++ b/src/app.js\n@@ -1 +1 @@\n-original\n+alternative\n',
+      'repair-report.json':{fixVerified:true,sourceHashes:[{path:'src/app.js',before:sha('original\n'),after:sha('alternative\n')}]},
+      'repair-tests.log':'New accepted historical source, not a new consumer handoff.'});
+  }
+  await pool.query("INSERT INTO objectives(id,request,request_hash,mode,status,revision) VALUES($1,'{}','fixture','execute','executing',1)",[f.goal]);
+  await pool.query('UPDATE tasks SET plan_revision=1,max_attempts=6 WHERE id=$1',[f.consumer]);
+  const first=await pipeline(f);
+  expect(first.context.manifest).toHaveProperty('effectiveSources');
+  expect(first.r.instruction_snapshot.revisionId).toBeTruthy();
+  if(kind==='target-and-history'){
+    expect(first.context.manifest).toHaveProperty('resolvedInputSelection');
+    expect(first.context.manifest).toHaveProperty('effectiveSources.compositionSelection.targetAuthority');
+  }
+  await event(pool,'MODEL_TRANSPORT_EXHAUSTED',f.consumer,{version:1,source:'runtime-generation-boundary',runId:first.r.id,
+    runFence:first.r.fence,contextVersion:first.context.id,requestId:randomUUID(),generationAttempt:3,
+    reason:'provider_unavailable',code:'MODEL_REQUEST_FAILED',responseDelivered:false,traceComplete:true,pendingTools:0,cancelled:false});
+  await failRun(first.r.id,first.r.fence,'MODEL_REQUEST_FAILED','Late 502 without any delivered response');
+  const proof=async()=>({runId:first.r.id,executionRunId:first.r.id,workspace:first.t.execution.workspace,
+    checkedAt:new Date().toISOString(),candidate:{baseDigest:sha('base'),candidateDigest:sha('partial')},
+    process:{unit:'agentos-run-'+first.r.id,stopped:true,mainPid:0,populated:false,activeState:'inactive'}});
+  expect(await recoverTransportTasks(proof)).toEqual([f.consumer]);
+  const rid=randomUUID(),fence=randomUUID();
+  await tx(async db=>{
+    await lock(db);const receipt=await transportRetryAdmission(db,f.consumer);expect(receipt).toBeTruthy();
+    await db.query("INSERT INTO runs(id,task_id,attempt,fence,runtime,agent_version,state) VALUES($1,$2,$3,$4,'harness',1,'running')",[rid,f.consumer,first.r.attempt+1,fence]);
+    await admitTransportRetry(db,receipt,rid,fence);
+    await db.query("UPDATE tasks SET state='running',attempt_count=attempt_count+1 WHERE id=$1",[f.consumer]);
+  });
+  const r=(await pool.query('SELECT * FROM runs WHERE id=$1',[rid])).rows[0];
+  const t=await task(f.consumer),next=await assembleContext(r,t,await acceptedDependencyArtifacts(t.id));
+  expect(transportInputProjection(next.manifest)).toEqual(transportInputProjection(first.context.manifest));
+  expect(next.manifest).toHaveProperty('transportRetry');
+  const inputs=await runtimeInputs(t,next.manifest,readArtifact),composition=patchComposition(t,next.manifest,inputs);
+  expect(composition?.patches).toEqual(first.composition?.patches);
+  expect(composition?.expectedCandidateDigest).toEqual(first.composition?.expectedCandidateDigest);
+  expect(bindCompositionInputs(composition,inputs)).toBeTruthy();
+});
 function hasActiveCompositionSelection(value:unknown):value is {effectiveSources:{compositionSelection:{active:{producerTaskId:string}[]}}}{
   if(!value||typeof value!=='object'||!('effectiveSources' in value))return false;
   const effectiveSources=value.effectiveSources;

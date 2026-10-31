@@ -4,6 +4,7 @@ import { planningRecovery } from './planning-recovery.js';
 import {refreshQueuedPlanningFeedback} from './planning-feedback-refresh.js';
 import {routeVerificationPlanningRecovery,sourceContractPlanningFailureForRun} from './verification-planning-recovery.js';
 import {readRequirementResolution} from './requirement-outcomes.js';
+import {hasTransportCause} from './transport-task-recovery.js';
 import {planningRunFeedback} from './planning-run-feedback.js';
 import {sourceReplanForFeedback,assertSourceReplanCurrent} from './objective-source-replan.js';
 import {routedPlanningRequest} from './objective-model-route.js';
@@ -224,6 +225,7 @@ export async function reconcilePlanning() {
         )
       ).rows;
       for (const t of failed) {
+        if(t.stage==='integrate'&&await hasTransportCause(db,t.id,t.run_id))continue;
         if(t.run_state==='submitted'&&await sourceContractPlanningFailureForRun(db,t.run_id)){
           await routeVerificationPlanningRecovery(db,t.id,t.run_id);
           continue;

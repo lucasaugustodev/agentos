@@ -1,5 +1,6 @@
 import { randomUUID, createHash } from 'node:crypto';
 import {selectRecoveryEvidence} from './recovery-evidence-selection.js';
+import {bindTransportRetryContext} from './transport-task-recovery.js';
 import { pool, tx, event, lock, type DB } from './db.js';
 import { config } from './config.js';
 import { DomainError } from './contracts.js';
@@ -271,6 +272,8 @@ export async function assembleContext(run: any, task: any, dependencies: any[]) 
       content=renderContent(selected);
       manifest.estimatedTokens=Math.ceil(content.length/4);
     }
+    const transportRetry=await bindTransportRetryContext(db,run,task,manifest,id);
+    if(transportRetry)Object.assign(manifest,{transportRetry});
     await db.query('INSERT INTO contexts(id,run_id,manifest,content) VALUES($1,$2,$3,$4)', [
       id,
       run.id,

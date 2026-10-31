@@ -18,6 +18,7 @@ import { hash, saveMemory } from './memory.js';
 import { quotaFor, supportsAccountExecution } from './accounts.js';
 import { workforceCapacityReason } from './workforce-policy.js';
 import { prepareTaskInstructions } from './task-instructions.js';
+import {transportRetryAdmission,admitTransportRetry} from './transport-task-recovery.js';
 import { workerSchedulerMaintenance, workerRunAdmission } from './worker-rollout.js';
 import { independentNativeSupervisorSql } from './native-supervision.js';
 import { readPreparedNativeAdmission, validateNativeAdmission, consumeNativeAdmission, finishNativeAdmission, inspectPreparedNativeRun, checkNativePreparation } from './supervised-opencode-admission.js';
@@ -543,6 +544,7 @@ export async function schedule(service?:'agentos-opencode',inspect=inspectPrepar
         if(observation.failed)throw Object.assign(Error('INSPECTION_FAILED'),{code:'SUPERVISED_NATIVE_INSPECTION_FAILED'});
       }
       await prepareTaskInstructions(db, t.id);
+      const transportResume=await transportRetryAdmission(db,t.id);
       if(prepared){
         prepared=await readPreparedNativeAdmission(db,t.id,prepared.receipt.id);
         if(!prepared)throw Object.assign(Error('BINDING_CHANGED'),{code:'SUPERVISED_NATIVE_BINDING_CHANGED'});
@@ -561,6 +563,7 @@ export async function schedule(service?:'agentos-opencode',inspect=inspectPrepar
         [id, t.id],
       );
       await db.query('UPDATE runs SET model=$2 WHERE id=$1', [id, t.model ?? account.model]);
+      if(transportResume)await admitTransportRetry(db,transportResume,id,fence);
       for (const r of [...new Set<string>(t.resources)])
         await db.query('INSERT INTO leases VALUES($1,$2)', [r, id]);
       await db.query(
@@ -582,6 +585,12 @@ export async function schedule(service?:'agentos-opencode',inspect=inspectPrepar
       } catch(e:any) {
         await db.query('ROLLBACK TO SAVEPOINT task_admission');
         const code=e?.code==='P0001'?e.message:e?.code;
+        if(/^TRANSPORT_RETRY_/.test(code??'')){
+          await db.query("UPDATE tasks SET state='recovery_blocked',reason=$2,updated_at=now() WHERE id=$1",
+            [t.id,'Retomada técnica requer supervisão: '+code+'. Trabalho preservado.']);
+          await event(db,'TRANSPORT_RETRY_ADMISSION_BLOCKED',t.id,{code,goalId:t.goal_id});
+          continue;
+        }
         const nativeRefusals=['SUPERVISION_HANDOFF_CHANGED','SUPERVISION_DISABLED','DEPENDENCIES_PENDING',
           'REPEATED_NO_PROGRESS','SEMANTIC_RETRY_REQUIRES_SUPERVISION','SEMANTIC_RETRY_EVIDENCE_INVALID','INVALID_PROVIDER_BACKOFF_PROOF'];
         if((t.supervised_native_prepared || t.execution?.supervisedAdmission) && (/^SUPERVISED_NATIVE_/.test(code??'') ||

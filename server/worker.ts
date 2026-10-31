@@ -18,6 +18,7 @@ import {inputFailureMetadata} from './input-failure.js';
 import { executeRuntime } from './runtime.js';
 import { syncRecallOnce } from './recall.js';
 import { recoverStoppedTasks, acceptedDependencyArtifacts } from './recovery.js';
+import {recoverTransportTasks} from './transport-task-recovery.js';
 import { PlanningEngine } from './planner.js';
 import { RunHeartbeat } from './run-heartbeat.js';
 import { readPendingValidations } from './validation-identity.js';
@@ -49,6 +50,8 @@ export class WorkerEngine {
     candidateValidationEvidenceSync: Promise<unknown> | null = null;
   publishedRebaseSync: Promise<unknown> | null = null;
   verificationSourceBindingSync: Promise<unknown> | null = null;
+  transportRecoverySync: Promise<unknown> | null = null;
+  transportRecoveryError: string | null = null;
   async start() {
     await installObjectiveReview();
     this.boss.on('error', () => {
@@ -95,6 +98,15 @@ export class WorkerEngine {
       this.publishedRebaseSync = reconcilePublishedRebases().catch(() => {}).finally(() => { this.publishedRebaseSync = null; });
     if (!this.verificationSourceBindingSync)
       this.verificationSourceBindingSync = reconcileVerificationSourceBindings().catch(() => {}).finally(() => { this.verificationSourceBindingSync = null; });
+    // Stop inspection and artifact I/O can be slow. One fenced reconciliation
+    // runs beside admission, so an unavailable SSH host cannot stall other work.
+    if (!this.transportRecoverySync)
+      this.transportRecoverySync = recoverTransportTasks().then(() => {
+        this.transportRecoveryError = null;
+      }).catch(() => {
+        this.transportRecoveryError = 'Falha na reconciliação de transporte; evidências preservadas.';
+        this.lastError = this.transportRecoveryError;
+      }).finally(() => { this.transportRecoverySync = null; });
     this.busy = true;
     try {
       await markUncertain();
@@ -130,7 +142,7 @@ export class WorkerEngine {
         }
       });
       this.lastTick = new Date().toISOString();
-      this.lastError = null;
+      this.lastError = this.transportRecoveryError;
     } catch {
       this.lastError = 'Ciclo de coordenação falhou; próxima tentativa automática.';
     } finally {
@@ -246,6 +258,7 @@ export class WorkerEngine {
     for (const a of this.active.values()) a.abort();
     await this.boss.stop({ graceful: true, timeout: 10000 });
     await this.memorySync;
+    await this.transportRecoverySync;
     while (this.busy) await new Promise((r) => setTimeout(r, 20));
   }
 }

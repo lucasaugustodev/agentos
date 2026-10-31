@@ -65,11 +65,12 @@ export async function appliedSupervisionOwnsContinuation(db:DB,taskId:string,run
 /** Ownership of a stopped technical failure; never admits another execution. */
 export async function requestRecoveryReview(taskId:string,runId:string,code:string,message:string,
   options:{stopProof?:any;routingFailureCode?:string}={}) {
-  if([runtimeProgressCode,operatorRecoveryCode].includes(code) && !options.stopProof)return null;
+  if(([runtimeProgressCode,operatorRecoveryCode].includes(code)||code.startsWith('TRANSPORT_RETRY_')) && !options.stopProof)return null;
   return tx(async db=>{
     await lock(db);
     const operatorRecovery=code===operatorRecoveryCode;
-    const stoppedProgress=[runtimeProgressCode,operatorRecoveryCode].includes(code) && !!options.stopProof;
+    const stoppedTransport=code.startsWith('TRANSPORT_RETRY_')&&!!options.stopProof;
+    const stoppedProgress=([runtimeProgressCode,operatorRecoveryCode].includes(code)||stoppedTransport) && !!options.stopProof;
     const task=(await db.query(`SELECT t.id,t.goal_id,t.state,t.recovery,t.attempt_count,g.state goal_state FROM tasks t JOIN goals g ON g.id=t.goal_id
       JOIN settings s ON s.id='supervision:'||g.id LEFT JOIN settings a ON a.id='autonomy:'||g.project
       WHERE t.id=$1 AND (g.state='active' OR ($2::boolean AND g.state='failed')) AND s.value->>'enabled'='true'
@@ -93,6 +94,13 @@ export async function requestRecoveryReview(taskId:string,runId:string,code:stri
     }
     const run=(await db.query('SELECT id,task_id,state,error_code,attempt,fence FROM runs WHERE task_id=$1 ORDER BY attempt DESC LIMIT 1',[taskId])).rows[0];
     if(run?.id!==runId || !['failed','submitted'].includes(run.state) || providerAvailabilityFailure(run.error_code))return null;
+    if(code.startsWith('TRANSPORT_RETRY_')){
+      const {hasTransportCause}=await import('./transport-task-recovery.js');
+      if(!await hasTransportCause(db,taskId,runId)||await appliedSupervisionOwnsContinuation(db,taskId,runId)||
+        (await db.query(`SELECT 1 FROM tasks WHERE id=$1
+        AND (execution#>>'{continuation,owner}'='user' OR recovery->>'mode'='manual')
+        UNION ALL SELECT 1 FROM leases l JOIN runs r ON r.id=l.run_id WHERE r.task_id=$1 LIMIT 1`,[taskId])).rowCount)return null;
+    }
     // An inspection may finish after the exact applied decision has queued
     // the next attempt. Its old failure is no new recovery episode. This is
     // checked inside the lock, before any new case or goal reactivation.
@@ -108,7 +116,7 @@ export async function requestRecoveryReview(taskId:string,runId:string,code:stri
       operatorReceipt=recorded.checkpoint.operatorRecoveryStop;
     }
     if(stoppedProgress || task.goal_state==='failed'){
-      if(!stoppedProgress || run.state!=='failed' || run.error_code!==code || run.attempt!==task.attempt_count)return null;
+      if(!stoppedProgress || run.state!=='failed' || (!stoppedTransport&&run.error_code!==code) || run.attempt!==task.attempt_count)return null;
       const snapshot=(await db.query('SELECT instruction_snapshot FROM runs WHERE id=$1',[runId])).rows[0]?.instruction_snapshot;
       if(snapshot?.schema!==1 || snapshot.task?.id!==taskId || snapshot.task?.goal_id!==task.goal_id || !snapshot.task?.execution?.workspace)return null;
       try {assertStopped(options.stopProof,{...run,instruction_snapshot:snapshot},task);}catch{return null;}
@@ -129,7 +137,7 @@ export async function requestRecoveryReview(taskId:string,runId:string,code:stri
     const reactivate=async(caseId:string)=>{
       if(task.goal_state!=='failed')return;
       await db.query("UPDATE goals SET state='active' WHERE id=$1 AND state='failed'",[task.goal_id]);
-      await event(db,'GOAL_ACTIVE',task.goal_id,{source:operatorRecovery?'stopped_operator_recovery_review':'stopped_runtime_progress_review',caseId,sourceRunId:runId});
+      await event(db,'GOAL_ACTIVE',task.goal_id,{source:operatorRecovery?'stopped_operator_recovery_review':stoppedTransport?'stopped_transport_review':'stopped_runtime_progress_review',caseId,sourceRunId:runId});
     };
     const existing=(await db.query(`SELECT id,state,source_run_id,request_key FROM supervision_cases WHERE task_id=$1
       AND state IN('open','decided','delegated','waiting_evidence') ORDER BY created_at LIMIT 1`,[taskId])).rows[0];

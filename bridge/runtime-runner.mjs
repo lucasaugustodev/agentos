@@ -254,6 +254,12 @@ export async function runHarness(params, signal, generate, emit = () => {}) {
           // Nothing but keepalive comments has reached the SDK; earlier tools
           // are settled. Retry this immutable generation, never the tool loop.
           const reason=modelTransportFailure(e);
+          if(reason&&generationAttempt===3&&!generationSignal.aborted&&
+            transportToolTraceComplete&&pendingTransportTools.size===0)
+            emit('MODEL_TRANSPORT_EXHAUSTED',{version:1,source:'runtime-generation-boundary',
+              runId:params.runId,runFence:params.runFence,contextVersion:params.contextVersion,
+              requestId,generationAttempt,reason,code:channel.failureCode(e),
+              responseDelivered:false,traceComplete:true,pendingTools:0,cancelled:false});
           if(!reason||generationAttempt>=3||generationSignal.aborted||
             !transportToolTraceComplete||pendingTransportTools.size!==0)throw e;
           emit('MODEL_GENERATION_RETRY',{requestId,requests:requestSequence,generationAttempt,

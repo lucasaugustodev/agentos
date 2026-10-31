@@ -23,6 +23,7 @@ import {analyticalPrompt,analyticalPromptCharacterLimit,promptCheckpoint} from '
 import {workerValidationInstruction} from './worker-validation.js';
 import {retryGuidancePrompt} from './task-retry-guidance.js';
 import {prepareBoundRuntimeWorkspace,assertBoundRuntimePreparationCurrent} from './runtime-source-preparation.js';
+import {assertTransportRetryCurrent} from './transport-task-recovery.js';
 export {promptCheckpoint} from './analytical-prompt.js';
 
 export type RuntimeResult = {
@@ -99,6 +100,7 @@ async function executeRemoteHarness(input: RuntimeInput): Promise<RuntimeResult>
         totalBytes:inputs.reduce((n,a)=>n+Buffer.byteLength(a.base64,'base64'),0),digest:inputBundle.digest});
     }
     await assertBoundRuntimePreparationCurrent(input);
+    await assertTransportRetryCurrent(input);
   } catch(e:any) {
     // No worker.execute request has been sent. Persist this fact before the
     // outer worker records failure; recovery still inspects the actual unit.
