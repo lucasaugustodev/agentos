@@ -23,12 +23,16 @@ const counters=value=>({toolCalls:value.toolCalls,toolResults:value.toolResults,
 
 // Run the actual runner and its readline/session handler. Only system, storage,
 // model and collection boundaries are replaced; no tool-counting logic is copied.
-async function runFixture(events,{reason={kind:'completed'},noise=[],generationFailures,unmarked=false,cancelBackoff=false,adapterFailure=false,lateHeaders=false,partialBody=false,providerWait}={}){
+async function runFixture(events,{reason={kind:'completed'},noise=[],generationFailures,unmarked=false,cancelBackoff=false,adapterFailure=false,lateHeaders=false,partialBody=false,providerWait,initialGuidance=false,compositionFixture=false,badPromptReceipt=false}={}){
   const runId=randomUUID(),receiptId=randomUUID(),emitted=[],saved=[],writes=new Map();
   const controller=new AbortController();
   let gatewayHandler,generations=0,gateActive=0,gateAdmissions=0,fetches=0;
   const wire=[];
   const providerBodies=[];
+  const initialPrompts=[];
+  const initialPrompt=initialGuidance?'Operator retry guidance: restore original tests; keep database coverage pending for integration CI.':'Counter fixture without a provider call.';
+  const retryGuidance=initialGuidance?{bindingId:randomUUID(),requestId:randomUUID(),
+    instructionDigest:createHash('sha256').update(initialPrompt).digest('hex'),promptDigest:createHash('sha256').update(initialPrompt).digest('hex')}:undefined;
   const child=new EventEmitter();child.stdout=new PassThrough();child.stderr=new PassThrough();
   const frame=value=>child.stdout.write(JSON.stringify(value)+'\n');
   const event=value=>frame({method:'session.event',params:{sessionId:runId,event:value}});
@@ -40,7 +44,8 @@ async function runFixture(events,{reason={kind:'completed'},noise=[],generationF
           frame({id:message.id,result:{serverInfo:{name:'deepseek-harness-sdk-runtime'}}});return;
         }
         assert.equal(message.method,'session/prompt');
-        frame({id:message.id,result:{messageId:receiptId}});
+        initialPrompts.push(message.params.contentBlocks.map(b=>b.text).join('\n'));
+        frame({id:message.id,result:badPromptReceipt==='null'?null:badPromptReceipt==='malformed'?{messageId:'-'.repeat(36)}:badPromptReceipt?{}:{messageId:receiptId}});
         frame({method:'session.status',params:{sessionId:runId,status:'running'}});
         event({type:'agent/inbox/spliced',data:{inserted:[{id:receiptId}]}});
         for(const value of noise){
@@ -68,7 +73,7 @@ async function runFixture(events,{reason={kind:'completed'},noise=[],generationF
     final(done){queueMicrotask(()=>child.emit('close',0));done();},
   });
   const io={
-    mkdir:async()=>{},realpath:async value=>value,stat:forbidden,readdir:forbidden,
+    mkdir:async()=>{},realpath:async value=>value,stat:compositionFixture?async()=>({isDirectory:()=>false}):forbidden,readdir:forbidden,
     readFile:async value=>{
       if(value==='/proc/meminfo')return 'MemAvailable: 104857600 kB\n';
       if(value instanceof URL&&value.pathname.endsWith('/artifact-collector.mjs'))return Buffer.from('fixture collector identity');
@@ -96,17 +101,18 @@ async function runFixture(events,{reason={kind:'completed'},noise=[],generationF
     }},
     './runtime-gateway.mjs':{toGeneration:()=>({accountId:'fixture',model:'fixture',messages:[]}),completion:modelGateway.completion},
     './runtime-model-channel.mjs':modelChannel,
-    './workspaces.mjs':{workspaceOperation:forbidden},
+    './workspaces.mjs':{workspaceOperation:compositionFixture?async request=>request.action==='compose'
+      ?{complete:true,receipts:[{status:'applied'}]}:{baseDigest:'a'.repeat(64),candidateDigest:'b'.repeat(64),patch:'fixture patch'}:forbidden},
     './source-inputs.mjs':{materializeSourceInputs:()=>({inputs:[],telemetry:{materialized:false},instruction:''})},
     './artifact-input-bundle.mjs':{hydrateArtifactInputBundle:async value=>value,referencedInputLimitBytes:1024},
-    './composition-inputs.mjs':{bindCompositionInputs:forbidden},
-    './runtime-artifacts.mjs':{preserveRuntimeArtifactClaims:forbidden,runtimeArtifactInstruction:''},
+    './composition-inputs.mjs':{bindCompositionInputs:compositionFixture?value=>value:forbidden},
+    './runtime-artifacts.mjs':{preserveRuntimeArtifactClaims:compositionFixture?()=>[]:forbidden,runtimeArtifactInstruction:''},
     './task-delivery-contract.mjs':{museTaskDeliveryInstruction:()=>''},
     './delivery-manifest.mjs':{deliveryContract:()=>({requiredArtifacts:[]}),extractPromptJsonFields:()=>[],
       prepareDeliveryManifest:async()=>{},collectDeliveryManifest:async()=>null,deliveryManifestInstructionFor:()=>''},
     './runtime-progress.mjs':{analyzePollTrace:()=>false},
     './inspect-runtime-progress.mjs':{inspectRuntimeProgress:forbidden,checkpointRuntimeProgress:forbidden},
-    './runtime-handoff.mjs':{captureRuntimeHandoff:forbidden,runtimeHandoffInstruction:''},
+    './runtime-handoff.mjs':{captureRuntimeHandoff:compositionFixture?async()=>null:forbidden,runtimeHandoffInstruction:''},
     './runtime-memory.mjs':{harnessMemory:()=>({memoryMiB:1024,minAvailableKiB:1,memoryMax:'MemoryMax=1G',slotMemory:'1024'})},
     './process-stop.mjs':{stopUnit:async(_unit,ended)=>{assert.equal(ended(),true);return {stopped:true};}},
     './unit-exit.mjs':{inspectUnitExit:async()=>null},
@@ -140,7 +146,9 @@ async function runFixture(events,{reason={kind:'completed'},noise=[],generationF
     const {runHarness}=await import(fixtureUrl.href);
     value=await runHarness({runId,workspace:'fixture/counters',accountId:'fixture',model:'fixture',
       ...(generationFailures!==undefined?{runFence:randomUUID(),contextVersion:randomUUID()}:{}),
-      prompt:'Counter fixture without a provider call.',context:{}},controller.signal,async input=>{
+      ...(compositionFixture?{managed:true,composition:{version:1},inputs:[]}:{}),
+      prompt:initialPrompt,...(retryGuidance?{retryGuidance}:{}),context:{}},controller.signal,async input=>{
+        if(initialGuidance)assert.ok(initialPrompts[0].includes(initialPrompt),'Guidance must be delivered in the first SDK prompt before generation');
         generations++;assert.equal(gateActive,1);
         assert.equal(input.generationAttempt,generations);
         assert.ok(wire.every(s=>s.startsWith(':')),'Only transport comments may precede a validated completion');
@@ -175,11 +183,38 @@ async function runFixture(events,{reason={kind:'completed'},noise=[],generationF
   catch(e){error=e;}
   finally{hooks.deregister();delete globalThis[symbol];child.stdout.end();child.stderr.end();}
   assert.deepEqual(saved.slice(0,2).map(s=>s.state),['starting','running']);
-  assert.equal(saved.at(-1).stopped,true);
+  assert.equal(saved.at(-1).stopped,true,error?.stack);
   assert.equal(emitted.filter(e=>e.kind==='HARNESS_STOPPED').length,1);
   assert.equal(gateActive,0);
-  return {value,error,saved,emitted,writes,wire,generations,gateAdmissions,fetches,providerBodies};
+  return {value,error,saved,emitted,writes,wire,generations,gateAdmissions,fetches,providerBodies,initialPrompts,retryGuidance};
 }
+
+test('delivers bound retry guidance in the initial SDK prompt before generation without claiming compliance',async()=>{
+  const f=await runFixture([],{initialGuidance:true,generationFailures:0});
+  assert.equal(f.error,undefined);assert.equal(f.generations,1);assert.equal(f.initialPrompts.length,1);
+  const delivered=f.emitted.filter(e=>e.kind==='TASK_RETRY_GUIDANCE_PROMPT_DELIVERED');
+  assert.equal(delivered.length,1);assert.equal(delivered[0].payload.bindingId,f.retryGuidance.bindingId);
+  assert.match(delivered[0].payload.boundary,/not evidence of comprehension, compliance or acceptance/);
+  assert.equal(f.emitted.some(e=>e.kind==='TASK_RETRY_GUIDANCE_CONSUMED'),false);
+  assert.equal(delivered[0].payload.deliveredPromptDigest,createHash('sha256').update(f.initialPrompts[0]).digest('hex'));
+});
+
+test('preserves guidance while legitimate managed composition enriches the initial SDK prompt',async()=>{
+  const f=await runFixture([],{initialGuidance:true,compositionFixture:true,generationFailures:0});
+  assert.equal(f.error,undefined);assert.equal(f.generations,1);
+  assert.match(f.initialPrompts[0],/Operator retry guidance/);assert.match(f.initialPrompts[0],/RUNTIME PATCH COMPOSITION/);
+  const delivered=f.emitted.find(e=>e.kind==='TASK_RETRY_GUIDANCE_PROMPT_DELIVERED');
+  assert.ok(delivered);assert.equal(delivered.payload.deliveredPromptDigest,createHash('sha256').update(f.initialPrompts[0]).digest('hex'));
+  assert.notEqual(delivered.payload.promptDigest,delivered.payload.deliveredPromptDigest);
+});
+
+test('does not claim initial guidance delivery when the SDK prompt receipt has no message identity',async()=>{
+  for(const badPromptReceipt of [true,'null','malformed']){
+    const f=await runFixture([],{initialGuidance:true,badPromptReceipt});
+    assert.equal(f.error.code,'RETRY_GUIDANCE_PROMPT_UNCONFIRMED');
+    assert.equal(f.emitted.some(e=>e.kind==='TASK_RETRY_GUIDANCE_PROMPT_DELIVERED'),false);
+  }
+});
 
 test('51 completed tool calls remain 51 calls while the activity counter retains all 102 events',async()=>{
   const events=Array.from({length:51},(_,i)=>[call('call-'+i),result('call-'+i)]).flat();

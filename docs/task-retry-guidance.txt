@@ -1,0 +1,39 @@
+Task retry guidance
+
+POST /api/tasks/<task-id>/retry-guidance uses the existing operator session or
+API token. Operations-only credentials cannot authorize it. The strict body is:
+requestId, expectedSourceRunId, expectedSourceFence, expectedAttempt,
+expectedRevision, instruction (20..2000 characters), instructionDigest (SHA256
+of the exact UTF-8 instruction). Keep credentials outside payloads and logs.
+
+This endpoint supplies advisory context to a retry already scheduled for the
+same stopped Harness task. It does not schedule a run or replan the objective.
+The controller inspects physical stop, then rechecks latest run/fence/attempt,
+active goal, revision, task state and ownership under the admission lock. A live
+successor, cancelled source, paused goal or uncertain validation owner refuses
+registration. One immutable guidance request is allowed per source attempt;
+identical requestId/content replays return its receipt, including after dispatch.
+Conflicting content or a second request for the same source is rejected.
+
+Registration leaves the source run, checkpoint, task contract, context, sibling
+tasks and acceptances untouched. At context assembly for exactly attempt+1,
+the controller rechecks revision and contract and atomically binds the request
+to the new run/fence/context. Stale or already bound guidance fails closed.
+It cannot be silently applied to attempt+2 or a different plan.
+
+The immutable new context contains the guidance. Runtime verifies the persisted
+binding and context, and includes the advisory text directly in the initial
+worker prompt. It therefore does not wait for a live inbox or a second model
+call. The bridge verifies that initial prompt's digest and emits:
+
+TASK_RETRY_GUIDANCE_REGISTERED -- authenticated immutable request recorded.
+TASK_RETRY_GUIDANCE_BOUND -- one successor context bound; not yet delivered.
+TASK_RETRY_GUIDANCE_PROMPT_DELIVERED -- SDK acknowledged the initial prompt.
+
+The last event does not prove understanding, compliance, tool success or task
+acceptance. Inspect actual edits and test evidence. Existing validation and QA
+remain authoritative; instructions grant no wider permissions or scope.
+
+Migration is additive and belongs to the canonical schema preparation. No
+existing snapshots are backfilled. Install and test only through the normal
+isolated validation and reviewed release path.

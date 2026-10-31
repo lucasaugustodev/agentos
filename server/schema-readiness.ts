@@ -14,6 +14,7 @@ export const migrationModules = [
   'server/artifact-recovery-policy.ts',
   'server/cycles/store.ts',
   'server/task-instructions.ts',
+  'server/task-retry-guidance-schema.ts',
   'server/runtime-lookup-indexes.ts',
   'server/objective-model-route-schema.ts',
 ] as const;

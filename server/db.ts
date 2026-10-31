@@ -6,6 +6,7 @@ import { installArtifactRecoveryPolicy } from './artifact-recovery-policy.js';
 import { installWorkforcePolicy } from './workforce-policy.js';
 import { migrateCycles } from './cycles/store.js';
 import { installTaskInstructions } from './task-instructions.js';
+import { installTaskRetryGuidance } from './task-retry-guidance-schema.js';
 import { installRuntimeLookupIndexes } from './runtime-lookup-indexes.js';
 import { installObjectiveModelRoutes } from './objective-model-route-schema.js';
 export const pool = new pg.Pool({
@@ -178,5 +179,6 @@ INSERT INTO settings VALUES('remote-capacity','{"maxRuns":2,"memoryMiB":3600,"cp
     await installObjectiveModelRoutes(db);
   });
   await installTaskInstructions(pool);
+  await installTaskRetryGuidance(pool);
   await installRuntimeLookupIndexes(pool);
 }

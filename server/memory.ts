@@ -9,6 +9,7 @@ import { selectMemoryContext } from './memory-selection.js';
 import {analyticalPrompt,fitManagerOptionalMemory} from './analytical-prompt.js';
 import { managerInlineMemoryHashes } from './manager-context.js';
 import { instructionTask, instructionEvidence } from './task-instructions.js';
+import {prepareRetryGuidanceContext,persistRetryGuidanceBinding} from './task-retry-guidance.js';
 import { backlogDeliveryContext } from './backlog-handoffs.js';
 import { effectiveSourceManifest } from './effective-source-manifest.js';
 import {resolvedInputSelection,assertResolvedInputSelection} from './resolved-input-selection.js';
@@ -263,12 +264,20 @@ export async function assembleContext(run: any, task: any, dependencies: any[]) 
       }});
       manifest.estimatedTokens=Math.ceil(content.length/4);
     }
+    const retryGuidance=await prepareRetryGuidanceContext(db,run,task,id);
+    if(retryGuidance){
+      Object.assign(manifest,{retryGuidance:retryGuidance.binding});
+      fixedContext.push(retryGuidance.text);
+      content=renderContent(selected);
+      manifest.estimatedTokens=Math.ceil(content.length/4);
+    }
     await db.query('INSERT INTO contexts(id,run_id,manifest,content) VALUES($1,$2,$3,$4)', [
       id,
       run.id,
       JSON.stringify(manifest),
       content,
     ]);
+    if(retryGuidance)await persistRetryGuidanceBinding(db,retryGuidance);
     await db.query('UPDATE runs SET context_id=$2 WHERE id=$1', [run.id, id]);
     await event(db, 'CONTEXT_ASSEMBLED', run.id, {
       contextId: id,
