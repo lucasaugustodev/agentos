@@ -24,6 +24,7 @@ import { RunHeartbeat } from './run-heartbeat.js';
 import { readPendingValidations } from './validation-identity.js';
 import { reconcileCandidateValidations,reconcileWorkerValidationIntents } from './candidate-validation.js';
 import { reconcileCandidateValidationEvidence } from './candidate-validation-evidence.js';
+import { waitForCandidateValidationStop } from './candidate-validation-lifecycle.js';
 import { reconcilePublishedRebases } from './published-rebase.js';
 import { reconcileVerificationSourceBindings } from './verification-source-binding.js';
 import {PlanningWake} from './planning-wake.js';
@@ -91,7 +92,7 @@ export class WorkerEngine {
       this.lastReviewScan=Date.now();this.reviewSync=this.reviews.tick().catch(()=>{}).finally(()=>{this.reviewSync=null;});
     }
     if (!this.candidateValidationSync)
-      this.candidateValidationSync = reconcileWorkerValidationIntents().then(()=>reconcileCandidateValidations()).catch(() => {}).finally(() => { this.candidateValidationSync = null; });
+      this.candidateValidationSync = reconcileWorkerValidationIntents().then(()=>reconcileCandidateValidations(undefined, undefined, () => !this.stopped)).catch(() => {}).finally(() => { this.candidateValidationSync = null; });
       if (!this.candidateValidationEvidenceSync)
         this.candidateValidationEvidenceSync = reconcileCandidateValidationEvidence().catch(() => {}).finally(() => { this.candidateValidationEvidenceSync = null; });
     if (!this.publishedRebaseSync)
@@ -249,12 +250,15 @@ export class WorkerEngine {
   }
   async stop() {
     this.stopped = true;
+    if (this.timer) clearInterval(this.timer);
+    if (this.memoryTimer) clearInterval(this.memoryTimer);
+    await waitForCandidateValidationStop([
+      this.candidateValidationSync, this.candidateValidationEvidenceSync,
+    ]);
     await this.wake.close();
     await this.reviews.close();
     await this.reviewSync;
     await this.planner.close();
-    if (this.timer) clearInterval(this.timer);
-    if (this.memoryTimer) clearInterval(this.memoryTimer);
     for (const a of this.active.values()) a.abort();
     await this.boss.stop({ graceful: true, timeout: 10000 });
     await this.memorySync;

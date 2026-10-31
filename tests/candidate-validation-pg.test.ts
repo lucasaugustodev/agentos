@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, beforeEach, expect, it } from 'vitest';
 import { createHash, randomUUID } from 'node:crypto';
-import { pool, migrate } from '../server/db.js';
+import { pool, migrate, tx } from '../server/db.js';
+import { claimWorkerDrain, admitWorkerRestart, admitWorkerServiceRestart } from '../server/worker-rollout.js';
 import { seedRegistry } from '../server/registry.js';
 import {
   installManagement,
@@ -22,6 +23,7 @@ beforeAll(async () => {
 });
 beforeEach(async () => {
   await pool.query("DELETE FROM settings WHERE id='model-policy'");
+  await pool.query("DELETE FROM settings WHERE id='maintenance'");
   await pool.query("DELETE FROM settings WHERE id LIKE 'candidate-validation:%'");
   await pool.query('TRUNCATE goals,agents,accounts,events CASCADE');
   await seedRegistry();
@@ -117,6 +119,7 @@ beforeEach(async () => {
 });
 afterAll(async () => {
   await pool.query("DELETE FROM settings WHERE id='model-policy'");
+  await pool.query("DELETE FROM settings WHERE id='maintenance' OR id LIKE 'candidate-validation:%'");
   await pool.end();
 });
 function proposal(extra: any = {}) {
@@ -202,6 +205,97 @@ const receipt = (request: any, state: string, extra: any = {}) => ({
   ),
   state,
   ...extra,
+});
+
+const maintenanceRelease = () => ({candidate:'/opt/agentos/releases/managed-'+randomUUID(),digest:'d'.repeat(64)});
+
+it('serializes a committed drain before CI claims, preserving proposed work without dispatch', async () => {
+  const proposed = await action(), before = await stored(proposed.actionId!);
+  const db = await pool.connect();
+  let reconcile: Promise<void> | undefined;
+  const calls: string[] = [];
+  try {
+    await db.query('BEGIN');
+    const reservation = await claimWorkerDrain(db, maintenanceRelease());
+    expect(reservation.status).toBe('draining');
+    reconcile = reconcileCandidateValidations(async mode => { calls.push(mode); throw Error('MUST_NOT_DISPATCH'); }, inspect);
+    // The reservation is still uncommitted. A second connection cannot acquire
+    // the same transaction lock, irrespective of when its claim query arrives.
+    const observer = await pool.connect();
+    try {
+      await observer.query('BEGIN');
+      expect((await observer.query('SELECT pg_try_advisory_xact_lock(4280001) ok')).rows[0].ok).toBe(false);
+      await observer.query('ROLLBACK');
+    } finally { observer.release(); }
+    await db.query('COMMIT');
+    await reconcile;
+    expect(calls).toEqual([]);
+    expect(await stored(proposed.actionId!)).toEqual(before);
+    expect(await tx(client => admitWorkerRestart(client, reservation.token!))).toMatchObject({ready:true,counts:{candidate_validations:0}});
+  } finally {
+    await db.query('ROLLBACK'); db.release();
+    if(reconcile) await reconcile;
+  }
+});
+
+it('a CI claim before the drain blocks restart until its receipt, then defers frozen execution', async () => {
+  const proposed = await action();
+  let entered!: () => void, finish!: () => void;
+  const started = new Promise<void>(resolve => { entered=resolve; });
+  const release = new Promise<void>(resolve => { finish=resolve; });
+  const calls: string[] = [];
+  const reconcile = reconcileCandidateValidations(async(mode, request) => {
+    calls.push(mode); entered(); await release;
+    return receipt(request,'frozen',{frozenWorkspace:'agentos/ci-frozen-test'});
+  },inspect);
+  try {
+    await started;
+    const reservation=await tx(db=>claimWorkerDrain(db,maintenanceRelease()));
+    expect((await stored(proposed.actionId!)).state).toBe('freezing');
+    expect(await tx(db=>admitWorkerRestart(db,reservation.token!))).toMatchObject({ready:false,counts:{candidate_validations:1}});
+    finish(); await reconcile;
+    const frozen=await stored(proposed.actionId!);
+    expect(frozen.state).toBe('frozen');
+    await reconcileCandidateValidations(async mode=>{calls.push(mode);throw Error('MUST_NOT_START');},inspect);
+    expect(await stored(proposed.actionId!)).toEqual(frozen);
+    expect(calls).toEqual(['freeze']);
+    expect(await tx(db=>admitWorkerRestart(db,reservation.token!))).toMatchObject({ready:true});
+    await pool.query("DELETE FROM settings WHERE id='maintenance'");
+    await reconcileCandidateValidations(async(mode,request)=>{
+      calls.push(mode);return receipt(request,'completed',{passed:true});
+    },inspect);
+    expect(calls).toEqual(['freeze','execute']);
+    expect((await stored(proposed.actionId!)).state).toBe('completed');
+    expect((await pool.query('SELECT count(*)::int n FROM acceptances WHERE task_id=$1',[f.taskId])).rows[0].n).toBe(0);
+  } finally { finish(); await reconcile; }
+});
+
+it.each(['running','uncertain'])('continues receipt-only reconciliation for %s ownership during drain',async state=>{
+  const proposed=await action(), value=await stored(proposed.actionId!);
+  await pool.query('UPDATE settings SET value=$2 WHERE id=$1',['candidate-validation:'+proposed.actionId,
+    JSON.stringify({...value,state,claimedAt:'2000-01-01T00:00:00Z'})]);
+  const reservation=await tx(db=>claimWorkerDrain(db,maintenanceRelease()));
+  expect(await tx(db=>admitWorkerRestart(db,reservation.token!))).toMatchObject({ready:false,counts:{candidate_validations:1}});
+  const modes:string[]=[];
+  await reconcileCandidateValidations(async(mode,request)=>{modes.push(mode);return receipt(request,'completed',{passed:true});},inspect,()=>false);
+  expect(modes).toEqual(['receipt']);
+  expect((await stored(proposed.actionId!)).state).toBe('completed');
+  expect(await tx(db=>admitWorkerRestart(db,reservation.token!))).toMatchObject({ready:true});
+});
+
+it.each(['freezing','running','uncertain','future-active-state',null])('blocks canonical and worker-lane restart for unresolved CI state %s',async state=>{
+  const proposed=await action(), value=await stored(proposed.actionId!);
+  await pool.query('UPDATE settings SET value=$2 WHERE id=$1',['candidate-validation:'+proposed.actionId,JSON.stringify({...value,state})]);
+  const reservation=await tx(db=>claimWorkerDrain(db,maintenanceRelease(),'per_service'));
+  expect(await tx(db=>admitWorkerRestart(db,reservation.token!))).toMatchObject({ready:false,counts:{candidate_validations:1}});
+  expect(await tx(db=>admitWorkerServiceRestart(db,reservation.token!,'agentos-workers'))).toMatchObject({ready:false,counts:{candidate_validations:1}});
+});
+
+it('local shutdown gate defers a proposed effect without clearing ownership or touching its contract',async()=>{
+  const proposed=await action(), before=await stored(proposed.actionId!);
+  const modes:string[]=[];
+  await reconcileCandidateValidations(async mode=>{modes.push(mode);throw Error('NO_DISPATCH');},inspect,()=>false);
+  expect(modes).toEqual([]);expect(await stored(proposed.actionId!)).toEqual(before);
 });
 
 it('admits one accepted Sol decision and preserves canonical task/candidate/criteria', async () => {

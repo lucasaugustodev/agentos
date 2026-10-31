@@ -6,6 +6,7 @@ import { DomainError } from './contracts.js';
 import type { WorkerReadiness } from './worker-readiness.js';
 import { isDeepStrictEqual } from 'node:util';
 import { independentNativeSupervisorSql } from './native-supervision.js';
+import { activeCandidateValidationCount } from './candidate-validation-lifecycle.js';
 
 export type WorkerRelease = { candidate: string; digest: string; [key: string]: unknown };
 export type PendingWorkerRelease = { record: WorkerRelease; version: string };
@@ -339,7 +340,8 @@ export async function admitWorkerRestart(db: DB, token: string) {
     (SELECT count(*) FROM cycle_attempts WHERE state IN(${active}))::int cycles,
     (SELECT count(*) FROM planning_runs WHERE state='running')::int planning`)
   ).rows[0];
-  if (counts.runs || counts.cycles || counts.planning) return { ready: false, counts };
+  counts.candidate_validations = await activeCandidateValidationCount(db);
+  if (Object.values(counts).some((n) => Number(n) > 0)) return { ready: false, counts };
   await saveMaintenance(db, {
     ...value,
     workerRollout: { ...value.workerRollout, phase: 'restarting' },
@@ -382,6 +384,7 @@ export async function admitWorkerServiceRestart(db: DB, token: string, service: 
     jobs: 0,
     cycles: 0,
     planning: 0,
+    candidate_validations: 0,
   };
   if (service === 'agentos-opencode' && tables.native)
     counts.jobs = (
@@ -409,6 +412,8 @@ export async function admitWorkerServiceRestart(db: DB, token: string, service: 
     counts.planning = (
       await db.query("SELECT count(*)::int n FROM planning_runs WHERE state='running'")
     ).rows[0].n;
+  if (service === 'agentos-workers')
+    counts.candidate_validations = await activeCandidateValidationCount(db);
   if (Object.values(counts).some((n) => n > 0)) return { ready: false, counts };
   const phase =
     prior?.phase === 'restarting' || prior?.phase === 'awaiting_readiness'

@@ -11,6 +11,7 @@ import { runtimeCandidateDigest } from './operation-progress.js';
 import { readDeliverySourceIdentity, sourceIdentityFrozen } from './delivery-source-resolution.js';
 import {workerValidationAuthority,verifyWorkerValidationAuthority,readWorkerValidationIdentity,validationDigest} from './worker-validation.js';
 import {readCandidateReadinessProof} from './candidate-readiness.js';
+import { candidateValidationMayStart } from './candidate-validation-lifecycle.js';
 
 const owned = ['proposed', 'freezing', 'frozen', 'running', 'uncertain'];
 const sha = (bytes: Buffer | string) => createHash('sha256').update(bytes).digest('hex');
@@ -602,6 +603,7 @@ async function update(db: DB, value: any, state: string, extra: any = {}) {
 export async function reconcileCandidateValidations(
   dispatch: Dispatch = dispatchCandidateValidation,
   inspect = inspectStopped,
+  mayStart: () => boolean = () => true,
 ) {
   const rows = (
     await pool.query(
@@ -629,6 +631,9 @@ export async function reconcileCandidateValidations(
         ]);
         return { value: current, mode: 'receipt' as const };
       }
+      // No new external effect after a drain reservation or local shutdown.
+      // The scheduler lock above serializes this decision with maintenance.
+      if (!mayStart() || !await candidateValidationMayStart(db)) return null;
       try {
         const target = await authorizedBinding(db,current);
         if (target.contractDigest !== current.request.contractDigest)
