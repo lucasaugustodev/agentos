@@ -146,6 +146,8 @@ export async function runHarness(params, signal, generate, emit = () => {}) {
   await writeFile(`${home}/context.json`, JSON.stringify(params.context));
   let requests = 0,
     toolCalls = 0,
+    toolResults = 0,
+    toolEvents = 0,
     gatewayError,
     cancelled = false;
   const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: null };
@@ -474,9 +476,13 @@ export async function runHarness(params, signal, generate, emit = () => {}) {
           .map((b) => b.text)
           .join('\n');
       if (e?.type === 'turn/end') turnReason = e.data?.reason;
+      // Calls and results are separate SDK events. Keep the historical event
+      // counter for activity consumers without reporting each result as a call.
+      if (e?.type === 'tool/call') toolCalls++;
+      if (e?.type === 'tool/result') toolResults++;
       if (/tool/.test(e?.type ?? '')) {
-        toolCalls++;
-        emit('HARNESS_TOOL_EVENT', { type: e.type, toolEvents: toolCalls });
+        toolEvents++;
+        emit('HARNESS_TOOL_EVENT', { type: e.type, toolEvents, toolCalls, toolResults });
       }
       const toolFailure = projectHarnessToolFailure(e, guidanceIdentity, observedToolCalls);
       if (toolFailure) emit('HARNESS_TOOL_FAILURE', toolFailure);
@@ -595,6 +601,8 @@ export async function runHarness(params, signal, generate, emit = () => {}) {
       unit,
       requests,
       toolCalls,
+      toolResults,
+      toolEvents,
       usage,
       turnReason,
       stopped: true,
@@ -606,7 +614,7 @@ export async function runHarness(params, signal, generate, emit = () => {}) {
       artifacts,
       usage,
       composition,
-      evidence: { requests, toolCalls, turnReason, stopped: true },
+      evidence: { requests, toolCalls, toolResults, toolEvents, turnReason, stopped: true },
     };
   } catch (e) {
     await stop();
@@ -625,6 +633,8 @@ export async function runHarness(params, signal, generate, emit = () => {}) {
       artifactIndex: e.index,
       requests,
       toolCalls,
+      toolResults,
+      toolEvents,
       exitCode,
       turnReason,
       stopped: true,
