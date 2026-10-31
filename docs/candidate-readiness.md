@@ -8,7 +8,7 @@ the exact candidate, and all prescribed local evidence. Independent QA follows.
 
 ## Initial scope
 
-- Only a closed incremental `agentos.validate` integration batch whose covered
+- Only an incremental `agentos.validate` integration batch whose covered
   requirements equal the authenticated map. Unsupported or unmapped scope fails
   explicitly; the planner cannot infer omitted controls from prose.
 - The existing worker validation policy must include `integrate`. An independent
@@ -56,6 +56,17 @@ The controller binds this map to a new plan and records provenance. A plan or
 worker cannot self-declare either `candidate_readiness` or `candidate_ci` by
 copying hashes. Replacement or revocation of the map/policy invalidates current
 authority; it never upgrades an already admitted legacy attempt.
+
+For an explicit subset batch, add `scope: {kind: "batch", originalRequirements:
+[{id, digest}, ...]}` containing the complete original objective universe. The
+map's `requirements` and its obligations describe exactly the selected batch;
+all IDs and description digests must match that pinned universe. Registration,
+planning and admission still verify the entire original universe, and the plan
+must retain every original requirement and its incremental partition. Other
+requirements remain pending or completed according to the existing canonical
+incremental authority; accepting this batch does not complete them. The complete
+registered CI policy remains required and is never filtered by batch membership.
+Without `scope`, the original whole-objective contract and digest are unchanged.
 
 ## Execution and acceptance
 

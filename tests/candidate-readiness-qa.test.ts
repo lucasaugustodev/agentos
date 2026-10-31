@@ -12,12 +12,15 @@ import {seedRegistry} from '../server/registry.js';
 import {installManagement} from '../server/management.js';
 import {writeArtifact,completeRun,validateTask} from '../server/service.js';
 import {registerWorkerValidationPolicy,validationDigest,canonicalValidationValue,workerValidationInstruction,workerValidationGate} from '../server/worker-validation.js';
-import {registerCandidateReadinessMap,bindCandidateReadinessPlan,recordCandidateReadinessAdmission,readCandidateReadinessProof} from '../server/candidate-readiness.js';
+import {registerCandidateReadinessMap,bindCandidateReadinessPlan,recordCandidateReadinessAdmission,readCandidateReadinessProof,
+  verifyBoundCandidateReadinessPlan} from '../server/candidate-readiness.js';
+import {candidateReadinessMapSchema} from '../server/candidate-readiness-contract.js';
 import {reconcileWorkerValidationIntents,reconcileCandidateValidations} from '../server/candidate-validation.js';
 import {reconcileCandidateValidationEvidence} from '../server/candidate-validation-evidence.js';
 import {taskDeliveryContract} from '../bridge/task-delivery-contract.mjs';
 import {readValidationSnapshot} from '../server/validation-identity.js';
 import {planSchema} from '../server/objective-contracts.js';
+import {assertIncrementalAuthority} from '../server/incremental-planning.js';
 
 // Real PostgreSQL, admission triggers, artifacts, acceptance CAS and canonical
 // evidence parser. Physical inspector and registered external CI are controlled
@@ -118,6 +121,29 @@ async function acceptedIntegration(){
   await reconcileCandidateValidationEvidence(async()=>exported(job));
   expect((await validateTask(f.task)).passed).toBe(true);return job;
 }
+async function configureThreeOfSixBatch(){
+  const requirements=Array.from({length:6},(_,i)=>({id:'req-'+(i+1),description:i?`Preserve independently verified objective requirement ${i+1}.`:description}));
+  const covers=['req-1','req-2','req-3'],pending=['req-4','req-5','req-6'];
+  const plan=structuredClone(f.originalPlan);
+  plan.requirements=requirements;
+  plan.incremental={version:1,selectedRequirementId:'req-1',selectedRequirementIds:covers,completedRequirementIds:[],pendingRequirementIds:pending};
+  for(const task of plan.tasks)task.covers=covers;
+  await pool.query('UPDATE objectives SET request=$2 WHERE id=$1',[f.goal,JSON.stringify({project:'agentos',requirements:requirements.map(r=>r.description)})]);
+  await pool.query('UPDATE plan_revisions SET plan=$2 WHERE id=$1',[f.revision,JSON.stringify(plan)]);
+  f.map={...f.map,scope:{kind:'batch',originalRequirements:requirements.map(r=>({id:r.id,digest:validationDigest(r.description)}))},
+    requirements:requirements.slice(0,3).map(r=>({id:r.id,digest:validationDigest(r.description)})),
+    obligations:f.map.obligations.map((o:any)=>({...o,requirements:covers}))};
+  f.registration=await registerCandidateReadinessMap(f.goal,f.map,{channel:'operator-session'});
+  f.originalPlan=plan;
+  f.plan=await tx(async db=>{await lock(db);return bindCandidateReadinessPlan(db,f.goal,plan,{consumerRelease:expected});});
+  f.criterion=f.plan.tasks[0].criteria[0];
+  await pool.query('UPDATE plan_revisions SET plan=$2 WHERE id=$1',[f.revision,JSON.stringify(f.plan)]);
+  for(const [key,id] of [['integrate',f.task],['verify',f.qa.task]]){
+    const task=f.plan.tasks.find((t:any)=>t.key===key);
+    await pool.query('UPDATE tasks SET description=$2,criteria=$3,covers=$4 WHERE id=$1',[id,task.description,JSON.stringify(task.criteria),JSON.stringify(covers)]);
+  }
+  return {requirements,covers,pending};
+}
 async function admitQa(options:{localPassed?:boolean,changedCandidate?:boolean,submit?:boolean,realContext?:boolean}={}){
   await tx(async db=>{
     await lock(db);
@@ -159,6 +185,87 @@ it('carries canonical CI into independent QA context and accepts only the same s
   expect(result.checks.find(c=>c.id==='verified')?.passed).toBe(true);
   expect((await pool.query("SELECT count(*)::int n FROM settings WHERE id LIKE 'candidate-validation:%'")).rows[0].n).toBe(1);
   expect((await pool.query('SELECT state FROM goals WHERE id=$1',[f.goal])).rows[0].state).toBe('completed');
+});
+it('accepts the exact three-requirement batch through CI and QA while all six original requirements remain and the goal stays active',async()=>{
+  const {requirements,covers,pending}=await configureThreeOfSixBatch();
+  expect(f.registration.requiredDatabaseTests).toEqual(required);
+  expect(f.registration.policyDigest).toBe(f.policy.policyDigest);
+  const job=await acceptedIntegration();await admitQa({realContext:true});
+  const sourceRun=await run();
+  expect(sourceRun.instruction_snapshot.candidateReadiness.registration.contract.scope.originalRequirements)
+    .toEqual(f.map.scope.originalRequirements);
+  expect(sourceRun.instruction_snapshot.workerValidation.policy.requiredDatabaseTests).toEqual(required);
+  const result=await validateTask(f.qa.task);expect(result.passed).toBe(true);
+  const latest=(await pool.query('SELECT plan FROM plan_revisions WHERE id=$1',[f.revision])).rows[0].plan;
+  expect(latest.requirements).toEqual(requirements);expect(latest.incremental.pendingRequirementIds).toEqual(pending);
+  expect(latest.incremental.completedRequirementIds).toEqual([]);
+  expect((await pool.query('SELECT state FROM goals WHERE id=$1',[f.goal])).rows[0].state).toBe('active');
+  const accepted=(await pool.query("SELECT t.covers,a.passed FROM acceptances a JOIN tasks t ON t.id=a.task_id WHERE t.goal_id=$1",[f.goal])).rows;
+  expect(accepted).toHaveLength(2);expect(accepted.every(r=>r.passed&&JSON.stringify(r.covers)===JSON.stringify(covers))).toBe(true);
+  expect((await pool.query("SELECT count(*)::int n FROM settings WHERE id LIKE 'candidate-validation:%'")).rows[0].n).toBe(1);
+  expect(job.request.runtimeAuthority.policyRegistration.policy.requiredDatabaseTests).toEqual(required);
+});
+it.each(['remove-universe','change-universe','change-universe-id','expand-covers','drop-pending','change-selected'])(
+  'refuses batch plan tampering: %s',async(mode)=>{
+    await configureThreeOfSixBatch();const plan=structuredClone(f.originalPlan);
+    if(mode==='remove-universe')plan.requirements.pop();
+    if(mode==='change-universe')plan.requirements[5].description+=' changed';
+    if(mode==='change-universe-id')plan.requirements[5].id='req-another';
+    if(mode==='expand-covers')plan.tasks[0].covers.push('req-4');
+    if(mode==='drop-pending')plan.incremental.pendingRequirementIds=[];
+    if(mode==='change-selected')plan.incremental.selectedRequirementIds=['req-1','req-2'];
+    await expect(tx(async db=>{await lock(db);return bindCandidateReadinessPlan(db,f.goal,plan,{consumerRelease:expected});})).rejects.toMatchObject({code:expect.stringMatching(/^READINESS_(OBLIGATIONS_UNMAPPED|BATCH_PARTITION_UNBOUND)$/)});
+    expect((await pool.query('SELECT count(*)::int n FROM runs WHERE task_id=$1',[f.task])).rows[0].n).toBe(0);
+  });
+it('refuses a changed original requirement after registration before admission and preserves accepted CI history after later drift',async()=>{
+  await configureThreeOfSixBatch();const before=structuredClone(f.plan);
+  const altered=structuredClone(f.plan);altered.requirements[5].description+=' changed';
+  await pool.query('UPDATE plan_revisions SET plan=$2 WHERE id=$1',[f.revision,JSON.stringify(altered)]);
+  await expect(admit()).rejects.toMatchObject({code:'READINESS_REQUIREMENTS_CHANGED'});
+  await pool.query('UPDATE plan_revisions SET plan=$2 WHERE id=$1',[f.revision,JSON.stringify(before)]);
+  await acceptedIntegration();await admitQa();
+  const frozen=(await run()).instruction_snapshot;
+  await pool.query('UPDATE plan_revisions SET plan=$2 WHERE id=$1',[f.revision,JSON.stringify(altered)]);
+  expect((await validateTask(f.qa.task)).passed).toBe(false);
+  expect((await run()).instruction_snapshot).toEqual(frozen);
+  expect((await pool.query('SELECT count(*)::int n FROM acceptances WHERE run_id=$1 AND passed',[f.run])).rows[0].n).toBe(1);
+  expect((await pool.query('SELECT count(*)::int n FROM acceptances WHERE run_id=$1 AND passed',[f.qa.run])).rows[0].n).toBe(0);
+});
+it('does not let a saved batch plan remove readiness and fall back to a legacy passed boolean',async()=>{
+  await configureThreeOfSixBatch();const stripped=structuredClone(f.plan);
+  stripped.tasks[0].criteria=structuredClone(f.originalPlan.tasks[0].criteria);
+  await expect(tx(async db=>{await lock(db);return verifyBoundCandidateReadinessPlan(db,f.goal,stripped);})).rejects.toMatchObject({code:'READINESS_BATCH_CRITERION_REMOVED'});
+});
+it('preserves the canonical incremental authority: a batch cannot move an unverified outside requirement to completed',async()=>{
+  await configureThreeOfSixBatch();const changed=structuredClone(f.originalPlan);
+  changed.incremental.completedRequirementIds=['req-4'];changed.incremental.pendingRequirementIds=['req-5','req-6'];
+  const bound=await tx(async db=>{await lock(db);return bindCandidateReadinessPlan(db,f.goal,changed,{consumerRelease:expected});});
+  const previous=(await pool.query('SELECT plan FROM plan_revisions WHERE id=$1',[f.revision])).rows[0].plan;
+  await expect(assertIncrementalAuthority(pool,{objective_id:f.goal,feedback:{reports:[]},
+    request:{requirements:previous.requirements.map((r:any)=>r.description)}},bound,previous)).rejects.toMatchObject({code:'PLAN_INVALID'});
+  expect((await pool.query('SELECT plan FROM plan_revisions WHERE id=$1',[f.revision])).rows[0].plan.incremental.completedRequirementIds).toEqual([]);
+});
+it('does not let a saved batch plan remove inherited CI from its independent QA',async()=>{
+  await configureThreeOfSixBatch();const stripped=structuredClone(f.plan);
+  stripped.tasks.find((t:any)=>t.key==='verify').criteria=stripped.tasks.find((t:any)=>t.key==='verify').criteria.filter((c:any)=>c.type!=='candidate_ci');
+  await expect(tx(async db=>{await lock(db);return verifyBoundCandidateReadinessPlan(db,f.goal,stripped);})).rejects.toMatchObject({code:'READINESS_BATCH_QA_REMOVED'});
+});
+it('keeps the absent-scope contract and digest byte-compatible and rejects implicit subsets or mismatched universe identities',async()=>{
+  const legacy=structuredClone(f.map);
+  expect(candidateReadinessMapSchema.parse(legacy)).toEqual(legacy);
+  expect(Object.hasOwn(candidateReadinessMapSchema.parse(legacy),'scope')).toBe(false);
+  expect(validationDigest(candidateReadinessMapSchema.parse(legacy))).toBe(validationDigest(legacy));
+  await configureThreeOfSixBatch();
+  const implicit=structuredClone(f.map);delete implicit.scope;
+  await expect(registerCandidateReadinessMap(f.goal,implicit,{channel:'operator-session'})).rejects.toMatchObject({code:'READINESS_REQUIREMENTS_CHANGED'});
+  const changed=structuredClone(f.map);changed.requirements[0].digest='f'.repeat(64);
+  await expect(registerCandidateReadinessMap(f.goal,changed,{channel:'operator-session'})).rejects.toMatchObject({code:'READINESS_BATCH_REQUIREMENTS_UNBOUND'});
+  const duplicated=structuredClone(f.map);duplicated.scope.originalRequirements.push(duplicated.scope.originalRequirements[0]);
+  await expect(registerCandidateReadinessMap(f.goal,duplicated,{channel:'operator-session'})).rejects.toMatchObject({code:'READINESS_BATCH_REQUIREMENTS_UNBOUND'});
+  const replaced=structuredClone(f.map);replaced.scope.originalRequirements[5].id='req-another';
+  await expect(registerCandidateReadinessMap(f.goal,replaced,{channel:'operator-session'})).rejects.toMatchObject({code:'READINESS_REQUIREMENTS_CHANGED'});
+  const outside=structuredClone(f.map);outside.requirements[0].id='req-outside';
+  await expect(registerCandidateReadinessMap(f.goal,outside,{channel:'operator-session'})).rejects.toMatchObject({code:'READINESS_BATCH_REQUIREMENTS_UNBOUND'});
 });
 it('assembles the real initial QA context and artifact contract before any model execution',async()=>{
   const job=await acceptedIntegration();await admitQa({realContext:true,submit:false});

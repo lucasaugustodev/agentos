@@ -44,6 +44,11 @@ async function policy(db:DB,goalId:string){
 export function validateCandidateReadinessPartition(map:CandidateReadinessMap,required:any[]){
   const req=map.requirements.map(x=>x.id),ids=map.obligations.map(x=>x.id);
   require(new Set(req).size===req.length&&new Set(ids).size===ids.length,'READINESS_OBLIGATIONS_INVALID');
+  if(map.scope){
+    const universe=map.scope.originalRequirements;
+    require(new Set(universe.map(r=>r.id)).size===universe.length&&
+      map.requirements.every(r=>universe.some(original=>same(original,r))),'READINESS_BATCH_REQUIREMENTS_UNBOUND');
+  }
   require(map.obligations.every(o=>new Set(o.requirements).size===o.requirements.length&&o.requirements.every(id=>req.includes(id)))&&
     req.every(id=>map.obligations.some(o=>o.requirements.includes(id))),'READINESS_OBLIGATIONS_UNMAPPED');
   const local=map.obligations.filter(o=>o.kind==='local');
@@ -51,6 +56,20 @@ export function validateCandidateReadinessPartition(map:CandidateReadinessMap,re
   require(local.length>0&&new Set(local.map(x=>x.name)).size<=20,'READINESS_LOCAL_OBLIGATIONS_REQUIRED');
   require(new Set(sorted(deferred)).size===deferred.length&&same(sorted(deferred),sorted(required)),
     'READINESS_CI_OBLIGATIONS_UNBOUND');
+}
+function requirementUniverse(map:CandidateReadinessMap){return map.scope?.originalRequirements??map.requirements;}
+function verifyPlanScope(plan:ProposedPlan,reg:Registration){
+  require(same(sorted(plan.requirements.map(r=>({id:r.id,digest:validationDigest(r.description)}))),
+    sorted(requirementUniverse(reg.contract))),'READINESS_OBLIGATIONS_UNMAPPED');
+  if(!reg.contract.scope)return;
+  const selected=plan.incremental?.selectedRequirementIds??[plan.incremental?.selectedRequirementId];
+  const completed=plan.incremental?.completedRequirementIds??[],pending=plan.incremental?.pendingRequirementIds??[];
+  const partition=[...selected,...completed,...pending],universe=requirementUniverse(reg.contract).map(r=>r.id);
+  require(!!plan.incremental&&same([...selected].sort(),reg.contract.requirements.map(r=>r.id).sort())&&
+    selected.includes(plan.incremental.selectedRequirementId)&&new Set(partition).size===partition.length&&
+    same([...partition].sort(),[...universe].sort()),'READINESS_BATCH_PARTITION_UNBOUND');
+  const integrations=plan.tasks.filter(t=>t.stage==='integrate');
+  require(integrations.length===1&&same([...integrations[0].covers].sort(),[...selected].sort()),'READINESS_OBLIGATIONS_UNMAPPED');
 }
 export function readinessCriterion(reg:Registration){
   return candidateReadinessCriterionSchema.parse({id:'integrated-readiness',label:'Candidata integrada pronta; aceite depende de CI canônica',
@@ -70,7 +89,7 @@ async function registration(db:DB,goalId:string){
   require(reg.policyRegistrationId===p.registrationId&&reg.contract.policyRegistrationId===p.registrationId&&
     reg.policyDigest===p.policyDigest&&same(reg.requiredDatabaseTests,p.policy.requiredDatabaseTests),'READINESS_POLICY_CHANGED');
   validateCandidateReadinessPartition(reg.contract,p.policy.requiredDatabaseTests);
-  require(same(sorted(reg.contract.requirements),sorted(await originalRequirements(db,goalId))),'READINESS_REQUIREMENTS_CHANGED');
+  require(same(sorted(requirementUniverse(reg.contract)),sorted(await originalRequirements(db,goalId))),'READINESS_REQUIREMENTS_CHANGED');
   return reg;
 }
 /** Future plans only. The map does not amend any already admitted task/attempt. */
@@ -83,7 +102,7 @@ export async function registerCandidateReadinessMap(goalId:string,raw:unknown,au
     const p=await policy(db,goalId);
     require(contract.policyRegistrationId===p.registrationId,'READINESS_POLICY_CHANGED');
     validateCandidateReadinessPartition(contract,p.policy.requiredDatabaseTests);
-    require(same(sorted(contract.requirements),sorted(await originalRequirements(db,goalId))),'READINESS_REQUIREMENTS_CHANGED');
+    require(same(sorted(requirementUniverse(contract)),sorted(await originalRequirements(db,goalId))),'READINESS_REQUIREMENTS_CHANGED');
     const reg:Registration={version:1,id:mapId(goalId),registrationId:randomUUID(),goalId,contract,
       contractDigest:validationDigest(contract),policyRegistrationId:p.registrationId,policyDigest:p.policyDigest,
       requiredDatabaseTests:p.policy.requiredDatabaseTests,channel};
@@ -105,9 +124,9 @@ export async function bindCandidateReadinessPlan(db:DB,goalId:string,plan:Propos
   const reg=await registration(db,goalId);await consumer(db,options);
   const integrations=plan.tasks.filter(t=>t.stage==='integrate');
   require(!!plan.incremental&&integrations.length===1,'READINESS_SCOPE_UNMAPPED');
+  verifyPlanScope(plan,reg);
   const original=integrations[0];
-  require(same([...original.covers].sort(),reg.contract.requirements.map(r=>r.id).sort())&&
-    same(sorted(plan.requirements.map(r=>({id:r.id,digest:validationDigest(r.description)}))),sorted(reg.contract.requirements)),
+  require(same([...original.covers].sort(),reg.contract.requirements.map(r=>r.id).sort()),
     'READINESS_OBLIGATIONS_UNMAPPED');
   require(original.criteria.length===1&&original.criteria[0].type==='json_field'&&original.criteria[0].name==='delivery.json'&&
     original.criteria[0].field==='passed'&&original.criteria[0].equals===true,'READINESS_ORIGINAL_CRITERIA_UNMAPPED');
@@ -118,7 +137,9 @@ export async function bindCandidateReadinessPlan(db:DB,goalId:string,plan:Propos
     'The original requirement descriptions below remain the product obligation. Validation controls are the finite authenticated map, '+
     'not freeform verification prose. Complete its local controls, report readiness honestly, and finish so the controller runs its database controls. '+
     'Do not create databases, patch tools or claim database tests executed locally. Acceptance and independent QA remain pending.\n'+
-    'Requirements: '+JSON.stringify(result.requirements)+'\nRegistered controls: '+JSON.stringify(reg.contract.obligations)+
+    'Requirements: '+JSON.stringify(reg.contract.scope?result.requirements.filter(r=>task.covers.includes(r.id)):result.requirements)+
+    (reg.contract.scope?'\nOnly this batch is assigned. All other original objective requirements remain outside this batch; preserve their existing pending/completed state.':'')+
+    '\nRegistered controls: '+JSON.stringify(reg.contract.obligations)+
     '\nIntegration dependencies: '+JSON.stringify(task.dependencies)+'\nOriginal integration description (historical context, superseded only for CI handoff wording): '+
     prior.replace(/Execute os controles combinados:[\s\S]*$/,'Combined validation obligations are prescribed by the registered map above.');
   require(task.description.length<=20000,'READINESS_CONTEXT_TOO_LARGE');
@@ -170,6 +191,17 @@ export async function recordCandidateReadinessAdmission(db:DB,task:any,runId:str
   return proof;
 }
 export async function verifyBoundCandidateReadinessPlan(db:DB,goalId:string,plan:ProposedPlan){
+  const configured=(await db.query('SELECT value FROM settings WHERE id=$1',[mapId(goalId)])).rows[0]?.value;
+  if(configured?.contract?.enabled&&configured.contract.scope?.kind==='batch'){
+    const reg=await registration(db,goalId);verifyPlanScope(plan,reg);
+    const integrate=plan.tasks.find(t=>t.stage==='integrate')!;
+    require(integrate.criteria.length===1&&same(integrate.criteria[0],readinessCriterion(reg)),
+      'READINESS_BATCH_CRITERION_REMOVED');
+    const qa=plan.tasks.filter(t=>t.stage==='verify'&&t.sourceTask===integrate.key);
+    require(qa.length===1&&qa[0].dependencies.includes(integrate.key)&&
+      same([...qa[0].covers].sort(),[...integrate.covers].sort())&&
+      qa[0].criteria.some(c=>c.type==='candidate_ci'),'READINESS_BATCH_QA_REMOVED');
+  }
   for(const task of plan.tasks)if(task.criteria.some(c=>c.type==='candidate_readiness'))
     await verifyCandidateReadinessAdmission(db,{...task,goal_id:goalId,execution:{kind:'harness'}});
   for(const task of plan.tasks)for(const criterion of task.criteria)if(criterion.type==='candidate_ci'){

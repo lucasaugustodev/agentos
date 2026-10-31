@@ -42,7 +42,9 @@ export function bindCandidateReadinessQaPlan(plan:ProposedPlan,registration:any)
       'Execute every local obligation independently and publish its own actual evidence artifact. '+
       'Publish evidence/verification.json with passed:true only when local checks and the supplied canonical CI evidence satisfy the original requirements; '+
       'use passed:false for any failure, missing evidence or source mismatch. A copied CI report is never authority. '+
-      'Preserve the candidate; changes invalidate inherited CI. Original requirements: '+JSON.stringify(result.requirements)+
+      'Preserve the candidate; changes invalidate inherited CI. Original requirements: '+
+      JSON.stringify(registration.contract.scope?result.requirements.filter(r=>task.covers.includes(r.id)):result.requirements)+
+      (registration.contract.scope?'\nVerify only this exact batch. Other original objective requirements retain their pending/completed state; this QA cannot mark them complete.':'')+
       '\nRegistered finite controls: '+JSON.stringify(registration.contract.obligations)+
       '\nOriginal verification scope (the registered CI execution wording above supersedes only unavailable duplicate database execution): '+task.description;
     if(task.description.length>20000)reject('READINESS_QA_CONTEXT_TOO_LARGE');
