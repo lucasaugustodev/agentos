@@ -27,6 +27,7 @@ import { assertSupervisedResume, continuationSignature } from './supervision-han
 import { requestProgressReplan } from './retry-progress.js';
 import {reconcileVerificationRevisions} from './verification-revision-recovery.js';
 import {providerAvailabilityFailure} from '../shared/recovery.js';
+import {hasTransportCause} from './transport-task-recovery.js';
 import {requestRecoveryReview,appliedSupervisionOwnsContinuation,pendingSupervisionOwnsContinuation} from './recovery-supervision.js';
 import {verificationRoutingCode} from './verification-routing-failure.js';
 import {interruptedVerification,interruptedVerificationReason} from './verification-interruption.js';
@@ -651,6 +652,8 @@ export async function resumeFailedHarness(id: string, fence: string, proof: any)
       throw Error('STALE_RUN');
     const t = (await db.query('SELECT * FROM tasks WHERE id=$1 FOR UPDATE', [r.task_id])).rows[0];
     const g = (await db.query('SELECT * FROM goals WHERE id=$1', [t.goal_id])).rows[0];
+    if(t.stage==='integrate'&&await hasTransportCause(db,t.id,r.id)&&
+      !await appliedSupervisionOwnsContinuation(db,t.id,r.id))throw Error('TRANSPORT_RETRY_OWNED');
     if (
       !['active', 'failed'].includes(g.state) ||
       !['failed', 'submitted', 'recovery_blocked', 'reconciling', 'recovering_artifacts'].includes(
@@ -860,6 +863,8 @@ export class ContinuationSupervisor {
     await reconcileVerificationRevisions(this.inspect);
     const rows = await readContinuationCandidates(pool, new Date().toISOString());
     for (const t of rows) {
+      if(t.stage==='integrate'&&await hasTransportCause(pool,t.id,t.run_id)&&
+        !await appliedSupervisionOwnsContinuation(pool,t.id,t.run_id))continue;
       if (this.closing) return;
       // Disk failures belong to the shared resource probe, not an ever-growing
       // tree of semantic investigations which cannot start on the full volume.
@@ -1075,7 +1080,7 @@ export class ContinuationSupervisor {
           });
         } else await resumeFailedHarness(t.run_id, t.fence, proof);
       } catch (e: any) {
-        if (['STALE_RUN', 'TASK_CHANGED', 'GOAL_NOT_ACTIVE', 'SUPERVISION_PENDING'].includes(e.message)) continue;
+        if (['STALE_RUN', 'TASK_CHANGED', 'GOAL_NOT_ACTIVE', 'SUPERVISION_PENDING','TRANSPORT_RETRY_OWNED'].includes(e.message)) continue;
         if (e.message === 'NO_FAILED_CHECK') {
           const review = await requestRecoveryReview(t.id, t.run_id, 'NO_FAILED_CHECK',
             'A entrega anterior passou no contrato auxiliar, mas recebeu uma solicitação posterior de correção. O supervisor deve reconciliar a evidência e definir uma nova abordagem; repetir a inspeção não resolve o conflito. Preserve critérios, artefatos e aceite final.');

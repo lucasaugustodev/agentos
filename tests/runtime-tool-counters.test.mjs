@@ -258,6 +258,10 @@ test('exhausted generation retries preserve the ordinary terminal failure withou
   const f=await runFixture([call('a'),result('a')],{generationFailures:99});
   assert.equal(f.error.code,'MODEL_INCOMPLETE_RESPONSE');assert.equal(f.generations,3);assert.equal(f.gateAdmissions,3);
   assert.equal(f.emitted.filter(e=>e.kind==='MODEL_ERROR').length,1);
+  const proof=f.emitted.filter(e=>e.kind==='MODEL_TRANSPORT_EXHAUSTED');
+  assert.equal(proof.length,1);assert.equal(proof[0].payload.generationAttempt,3);
+  assert.equal(proof[0].payload.responseDelivered,false);assert.equal(proof[0].payload.traceComplete,true);
+  assert.equal(proof[0].payload.pendingTools,0);assert.equal(proof[0].payload.cancelled,false);
   assert.equal(f.saved.at(-1).stopped,true);
   assert.equal(f.wire.some(s=>s.includes('[DONE]')),false);
 });
@@ -265,12 +269,14 @@ test('neither a generic stream error nor an unsettled tool can authorize replay'
   for(const options of [{unmarked:true},{}]){
     const f=await runFixture(options.unmarked?[]:[call('unfinished'),result('unrelated')],{generationFailures:99,...options});
     assert.equal(f.generations,1);assert.equal(f.error.code,'MODEL_INCOMPLETE_RESPONSE');
+    assert.equal(f.emitted.filter(e=>e.kind==='MODEL_TRANSPORT_EXHAUSTED').length,0);
     assert.equal(f.emitted.filter(e=>e.kind==='RUNTIME_TRANSPORT_INTERRUPTED').length,0);
   }
 });
 test('caller cancellation during retry backoff prevents another admission and continuation proof',async()=>{
   const f=await runFixture([],{generationFailures:99,cancelBackoff:true});
   assert.equal(f.generations,1);assert.equal(f.gateAdmissions,1);assert.equal(f.error.code,'CANCELLED');
+  assert.equal(f.emitted.filter(e=>e.kind==='MODEL_TRANSPORT_EXHAUSTED').length,0);
   assert.equal(f.emitted.filter(e=>e.kind==='RUNTIME_TRANSPORT_INTERRUPTED').length,0);
 });
 test('real adapter retries remain bounded at nine fast fetches or three late-502 fetches across three gated generations',async()=>{
@@ -278,6 +284,7 @@ test('real adapter retries remain bounded at nine fast fetches or three late-502
     const f=await runFixture([],{generationFailures:99,adapterFailure:true,lateHeaders});
     assert.equal(f.error.code,'MODEL_REQUEST_FAILED');assert.equal(f.generations,3);assert.equal(f.gateAdmissions,3);
     assert.equal(f.fetches,lateHeaders?3:9);
+    assert.equal(f.emitted.filter(e=>e.kind==='MODEL_TRANSPORT_EXHAUSTED').length,1);
     assert.equal(f.wire.some(s=>s.includes('[DONE]')),false);
   }
 });
@@ -296,6 +303,7 @@ test('a partial provider body never authorizes outer generation retry even after
   const f=await runFixture([],{generationFailures:99,adapterFailure:true,partialBody:true});
   assert.equal(f.error.code,'MODEL_INCOMPLETE_RESPONSE');assert.equal(f.generations,1);assert.equal(f.fetches,1);
   assert.equal(f.gateAdmissions,1);assert.equal(f.emitted.filter(e=>e.kind==='MODEL_GENERATION_RETRY').length,0);
+  assert.equal(f.emitted.filter(e=>e.kind==='MODEL_TRANSPORT_EXHAUSTED').length,0);
   assert.equal(f.wire.some(s=>s.includes('[DONE]')),false);
 });
 test('the gateway never replaces a late 503 Retry-After with its shorter generation backoff',async()=>{

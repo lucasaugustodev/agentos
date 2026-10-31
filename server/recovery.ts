@@ -1,6 +1,7 @@
 import { pool, tx, lock, event } from './db.js';
 import {routeVerificationPlanningRecovery} from './verification-planning-recovery.js';
 import {sourceContractPlanningFailure} from './source-output-validation.js';
+import {hasTransportCause} from './transport-task-recovery.js';
 
 // This loop owns transitions, not semantic judgments. A new worker receives the
 // failed evidence and a narrower repair/replanning assignment, in the same scope.
@@ -24,6 +25,7 @@ export async function recoverStoppedTasks() {
     ).rows;
     const scheduled: string[] = [];
     for (const source of rows) {
+      if(source.stage==='integrate'&&await hasTransportCause(db,source.id,source.source_run_id))continue;
       if (source.execution?.kind !== 'harness' && !source.is_demo) continue;
       // An earlier row may have invalidated this descendant in this transaction.
       const fresh = (await db.query('SELECT state FROM tasks WHERE id=$1', [source.id])).rows[0];
