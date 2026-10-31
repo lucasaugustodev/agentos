@@ -28,6 +28,7 @@ import { chatEngine, listChats, newChat, chatDetail } from './chat.js';
 import type { WorkerEngine } from './worker.js';
 import { submitObjective, objectiveDetail, feedbackObjective } from './planner.js';
 import {registerObjectiveInput} from './objective-inputs.js';
+import {registerTaskRetryGuidance} from './task-retry-guidance.js';
 import {registerSourceReplanFeedback} from './objective-source-replan.js';
 import {objectiveModelRoute,registerObjectiveModelRoute} from './objective-model-route.js';
 import {registerWorkerValidationPolicy} from './worker-validation.js';
@@ -337,6 +338,11 @@ export function makeApp(engine?: WorkerEngine) {
         })
         .parse(req.body);
     return retryTask(id, body.checkpoint, { accountId: body.accountId, model: body.model });
+  });
+  app.post('/api/tasks/:id/retry-guidance',{bodyLimit:12288},async req=>{
+    const bearer=(req.headers.authorization??'').replace(/^Bearer /,'');
+    return registerTaskRetryGuidance(z.uuid().parse((req.params as any).id),req.body,
+      {channel:bearer&&equal(bearer,config.apiToken)?'api-token':'operator-session'});
   });
   app.get('/api/artifacts/:id', async (req, reply) => {
     const a = await readArtifact(z.uuid().parse((req.params as any).id));

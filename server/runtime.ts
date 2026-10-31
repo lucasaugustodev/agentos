@@ -21,6 +21,7 @@ import {stageArtifactInputBundle} from './artifact-input-bundle.js';
 import {inputFailureMetadata} from './input-failure.js';
 import {analyticalPrompt,analyticalPromptCharacterLimit,promptCheckpoint} from './analytical-prompt.js';
 import {workerValidationInstruction} from './worker-validation.js';
+import {retryGuidancePrompt} from './task-retry-guidance.js';
 import {prepareBoundRuntimeWorkspace,assertBoundRuntimePreparationCurrent} from './runtime-source-preparation.js';
 export {promptCheckpoint} from './analytical-prompt.js';
 
@@ -86,7 +87,9 @@ async function executeRemoteHarness(input: RuntimeInput): Promise<RuntimeResult>
   let deliveryContract;
   let composition;
   let inputBundle;
+  let retryGuidance:Awaited<ReturnType<typeof retryGuidancePrompt>>;
   try {
+    retryGuidance=await retryGuidancePrompt(input.run,input.context);
     inputs = await runtimeInputs(input.task,input.context.manifest,readArtifact,{transport:'referenced-v1'});
     deliveryContract = taskDeliveryContract(input.task.criteria);
     composition=patchComposition(input.task,input.context.manifest,inputs);
@@ -103,6 +106,12 @@ async function executeRemoteHarness(input: RuntimeInput): Promise<RuntimeResult>
       workspace:input.task.execution.workspace,code:e.code ?? 'PREFLIGHT_FAILED',inputFailure:inputFailureMetadata(e)});
     throw e;
   }
+  const prompt=[input.task.title,input.task.description,workerValidationInstruction(input.run),
+    'INSTRUCTION MANIFEST: '+JSON.stringify(input.context.manifest.taskInstructions??null),
+    'Role: '+input.task.agent_id,'Criteria: '+JSON.stringify(input.task.criteria),
+    'Checkpoint: '+JSON.stringify(promptCheckpoint(input.run.checkpoint)),
+    'Plan revision feedback: '+JSON.stringify(input.task.execution.revisionFeedback??null),
+    ...(retryGuidance?[retryGuidance.text]:[])].join('\n\n');
   let events = Promise.resolve();
   const result = await accountBridge
     .request(
@@ -124,18 +133,8 @@ async function executeRemoteHarness(input: RuntimeInput): Promise<RuntimeResult>
         deliveryContract,
         ...(input.task.execution.sourceContract?{sourceContract:input.task.execution.sourceContract}:{}),
         composition,
-        prompt: [
-          input.task.title,
-          input.task.description,
-          workerValidationInstruction(input.run),
-          'INSTRUCTION MANIFEST: ' +
-            JSON.stringify(input.context.manifest.taskInstructions ?? null),
-          'Role: ' + input.task.agent_id,
-          'Criteria: ' + JSON.stringify(input.task.criteria),
-          'Checkpoint: ' + JSON.stringify(promptCheckpoint(input.run.checkpoint)),
-          'Plan revision feedback: ' +
-            JSON.stringify(input.task.execution.revisionFeedback ?? null),
-        ].join('\n\n'),
+        prompt,
+        ...(retryGuidance?{retryGuidance:{...retryGuidance.metadata,promptDigest:hash(prompt)}}:{}),
         context: input.context,
         inputs:inputBundle?[]:inputs,
         ...(inputBundle?{inputBundle}:{}),

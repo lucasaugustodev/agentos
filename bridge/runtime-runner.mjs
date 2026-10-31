@@ -57,6 +57,17 @@ export async function runHarness(params, signal, generate, emit = () => {}) {
   catch(e){emit('HARNESS_NOT_STARTED',{confirmed:true,phase:'model_policy',code:e.code??'MODEL_POLICY_GLM_ONLY'});throw e;}
   try{params=await hydrateArtifactInputBundle(params,signal);}
   catch(e){emit('HARNESS_NOT_STARTED',{confirmed:true,phase:'input_bundle',code:e.code??'INPUT_BUNDLE_INVALID'});throw e;}
+  const retryGuidance=params.retryGuidance;
+  const guidanceUuid=/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i;
+  // Bind the controller's received prompt before legitimate runtime enrichment
+  // such as patch-composition findings appends context to it.
+  if(retryGuidance && (Object.keys(retryGuidance).sort().join(',')!=='bindingId,instructionDigest,promptDigest,requestId'||
+    !guidanceUuid.test(retryGuidance.bindingId??'')||!guidanceUuid.test(retryGuidance.requestId??'')||
+    !/^[a-f0-9]{64}$/.test(retryGuidance.instructionDigest??'')||
+    typeof params.prompt!=='string'||createHash('sha256').update(params.prompt).digest('hex')!==retryGuidance.promptDigest)){
+    emit('HARNESS_NOT_STARTED',{confirmed:true,phase:'initial_guidance',code:'RETRY_GUIDANCE_PROMPT_CHANGED'});
+    throw error('RETRY_GUIDANCE_PROMPT_CHANGED');
+  }
   if (params.accountId?.startsWith('agentos:muse:')) {
     const accounts = JSON.parse(await readFile('/var/lib/agentos-bridge/accounts.json', 'utf8'));
     const account = accounts.find(a => a.id === params.accountId && a.family === 'muse');
@@ -580,11 +591,18 @@ export async function runHarness(params, signal, generate, emit = () => {}) {
       ? params.deliveryContract.artifacts
       : [{ name: 'report.json', path: 'evidence/report.json', mime: 'application/json' }];
     const prompt = `${params.prompt}${roleClosure}${sourceInputs.instruction}\n\nContext manifest and shared memory: /home/agent/context.json\nInputs: /home/agent/inputs/\nRoutine code errors, failing tests and missing references that can be fixed in this workspace are implementation work, not external blockers. When assigned implementation, edit and test until the scoped task is done; do not return only a diagnosis of a fixable error. Do not expand scope or claim success without evidence. Output: respond with JSON {"summary":"...","artifacts":${JSON.stringify(exampleArtifacts)}}. Artifacts must be real files under this workspace, not claimed executions. Return a limitation only for an actual unmet external dependency or unresolved verified defect. Never claim independent acceptance.`;
+    const initialPrompt=prompt + museTaskDeliveryInstruction(params.deliveryContract) + runtimeHandoffInstruction + runtimeArtifactInstruction + deliveryManifestInstructionFor(outputContract) + (repairSnapshot ? repairFinalizationInstruction : '');
     const receipt = await rpc('session/prompt', {
       sessionId: params.runId,
-      contentBlocks: [{ type: 'text', text: prompt + museTaskDeliveryInstruction(params.deliveryContract) + runtimeHandoffInstruction + runtimeArtifactInstruction + deliveryManifestInstructionFor(outputContract) + (repairSnapshot ? repairFinalizationInstruction : '') }],
+      contentBlocks: [{ type: 'text', text: initialPrompt }],
     });
-    receiptId = receipt.messageId;
+    receiptId = receipt?.messageId;
+    if(retryGuidance&&!guidanceUuid.test(receiptId??''))throw error('RETRY_GUIDANCE_PROMPT_UNCONFIRMED');
+    if(retryGuidance)emit('TASK_RETRY_GUIDANCE_PROMPT_DELIVERED',{
+      runId:params.runId,runFence:params.runFence,contextVersion:params.contextVersion,
+      ...retryGuidance,messageId:receiptId,deliveredPromptDigest:createHash('sha256').update(initialPrompt).digest('hex'),
+      boundary:'SDK prompt receipt; not evidence of comprehension, compliance or acceptance',
+    });
     if (guidanceIdentity) {
       guidance = await createRuntimeGuidanceServer({directory:dir,identity:guidanceIdentity,emit,dispatch:request =>
         Promise.race([rpc('session/steer', {sessionId:params.runId,runId:params.runId,runFence:params.runFence,actionId:request.actionId,
