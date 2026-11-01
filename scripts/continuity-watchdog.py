@@ -47,6 +47,56 @@ def digest(value):
     return hashlib.sha256(value if isinstance(value, bytes) else canonical(value)).hexdigest()
 
 
+def evidence_material(value):
+    """Order only contract-defined inventories; preserve duplicates and sequences.
+
+    Never recursively sort arbitrary arrays: CPU cases, review instructions,
+    patch hunks and other ordered payloads retain their original meaning.
+    """
+    def inventory(rows, *identity):
+        return sorted(rows, key=lambda row: (tuple(str(row.get(k, "")) for k in identity), canonical(row)))
+    def repair(row):
+        result = dict(row)
+        if "producerArtifacts" in result:
+            result["producerArtifacts"] = inventory(result["producerArtifacts"], "id")
+        return result
+    def diagnostics(row):
+        result = dict(row)
+        for key, ids in [("outcomes", ("occurrenceId", "candidateSHA256")),
+                         ("repairableEvidence", ("occurrenceId", "candidateArtifactId"))]:
+            if key in result:
+                result[key] = inventory([repair(r) for r in result[key]], *ids)
+        return result
+    result = dict(value)
+    if "outcomes" in result:
+        outcomes = []
+        for row in result["outcomes"]:
+            row = dict(row)
+            for key, identity in [("artifacts", "id"), ("failures", "attemptId")]:
+                if key in row: row[key] = inventory(row[key], identity)
+            if row.get("executionEvidence"):
+                row["executionEvidence"] = dict(row["executionEvidence"])
+                if "artifacts" in row["executionEvidence"]:
+                    row["executionEvidence"]["artifacts"] = inventory(row["executionEvidence"]["artifacts"], "id")
+            outcomes.append(row)
+        result["outcomes"] = inventory(outcomes, "occurrenceId")
+    for key, ids in [("catalog", ("id",)), ("officialJobs", ("id",)),
+                     ("diagnostics", ("occurrenceId", "candidateSHA256"))]:
+        if key in result: result[key] = inventory(result[key], *ids)
+    for key, nested, ids in [("pipelineOwners", ["stages", "occurrenceIds", "jobIds"], ("problem", "ownerKey")),
+                             ("active", ["attemptIds"], ("occurrenceId",))]:
+        if key in result:
+            result[key] = inventory([{**row, **{k: sorted(row[k]) for k in nested if k in row}}
+                                     for row in result[key]], *ids)
+    for key in ["pendingOfficialCandidateSHA256", "confirmedSourceArtifactIds", "blockedProblems", "eligibleProblems"]:
+        if key in result: result[key] = sorted(result[key])
+    if "autoCheckDiagnostics" in result:
+        result["autoCheckDiagnostics"] = diagnostics(result["autoCheckDiagnostics"])
+    if "repairableEvidence" in result:
+        result["repairableEvidence"] = diagnostics({"repairableEvidence": result["repairableEvidence"]})["repairableEvidence"]
+    return result
+
+
 def now_iso():
     return dt.datetime.now(dt.timezone.utc).isoformat()
 
@@ -351,7 +401,7 @@ def action_evidence(observation, config):
             "pipelineOwners": selected(observation["pipelineOwners"]),
             "diagnostics": selected(diagnostics["outcomes"]),
             "repairableEvidence": selected(diagnostics["repairableEvidence"])}
-        boards[problem] = digest(material)
+        boards[problem] = digest(evidence_material(material))
     return {"version": 1, "authoritySHA256": digest(authority), "boards": boards}
 
 
@@ -873,6 +923,9 @@ class Watchdog:
             raw = protected_bytes(ref["path"], 12288)
             require(digest(raw) == ref["sha256"], "COMPARISON_CONTEXT_CHANGED")
             comparison_context = json.loads(raw)
+        # Diagnostics may select a source from this inventory. Stabilize that
+        # selection too, before computing either the global or per-board proof.
+        catalog = evidence_material({"catalog": catalog})["catalog"]
         diagnostics = self.auto_check_diagnostics(catalog, details, tested)
         for row in diagnostics["outcomes"]:
             if row.get("classification") in ["repair_evidence", "new_hypothesis_required", "repair_exhausted"]:
@@ -883,6 +936,7 @@ class Watchdog:
                     "pendingOfficialCandidateSHA256": sorted(pending), "autoCheckDiagnostics": diagnostics}
         if comparison_context:
             material["comparisonContext"] = comparison_context
+        material = evidence_material(material)
         fingerprint = digest(material)
         self.save()
         active_progress = [dt.datetime.fromisoformat(r["progress"]["at"].replace("Z", "+00:00")).timestamp()

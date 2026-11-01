@@ -112,7 +112,7 @@ class WatchTests(unittest.TestCase):
         for source in review['input']['catalog']:
             if source['problem'] in review['input']['eligibleProblems']:
                 sources.setdefault(source['problem'], source)
-        chosen = list(sources.values())
+        chosen = sorted(sources.values(), key=lambda r: ['muse_decode_layer', 'muse_prefill_layer', 'muse_attention_decode'].index(r['problem']))
         if not chosen: chosen = review['input']['catalog'][:1]  # Deliberately invalid plans for diagnostic tests.
         return {'version': 1, 'evidenceFingerprint': review['fingerprint'], 'decision': 'experiments',
             'reason': 'Measured bottleneck requires a discriminating CPU experiment.', 'experiments': [
@@ -966,6 +966,70 @@ class WatchTests(unittest.TestCase):
         self.assertEqual(W.action_evidence(obs, self.config), W.action_evidence(changed, self.config))
         self.assertTrue(W.unchanged_action_scope(pending, changed, self.config))
 
+    def test_artifact_inventory_permutation_keeps_global_and_action_evidence(self):
+        self.add_seed(); before = self.w.observe()
+        self.w.tick(); self.complete_review()
+        for detail in self.client.occurrences.values():
+            detail['artifacts'].reverse()
+        after = self.w.observe()
+        self.assertEqual(before['fingerprint'], after['fingerprint'])
+        self.assertEqual(W.action_evidence(before, self.config), W.action_evidence(after, self.config))
+        result = self.w.tick()
+        self.assertEqual(result['state'], 'experiments_dispatched')
+        self.assertEqual(len(result['dispatched']), 1)
+        self.assertEqual(len(self.client.posts), 3)
+        self.reload(); self.w.tick()
+        self.assertEqual(len(self.w.state['experiments']), 1)
+
+    def test_artifact_identity_content_and_qa_change_still_invalidate_hash(self):
+        before = self.w.observe(); original = copy.deepcopy(self.client.occurrences[self.seed]['artifacts'])
+        for field, value in [('id', uid()), ('size', 999)]:
+            after = copy.deepcopy(before); after['outcomes'][0]['artifacts'][0][field] = value
+            self.assertNotEqual(W.action_evidence(before, self.config), W.action_evidence(after, self.config))
+        qa = next(r for r in original if r['name'] == 'qa-verification.json')
+        review = json.loads(self.client.artifacts[qa['id']]); review['passed'] = True
+        self.client.complete(self.seed, {'candidate.py': b'# candidate source\n', 'qa-verification.json': review})
+        self.assertNotEqual(before['fingerprint'], self.w.observe()['fingerprint'])
+
+    def test_semantic_sequences_and_duplicate_inventory_are_not_erased(self):
+        first = {'outcomes': [{'occurrenceId': 'one', 'problem': 'muse_decode_layer',
+            'artifacts': [{'id': 'candidate', 'digest': 'a'}, {'id': 'qa', 'digest': 'b'}],
+            'failures': [{'attemptId': 'two', 'code': 'X'}, {'attemptId': 'one', 'code': 'Y'}],
+            'executionEvidence': {'artifacts': [{'id': 'result'}, {'id': 'checker'}],
+                'cpu': {'failedCases': [{'name': 'first'}, {'name': 'second'}]}}}],
+            'instructions': ['prepare', 'run'], 'patchHunks': ['hunk1', 'hunk2']}
+        permuted = copy.deepcopy(first)
+        for key in ['artifacts', 'failures']: permuted['outcomes'][0][key].reverse()
+        permuted['outcomes'][0]['executionEvidence']['artifacts'].reverse()
+        self.assertEqual(W.evidence_material(first), W.evidence_material(permuted))
+        for change in ['cases', 'instructions', 'patch', 'duplicate']:
+            altered = copy.deepcopy(first)
+            if change == 'cases': altered['outcomes'][0]['executionEvidence']['cpu']['failedCases'].reverse()
+            elif change == 'instructions': altered['instructions'].reverse()
+            elif change == 'patch': altered['patchHunks'].reverse()
+            else: altered['outcomes'][0]['artifacts'].append(copy.deepcopy(altered['outcomes'][0]['artifacts'][0]))
+            self.assertNotEqual(W.evidence_material(first), W.evidence_material(altered))
+
+    def test_known_job_owner_and_diagnostic_inventories_are_order_independent(self):
+        first = {'catalog': [{'id': 'b'}, {'id': 'a'}], 'officialJobs': [{'id': 'j2'}, {'id': 'j1'}],
+            'pipelineOwners': [{'problem': 'prefill', 'ownerKey': 'two', 'stages': ['gpu', 'native'],
+                'occurrenceIds': ['o2', 'o1'], 'jobIds': ['j2', 'j1']}, {'problem': 'decode', 'ownerKey': 'one'}],
+            'autoCheckDiagnostics': {'outcomes': [{'occurrenceId': 'o2'}, {'occurrenceId': 'o1'}],
+                'repairableEvidence': [{'occurrenceId': 'o2', 'producerArtifacts': [{'id': 'b'}, {'id': 'a'}]},
+                                       {'occurrenceId': 'o1', 'producerArtifacts': []}]},
+            'active': [{'occurrenceId': 'o2', 'attemptIds': ['a2', 'a1']}, {'occurrenceId': 'o1', 'attemptIds': []}]}
+        shuffled = copy.deepcopy(first)
+        for key in ['catalog', 'officialJobs', 'pipelineOwners', 'active']: shuffled[key].reverse()
+        owner = next(r for r in shuffled['pipelineOwners'] if r['ownerKey'] == 'two')
+        for key in ['stages', 'occurrenceIds', 'jobIds']: owner[key].reverse()
+        for key in ['outcomes', 'repairableEvidence']: shuffled['autoCheckDiagnostics'][key].reverse()
+        for row in shuffled['autoCheckDiagnostics']['repairableEvidence']: row['producerArtifacts'].reverse()
+        for row in shuffled['active']: row['attemptIds'].reverse()
+        self.assertEqual(W.digest(W.evidence_material(first)), W.digest(W.evidence_material(shuffled)))
+        for key in ['catalog', 'officialJobs']:
+            changed = copy.deepcopy(first); changed[key][0]['id'] = 'different'
+            self.assertNotEqual(W.evidence_material(first), W.evidence_material(changed))
+
     def test_partial_ack_other_board_change_recovers_unknown_run_by_get(self):
         self.add_seed(); attention = self.add_seed('muse_attention_decode', b'# independent attention\n')
         self.w.tick(); self.complete_review(self.plan(2)); self.client.timeout_after_commit_number = 5
@@ -1001,7 +1065,8 @@ class WatchTests(unittest.TestCase):
     def test_failed_qa_does_not_exhaust_official_capacity(self):
         obs = self.w.observe()
         self.assertEqual(obs['availableCandidateSlots'], 2)
-        self.assertEqual(obs['outcomes'][0]['artifacts'][1]['review']['passed'], False)
+        qa = next(a for a in obs['outcomes'][0]['artifacts'] if a['name'] == 'qa-verification.json')
+        self.assertEqual(qa['review']['passed'], False)
 
     def test_actual_official_identity_and_nested_summary(self):
         self.config['officialJobs'] = [{'id': '1717a286eb2949c0', 'problem': 'muse_decode_layer', 'sourceSHA256': 'a' * 64}]
