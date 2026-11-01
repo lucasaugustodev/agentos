@@ -69,3 +69,33 @@ Missing evidence is a blocked qualification, never permission to assume it passe
 Registry tests need a root-owned temporary directory with protected parents.
 Set TMPDIR to a dedicated root-only test directory on the server; do not change
 ownership or permissions of a shared build directory to make these tests pass.
+
+The optional adapter status reader checks its root-owned policy, current watcher
+code/config pins, freshness, native occurrence, source and QA artifact identities.
+Controller/storage/transport failures, quota and uncertain effects never authorize
+kernel evidence repair. Missing evidence can produce a fixed repair_evidence cycle:
+the candidate and original base stay byte-identical, previous checker/results come
+from the same original producer attempt, and a new independent QA replays the work.
+Semantic/numerical failures require a new code hypothesis instead. Two unsuccessful
+repairs isolate that candidate with an explicit repair_exhausted diagnostic; no
+third repair is enqueued, while other eligible sources remain available. Disabled
+or inactive adapter policy provides diagnostic information only, never repair authority.
+
+Transport-only patch normalization accepts only one file with either canonical
+headers or that board's exact kernel submission headers. It changes just those two
+headers, applies every hunk in memory, and requires exact candidate bytes. Original
+patch, canonical patch and application proof retain separate hashes. Arbitrary,
+truncated, multi-file or divergent patches cannot use this repair action.
+
+Material age derives from published artifacts or completed native stages and is
+reported separately from controller dispatch age. A diagnostic call cannot reset
+material age. Files still being built inside an active workspace are not published
+progress, and this limitation is explicit in the supervisor input.
+
+A changed supervisor prompt requires updating the existing native control cycle
+through PUT /api/cycles/:id with its expected version before installing matching
+controlDefinitionSHA256/controlVersion configuration. Never create a replacement
+control cycle or mutate active occurrence snapshots. Wait until no supervisor plan
+is pending, preserve prior config/code receipts, and validate the next actual native
+dispatch uses the new definition. Tests cover stale version rejection and preserved
+old snapshots; deployment still requires a separate live verification.

@@ -1,5 +1,6 @@
 """Server-only deterministic qualification of the periodic supervisor controller."""
 import copy
+import difflib
 import importlib.util
 import json
 import pathlib
@@ -204,6 +205,198 @@ class WatchTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'PROTECTED_OWNER_MODE'): W.protected_bytes(path, 32)
         path.chmod(0o600); link = self.root / 'link.json'; link.symlink_to(path)
         with self.assertRaisesRegex(ValueError, 'PROTECTED_PATH'): W.protected_bytes(link, 32)
+
+    def complete_repair_source(self, oid):
+        detail = self.client.occurrences[oid]
+        base = detail['occurrence']['input']['experiment']['sourceArtifact']
+        original = self.client.artifacts[base['id']]
+        candidate = b'# fixed candidate source\n'
+        patch = ''.join(difflib.unified_diff(original.decode().splitlines(True), candidate.decode().splitlines(True),
+                                            fromfile='base-candidate.py', tofile='candidate.py')).encode()
+        self.client.complete(oid, {'candidate.py': candidate, 'implementation.patch': patch,
+            'cpu-checks.py': b'# independently replay this checker\n', 'cpu-result.json': {'passed': True},
+            'verification.json': {'passed': True, 'sourceSHA256': base['digest'], 'candidateSHA256': W.digest(candidate)},
+            'qa-verification.json': {'passed': True, 'sourceSHA256': base['digest'], 'candidateSHA256': W.digest(candidate),
+                'cpuReplayPassed': True, 'scopePreserved': True, 'approvedForOfficialReview': True,
+                'gpuValidated': False, 'officialActionsPerformed': False}})
+        detail = self.client.occurrences[oid]
+        qa = next(a for a in detail['artifacts'] if a['name'] == 'qa-verification.json')
+        sid, aid = uid(), uid()
+        detail['steps'].append({'id': sid, 'attempt': 1, 'state': 'completed', 'definition': {'kind': 'agent'}})
+        detail['attempts'].append({'id': aid, 'step_id': sid, 'number': 1, 'state': 'completed',
+            'finished_at': '2026-11-01T18:00:00Z', 'fence': uid(), 'receipt': {'stopped': True}})
+        qa['attempt_id'] = aid
+        return {'occurrenceId': oid, 'problem': 'muse_decode_layer', 'candidateSHA256': W.digest(candidate),
+                'qaArtifactId': qa['id'], 'qaSHA256': qa['digest'], 'state': 'rejected_repairable',
+                'jobId': None, 'postAttempted': False, 'code': 'CPU_RESULT_BINDING'}
+
+    def install_diagnostic_fixture(self, rows, observed=10000):
+        self.config['autoCheckStatusPath'] = str(self.root / 'auto-check-status.json')
+        self.config['autoCheckPolicyPath'] = str(self.root / 'auto-check-policy.json')
+        config_path = self.root / 'watcher-config.json'; W.atomic(config_path, self.config)
+        code_path = self.root / 'watcher-code.py'; code_path.write_bytes(SOURCE.read_bytes())
+        policy = {'version': 1, 'enabled': True, 'authority': 'operator-delegated-diagnostic-check',
+            'allowedActions': ['check'], 'automaticPostRetry': False, 'watchId': self.config['watchId'],
+            'controlCycleId': self.config['controlCycleId'], 'workspace': self.config['workspace'],
+            'model': self.config['model'], 'accountId': self.config['accountId'], 'boards': {'muse_decode_layer': {}},
+            'expiresAt': 20000, 'watcherConfig': {'path': str(config_path), 'sha256': W.digest(config_path.read_bytes())},
+            'watcherCode': {'path': str(code_path), 'sha256': W.digest(code_path.read_bytes())}}
+        W.atomic(self.config['autoCheckPolicyPath'], policy)
+        W.atomic(self.config['autoCheckStatusPath'], {'version': 1, 'watchId': self.config['watchId'],
+            'observedAt': observed, 'mode': 'check', 'policySHA256': W.digest(policy), 'policyExpiresAt': 20000,
+            'controllerState': 'active', 'outcomes': rows})
+
+    def repairable_operation(self):
+        self.w.tick(); self.complete_review(); self.w.tick()
+        target = self.w.state['experiments'][-1]['occurrenceId']
+        status = self.complete_repair_source(target); self.install_diagnostic_fixture([status])
+        return status
+
+    def submit_repair_plan(self):
+        self.assertEqual(self.w.tick()['state'], 'supervisor_dispatched')
+        review = self.w.state['supervisions'][-1]
+        target = review['input']['autoCheckDiagnostics']['repairableEvidence'][0]
+        plan = self.plan(); plan['decision'] = 'repair_evidence'
+        plan['experiments'][0]['sourceArtifactId'] = target['candidateArtifactId']
+        self.complete_review(plan)
+        return self.w.tick()
+
+    def test_rejected_evidence_dispatches_immutable_repair_then_independent_qa(self):
+        status = self.repairable_operation()
+        observation = self.w.observe()
+        self.assertEqual(observation['pendingOfficialCandidateSHA256'], [])
+        result = self.submit_repair_plan(); self.assertEqual(result['state'], 'experiments_dispatched')
+        record = self.w.state['experiments'][-1]
+        self.assertEqual(record['repairCandidateSHA256'], status['candidateSHA256'])
+        detail = self.client.occurrences[record['occurrenceId']]
+        packet = detail['occurrence']['input']['experiment']
+        target = packet['repairTarget']
+        self.assertEqual(target['occurrenceId'], status['occurrenceId'])
+        self.assertEqual(target['candidateSHA256'], status['candidateSHA256'])
+        original = self.client.occurrences[status['occurrenceId']]['occurrence']['input']['experiment']['sourceArtifact']
+        self.assertEqual(packet['sourceArtifact']['digest'], original['digest'])
+        self.assertEqual(len({a['attemptId'] for a in target['materials']}), 1)
+        self.assertEqual([s['key'] for s in detail['occurrence']['definition']['steps']], ['produce', 'independent-qa'])
+        self.assertEqual(detail['occurrence']['definition']['allowedActions'], [])
+
+    def test_two_failed_repairs_isolate_candidate_without_blocking_other_work(self):
+        status = self.repairable_operation(); rows = [status]
+        for _ in range(2):
+            self.submit_repair_plan()
+            row = self.complete_repair_source(self.w.state['experiments'][-1]['occurrenceId'])
+            rows.append(row); self.install_diagnostic_fixture(rows)
+        result = self.w.tick()
+        self.assertEqual(result['state'], 'supervisor_dispatched')
+        review = self.w.state['supervisions'][-1]
+        self.assertTrue(review['input']['isolatedCandidates'])
+        self.assertFalse(any(a['digest'] == status['candidateSHA256'] for a in review['input']['catalog']))
+        invalid = self.plan(); invalid['decision'] = 'repair_evidence'
+        with self.assertRaisesRegex(ValueError, 'PLAN_CAPACITY'):
+            W.validate_plan(invalid, {'fingerprint': review['fingerprint'], **review['input']}, self.config)
+        self.complete_review(self.plan())
+        self.assertEqual(self.w.tick()['state'], 'experiments_dispatched')
+        self.assertEqual(len([r for r in self.w.state['experiments'] if r.get('repairOf')]), 2)
+
+    def test_diagnostic_hash_or_source_lineage_conflict_cannot_authorize_repair(self):
+        status = self.repairable_operation()
+        self.install_diagnostic_fixture([{**status, 'candidateSHA256': 'f' * 64}])
+        with self.assertRaisesRegex(ValueError, 'REPAIR_ARTIFACT_BINDING'): self.w.observe()
+        self.install_diagnostic_fixture([status])
+        detail = self.client.occurrences[status['occurrenceId']]
+        qa = next(a for a in detail['artifacts'] if a['id'] == status['qaArtifactId'])
+        value = json.loads(self.client.artifacts[qa['id']]); value['sourceSHA256'] = 'f' * 64
+        raw = W.canonical(value); self.client.artifacts[qa['id']] = raw; qa.update(digest=W.digest(raw), size=len(raw))
+        self.install_diagnostic_fixture([{**status, 'qaSHA256': qa['digest']}])
+        with self.assertRaisesRegex(ValueError, 'REPAIR_SOURCE_LINEAGE'): self.w.observe()
+
+    def test_controller_quota_uncertain_and_stale_diagnostics_never_authorize_repair(self):
+        status = self.repairable_operation()
+        for state in ['controller_blocked', 'observation_wait', 'quota_wait', 'uncertain_owned', 'paused']:
+            self.install_diagnostic_fixture([{**status, 'state': state}])
+            observation = self.w.observe()
+            self.assertEqual(observation['autoCheckDiagnostics']['repairableEvidence'], [])
+            self.assertIn(status['candidateSHA256'], observation['pendingOfficialCandidateSHA256'])
+        self.install_diagnostic_fixture([status], observed=9000)
+        self.assertEqual(self.w.observe()['autoCheckDiagnostics']['controllerState'], 'observation_stale')
+
+    def test_disabled_or_nonactive_inspection_policy_is_diagnostic_only(self):
+        status_row = self.repairable_operation()
+        policy = W.read_json(self.config['autoCheckPolicyPath']); policy['enabled'] = False
+        W.atomic(self.config['autoCheckPolicyPath'], policy)
+        status = W.read_json(self.config['autoCheckStatusPath']); status['policySHA256'] = W.digest(policy)
+        W.atomic(self.config['autoCheckStatusPath'], status)
+        observation = self.w.observe()
+        self.assertFalse(observation['autoCheckDiagnostics']['repairAuthority'])
+        self.assertEqual(observation['autoCheckDiagnostics']['repairableEvidence'], [])
+        self.assertIn(status_row['candidateSHA256'], observation['pendingOfficialCandidateSHA256'])
+        policy['enabled'] = True; W.atomic(self.config['autoCheckPolicyPath'], policy)
+        status.update(policySHA256=W.digest(policy), controllerState='inspection_only_policy_disabled')
+        W.atomic(self.config['autoCheckStatusPath'], status)
+        self.assertFalse(self.w.observe()['autoCheckDiagnostics']['repairAuthority'])
+
+    def test_semantic_failure_requires_new_hypothesis_not_evidence_repair(self):
+        status = self.repairable_operation(); detail = self.client.occurrences[status['occurrenceId']]
+        qa = next(a for a in detail['artifacts'] if a['id'] == status['qaArtifactId'])
+        value = json.loads(self.client.artifacts[qa['id']]); value['canonicalPrecisionPreserved'] = False
+        raw = W.canonical(value); self.client.artifacts[qa['id']] = raw; qa.update(digest=W.digest(raw), size=len(raw))
+        self.install_diagnostic_fixture([{**status, 'qaSHA256': qa['digest'], 'code': 'QA_ATTESTATION_MISSING_canonicalPrecisionPreserved'}])
+        diagnostic = self.w.observe()['autoCheckDiagnostics']
+        self.assertEqual(diagnostic['repairableEvidence'], [])
+        self.assertEqual(diagnostic['outcomes'][0]['classification'], 'new_hypothesis_required')
+
+    def test_material_age_does_not_reset_when_a_supervisor_is_dispatched(self):
+        detail = self.client.occurrences[self.seed]
+        detail['occurrence'].update(state='running', created_at='1970-01-01T02:30:00Z')
+        detail['attempts'][0].update(state='running', finished_at=None)
+        before = self.w.observe()['idleSeconds']; self.w.tick()
+        self.assertEqual(self.w.observe()['idleSeconds'], before)
+        self.assertEqual(before, 1000)
+        self.assertEqual(self.w.observe()['controllerDispatchAgeSeconds'], 0)
+
+    def test_header_normalization_preserves_original_hunks_and_exact_candidate(self):
+        base, candidate = b'old\nkept\n', b'new\nkept\n'
+        patch = ''.join(difflib.unified_diff(base.decode().splitlines(True), candidate.decode().splitlines(True),
+            fromfile='a/kernels/muse_decode_layer/submission.py', tofile='b/kernels/muse_decode_layer/submission.py')).encode()
+        canonical, proof = W.normalized_repair_patch(base, candidate, patch, 'muse_decode_layer')
+        self.assertEqual(canonical.splitlines(True)[2:], patch.splitlines(True)[2:])
+        self.assertEqual(canonical.splitlines(True)[:2], [b'--- base-candidate.py\n', b'+++ candidate.py\n'])
+        self.assertEqual(proof['originalPatchSHA256'], W.digest(patch))
+        self.assertEqual(proof['candidateSHA256'], W.digest(candidate))
+        self.assertTrue(proof['appliedExactly'])
+        for bad in [patch.replace(b'muse_decode_layer', b'muse_prefill_layer'), patch[:-len(b' kept\n')],
+                    patch + b'--- other\n+++ stolen\n@@ -1 +1 @@\n-old\n+new\n']:
+            with self.assertRaisesRegex(ValueError, 'REPAIR_PATCH_'):
+                W.normalized_repair_patch(base, candidate, bad, 'muse_decode_layer')
+        with self.assertRaisesRegex(ValueError, 'REPAIR_PATCH_CANDIDATE_MISMATCH'):
+            W.normalized_repair_patch(base, b'wrong\n', patch, 'muse_decode_layer')
+
+    def test_actual_next_dispatch_requires_updated_control_definition_and_version(self):
+        cycle = self.client.cycles[self.config['controlCycleId']]
+        cycle.update(version=1, definition={**W.supervisor_definition(self.config), 'steps': [
+            {**W.supervisor_definition(self.config)['steps'][0], 'instructions': 'Old supervisor contract'}]})
+        old = self.client.make_occurrence(cycle['id'], {'requestKey': 'old-snapshot', 'input': {}})
+        self.config['controlVersion'] = 2
+        with self.assertRaisesRegex(ValueError, 'CONTROL_CHANGED'): self.w.tick()
+        self.assertEqual(self.client.posts, [])
+        cycle.update(version=2, definition=W.supervisor_definition(self.config))
+        self.assertEqual(self.w.tick()['state'], 'supervisor_dispatched')
+        new = self.client.occurrences[self.w.state['supervisions'][-1]['occurrenceId']]['occurrence']
+        self.assertIn('repair_evidence', new['definition']['steps'][0]['instructions'])
+        self.assertEqual(old['definition']['steps'][0]['instructions'], 'Old supervisor contract')
+
+    def test_status_policy_or_config_hash_conflict_cannot_dispatch_repair(self):
+        self.repairable_operation()
+        status = W.read_json(self.config['autoCheckStatusPath']); status['policySHA256'] = 'f' * 64
+        W.atomic(self.config['autoCheckStatusPath'], status)
+        with self.assertRaisesRegex(ValueError, 'AUTO_CHECK_POLICY_BINDING'): self.w.observe()
+
+    def test_repaired_candidate_or_patch_change_is_not_accepted_as_evidence_repair(self):
+        self.repairable_operation(); self.submit_repair_plan()
+        oid = self.w.state['experiments'][-1]['occurrenceId']
+        self.complete_repair_source(oid)
+        candidate = next(a for a in self.client.occurrences[oid]['artifacts'] if a['name'] == 'candidate.py')
+        candidate['digest'] = 'f' * 64
+        with self.assertRaisesRegex(ValueError, 'REPAIR_IMMUTABLE_ARTIFACT_CHANGED'): self.w.observe()
 
     def test_recurrent_supervisor_dispatch_completion_new_supervisor(self):
         self.assertEqual(self.w.tick()['state'], 'supervisor_dispatched')

@@ -25,6 +25,12 @@ PROBLEMS = {"muse_decode_layer", "muse_prefill_layer", "muse_attention_decode"}
 LIVE = {"queued", "running", "waiting", "recovering", "cancelling", "reconciling"}
 TERMINAL = {"completed", "failed", "cancelled", "attention"}
 UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+EVIDENCE_REPAIR_CODES = {"PATCH_HEADER_SCOPE", "CPU_REPLAY_EXECUTION_UNPROVEN", "QA_LIMITATIONS_MISSING", "QA_TEST_BINDING",
+    "CPU_RESULT_BINDING", "CPU_MEANINGFUL_cases", "CPU_MEANINGFUL_negativeControls", "CPU_CASES_NOT_REPLAYED",
+    "QA_ATTESTATION_MISSING_canonicalPrecisionPreserved", "QA_ATTESTATION_MISSING_evaluatorIndependent",
+    "QA_ATTESTATION_MISSING_upstreamAttributionPreserved"}
+SEMANTIC_REJECTION_CODES = {"QA_NOT_APPROVED", "QA_BLOCKING_FINDINGS", "QA_SOURCE_OR_SCOPE_MISMATCH",
+    "QA_OVERCLAIM", "SOURCE_REQUIRES_MANUAL_REVIEW"}
 
 
 def require(ok, code):
@@ -110,6 +116,45 @@ def compact_outcomes(outcomes):
     return rows
 
 
+def normalized_repair_patch(base, candidate, original_patch, problem):
+    """Normalize only approved header names; apply every hunk without invoking a shell."""
+    require(problem in PROBLEMS, "REPAIR_PATCH_BOARD")
+    lines = original_patch.decode("utf-8").splitlines(keepends=True)
+    headers = ["--- base-candidate.py\n", "+++ candidate.py\n"]
+    legacy = ["--- a/kernels/" + problem + "/submission.py\n", "+++ b/kernels/" + problem + "/submission.py\n"]
+    require(len(lines) >= 3 and lines[:2] in [headers, legacy], "REPAIR_PATCH_HEADER_SCOPE")
+    lines[:2] = headers
+    canonical_patch = "".join(lines).encode()
+    source = base.decode("utf-8").splitlines(keepends=True)
+    output, cursor, index, hunks = [], 0, 2, 0
+    while index < len(lines):
+        match = re.fullmatch(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@[^\n]*\n", lines[index])
+        require(match is not None, "REPAIR_PATCH_HUNK_SCHEMA")
+        start, old_count, new_start, new_count = int(match[1]), int(match[2] or 1), int(match[3]), int(match[4] or 1)
+        target = start - 1 if old_count else start
+        require(cursor <= target <= len(source), "REPAIR_PATCH_HUNK_RANGE")
+        output.extend(source[cursor:target]); cursor = target
+        require(new_start == len(output) + (1 if new_count else 0), "REPAIR_PATCH_NEW_RANGE")
+        removed = added = 0
+        index += 1; hunks += 1
+        while index < len(lines) and not lines[index].startswith("@@ "):
+            line = lines[index]
+            require(line[0] in " +-", "REPAIR_PATCH_BODY_SCHEMA")
+            if line[0] in " -":
+                require(cursor < len(source) and source[cursor] == line[1:], "REPAIR_PATCH_BASE_MISMATCH")
+                cursor += 1; removed += 1
+            if line[0] in " +":
+                output.append(line[1:]); added += 1
+            index += 1
+        require(removed == old_count and added == new_count, "REPAIR_PATCH_HUNK_COUNT")
+    require(hunks > 0, "REPAIR_PATCH_EMPTY")
+    output.extend(source[cursor:])
+    require("".join(output).encode() == candidate, "REPAIR_PATCH_CANDIDATE_MISMATCH")
+    return canonical_patch, {"method": "approved_headers_only_and_full_in_memory_application",
+        "originalPatchSHA256": digest(original_patch), "canonicalPatchSHA256": digest(canonical_patch),
+        "baseSHA256": digest(base), "candidateSHA256": digest(candidate), "hunks": hunks, "appliedExactly": True}
+
+
 def confirmed_boundary(detail):
     """A terminal label alone is not proof the native executor stopped."""
     if detail["occurrence"]["state"] not in TERMINAL:
@@ -158,7 +203,7 @@ only; MoE/BF16 standalone boards belong to another operator.
 Publish evidence/continuation-plan.json and evidence/supervisor-summary.txt.
 The JSON must have exactly these fields:
 { "version":1, "evidenceFingerprint":"<input evidenceFingerprint>",
-  "decision":"experiments" or "await_external" or "observe_active", "reason":"20..1200 characters",
+  "decision":"experiments" or "repair_evidence" or "await_external" or "observe_active", "reason":"20..1200 characters",
   "experiments":[{ "id":"short-lowercase-id", "problem":"muse_decode_layer" or
     "muse_prefill_layer" or "muse_attention_decode", "sourceArtifactId":"UUID from catalog",
     "hypothesis":"20..1200 characters", "instructions":"50..12000 characters" }] }
@@ -176,6 +221,17 @@ Do not generate work just to fill slots. The deterministic controller creates pr
 and independent QA tasks after validating this plan. No arbitrary shell/URL/action
 or account/model/workspace field is accepted in the plan.
 Your summary must state trigger, observed idle duration, next action or explicit blocker.
+Report any isolated/exhausted candidate explicitly and choose useful work from other
+eligible sources; one candidate's evidence failure must not pause unrelated boards.
+When verified autoCheckDiagnostics contains repairableEvidence, you may instead use
+decision="repair_evidence" and experiments naming its exact candidate sourceArtifactId.
+This fixed action preserves the existing candidate/base/patch byte for byte, replays
+and repairs only evidence, then performs a new independent QA. It cannot fix semantic
+or numerical defects. Use a new experiment hypothesis for an actual code defect.
+Quota, paused policy and uncertain POST ownership are never repair authority.
+Do not build a plan validator, validation script, plan test suite or extra report:
+the controller validates the plan deterministically. Publish only the decision JSON
+and a concise supervisor-summary.txt plus any mandatory native runtime handoff.
 """
 
 
@@ -215,19 +271,23 @@ def validate_config(config, bound=True):
     if bound:
         require(UUID.fullmatch(config.get("controlCycleId", "")), "CONTROL_CYCLE_ID")
         require(config.get("controlDefinitionSHA256") == digest(supervisor_definition(config)), "CONTROL_DEFINITION")
+        require("controlVersion" not in config or type(config["controlVersion"]) is int and config["controlVersion"] >= 1,
+                "CONTROL_VERSION")
     return config
 
 
 def validate_plan(plan, observation, config):
     require(type(plan) is dict and set(plan) == {"version", "evidenceFingerprint", "decision", "reason", "experiments"}, "PLAN_FIELDS")
     require(plan["version"] == 1 and plan["evidenceFingerprint"] == observation["fingerprint"], "PLAN_EVIDENCE")
-    require(plan["decision"] in ["experiments", "await_external", "observe_active"] and type(plan["reason"]) is str
+    require(plan["decision"] in ["experiments", "repair_evidence", "await_external", "observe_active"] and type(plan["reason"]) is str
             and 20 <= len(plan["reason"]) <= 1200, "PLAN_DECISION")
     experiments = plan["experiments"]
     require(type(experiments) is list, "PLAN_EXPERIMENTS")
-    capacity = min(config["maxPendingCandidates"], observation["availableCandidateSlots"])
+    repairs = observation.get("autoCheckDiagnostics", {}).get("repairableEvidence", [])
+    capacity = min(config["maxPendingCandidates"], len(repairs) if plan["decision"] == "repair_evidence"
+                   else observation["availableCandidateSlots"])
     require((plan["decision"] in ["await_external", "observe_active"] and not experiments) or
-            (plan["decision"] == "experiments" and 1 <= len(experiments) <= capacity), "PLAN_CAPACITY")
+            (plan["decision"] in ["experiments", "repair_evidence"] and 1 <= len(experiments) <= capacity), "PLAN_CAPACITY")
     if observation.get("diagnosticOnly"):
         require(plan["decision"] == "observe_active" and any(r["occurrenceId"] in plan["reason"]
                 for r in observation.get("active", [])), "LIVE_OWNER_DIAGNOSIS_ONLY")
@@ -245,6 +305,9 @@ def validate_plan(plan, observation, config):
         require(exp["problem"] in PROBLEMS, "EXPERIMENT_SCOPE")
         source = catalog.get(exp["sourceArtifactId"])
         require(source and source["name"] == "candidate.py" and source["problem"] == exp["problem"], "SOURCE_SCOPE")
+        if plan["decision"] == "repair_evidence":
+            require(any(r["candidateArtifactId"] == exp["sourceArtifactId"] and r["problem"] == exp["problem"]
+                        for r in repairs), "REPAIR_SCOPE_NOT_AUTHORIZED")
         require(type(exp["hypothesis"]) is str and 20 <= len(exp["hypothesis"]) <= 1200, "HYPOTHESIS")
         require(type(exp["instructions"]) is str and 50 <= len(exp["instructions"]) <= 12000, "INSTRUCTIONS")
     return plan
@@ -303,7 +366,8 @@ class Watchdog:
     def control(self):
         value = self.client.request("GET", "/api/cycles/" + self.config["controlCycleId"])
         require(value["cycle"]["id"] == self.config["controlCycleId"] and
-                digest(value["cycle"]["definition"]) == self.config["controlDefinitionSHA256"], "CONTROL_CHANGED")
+                digest(value["cycle"]["definition"]) == self.config["controlDefinitionSHA256"] and
+                ("controlVersion" not in self.config or value["cycle"].get("version") == self.config["controlVersion"]), "CONTROL_CHANGED")
         return value
 
     def find_post(self, kind, cycle_id, key):
@@ -405,16 +469,123 @@ class Watchdog:
             jobs.append({k: row[k] for k in ["id", "problem", "sourceSHA256"]})
         return jobs
 
+    def auto_check_diagnostics(self, catalog, details, tested):
+        path = self.config.get("autoCheckStatusPath")
+        if not path or not pathlib.Path(path).exists():
+            return {"controllerState": "not_registered", "outcomes": [], "repairableEvidence": []}
+        policy_raw = protected_bytes(self.config.get("autoCheckPolicyPath", ""), 262144)
+        policy = json.loads(policy_raw)
+        status = json.loads(protected_bytes(path, 262144))
+        require(policy.get("version") == status.get("version") == 1
+                and policy.get("authority") == "operator-delegated-diagnostic-check"
+                and policy.get("allowedActions") == ["check"] and policy.get("automaticPostRetry") is False
+                and policy.get("watchId") == status.get("watchId") == self.config["watchId"]
+                and policy.get("controlCycleId") == self.config["controlCycleId"]
+                and policy.get("workspace") == self.config["workspace"]
+                and policy.get("model") == self.config["model"] and policy.get("accountId") == self.config["accountId"]
+                and set(policy.get("boards", {})).issubset(PROBLEMS) and policy.get("boards")
+                and status.get("policySHA256") == digest(policy_raw), "AUTO_CHECK_POLICY_BINDING")
+        config_ref, code_ref = policy.get("watcherConfig", {}), policy.get("watcherCode", {})
+        config_raw = protected_bytes(config_ref.get("path", ""), 262144)
+        code_raw = protected_bytes(code_ref.get("path", ""), 1048576)
+        require(digest(config_raw) == config_ref.get("sha256") and json.loads(config_raw) == self.config
+                and digest(code_raw) == code_ref.get("sha256") == digest(pathlib.Path(__file__).read_bytes()),
+                "AUTO_CHECK_WATCHER_BINDING")
+        require(type(status.get("observedAt")) in [int, float] and status["observedAt"] <= self.clock() + 5
+                and status.get("policyExpiresAt") == policy.get("expiresAt")
+                and type(status.get("outcomes")) is list, "AUTO_CHECK_STATUS_SCHEMA")
+        summary = {"controllerState": status.get("controllerState"), "policySHA256": digest(policy_raw),
+                   "outcomes": [], "repairableEvidence": []}
+        if self.clock() - status["observedAt"] > self.config["intervalSeconds"] * 3:
+            return {**summary, "controllerState": "observation_stale"}
+        if policy.get("expiresAt", 0) <= self.clock():
+            return {**summary, "controllerState": "policy_expired"}
+        repair_authority = policy.get("enabled") is True and status.get("controllerState") == "active"
+        if not repair_authority:
+            summary["controllerState"] = "inspection_only_policy_disabled" if policy.get("enabled") is not True else status.get("controllerState")
+        summary["repairAuthority"] = repair_authority
+        registered = {r["occurrenceId"]: r for r in self.state["experiments"]}
+        for row in status["outcomes"]:
+            oid = row.get("occurrenceId")
+            require(oid in registered and registered[oid]["problem"] == row.get("problem")
+                    and row["problem"] in policy["boards"], "AUTO_CHECK_OWNER_BINDING")
+            require(row.get("state") in ["await_native", "eligible", "check_running", "rejected_repairable",
+                    "quota_wait", "uncertain_owned", "paused", "controller_blocked", "observation_wait"], "AUTO_CHECK_STATE_UNKNOWN")
+            if oid not in details:
+                continue  # Own already-dispatched actions cannot invalidate a remaining approved action set.
+            item = {k: row.get(k) for k in ["occurrenceId", "problem", "candidateSHA256", "qaArtifactId", "qaSHA256",
+                                          "state", "jobId", "code"]}
+            summary["outcomes"].append(item)
+            if not repair_authority:
+                item["classification"] = "diagnostic_only"; continue
+            if row.get("candidateSHA256") in tested:
+                item["classification"] = "official_job_registered"; continue
+            if row["state"] != "rejected_repairable":
+                continue
+            require(row.get("jobId") is None and row.get("postAttempted") is not True,
+                    "AUTO_CHECK_UNCERTAIN_EFFECT")
+            detail = details[oid]
+            require(detail["occurrence"]["state"] == "completed" and confirmed_boundary(detail), "REPAIR_BOUNDARY_UNCONFIRMED")
+            source = next((r for r in catalog if r["occurrenceId"] == oid and r["digest"] == row.get("candidateSHA256")), None)
+            latest = {a["id"] for a in detail["attempts"] if any(s["id"] == a["step_id"]
+                      and s["attempt"] == a["number"] for s in detail["steps"])}
+            qa = next((a for a in detail["artifacts"] if a["id"] == row.get("qaArtifactId") and
+                       a["digest"] == row.get("qaSHA256") and a["name"] == "qa-verification.json"
+                       and a["attempt_id"] in latest), None)
+            require(source and qa, "REPAIR_ARTIFACT_BINDING")
+            repairs = [r for r in self.state["experiments"] if r.get("repairCandidateSHA256") == source["digest"]
+                       and r["problem"] == row["problem"] and r["occurrenceId"] in details]
+            if repairs and repairs[-1]["occurrenceId"] != oid:
+                item["classification"] = "superseded_by_native_repair"; continue
+            review = json.loads(self.verified_artifact(qa, 32768))
+            base = detail["occurrence"].get("input", {}).get("experiment", {}).get("sourceArtifact", {})
+            require(review.get("candidateSHA256") == source["digest"] and review.get("sourceSHA256") == base.get("digest")
+                    and bool(base.get("digest")), "REPAIR_SOURCE_LINEAGE")
+            code = row.get("code") or ""
+            semantic_failure = any(review.get(k) is False for k in ["passed", "scopePreserved", "cpuReplayPassed",
+                "canonicalPrecisionPreserved", "evaluatorIndependent", "upstreamAttributionPreserved"])
+            semantic_failure = semantic_failure or bool(review.get("blockingFindings"))
+            item["classification"] = "new_hypothesis_required" if semantic_failure or code in SEMANTIC_REJECTION_CODES else "diagnosis_required"
+            if code not in EVIDENCE_REPAIR_CODES or semantic_failure:
+                continue
+            producer_artifacts = [a for a in detail["artifacts"] if a["attempt_id"] in latest and
+                                  a["name"] in ["candidate.py", "implementation.patch", "cpu-checks.py", "cpu-result.json", "verification.json"]]
+            by_name = {a["name"]: a for a in producer_artifacts}
+            require(len(producer_artifacts) == len(by_name) == 5, "REPAIR_PRODUCER_EVIDENCE_SET")
+            require(len({a["attempt_id"] for a in producer_artifacts}) == 1 and qa["attempt_id"] not in
+                    {a["attempt_id"] for a in producer_artifacts}, "REPAIR_INDEPENDENT_LINEAGE")
+            canonical_patch, patch_proof = normalized_repair_patch(self.verified_artifact(base),
+                self.verified_artifact(by_name["candidate.py"]), self.verified_artifact(by_name["implementation.patch"]), row["problem"])
+            cpu = json.loads(self.verified_artifact(by_name["cpu-result.json"], 131072))
+            evidence = review.get("cpuEvidence") or {}
+            for container, key, expected in [(cpu, "candidateSHA256", source["digest"]),
+                    (cpu, "checkerSHA256", by_name["cpu-checks.py"]["digest"]),
+                    (evidence, "checkerSHA256", by_name["cpu-checks.py"]["digest"]),
+                    (evidence, "resultSHA256", by_name["cpu-result.json"]["digest"])]:
+                require(container.get(key) in [None, expected], "REPAIR_EVIDENCE_HASH_CONFLICT")
+            if cpu.get("passed") is not True:
+                item["classification"] = "new_hypothesis_required"; continue
+            if len(repairs) >= 2:
+                item["classification"] = "repair_exhausted"; continue
+            item["classification"] = "repair_evidence"
+            summary["repairableEvidence"].append({**item, "candidateArtifactId": source["id"],
+                "originalBaseArtifact": base, "producerArtifacts": producer_artifacts, "qaArtifact": qa,
+                "repairAttempt": len(repairs) + 1, "patchNormalization": patch_proof,
+                "canonicalPatch": {"sha256": digest(canonical_patch), "bytes": len(canonical_patch),
+                                   "base64": base64.b64encode(canonical_patch).decode()}})
+        return summary
+
     def observe(self, exclude_supervisor=None):
         records = [*self.config["seedOccurrences"], *[r for r in self.state["experiments"]
                    if r["supervisorOccurrenceId"] != exclude_supervisor]]
-        outcomes, catalog, active = [], [], []
+        outcomes, catalog, active, details, progress_epochs = [], [], [], {}, []
         registered_jobs = self.registered_jobs()
         tested = {job["sourceSHA256"] for job in registered_jobs}
         pending = set()
         for record in records:
             oid = record.get("occurrenceId", record.get("id"))
             detail = self.client.request("GET", "/api/cycle-runs/" + oid)
+            details[oid] = detail
             occurrence = detail["occurrence"]
             require(occurrence.get("id") == oid, "OCCURRENCE_IDENTITY")
             require(all(a["state"] in {"running", "completed", "failed", "cancelling", "reconciling"}
@@ -433,6 +604,7 @@ class Watchdog:
                 progress_at = latest_artifact["created_at"]
                 latest = {"id": "artifact:" + latest_artifact["id"], "kind": "ARTIFACT_CREATED", "created_at": progress_at}
             progress_epoch = dt.datetime.fromisoformat(progress_at.replace("Z", "+00:00")).timestamp() if progress_at else self.clock()
+            progress_epochs.append(progress_epoch)
             progress_ref = {"eventId": str(latest["id"]) if latest else None, "at": progress_at,
                             "kind": latest["kind"] if latest else "occurrence_created"}
             if occurrence["state"] in LIVE or live_attempts:
@@ -446,6 +618,11 @@ class Watchdog:
             artifacts, qa_reviews = [], []
             latest_attempts = {a["id"] for a in detail["attempts"] if any(
                 s["id"] == a["step_id"] and s["attempt"] == a["number"] for s in detail["steps"])}
+            if record.get("repairCandidateSHA256"):
+                for a in detail["artifacts"]:
+                    if a["attempt_id"] in latest_attempts and a["name"] in ["candidate.py", "implementation.patch"]:
+                        expected = record["repairCandidateSHA256"] if a["name"] == "candidate.py" else record["repairPatchSHA256"]
+                        require(a["digest"] == expected, "REPAIR_IMMUTABLE_ARTIFACT_CHANGED")
             for row in detail["artifacts"]:
                 if row["attempt_id"] not in latest_attempts:
                     continue
@@ -496,15 +673,24 @@ class Watchdog:
             require(digest(raw) == ref["sha256"], "COMPARISON_CONTEXT_CHANGED")
             comparison_context = json.loads(raw)
         slots = max(0, self.config["maxPendingCandidates"] - len(pending))
+        diagnostics = self.auto_check_diagnostics(catalog, details, tested)
+        for row in diagnostics["outcomes"]:
+            if row.get("classification") in ["repair_evidence", "new_hypothesis_required", "repair_exhausted"]:
+                pending.discard(row["candidateSHA256"])
+        slots = max(0, self.config["maxPendingCandidates"] - len(pending))
         material = {"outcomes": outcomes, "officialJobs": jobs, "availableCandidateSlots": slots,
-                    "pendingOfficialCandidateSHA256": sorted(pending)}
+                    "pendingOfficialCandidateSHA256": sorted(pending), "autoCheckDiagnostics": diagnostics}
         if comparison_context:
             material["comparisonContext"] = comparison_context
         fingerprint = digest(material)
         self.save()
+        active_progress = [dt.datetime.fromisoformat(r["progress"]["at"].replace("Z", "+00:00")).timestamp()
+                           for r in active if r["progress"].get("at")]
+        material_at = min(active_progress) if active_progress else max(progress_epochs, default=self.clock())
         return {**material, "catalog": catalog, "fingerprint": fingerprint, "active": active,
                 "pendingOfficialJobs": pending_jobs, "diagnosticOnly": bool(active),
-                "idleSeconds": max(0, int(self.clock() - self.state.get("lastDispatchAt", self.state["createdAt"])))}
+                "idleSeconds": max(0, int(self.clock() - material_at)),
+                "controllerDispatchAgeSeconds": max(0, int(self.clock() - self.state.get("lastDispatchAt", self.state["createdAt"])))}
 
     def submit_supervisor(self, observation):
         failures = [r for r in self.state["supervisions"] if r["fingerprint"] == observation["fingerprint"] and r["state"] == "failed"]
@@ -516,6 +702,16 @@ class Watchdog:
             ["outcomes", "catalog", "officialJobs", "availableCandidateSlots", "pendingOfficialCandidateSHA256", "active", "diagnosticOnly"]}}}
         body["input"]["priorDispatches"] = self.state["experiments"][-10:]
         body["input"]["outcomes"] = compact_outcomes(observation["outcomes"])
+        body["input"]["autoCheckDiagnostics"] = observation["autoCheckDiagnostics"]
+        body["input"]["autoCheckDiagnostics"] = {**observation["autoCheckDiagnostics"], "repairableEvidence": [
+            {k: v for k, v in row.items() if k not in ["producerArtifacts", "qaArtifact", "originalBaseArtifact", "canonicalPatch"]}
+            for row in observation["autoCheckDiagnostics"]["repairableEvidence"]]}
+        isolated = [r for r in observation["autoCheckDiagnostics"]["outcomes"] if r.get("classification") == "repair_exhausted"]
+        isolated_sha = {r["candidateSHA256"] for r in isolated}
+        body["input"]["catalog"] = [a for a in observation["catalog"] if a["digest"] not in isolated_sha]
+        body["input"]["isolatedCandidates"] = isolated
+        body["input"]["controllerDispatchAgeSeconds"] = observation["controllerDispatchAgeSeconds"]
+        body["input"]["materialAgeUsesPublishedArtifactsOnly"] = True
         if observation.get("comparisonContext"):
             body["input"]["comparisonContext"] = observation["comparisonContext"]
         body["input"]["interpretationRules"] = [
@@ -534,7 +730,8 @@ class Watchdog:
         self.state["supervisions"].append(record)
         self.state["lastDispatchAt"] = self.clock()
         self.save()
-        return self.status("supervisor_dispatched", occurrenceId=row["id"], trigger=body["input"]["trigger"], idleSeconds=observation["idleSeconds"])
+        return self.status("supervisor_dispatched", occurrenceId=row["id"], trigger=body["input"]["trigger"],
+                           idleSeconds=observation["idleSeconds"], isolatedCandidates=body["input"].get("isolatedCandidates", []))
 
     def material_packet(self, experiment, observation):
         source = next(row for row in observation["catalog"] if row["id"] == experiment["sourceArtifactId"])
@@ -553,6 +750,10 @@ class Watchdog:
                 "hypothesis": experiment["hypothesis"], "instructions": experiment["instructions"]}
 
     def dispatch_experiment(self, experiment, observation, supervisor):
+        repair = None
+        if supervisor["approvedPlan"]["decision"] == "repair_evidence":
+            repair = next(r for r in observation["autoCheckDiagnostics"]["repairableEvidence"]
+                          if r["candidateArtifactId"] == experiment["sourceArtifactId"])
         producer = COMMON + """Read input.experiment. Implement exactly its bounded hypothesis against
 base-candidate.py. Publish candidate.py, implementation.patch, cpu-checks.py,
 cpu-result.json and verification.json. verification must state sourceSHA256,
@@ -565,10 +766,12 @@ CPU tests must exercise the distinguishing arithmetic/indexing/dispatch behavior
 include a negative control, and report limitations. Do not import CUDA candidates on CPU.
 cpu-result.json must contain passed, candidateSHA256, checkerSHA256,
 cases [{name,passed}] and negativeControls [{name,detected}]. Execute the actual
-cpu-checks.py with python3 in one bash call that also prints the SHA256 of both
-cpu-checks.py and candidate.py (for example sha256sum ... && python3 ...).
-Use absolute paths in that exact command structure, not echo or a conditional skip.
-The call result must contain the two actual hashes and the replay's exit status;
+cpu-checks.py with this MANDATORY exact one-line bash structure:
+sha256sum ABS_CHECKER ABS_CANDIDATE && python3 ABS_CHECKER [args]
+Both checker paths must be identical absolute paths ending cpu-checks.py; candidate
+must be an absolute path ending candidate.py. No cd, newline, echo, redirection,
+conditional skip or appended exit-status command. The tool supplies the exit status.
+The call result must contain the two actual hashes and successful replay status;
 record results truthfully. Passing requires every case and negative control to pass.
 """
         qa = COMMON + """Independently read the actual predecessor candidate, patch and checks.
@@ -583,9 +786,32 @@ upstreamAttributionPreserved, blockingFindings (array), and cpuEvidence containi
 checkerSHA256, resultSHA256, cases [{name,passed}] and negativeControls [{name,detected}].
 Derive these from the actual replay and file bytes; never invent tool-call IDs or attestations.
 Replay the actual predecessor cpu-checks.py with python3 in one bash call that
-prints its SHA256 and candidate.py SHA256. The call's output must include both
-actual hashes and exit status. Bind cpuEvidence.resultSHA256 to the actual
+uses exactly: sha256sum ABS_CHECKER ABS_CANDIDATE && python3 ABS_CHECKER [args]
+Both checker paths are the same absolute cpu-checks.py path, and candidate is the
+absolute candidate.py path. One line; no cd, newline, echo, redirection or appended
+exit-status command. The tool supplies exit status. Both real hashes must appear.
+Bind cpuEvidence.resultSHA256 to the actual
 predecessor cpu-result.json and repeat its cases/negativeControls only if replayed.
+"""
+        if repair:
+            producer += """\nEVIDENCE REPAIR OVERRIDES CODE IMPLEMENTATION: input.experiment.repairTarget
+contains immutable candidate.py, original implementation.patch and previous CPU
+evidence from one confirmed original producer attempt. Copy candidate EXACTLY and
+publish the supplied canonicalPatch EXACTLY as implementation.patch. The controller
+may normalize only approved transport headers and has already applied every hunk
+in memory to prove the same candidate. Preserve original patch bytes in the inputs;
+do not change kernel code, base source, attribution or the supplied canonical patch.
+Reuse the prior
+checker as evidence to inspect, not proof of success. Correct only checker/replay,
+schema and provenance evidence identified by the bound adapter code. Re-run actual
+checks with the mandatory command above. If a semantic/numerical defect appears,
+report it and fail; do not convert that defect into a successful metadata repair.
+Publish all normal producer outputs; sourceSHA256 still binds the original base.
+"""
+            qa += """\nThis is evidence-only repair. Independently verify candidate and patch bytes
+equal repairTarget candidate and canonicalPatch before replay. Verify the header-only
+normalization proof preserves all hunks and original patch provenance. Any kernel difference fails this action.
+Do not copy former attestations; inspect precision, attribution and replay yourself.
 """
         steps = [native_step(self.config, "produce", "Implementar experiência: " + experiment["id"], producer,
                  ["candidate.py", "implementation.patch", "cpu-checks.py", "cpu-result.json", "verification.json"]),
@@ -599,7 +825,19 @@ predecessor cpu-result.json and repeat its cases/negativeControls only if replay
                                      "field": field, "equals": value} for field, value in fields.items())
         d = definition(self.config, "OpenKernel — " + experiment["id"], steps)
         key = self.config["watchId"] + "-experiment-" + digest([supervisor["occurrenceId"], experiment])[:32]
-        packet = self.material_packet(experiment, observation)
+        packet = self.material_packet(experiment if not repair else {**experiment,
+            "sourceArtifactId": repair["originalBaseArtifact"]["id"]}, observation)
+        if repair:
+            artifacts = repair["producerArtifacts"]
+            packet["repairTarget"] = {"occurrenceId": repair["occurrenceId"], "candidateSHA256": repair["candidateSHA256"],
+                "qaArtifactId": repair["qaArtifactId"], "qaSHA256": repair["qaSHA256"], "code": repair["code"],
+                "canonicalPatch": repair["canonicalPatch"], "patchNormalization": repair["patchNormalization"],
+                "materials": [{"name": a["name"], "artifactId": a["id"], "attemptId": a["attempt_id"],
+                    "sha256": a["digest"], "bytes": a["size"], "base64": base64.b64encode(self.verified_artifact(a)).decode()}
+                    for a in artifacts]}
+            for step, name in [(steps[0], "verification.json"), (steps[1], "qa-verification.json")]:
+                step["criteria"].append({"id": "immutable-repair-candidate", "label": "Preserve original candidate bytes",
+                    "type": "json_field", "name": name, "field": "candidateSHA256", "equals": repair["candidateSHA256"]})
         created = self.post_once("create", key, {"requestKey": key, "definition": d})
         body = {"requestKey": key + "-run", "input": {"version": 1, "watchId": self.config["watchId"],
             "supervisorOccurrenceId": supervisor["occurrenceId"], "evidenceFingerprint": observation["fingerprint"],
@@ -608,6 +846,11 @@ predecessor cpu-result.json and repeat its cases/negativeControls only if replay
         row = self.post_once("run", key + "-run", body, created["id"])
         record = {"occurrenceId": row["id"], "cycleId": created["id"], "problem": experiment["problem"],
                   "supervisorOccurrenceId": supervisor["occurrenceId"], "experimentId": experiment["id"]}
+        if repair:
+            record.update({"repairOf": repair["occurrenceId"], "repairCandidateSHA256": repair["candidateSHA256"],
+                "repairCode": repair["code"], "repairAttempt": repair["repairAttempt"],
+                "repairPatchSHA256": repair["canonicalPatch"]["sha256"],
+                "repairOriginalPatchSHA256": repair["patchNormalization"]["originalPatchSHA256"]})
         if not any(r["occurrenceId"] == row["id"] for r in self.state["experiments"]):
             self.state["experiments"].append(record)
         self.state["lastDispatchAt"] = self.clock()
@@ -624,10 +867,12 @@ predecessor cpu-result.json and repeat its cases/negativeControls only if replay
         dispatched = [self.dispatch_experiment(exp, observation, pending) for exp in plan["experiments"]]
         pending.update({"state": "consumed", "decision": plan["decision"], "reason": plan["reason"]})
         self.state["outcomes"][pending["fingerprint"]] = {"supervisorOccurrenceId": pending["occurrenceId"],
-            "decision": plan["decision"], "reason": plan["reason"], "dispatched": dispatched}
+            "decision": plan["decision"], "reason": plan["reason"], "dispatched": dispatched,
+            "isolatedCandidates": pending["input"].get("isolatedCandidates", [])}
         self.save()
         return self.status("experiments_dispatched" if dispatched else "active_owner_preserved" if plan["decision"] == "observe_active" else "awaiting_external", dispatched=dispatched,
-                           supervisorOccurrenceId=pending["occurrenceId"], reason=plan["reason"])
+                           supervisorOccurrenceId=pending["occurrenceId"], reason=plan["reason"],
+                           isolatedCandidates=pending["input"].get("isolatedCandidates", []))
 
     def tick(self):
         if self.control()["cycle"]["state"] != "active":
