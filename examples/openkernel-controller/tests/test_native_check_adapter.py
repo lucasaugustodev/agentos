@@ -267,6 +267,45 @@ class Fixture(unittest.TestCase):
         self.put(path, self.source)
         with self.assertRaisesRegex(ValueError, "ARTIFACT_BYTES_CHANGED"): self.audit.audit(OCC)
 
+    def test_optional_empty_workspace_patches_preserve_full_audit(self):
+        for attempt in IDS:
+            for name in ("changes.patch", "extra.log"):
+                row = self.artifact(name, b"", attempt)
+                self.detail["artifacts"].append(row)
+                if attempt == IDS[0]:
+                    path = pathlib.Path(self.paths["workerRunsDirectory"]) / IDS[1] / "home/inputs" / row["id"] / row["name"]
+                    self.put(path, b"")
+        result = self.lane.run(OCC, "inspect")
+        self.assertEqual(result["state"], "eligible")
+        self.assertEqual(self.official.posts, 0)
+
+    def test_empty_mandatory_or_arbitrary_artifact_rejected(self):
+        for name in (*A.PRODUCER_FILES, *A.QA_FILES, "other.patch"):
+            with self.subTest(name=name):
+                row = self.artifact(name, b"")
+                with self.assertRaisesRegex(ValueError, "ARTIFACT_SIZE"): self.audit.artifact(row)
+
+    def test_empty_workspace_patch_requires_real_empty_digest(self):
+        row = self.artifact("changes.patch", b"")
+        row["digest"] = A.digest(self.candidate)
+        with self.assertRaisesRegex(ValueError, "ARTIFACT_BYTES_CHANGED"): self.audit.artifact(row, allow_empty=True)
+
+    def test_empty_workspace_patch_bytes_still_verified(self):
+        row = self.artifact("changes.patch", b"")
+        self.put(pathlib.Path(self.paths["artifactDirectory"]) / row["digest"], b"tampered")
+        with self.assertRaisesRegex(ValueError, "ARTIFACT_BYTES_CHANGED"): self.audit.artifact(row, allow_empty=True)
+
+    def test_audit_never_marks_required_evidence_optional(self):
+        for attempt, required in ((IDS[0], A.PRODUCER_FILES), (IDS[1], A.QA_FILES)):
+            for name in required:
+                row = next(r for r in self.detail["artifacts"] if r["attempt_id"] == attempt and r["name"] == name)
+                original = copy.deepcopy(row)
+                row.update(size=0, digest=A.digest(b""))
+                self.put(pathlib.Path(self.paths["artifactDirectory"]) / A.digest(b""), b"")
+                with self.subTest(name=name), self.assertRaisesRegex(ValueError, "ARTIFACT_SIZE"):
+                    self.audit.audit(OCC)
+                row.clear(); row.update(original)
+
     def test_source_derivative_without_provenance_blocks(self):
         self.p["boards"][BOARD]["seedSources"] = {}
         with self.assertRaises(OSError): self.audit.audit(OCC)

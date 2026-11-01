@@ -247,9 +247,13 @@ class NativeAudit:
         self.artifacts = pathlib.Path(policy["artifactDirectory"])
         self.runs = pathlib.Path(policy["workerRunsDirectory"])
 
-    def artifact(self, row):
+    def artifact(self, row, *, allow_empty=False):
         require(UUID.fullmatch(row.get("id", "")) and SHA.fullmatch(row.get("digest", "")), "ARTIFACT_IDENTITY")
-        require(type(row.get("size")) is int and 0 < row["size"] <= 1024 * 1024, "ARTIFACT_SIZE")
+        # Only the trusted audit loop can allow empty optional attachments.
+        # Required acceptance evidence and source lookups remain nonempty.
+        # Empty content still has to match its real size and SHA256 below.
+        require(type(row.get("size")) is int and (0 < row["size"] <= 1024 * 1024
+                or row["size"] == 0 and allow_empty is True), "ARTIFACT_SIZE")
         raw = self.io.read_regular(self.artifacts / row["digest"], 1024 * 1024)
         require(len(raw) == row["size"] and digest(raw) == row["digest"], "ARTIFACT_BYTES_CHANGED")
         return raw
@@ -335,7 +339,7 @@ class NativeAudit:
             files[key], artifacts[key] = {}, rows
             for row in rows:
                 require(re.fullmatch(r"[\w][\w.-]{0,160}", row["name"]), "ARTIFACT_NAME")
-                data = self.artifact(row)
+                data = self.artifact(row, allow_empty=row["name"] not in required)
                 files[key][row["name"]] = data
                 frozen[key + "--" + row["name"]] = data
             transcript = self.io.read_regular(home / "sessions" / "--workspace--" / a["id"] / "session.v3.jsonl", 24 * 1024 * 1024)
