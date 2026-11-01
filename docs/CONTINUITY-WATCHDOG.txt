@@ -244,3 +244,24 @@ predecessor. The alias requires matching persisted repair identity, original bas
 candidate, patch proof, input scope and predecessor artifacts. Missing or conflicting
 links retain conservative accounting. Equal bytes alone never merge actors, and
 two actual repair actors continue to occupy two native slots.
+
+Evidence repair carries the complete previous qa-verification.json in
+input.experiment.repairQADiagnostic, separate from repairTarget and the canonical
+materials list. The report is limited to32KiB and byte-checked against its artifact
+size/SHA. Its current native QA step, attempt, fence, confirmed stop, candidate and
+base must match; the runtime manifest must bind that occurrence/step/attempt/fence.
+cycleInputSHA256 is the digest recorded in that authenticated manifest, not an
+independent rehash of the task-input file in this context helper.
+
+The envelope explicitly says prior_qa_diagnostic_only_not_current_acceptance and
+currentAcceptance:false. All report fields and ordered arrays are preserved as
+historical data. They grant no permission, scope change or acceptance, and cannot
+replace the repair's own replay and independent QA. The planner already receives
+the prior review; this additional complete worker diagnostic is omitted from its
+compact repair summary. It remains included in the board's evidence binding.
+
+Only newly dispatched repairs receive this context. Existing native inputs,
+definitions and uncertain create/run receipts remain unchanged. Qualification
+includes119 server-only tests, with a causal handoff failure on the previous code,
+artifact/hash/size and candidate/attempt/fence counterexamples, unchanged replay
+instructions/materials/criteria, and the existing ownership/reconciliation tests.

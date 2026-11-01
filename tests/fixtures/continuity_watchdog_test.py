@@ -419,6 +419,10 @@ class WatchTests(unittest.TestCase):
                                 'definition': defs['independent-qa']})
         detail['attempts'].append({'id': aid, 'step_id': sid, 'number': 1, 'state': 'completed',
             'finished_at': '2026-11-01T18:00:00Z', 'fence': uid(), 'receipt': {'stopped': True}})
+        attempt = detail['attempts'][-1]
+        attempt['context'] = {'manifest': {'cycleId': detail['occurrence']['cycle_id'],
+            'occurrenceId': oid, 'step': 'independent-qa', 'cycleInput': {
+                'attemptId': aid, 'occurrenceId': oid, 'runFence': attempt['fence'], 'digest': 'a' * 64}}}
         qa['attempt_id'] = aid
         return {'occurrenceId': oid, 'problem': 'muse_decode_layer', 'candidateSHA256': W.digest(candidate),
                 'qaArtifactId': qa['id'], 'qaSHA256': qa['digest'], 'state': 'rejected_repairable',
@@ -588,6 +592,86 @@ class WatchTests(unittest.TestCase):
         self.assertEqual(len(owners), 2)
         self.assertEqual({x['occurrenceIds'][0] for x in owners}, {record['occurrenceId'], other['id']})
         self.assertEqual(observation['eligibleProblems'], [])
+
+    def prior_qa_diagnostic_fixture(self):
+        status = self.repairable_operation()
+        detail = self.client.occurrences[status['occurrenceId']]
+        qa = next(a for a in detail['artifacts'] if a['name'] == 'qa-verification.json')
+        value = json.loads(self.client.artifacts[qa['id']])
+        value.update(findings=[{'id': 'details-contamination', 'text': 'Mutants overwrite original-case diagnostics.'}],
+            limitations=['CPU-only; GPU correctness and speed unmeasured.'],
+            cpuEvidence={'cases': [{'name': 'coverage', 'passed': True, 'problems': []}],
+                         'negativeControls': [{'name': 'mutant', 'detected': True, 'note': {'missing': 16}}]})
+        raw = W.canonical(value); self.client.artifacts[qa['id']] = raw
+        qa.update(digest=W.digest(raw), size=len(raw)); status['qaSHA256'] = qa['digest']
+        self.install_diagnostic_fixture([status])
+        latest = {a['id'] for a in detail['attempts']}
+        return status, detail, qa, latest, value
+
+    def test_repair_delivers_complete_prior_qa_as_separate_diagnostic_not_acceptance(self):
+        status, original, qa, _, report = self.prior_qa_diagnostic_fixture()
+        before = copy.deepcopy(original)
+        self.assertEqual(self.submit_repair_plan()['state'], 'experiments_dispatched')
+        review = self.w.state['supervisions'][-1]['input']
+        self.assertNotIn('repairQADiagnostic', review['autoCheckDiagnostics']['repairableEvidence'][0])
+        detail = self.client.occurrences[self.w.state['experiments'][-1]['occurrenceId']]
+        packet = detail['occurrence']['input']['experiment']; diagnostic = packet['repairQADiagnostic']
+        self.assertEqual(diagnostic['report'], report)
+        self.assertEqual(diagnostic['artifact'], {k: qa[k] for k in ['id', 'name', 'digest', 'size']})
+        self.assertEqual(diagnostic['candidateSHA256'], status['candidateSHA256'])
+        self.assertEqual(diagnostic['attemptId'], qa['attempt_id'])
+        attempt = next(a for a in original['attempts'] if a['id'] == qa['attempt_id'])
+        self.assertEqual(diagnostic['runFence'], attempt['fence'])
+        self.assertEqual(diagnostic['authority'], 'prior_qa_diagnostic_only_not_current_acceptance')
+        self.assertIs(diagnostic['currentAcceptance'], False)
+        self.assertEqual({a['name'] for a in packet['materials']},
+                         {'base-candidate.py', 'canonical-TASK.md', 'canonical-AGENTS.md'})
+        self.assertEqual(len(packet['repairTarget']['materials']), 5)
+        self.assertNotIn('repairQADiagnostic', packet['repairTarget'])
+        self.assertEqual(original, before)
+        for step in detail['occurrence']['definition']['steps']:
+            self.assertIn('repairQADiagnostic', step['instructions'])
+            self.assertIn('sha256sum ABS_CHECKER ABS_CANDIDATE && python3 ABS_CHECKER', step['instructions'])
+        self.assertEqual([s['key'] for s in detail['occurrence']['definition']['steps']], ['produce', 'independent-qa'])
+        self.assertEqual(detail['occurrence']['definition']['allowedActions'], [])
+
+    def test_prior_qa_diagnostic_rejects_artifact_hash_and_size_before_dispatch(self):
+        status, detail, qa, latest, _ = self.prior_qa_diagnostic_fixture()
+        for field, value, code in [('digest', 'f' * 64, 'ARTIFACT_CORRUPT'),
+                                   ('size', 32769, 'REPAIR_QA_DIAGNOSTIC_SIZE')]:
+            row = {**qa, field: value}; posts = len(self.client.posts)
+            with self.assertRaisesRegex(ValueError, code):
+                self.w.repair_qa_diagnostic(detail, row, status['problem'], latest, status['candidateSHA256'])
+            self.assertEqual(len(self.client.posts), posts)
+
+    def test_prior_qa_diagnostic_rejects_candidate_attempt_and_fence_substitution(self):
+        status, detail, qa, latest, _ = self.prior_qa_diagnostic_fixture()
+        for mutation, code in [('candidate', 'REPAIR_QA_CANDIDATE_BINDING'),
+                               ('attempt', 'QA_CONTEXT_ATTEMPT'), ('fence', 'REPAIR_QA_MANIFEST_BINDING'),
+                               ('manifest-attempt', 'REPAIR_QA_MANIFEST_BINDING'),
+                               ('manifest-occurrence', 'REPAIR_QA_MANIFEST_BINDING'),
+                               ('manifest-step', 'REPAIR_QA_MANIFEST_BINDING')]:
+            with self.subTest(mutation=mutation):
+                d, row, wanted = copy.deepcopy(detail), dict(qa), status['candidateSHA256']
+                a = next(a for a in d['attempts'] if a['id'] == row['attempt_id'])
+                m = a['context']['manifest']
+                if mutation == 'candidate': wanted = 'f' * 64
+                elif mutation == 'attempt': row['attempt_id'] = uid()
+                elif mutation == 'fence': a['fence'] = uid()
+                elif mutation == 'manifest-attempt': m['cycleInput']['attemptId'] = uid()
+                elif mutation == 'manifest-occurrence': m['occurrenceId'] = uid()
+                else: m['step'] = 'produce'
+                with self.assertRaisesRegex(ValueError, code):
+                    self.w.repair_qa_diagnostic(d, row, status['problem'], latest, wanted)
+
+    def test_prior_qa_diagnostic_cannot_promote_unstopped_or_obsolete_qa_attempt(self):
+        status, detail, qa, latest, _ = self.prior_qa_diagnostic_fixture()
+        for mutation, code in [('stop', 'QA_CONTEXT_STOP_UNCONFIRMED'), ('obsolete', 'QA_CONTEXT_STEP_BINDING')]:
+            d = copy.deepcopy(detail); a = next(a for a in d['attempts'] if a['id'] == qa['attempt_id'])
+            if mutation == 'stop': a['receipt']['stopped'] = False
+            else: next(s for s in d['steps'] if s['id'] == a['step_id'])['attempt'] += 1
+            with self.assertRaisesRegex(ValueError, code):
+                self.w.repair_qa_diagnostic(d, qa, status['problem'], latest, status['candidateSHA256'])
 
     def test_existing_native_definition_and_input_are_reconciled_without_reformulation(self):
         legacy = W.definition(self.config, 'Already dispatched experiment', [
