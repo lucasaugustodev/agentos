@@ -358,3 +358,26 @@ bindings and unavailable artifact reads yield an occurrence-local diagnostic;
 unrelated boards remain observable and eligible. Existing persisted review
 requests and uncertain POST receipts are reconciled without rewriting their
 original input or adding new diagnostics retroactively.
+Evidence-repair ingestion has a separate raw/semantic size contract. Only the
+already authenticated producer cpu-result.json selected for a permitted repair
+may be read up to 256 KiB. Its original size and SHA must match. UTF-8 JSON is parsed
+without duplicate keys or nonfinite numbers, and the COMPLETE compact JSON must
+still fit 128 KiB. No fields, diagnostics, controls or ordered arrays are removed.
+Invalid envelopes remain local to that repair. The raw artifact stays unchanged
+in repairTarget.materials; this read path cannot accept a delivery or GPU check.
+
+Future repair instructions require a compact newly generated CPU report, fresh
+checker/result hashes and actual independent replay, preserving the exact kernel
+candidate and canonical patch. QA must retain its full findings and the complete
+case/control rows in a compact report within its unchanged 32 KiB limit. Existing
+inputs, definitions, intent identities, generic artifact limits, executionEvidence
+limits and official adapter rules are unchanged.
+
+Payload sizing for this revision is qualification evidence, not a new runtime
+guard or dependency. The isolated qualification measures the constructed request
+bodies with the Python serializer used by Client.request, and separately measures
+body.input using Node's JSON.stringify as runCycleAgent does for cycle-input.json.
+The full repair packet must remain below the adapter's 2 MiB input bound and the
+API's 3 MiB body bound. A generic preflight needs durable prepared create/run bodies
+and recovery of those exact bytes before new validation; it is separate work and
+must not prevent GET-only reconciliation or discard an unstarted valid remainder.

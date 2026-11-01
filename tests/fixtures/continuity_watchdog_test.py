@@ -726,8 +726,102 @@ class WatchTests(unittest.TestCase):
         self.client.artifacts[row['id']] = raw; row.update(digest=W.digest(raw), size=len(raw))
         observation = self.w.observe(); diagnostics = observation['autoCheckDiagnostics']
         self.assertEqual(diagnostics['repairableEvidence'], [])
-        self.assertEqual(diagnostics['outcomes'][0]['repairContextCode'], 'ARTIFACT_SIZE')
+        self.assertEqual(diagnostics['outcomes'][0]['repairContextCode'], 'REPAIR_CPU_LOGICAL_SIZE')
         self.assertIn('muse_prefill_layer', observation['eligibleProblems'])
+
+    def replace_repair_cpu(self, status, raw):
+        detail = self.client.occurrences[status['occurrenceId']]
+        row = next(a for a in detail['artifacts'] if a['name'] == 'cpu-result.json')
+        self.client.artifacts[row['id']] = raw; row.update(digest=W.digest(raw), size=len(raw))
+        return row
+
+    def test_formatting_heavy_repair_preserves_all_original_material_bytes(self):
+        status = self.repairable_operation(); detail = self.client.occurrences[status['occurrenceId']]
+        checker = next(a for a in detail['artifacts'] if a['name'] == 'cpu-checks.py')
+        report = {'passed': True, 'candidateSHA256': status['candidateSHA256'], 'checkerSHA256': checker['digest'],
+            'cases': [{'name': 'coverage', 'passed': True, 'problems': []}],
+            'negativeControls': [{'name': 'mutant', 'detected': True, 'note': {'missing': 16}}],
+            'details': {'complete': ['all values', True, 19, 0.125, None]}, 'limitations': ['CPU only.']}
+        raw = json.dumps(report, indent=2).encode() + b' ' * 140000
+        cpu = self.replace_repair_cpu(status, raw)
+        before = copy.deepcopy(detail); original_artifacts = dict(self.client.artifacts)
+        self.assertGreater(len(raw), 131072); self.assertLess(len(raw), 262144)
+        with self.assertRaisesRegex(ValueError, 'ARTIFACT_SIZE'):
+            self.w.verified_artifact(cpu, 131072)  # Generic and execution-evidence caps stay unchanged.
+        outcome = self.w.execution_evidence(detail)
+        self.assertEqual(outcome['code'], 'ARTIFACT_SIZE')
+        self.assertEqual(len(self.w.observe()['autoCheckDiagnostics']['repairableEvidence']), 1)
+        self.assertEqual(self.w.repair_cpu_report(cpu), report)
+        self.assertEqual(self.submit_repair_plan()['state'], 'experiments_dispatched')
+        new = self.client.occurrences[self.w.state['experiments'][-1]['occurrenceId']]['occurrence']
+        target = new['input']['experiment']['repairTarget']
+        for material in target['materials']:
+            source = next(a for a in before['artifacts'] if a['id'] == material['artifactId'])
+            self.assertEqual(W.base64.b64decode(material['base64']), original_artifacts[source['id']])
+            self.assertEqual(material['sha256'], source['digest']); self.assertEqual(material['bytes'], source['size'])
+        self.assertEqual(json.loads(W.base64.b64decode(next(m for m in target['materials'] if m['name'] == 'cpu-result.json')['base64'])), report)
+        self.assertEqual(detail, before)
+        self.assertFalse(new['input']['officialActionsAllowed'])
+        self.assertFalse(new['input']['experiment']['repairQADiagnostic']['currentAcceptance'])
+        producer, qa = new['definition']['steps']
+        self.assertIn('Rehash the edited checker and new result', producer['instructions'])
+        self.assertIn('Preserve every field, ordered array', producer['instructions'])
+        self.assertIn('COMPLETE cases and negativeControls', qa['instructions'])
+        self.assertIn('32768 bytes', qa['instructions'])
+
+    def test_repair_cpu_raw_and_logical_limits_are_independent_and_inclusive(self):
+        status = self.repairable_operation()
+        logical = b'{"passed":true,"padding":"' + b'x' * (131072 - len(b'{"passed":true,"padding":""}')) + b'"}'
+        row = self.replace_repair_cpu(status, logical + b' ' * (262144 - len(logical)))
+        self.assertEqual(len(W.canonical(self.w.repair_cpu_report(row))), 131072)
+        for raw, code in [(logical + b' ' * (262145 - len(logical)), 'ARTIFACT_SIZE'),
+                          (logical.replace(b'"padding":"', b'"padding":"x'), 'REPAIR_CPU_LOGICAL_SIZE')]:
+            row = self.replace_repair_cpu(status, raw)
+            with self.assertRaisesRegex(ValueError, code): self.w.repair_cpu_report(row)
+
+    def test_repair_cpu_rejects_duplicate_nonfinite_and_corrupt_bytes_locally(self):
+        status = self.repairable_operation(); self.add_seed('muse_prefill_layer')
+        self.install_diagnostic_fixture([status]); posts = len(self.client.posts)
+        for raw, code in [(b'{"passed":false,"passed":true}', 'REPAIR_CPU_DUPLICATE_JSON_KEY'),
+                (b'{"passed":true,"nested":{"x":1,"x":2}}', 'REPAIR_CPU_DUPLICATE_JSON_KEY'),
+                *[(b'{"passed":true,"value":' + n + b'}', 'REPAIR_CPU_NONFINITE_JSON')
+                  for n in [b'NaN', b'Infinity', b'-Infinity', b'1e999']]]:
+            with self.subTest(raw=raw):
+                self.replace_repair_cpu(status, raw)
+                observation = self.w.observe(); diagnostics = observation['autoCheckDiagnostics']
+                self.assertEqual(diagnostics['repairableEvidence'], [])
+                self.assertEqual(diagnostics['outcomes'][0]['repairContextCode'], code)
+                self.assertIn('muse_prefill_layer', observation['eligibleProblems'])
+                self.assertEqual(len(self.client.posts), posts)
+        for change in ['hash', 'size']:
+            row = self.replace_repair_cpu(status, b'{"passed":true}')
+            row.update({'digest': 'f' * 64} if change == 'hash' else {'size': row['size'] + 1})
+            with self.assertRaisesRegex(ValueError, 'ARTIFACT_CORRUPT'): self.w.repair_cpu_report(row)
+        self.assertEqual(self.w.tick()['state'], 'supervisor_dispatched')
+        self.complete_review(self.plan())
+        self.assertEqual(self.w.tick()['state'], 'experiments_dispatched')
+        self.assertEqual(self.w.state['experiments'][-1]['problem'], 'muse_prefill_layer')
+
+    def test_repair_cpu_cannot_hide_candidate_checker_or_qa_hash_conflict(self):
+        status = self.repairable_operation(); self.add_seed('muse_prefill_layer')
+        self.install_diagnostic_fixture([status])
+        for field in ['candidateSHA256', 'checkerSHA256']:
+            self.replace_repair_cpu(status, W.canonical({'passed': True, field: 'f' * 64}))
+            observation = self.w.observe(); diagnostics = observation['autoCheckDiagnostics']
+            self.assertFalse(diagnostics['repairableEvidence'])
+            self.assertEqual(diagnostics['outcomes'][0]['repairContextCode'], 'REPAIR_EVIDENCE_HASH_CONFLICT')
+            self.assertIn('muse_prefill_layer', observation['eligibleProblems'])
+        self.replace_repair_cpu(status, b'{"passed":true}')
+        qa = next(a for a in self.client.occurrences[status['occurrenceId']]['artifacts'] if a['name'] == 'qa-verification.json')
+        original = json.loads(self.client.artifacts[qa['id']])
+        for field in ['checkerSHA256', 'resultSHA256']:
+            report = {**original, 'cpuEvidence': {field: 'f' * 64}}
+            raw = W.canonical(report); self.client.artifacts[qa['id']] = raw
+            qa.update(digest=W.digest(raw), size=len(raw)); status['qaSHA256'] = qa['digest']
+            self.install_diagnostic_fixture([status])
+            diagnostics = self.w.observe()['autoCheckDiagnostics']
+            self.assertEqual(diagnostics['outcomes'][0]['repairContextCode'], 'REPAIR_EVIDENCE_HASH_CONFLICT')
+            self.assertFalse(diagnostics['repairableEvidence'])
 
     def test_untrusted_native_json_shapes_are_local_and_other_board_continues(self):
         status = self.repairable_operation(); self.add_seed('muse_prefill_layer')
