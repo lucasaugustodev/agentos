@@ -10,6 +10,7 @@ import argparse
 import ast
 import base64
 import datetime as dt
+import errno
 import fcntl
 import hashlib
 import importlib.util
@@ -620,7 +621,14 @@ def scan(lane, status_path, mode):
                                 "reconcile_existing_intent_never_post_again" if state == "uncertain_owned" else "await_controller_check")})
         except (ValueError, KeyError, OSError, TypeError, subprocess.TimeoutExpired) as error:
             code = str(error) if isinstance(error, ValueError) else type(error).__name__
-            status, remediation, job_id = "rejected_repairable", "supervisor_review_evidence_and_plan_native_correction", None
+            status, remediation, job_id = "controller_blocked", "repair_controller_without_replacing_candidate", None
+            if isinstance(error, OSError) and getattr(error, "errno", None) not in {errno.EROFS, errno.EACCES, errno.EPERM, errno.ENOSPC, errno.EDQUOT}:
+                status, remediation = "observation_wait", "retry_read_only_observation_preserve_owner"
+            elif isinstance(error, subprocess.TimeoutExpired):
+                status, remediation = "observation_wait", "retry_read_only_observation_preserve_owner"
+            elif isinstance(error, ValueError) and (code.startswith(("CPU_", "QA_", "PATCH_"))
+                    or code in {"NO_CANDIDATE_CHANGE", "SOURCE_REQUIRES_MANUAL_REVIEW"}):
+                status, remediation = "rejected_repairable", "supervisor_review_evidence_and_plan_native_correction"
             if code == "NATIVE_NOT_COMPLETED": status, remediation = "await_native", "preserve_active_native_owner"
             elif code in {"CHECK_QUOTA", "POLICY_DAILY_BUDGET", "LOCAL_RATE_WAIT", "EXTERNAL_RATE_WAIT", "TRACK_CLOSED"}:
                 status, remediation = "quota_wait", "await_official_quota_or_rate_window"

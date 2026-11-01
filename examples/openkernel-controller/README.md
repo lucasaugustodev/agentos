@@ -176,8 +176,10 @@ diagnostic and does not pause CPU workers.
 The root-owned registry records the confirmed job plus immutable native/QA,
 policy, audit, dispatch and transport receipt hashes. The watchdog reads it and
 owns terminal GET observation. A separate status snapshot distinguishes
-`await_native`, `eligible`, `check_running`, `rejected_repairable`, `quota_wait`
-and `uncertain_owned`, bound to occurrence and candidate/QA hashes. The watchdog
+`await_native`, `eligible`, `check_running`, `rejected_repairable`, `quota_wait`,
+`uncertain_owned`, `controller_blocked` and `observation_wait`, bound to occurrence
+and candidate/QA hashes. Controller permissions/storage/configuration failures and
+read timeouts preserve the candidate and never request a kernel repair. The watchdog
 must consume repairable rejections and wake its supervisor before activation;
 installing a timer that merely logs those errors would recreate the pending-queue
 stall. Do not activate only half of this integration.

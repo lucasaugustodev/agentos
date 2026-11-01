@@ -2,6 +2,7 @@
 import base64
 import copy
 import difflib
+import errno
 import importlib.util
 import json
 import os
@@ -358,7 +359,7 @@ class Fixture(unittest.TestCase):
         self.detail["occurrence"]["state"] = "completed"
         self.detail["attempts"][0]["receipt"]["stopped"] = False
         row = A.scan(self.lane, status, "inspect")["outcomes"][0]
-        self.assertEqual(row["state"], "rejected_repairable")
+        self.assertEqual(row["state"], "controller_blocked")
         self.assertEqual(row["candidateSHA256"], A.digest(self.candidate))
         self.detail["attempts"][0]["receipt"]["stopped"] = True
         self.assertEqual(A.scan(self.lane, status, "inspect")["outcomes"][0]["state"], "eligible")
@@ -401,6 +402,43 @@ class Fixture(unittest.TestCase):
             status = A.scan(self.lane, self.root / "status.json", "check")
         self.assertTrue(status["scanBudgetExhausted"])
         self.assertEqual(self.official.posts, 0)
+
+    def test_readonly_account_lock_is_controller_failure_not_kernel_repair(self):
+        original = A.os.open
+        def readonly_lock(path, flags, *args, **kwargs):
+            if pathlib.Path(path) == pathlib.Path(self.paths["accountLock"]) and flags & os.O_RDWR:
+                raise OSError(errno.EROFS, "Read-only file system")
+            return original(path, flags, *args, **kwargs)
+        with mock.patch.object(A.os, "open", side_effect=readonly_lock):
+            row = A.scan(self.lane, self.root / "status.json", "check")["outcomes"][0]
+        self.assertEqual(row["state"], "controller_blocked")
+        self.assertEqual(row["proposedRemediation"], "repair_controller_without_replacing_candidate")
+        self.assertEqual(row["candidateSHA256"], A.digest(self.candidate))
+        self.assertEqual(self.official.posts, 0)
+
+    def test_observation_timeout_preserves_owner(self):
+        self.runtime.api = mock.Mock(side_effect=TimeoutError("read timed out"))
+        row = A.scan(self.lane, self.root / "status.json", "check")["outcomes"][0]
+        self.assertEqual(row["state"], "observation_wait")
+        self.assertEqual(self.official.posts, 0)
+
+    def test_semantic_rejection_remains_repairable(self):
+        self.audit.audit = mock.Mock(side_effect=ValueError("QA_ATTESTATION_MISSING_canonicalPrecisionPreserved"))
+        row = A.scan(self.lane, self.root / "status.json", "check")["outcomes"][0]
+        self.assertEqual(row["state"], "rejected_repairable")
+        self.assertEqual(row["candidateSHA256"], A.digest(self.candidate))
+        self.assertEqual(self.official.posts, 0)
+
+    def test_acknowledged_post_dominates_later_registry_controller_failure(self):
+        original = IO.atomic_record
+        def failing(path, value):
+            if str(path) == self.paths["registryPath"]: raise OSError(errno.EROFS, "registry readonly")
+            return original(path, value)
+        with mock.patch.object(IO, "atomic_record", side_effect=failing):
+            row = A.scan(self.lane, self.root / "status.json", "check")["outcomes"][0]
+        self.assertEqual(row["state"], "check_running")
+        self.assertEqual(row["jobId"], "1234567890abcdef")
+        self.assertEqual(self.official.posts, 1)
 
 
 if __name__ == "__main__":
