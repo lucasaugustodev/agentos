@@ -71,6 +71,45 @@ def read_json(path):
     return json.loads(pathlib.Path(path).read_bytes())
 
 
+def protected_bytes(path, limit):
+    path = pathlib.Path(path)
+    require(path.is_absolute() and path.resolve() == path, "PROTECTED_PATH")
+    for item in [path, *path.parents]:
+        metadata = item.lstat()
+        require(metadata.st_uid == 0 and not metadata.st_mode & 0o022 and not stat.S_ISLNK(metadata.st_mode),
+                "PROTECTED_OWNER_MODE")
+    require(path.is_file() and path.stat().st_size <= limit, "PROTECTED_FILE_SIZE")
+    return path.read_bytes()
+
+
+def case_counts(raw):
+    records = (raw.get("result") or {}).get("records") or []
+    return {name: {"total": len(rows), "passed": sum(row.get("status") == "pass" for row in rows)}
+            for name, rows in [("tests", [r for r in records if r.get("event") == "test"]),
+                               ("benchmarks", [r for r in records if r.get("event") == "benchmark"])]}
+
+
+def compact_outcomes(outcomes):
+    rows = []
+    for outcome in outcomes:
+        row = {k: outcome[k] for k in ["occurrenceId", "problem", "state", "finishedAt", "failures"]}
+        row["artifacts"] = []
+        for artifact in outcome["artifacts"]:
+            if artifact["name"] not in ["candidate.py", "qa-verification.json", "cpu-result.json"]:
+                continue
+            item = {k: artifact[k] for k in ["id", "name", "digest", "size"]}
+            review = artifact.get("review")
+            if review:
+                item["review"] = {k: v for k, v in review.items() if k not in ["findings", "limitations"]}
+                for key in ["findings", "limitations"]:
+                    value = review.get(key)
+                    if value:
+                        item["review"][key] = str(value)[:480]
+            row["artifacts"].append(item)
+        rows.append(row)
+    return rows
+
+
 def confirmed_boundary(detail):
     """A terminal label alone is not proof the native executor stopped."""
     if detail["occurrence"]["state"] not in TERMINAL:
@@ -312,11 +351,66 @@ class Watchdog:
         require(len(raw) == row["size"] and digest(raw) == row["digest"], "ARTIFACT_CORRUPT")
         return raw
 
+    def registered_jobs(self):
+        jobs = list(self.config.get("officialJobs", []))
+        registry_path = self.config.get("officialRegistryPath")
+        if not registry_path or not pathlib.Path(registry_path).exists():
+            return jobs
+        registry = json.loads(protected_bytes(registry_path, 1048576))
+        require(registry.get("version") == 1 and registry.get("watchId") == self.config["watchId"]
+                and type(registry.get("jobs")) is list and len(registry["jobs"]) <= 1000, "OFFICIAL_REGISTRY_SCOPE")
+        allowed = {row["occurrenceId"]: row for row in self.state["experiments"]}
+        for row in registry["jobs"]:
+            require(re.fullmatch(r"[a-f0-9]{16,64}", row.get("id", "")) and row.get("problem") in PROBLEMS
+                    and re.fullmatch(r"[a-f0-9]{64}", row.get("sourceSHA256", "")), "REGISTERED_JOB_IDENTITY")
+            known = next((job for job in jobs if job["id"] == row["id"]), None)
+            if known:
+                require(all(known[k] == row[k] for k in ["problem", "sourceSHA256"]), "REGISTERED_JOB_CONFLICT")
+                continue
+            owner = allowed.get(row.get("occurrenceId"))
+            require(owner and owner["problem"] == row["problem"], "REGISTERED_JOB_OWNER")
+            detail = self.client.request("GET", "/api/cycle-runs/" + row["occurrenceId"])
+            require(detail["occurrence"]["state"] == "completed" and confirmed_boundary(detail), "REGISTERED_JOB_BOUNDARY")
+            qa = next((a for a in detail["artifacts"] if a["id"] == row.get("qaArtifactId")
+                       and a["name"] == "qa-verification.json" and a["digest"] == row.get("qaSHA256")), None)
+            latest = {a["id"] for a in detail["attempts"] if any(s["id"] == a["step_id"]
+                      and s["attempt"] == a["number"] for s in detail["steps"])}
+            require(qa is not None and qa["attempt_id"] in latest and any(a["name"] == "candidate.py"
+                    and a["digest"] == row["sourceSHA256"] and a["attempt_id"] in latest
+                    for a in detail["artifacts"]), "REGISTERED_JOB_ARTIFACTS")
+            review = json.loads(self.verified_artifact(qa, 32768))
+            source = detail["occurrence"].get("input", {}).get("experiment", {}).get("sourceArtifact", {})
+            require(review.get("passed") is True and review.get("candidateSHA256") == row["sourceSHA256"]
+                    and review.get("sourceSHA256") == source.get("digest") and bool(source.get("digest"))
+                    and review.get("approvedForOfficialReview") is True and review.get("cpuReplayPassed") is True
+                    and review.get("scopePreserved") is True and review.get("gpuValidated") is False
+                    and review.get("officialActionsPerformed") is False, "REGISTERED_JOB_QA")
+            receipt = protected_bytes(row.get("receiptPath", ""), 1048576)
+            require(digest(receipt) == row.get("receiptSHA256"), "REGISTERED_JOB_RECEIPT")
+            binding = json.loads(receipt)
+            require(binding.get("version") == 1 and binding.get("mode") == "check"
+                    and all(binding.get(k) == row.get(k) for k in ["id", "problem", "sourceSHA256", "occurrenceId",
+                        "qaArtifactId", "qaSHA256", "dispatchReceiptSHA256", "transportReceiptSHA256", "policySHA256", "auditSHA256"]),
+                    "REGISTERED_RECEIPT_BINDING")
+            require(all(re.fullmatch(r"[a-f0-9]{64}", binding.get(k, "")) for k in
+                        ["dispatchReceiptSHA256", "transportReceiptSHA256", "policySHA256", "auditSHA256"]), "REGISTERED_RECEIPT_PROOFS")
+            transport = binding.get("transportReceipt") or {}
+            identity = transport.get("identity") or {}
+            require(transport.get("state") == "job_recorded" and transport.get("mode") == "check"
+                    and (transport.get("receipt") or {}).get("job_id") == row["id"]
+                    and identity.get("sourceSha256") == row["sourceSHA256"]
+                    and all(identity.get(k) == row.get(k) for k in ["problem", "occurrenceId", "policySHA256", "auditSHA256"]),
+                    "REGISTERED_TRANSPORT_BINDING")
+            require(digest(transport) == binding["transportReceiptSHA256"], "REGISTERED_TRANSPORT_DIGEST")
+            jobs.append({k: row[k] for k in ["id", "problem", "sourceSHA256"]})
+        return jobs
+
     def observe(self, exclude_supervisor=None):
         records = [*self.config["seedOccurrences"], *[r for r in self.state["experiments"]
                    if r["supervisorOccurrenceId"] != exclude_supervisor]]
         outcomes, catalog, active = [], [], []
-        tested = {job["sourceSHA256"] for job in self.config.get("officialJobs", [])}
+        registered_jobs = self.registered_jobs()
+        tested = {job["sourceSHA256"] for job in registered_jobs}
         pending = set()
         for record in records:
             oid = record.get("occurrenceId", record.get("id"))
@@ -378,7 +472,7 @@ class Watchdog:
                 "progress": progress_ref,
                 "failures": [{"attemptId": a["id"], "code": a.get("error_code")} for a in detail["attempts"] if a["state"] == "failed"]})
         jobs, pending_jobs = [], []
-        for job in self.config.get("officialJobs", []):
+        for job in registered_jobs:
             cached = self.state["official"].get(job["id"])
             raw = cached or self.client.official(job)
             require(raw.get("id") == job["id"] and raw.get("board") == job["problem"], "OFFICIAL_IDENTITY")
@@ -391,14 +485,21 @@ class Watchdog:
             jobs.append({**{k: job[k] for k in ["id", "problem", "sourceSHA256"]}, "status": raw.get("status"),
                          "result": {k: result.get(k) for k in ["passed", "speedup", "speedup_ci", "score_us",
                              "baseline_us", "checks", "flags", "error", "status"]},
-                         "logTail": str(result.get("log_tail", ""))[-12000:], "receiptSHA256": digest(raw)})
-            if job.get("analysisEvidence"):
-                ref = job["analysisEvidence"]; data = pathlib.Path(ref["path"]).read_bytes()
-                require(len(data) <= 16384 and digest(data) == ref["sha256"], "ANALYSIS_EVIDENCE_CHANGED")
-                jobs[-1]["analysisEvidence"] = json.loads(data)
+                         "caseCounts": case_counts(raw), "receiptSHA256": digest(raw),
+                         "receiptPath": str(self.directory / ("official-" + job["id"] + ".json"))})
+            if raw.get("status") == "failed" or result.get("passed") is False or result.get("error"):
+                jobs[-1]["errorLogExcerpt"] = str(result.get("log_tail", ""))[-600:]
+        comparison_context = None
+        if self.config.get("comparisonContext"):
+            ref = self.config["comparisonContext"]
+            raw = protected_bytes(ref["path"], 12288)
+            require(digest(raw) == ref["sha256"], "COMPARISON_CONTEXT_CHANGED")
+            comparison_context = json.loads(raw)
         slots = max(0, self.config["maxPendingCandidates"] - len(pending))
         material = {"outcomes": outcomes, "officialJobs": jobs, "availableCandidateSlots": slots,
                     "pendingOfficialCandidateSHA256": sorted(pending)}
+        if comparison_context:
+            material["comparisonContext"] = comparison_context
         fingerprint = digest(material)
         self.save()
         return {**material, "catalog": catalog, "fingerprint": fingerprint, "active": active,
@@ -414,6 +515,14 @@ class Watchdog:
             "observedIdleSeconds": observation["idleSeconds"], "priorReviewErrors": [r.get("errorCode", "NATIVE_SUPERVISOR_FAILED") for r in failures], **{k: observation[k] for k in
             ["outcomes", "catalog", "officialJobs", "availableCandidateSlots", "pendingOfficialCandidateSHA256", "active", "diagnosticOnly"]}}}
         body["input"]["priorDispatches"] = self.state["experiments"][-10:]
+        body["input"]["outcomes"] = compact_outcomes(observation["outcomes"])
+        if observation.get("comparisonContext"):
+            body["input"]["comparisonContext"] = observation["comparisonContext"]
+        body["input"]["interpretationRules"] = [
+            "Known incumbent benchmarks and available source catalog are different sets. Never call the best available source the global best.",
+            "Use actual per-board caseCounts; do not copy Decode counts to Prefill or Attention.",
+            "Official full receipts are preserved by path/SHA; their logs are omitted from this bounded planning input.",
+            "Profile-based causal explanations and next hypotheses are inferences, not proof of performance."]
         requests = self.state.setdefault("reviewRequests", {})
         if key not in requests:
             requests[key] = body
@@ -448,15 +557,35 @@ class Watchdog:
 base-candidate.py. Publish candidate.py, implementation.patch, cpu-checks.py,
 cpu-result.json and verification.json. verification must state sourceSHA256,
 candidateSHA256, passed, scopePreserved, gpuValidated=false, officialActionsPerformed=false.
+implementation.patch must be a pure one-file unified diff with exact headers
+--- base-candidate.py and +++ candidate.py. Generate from the actual UTF-8 source
+and candidate with difflib.unified_diff, preserve final newlines, and verify that
+applying it reproduces candidate.py byte for byte. No other paths or files in the patch.
 CPU tests must exercise the distinguishing arithmetic/indexing/dispatch behavior,
 include a negative control, and report limitations. Do not import CUDA candidates on CPU.
+cpu-result.json must contain passed, candidateSHA256, checkerSHA256,
+cases [{name,passed}] and negativeControls [{name,detected}]. Execute the actual
+cpu-checks.py with python3 in one bash call that also prints the SHA256 of both
+cpu-checks.py and candidate.py (for example sha256sum ... && python3 ...).
+Use absolute paths in that exact command structure, not echo or a conditional skip.
+The call result must contain the two actual hashes and the replay's exit status;
+record results truthfully. Passing requires every case and negative control to pass.
 """
         qa = COMMON + """Independently read the actual predecessor candidate, patch and checks.
 Verify source binding, constrained scope, canonical precision/rules and replay meaningful CPU tests.
 Publish qa-verification.json and review.txt. JSON must contain passed, candidateSHA256,
 sourceSHA256, cpuReplayPassed, scopePreserved, approvedForOfficialReview, gpuValidated=false,
-officialActionsPerformed=false, findings (array). Fail candidly if wrong or missing evidence;
+officialActionsPerformed=false, findings (array), and limitations (nonempty array stating
+CPU-only validation and unmeasured GPU correctness/performance). Fail candidly if wrong or missing evidence;
 never claim GPU validity or speed from CPU/static checks. Your review cannot submit anything.
+Also explicitly report canonicalPrecisionPreserved, evaluatorIndependent,
+upstreamAttributionPreserved, blockingFindings (array), and cpuEvidence containing
+checkerSHA256, resultSHA256, cases [{name,passed}] and negativeControls [{name,detected}].
+Derive these from the actual replay and file bytes; never invent tool-call IDs or attestations.
+Replay the actual predecessor cpu-checks.py with python3 in one bash call that
+prints its SHA256 and candidate.py SHA256. The call's output must include both
+actual hashes and exit status. Bind cpuEvidence.resultSHA256 to the actual
+predecessor cpu-result.json and repeat its cases/negativeControls only if replayed.
 """
         steps = [native_step(self.config, "produce", "Implementar experiência: " + experiment["id"], producer,
                  ["candidate.py", "implementation.patch", "cpu-checks.py", "cpu-result.json", "verification.json"]),

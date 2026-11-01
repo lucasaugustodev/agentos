@@ -117,6 +117,94 @@ class WatchTests(unittest.TestCase):
     def reload(self):
         self.w = W.Watchdog(self.config, self.root / 'state', self.client, clock=lambda: 10060)
 
+    def register_completed_job(self):
+        self.w.tick(); self.complete_review(); self.w.tick()
+        row = self.w.state['experiments'][-1]
+        source = self.client.occurrences[row['occurrenceId']]['occurrence']['input']['experiment']['sourceArtifact']
+        self.client.complete(row['occurrenceId'], {'candidate.py': b'# reviewed new candidate\n', 'qa-verification.json': {
+            'passed': True, 'candidateSHA256': W.digest(b'# reviewed new candidate\n'), 'sourceSHA256': source['digest'],
+            'approvedForOfficialReview': True, 'cpuReplayPassed': True, 'scopePreserved': True,
+            'gpuValidated': False, 'officialActionsPerformed': False}})
+        qa = next(a for a in self.client.occurrences[row['occurrenceId']]['artifacts'] if a['name'] == 'qa-verification.json')
+        receipt = self.root / 'registered-receipt.json'
+        job = {'id': '0123456789abcdef', 'problem': row['problem'], 'sourceSHA256': W.digest(b'# reviewed new candidate\n'),
+               'occurrenceId': row['occurrenceId'], 'qaArtifactId': qa['id'], 'qaSHA256': qa['digest'],
+               'policySHA256': 'a' * 64, 'auditSHA256': 'b' * 64}
+        transport = {'state': 'job_recorded', 'mode': 'check', 'identity': {**{k: job[k] for k in
+            ['problem', 'occurrenceId', 'policySHA256', 'auditSHA256']}, 'sourceSha256': job['sourceSHA256']},
+            'receipt': {'job_id': job['id']}}
+        job['dispatchReceiptSHA256'] = 'c' * 64
+        job['transportReceiptSHA256'] = W.digest(transport)
+        W.atomic(receipt, {'version': 1, 'mode': 'check', **job, 'transportReceipt': transport})
+        job.update(receiptPath=str(receipt), receiptSHA256=W.digest(receipt.read_bytes()))
+        path = self.root / 'registry.json'; W.atomic(path, {'version': 1, 'watchId': self.config['watchId'], 'jobs': [job]})
+        self.config['officialRegistryPath'] = str(path)
+        return job, path
+
+    def test_registered_official_job_releases_pending_and_wakes_next_supervisor(self):
+        job, _ = self.register_completed_job()
+        self.assertEqual(self.w.observe()['pendingOfficialCandidateSHA256'], [])
+        self.assertEqual(self.w.observe()['officialJobs'][0]['id'], job['id'])
+        self.assertEqual(self.w.tick()['state'], 'supervisor_dispatched')
+
+    def test_registry_rejects_unregistered_owner_wrong_source_and_receipt(self):
+        job, path = self.register_completed_job()
+        for field, value, error in [('occurrenceId', uid(), 'REGISTERED_JOB_OWNER'),
+                                  ('sourceSHA256', 'f' * 64, 'REGISTERED_JOB_ARTIFACTS'),
+                                  ('receiptSHA256', 'f' * 64, 'REGISTERED_JOB_RECEIPT')]:
+            W.atomic(path, {'version': 1, 'watchId': self.config['watchId'], 'jobs': [{**job, field: value}]})
+            with self.assertRaisesRegex(ValueError, error): self.w.observe()
+
+    def test_registry_rejects_failed_qa_and_old_attempt_artifacts(self):
+        job, _ = self.register_completed_job()
+        d = self.client.occurrences[job['occurrenceId']]
+        d['steps'][0]['attempt'] += 1
+        with self.assertRaisesRegex(ValueError, 'REGISTERED_JOB_ARTIFACTS'): self.w.observe()
+        d['steps'][0]['attempt'] -= 1
+        qa = next(a for a in d['artifacts'] if a['id'] == job['qaArtifactId'])
+        review = json.loads(self.client.artifacts[qa['id']]); review['passed'] = False
+        raw = W.canonical(review); self.client.artifacts[qa['id']] = raw; qa.update(digest=W.digest(raw), size=len(raw))
+        job['qaSHA256'] = qa['digest']
+        W.atomic(self.config['officialRegistryPath'], {'version': 1, 'watchId': self.config['watchId'], 'jobs': [job]})
+        with self.assertRaisesRegex(ValueError, 'REGISTERED_JOB_QA'): self.w.observe()
+
+    def test_matching_receipt_hash_cannot_hide_wrong_job_or_transport_binding(self):
+        job, registry_path = self.register_completed_job()
+        original = json.loads(pathlib.Path(job['receiptPath']).read_bytes())
+        for kind in ['job', 'transport']:
+            receipt = copy.deepcopy(original)
+            if kind == 'job': receipt['id'] = 'f' * 16
+            else: receipt['transportReceipt']['identity']['sourceSha256'] = 'f' * 64
+            W.atomic(job['receiptPath'], receipt); job['receiptSHA256'] = W.digest(pathlib.Path(job['receiptPath']).read_bytes())
+            W.atomic(registry_path, {'version': 1, 'watchId': self.config['watchId'], 'jobs': [job]})
+            with self.assertRaisesRegex(ValueError, 'REGISTERED_RECEIPT_BINDING|REGISTERED_TRANSPORT_BINDING'):
+                self.w.observe()
+
+    def test_actual_official_record_vocabulary_counts_board_specific_cases(self):
+        raw = {'result': {'records': [{'event': 'test', 'status': 'pass'} for _ in range(5)] +
+                      [{'event': 'benchmark', 'status': 'pass'} for _ in range(8)] +
+                      [{'event': 'profile', 'status': 'pass'} for _ in range(8)]}}
+        self.assertEqual(W.case_counts(raw), {'tests': {'total': 5, 'passed': 5}, 'benchmarks': {'total': 8, 'passed': 8}})
+
+    def test_compaction_preserves_unknown_source_incumbent_and_failure_evidence(self):
+        path = self.root / 'comparisons.json'
+        W.atomic(path, {'incumbents': [{'id': '0123456789abcdef', 'sourceSHA256': None, 'sourceBindingKnown': False,
+                                       'problem': 'muse_decode_layer', 'speedup': 1.271882}]})
+        self.config['comparisonContext'] = {'path': str(path), 'sha256': W.digest(path.read_bytes())}
+        self.config['officialJobs'] = [{'id': '1123456789abcdef', 'problem': 'muse_decode_layer', 'sourceSHA256': 'a' * 64}]
+        self.w.tick(); inp = self.w.state['supervisions'][-1]['input']
+        self.assertIsNone(inp['comparisonContext']['incumbents'][0]['sourceSHA256'])
+        self.assertNotIn('logTail', inp['officialJobs'][0])
+        self.assertIn('receiptSHA256', inp['officialJobs'][0])
+        self.assertFalse(any(a['digest'] == 'a' * 64 for a in inp['catalog']))
+        self.assertLess(len(W.canonical(inp)), 20000)
+
+    def test_protected_registry_rejects_writable_and_symlink_paths(self):
+        path = self.root / 'unsafe.json'; path.write_bytes(b'{}'); path.chmod(0o666)
+        with self.assertRaisesRegex(ValueError, 'PROTECTED_OWNER_MODE'): W.protected_bytes(path, 32)
+        path.chmod(0o600); link = self.root / 'link.json'; link.symlink_to(path)
+        with self.assertRaisesRegex(ValueError, 'PROTECTED_PATH'): W.protected_bytes(link, 32)
+
     def test_recurrent_supervisor_dispatch_completion_new_supervisor(self):
         self.assertEqual(self.w.tick()['state'], 'supervisor_dispatched')
         self.complete_review(self.plan(2))
@@ -210,7 +298,9 @@ class WatchTests(unittest.TestCase):
         self.config['officialJobs'] = [{'id': '1717a286eb2949c0', 'problem': 'muse_decode_layer', 'sourceSHA256': 'a' * 64}]
         obs = self.w.observe()
         self.assertEqual(obs['officialJobs'][0]['result']['speedup'], 1.211222)
-        self.assertEqual(obs['officialJobs'][0]['logTail'], 'real tests complete')
+        self.assertNotIn('logTail', obs['officialJobs'][0])
+        receipt = json.loads(pathlib.Path(obs['officialJobs'][0]['receiptPath']).read_bytes())
+        self.assertEqual(receipt['result']['log_tail'], 'real tests complete')
 
     def test_corrupted_candidate_rejected_before_any_experiment_post(self):
         self.w.tick(); self.complete_review()

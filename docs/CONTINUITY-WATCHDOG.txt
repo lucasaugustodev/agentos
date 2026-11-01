@@ -45,3 +45,27 @@ never placed in worker prompts, outputs, command arguments or event artifacts.
 Qualification must distinguish: timer active, observation succeeded, supervisor
 dispatched, native attempt running, plan consumed, producer/QA dispatched, and an
 actual accepted/benchmarked outcome. Unit tests are not proof of live autonomy.
+
+Planning input separates named official incumbent benchmarks from available
+candidate source artifacts. An unknown incumbent source stays unknown and cannot
+be selected as an experiment base. Test/benchmark counts come from official
+record events per board. Full receipts remain protected and hash-addressed;
+successful log tails are omitted from the next model input. Root-pinned comparison
+context supplies compact measured profiles, uncertainty and next hypotheses.
+
+An optional root-owned official-check registry can register diagnostic jobs from
+a separately authorized adapter. The reader verifies native occurrence ownership,
+confirmed stop, current source/QA artifacts, successful source-bound QA, wrapper
+receipt identity and the exact CHECK transport receipt. Native dispatch provenance
+(dispatchReceiptSHA256) and GPU transport digest (transportReceiptSHA256) are
+separate. Registered results wake the next supervisor after their actual terminal
+status; this reader never authorizes or sends an official POST itself.
+
+Future experiment templates request reproducible one-file patches and explicit
+CPU checker/result hashes, cases, negative controls and limitations from both
+producer and independent replay. Older running cycle definitions remain intact.
+Missing evidence is a blocked qualification, never permission to assume it passed.
+
+Registry tests need a root-owned temporary directory with protected parents.
+Set TMPDIR to a dedicated root-only test directory on the server; do not change
+ownership or permissions of a shared build directory to make these tests pass.
