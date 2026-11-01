@@ -236,6 +236,36 @@ it('does not let a saved batch plan remove readiness and fall back to a legacy p
   stripped.tasks[0].criteria=structuredClone(f.originalPlan.tasks[0].criteria);
   await expect(tx(async db=>{await lock(db);return verifyBoundCandidateReadinessPlan(db,f.goal,stripped);})).rejects.toMatchObject({code:'READINESS_BATCH_CRITERION_REMOVED'});
 });
+it('binds only the final accumulated integration when intermediate source joins cover the same three-of-six batch',async()=>{
+  const {requirements,covers,pending}=await configureThreeOfSixBatch();
+  const plan=structuredClone(f.originalPlan),integration=plan.tasks.find((t:any)=>t.key==='integrate');
+  const producer={...structuredClone(integration),key:'source',stage:'work',agentId:'engineering.backend.node'};
+  const join={...structuredClone(integration),key:'source-join',dependencies:['source']};
+  const dependent={...structuredClone(producer),key:'dependent',sourceTask:'source-join',dependencies:['source-join']};
+  integration.dependencies=['source','dependent'];
+  plan.tasks.unshift(producer,join,dependent);
+  const before=structuredClone(plan);
+  const bound=await tx(async db=>{await lock(db);return bindCandidateReadinessPlan(db,f.goal,plan,{consumerRelease:expected});});
+  expect(plan).toEqual(before);
+  expect(bound.tasks.filter(t=>t.criteria.some(c=>c.type==='candidate_readiness')).map(t=>t.key)).toEqual(['integrate']);
+  expect(bound.tasks.find(t=>t.key==='source-join')).toEqual(join);
+  expect(bound.tasks.find(t=>t.key==='verify')?.criteria).toContainEqual(expect.objectContaining({type:'candidate_ci',sourceTaskKey:'integrate'}));
+  expect(bound.requirements).toEqual(requirements);
+  expect(bound.incremental).toMatchObject({selectedRequirementIds:covers,pendingRequirementIds:pending,completedRequirementIds:[]});
+  const stripped=structuredClone(bound);
+  stripped.tasks.find(t=>t.key==='integrate')!.criteria=integration.criteria;
+  await expect(tx(async db=>{await lock(db);return verifyBoundCandidateReadinessPlan(db,f.goal,stripped);})).rejects.toMatchObject({code:'READINESS_BATCH_CRITERION_REMOVED'});
+  expect((await pool.query('SELECT count(*)::int n FROM runs')).rows[0].n).toBe(0);
+});
+it('refuses an intermediate source branch outside the registered batch even when the final integration covers only that batch',async()=>{
+  await configureThreeOfSixBatch();const plan=structuredClone(f.originalPlan);
+  const integration=plan.tasks.find((t:any)=>t.key==='integrate');
+  plan.tasks.unshift({...structuredClone(integration),key:'foreign-source',stage:'work',agentId:'engineering.backend.node',covers:['req-4']});
+  integration.dependencies=['foreign-source'];
+  await expect(tx(async db=>{await lock(db);return bindCandidateReadinessPlan(db,f.goal,plan,{consumerRelease:expected});}))
+    .rejects.toMatchObject({code:'READINESS_OBLIGATIONS_UNMAPPED'});
+  expect((await pool.query('SELECT count(*)::int n FROM runs')).rows[0].n).toBe(0);
+});
 it('preserves the canonical incremental authority: a batch cannot move an unverified outside requirement to completed',async()=>{
   await configureThreeOfSixBatch();const changed=structuredClone(f.originalPlan);
   changed.incremental.completedRequirementIds=['req-4'];changed.incremental.pendingRequirementIds=['req-5','req-6'];

@@ -11,6 +11,7 @@ import {objectiveReviewControllerRelease,assertObjectiveReviewConsumerReady} fro
 import type {WorkerRelease} from './worker-rollout.js';
 import type {ProposedPlan} from './objective-contracts.js';
 import {bindCandidateReadinessQaPlan} from './candidate-readiness-qa-contract.js';
+import {finalCandidateIntegration} from './candidate-readiness-plan.js';
 
 const failure=(code:string)=>new DomainError(code,code,409);
 function require(ok:unknown,code:string):asserts ok {if(!ok)throw failure(code);}
@@ -68,8 +69,10 @@ function verifyPlanScope(plan:ProposedPlan,reg:Registration){
   require(!!plan.incremental&&same([...selected].sort(),reg.contract.requirements.map(r=>r.id).sort())&&
     selected.includes(plan.incremental.selectedRequirementId)&&new Set(partition).size===partition.length&&
     same([...partition].sort(),[...universe].sort()),'READINESS_BATCH_PARTITION_UNBOUND');
-  const integrations=plan.tasks.filter(t=>t.stage==='integrate');
-  require(integrations.length===1&&same([...integrations[0].covers].sort(),[...selected].sort()),'READINESS_OBLIGATIONS_UNMAPPED');
+  const integration=finalCandidateIntegration(plan);
+  require(same([...integration.covers].sort(),[...selected].sort()),'READINESS_OBLIGATIONS_UNMAPPED');
+  require(plan.tasks.filter(t=>t.stage==='work'||t.stage==='integrate')
+    .every(t=>t.covers.every(id=>selected.includes(id))),'READINESS_OBLIGATIONS_UNMAPPED');
 }
 export function readinessCriterion(reg:Registration){
   return candidateReadinessCriterionSchema.parse({id:'integrated-readiness',label:'Candidata integrada pronta; aceite depende de CI canônica',
@@ -122,10 +125,9 @@ export async function bindCandidateReadinessPlan(db:DB,goalId:string,plan:Propos
   const configured=(await db.query('SELECT value FROM settings WHERE id=$1',[mapId(goalId)])).rows[0]?.value;
   if(!configured?.contract?.enabled)return plan;
   const reg=await registration(db,goalId);await consumer(db,options);
-  const integrations=plan.tasks.filter(t=>t.stage==='integrate');
-  require(!!plan.incremental&&integrations.length===1,'READINESS_SCOPE_UNMAPPED');
+  require(!!plan.incremental,'READINESS_SCOPE_UNMAPPED');
+  const original=finalCandidateIntegration(plan);
   verifyPlanScope(plan,reg);
-  const original=integrations[0];
   require(same([...original.covers].sort(),reg.contract.requirements.map(r=>r.id).sort()),
     'READINESS_OBLIGATIONS_UNMAPPED');
   require(original.criteria.length===1&&original.criteria[0].type==='json_field'&&original.criteria[0].name==='delivery.json'&&
@@ -194,7 +196,7 @@ export async function verifyBoundCandidateReadinessPlan(db:DB,goalId:string,plan
   const configured=(await db.query('SELECT value FROM settings WHERE id=$1',[mapId(goalId)])).rows[0]?.value;
   if(configured?.contract?.enabled&&configured.contract.scope?.kind==='batch'){
     const reg=await registration(db,goalId);verifyPlanScope(plan,reg);
-    const integrate=plan.tasks.find(t=>t.stage==='integrate')!;
+    const integrate=finalCandidateIntegration(plan);
     require(integrate.criteria.length===1&&same(integrate.criteria[0],readinessCriterion(reg)),
       'READINESS_BATCH_CRITERION_REMOVED');
     const qa=plan.tasks.filter(t=>t.stage==='verify'&&t.sourceTask===integrate.key);
