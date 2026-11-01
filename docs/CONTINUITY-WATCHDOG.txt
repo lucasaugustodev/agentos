@@ -1,0 +1,47 @@
+CONTINUOUS OPERATION WATCHDOG
+
+The manual native cycle "Supervisão contínua — OpenKernel" is the visible owner.
+Its active/paused state controls future dispatch. A separate systemd timer checks
+registered native executions and official GET-only job results every two minutes.
+It does not reactivate an old completed objective or replan its full backlog.
+
+When registered work reaches a confirmed boundary, a native model supervisor
+receives bounded measured outcomes, actual independently verified QA JSON and an
+immutable artifact catalog. It produces continuation-plan.json. A deterministic
+consumer validates the exact evidence fingerprint, problem scope, source artifact,
+capacity and fixed runtime constraints before creating producer -> independent QA
+cycles. Terminal outputs become the next supervisor input. Empty JSON, arbitrary
+accounts/workspaces/actions and unverified waiting reasons are rejected.
+
+The watchdog also diagnoses ten minutes without published material evidence even
+when heartbeats or tool/model responses continue. This is a read-only suspicion:
+the supervisor cannot stop, retry or replace a live/uncertain executor. Long calls
+can be legitimate. A terminal label requires the native stopped receipt or a
+matching fenced HARNESS_STOPPED proof; manual review steps remain owned by their
+original controller.
+
+Only authorized Decode, Prefill and Attention experiments are dispatched. CPU
+source work is isolated and read-only against the source workspace. Independent
+QA remains mandatory. Global model/request capacity stays owned by AgentOS.
+Candidate limits prevent accumulating unmeasured variants. GPU CHECK/SCORE is
+not automatically authorized by this watchdog; awaiting official measurement is
+an explicit state, not a claim of autonomous GPU execution or verified gain.
+
+Durability: persist the approved plan before any dispatch, then persist each
+POST intent before I/O. Restart reconciles lost responses using canonical GETs;
+it never resends an ambiguous POST. Partial multi-experiment dispatch resumes its
+approved action set without treating its own progress as stale external evidence.
+Invalid supervisor plans get one corrective review, then remain a visible
+diagnostic failure instead of creating an unbounded model-call loop.
+
+Implementation: scripts/continuity-watchdog.py (Python standard library only).
+Tests: python3 -B tests/fixtures/continuity_watchdog_test.py, on server only.
+Registration and state contain private operational metadata and stay outside Git.
+Deploy a root-owned immutable script, root-only registration and state directory.
+Service uses User=root explicitly because the official CLI resolves its signed-in
+profile through that identity. Credentials are read by the trusted controller,
+never placed in worker prompts, outputs, command arguments or event artifacts.
+
+Qualification must distinguish: timer active, observation succeeded, supervisor
+dispatched, native attempt running, plan consumed, producer/QA dispatched, and an
+actual accepted/benchmarked outcome. Unit tests are not proof of live autonomy.
