@@ -1284,6 +1284,230 @@ class WatchTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'PLAN_DUPLICATE_BOARD'):
             W.validate_plan(plan, self.w.observe(), self.config)
 
+    def parallel_capacity(self):
+        before = W.digest(W.supervisor_definition(self.config))
+        self.config.update(pipelineCapacityVersion=2, maxPendingCandidates=12, maxPipelinesPerProblem=4)
+        W.validate_config(self.config)
+        self.assertEqual(W.digest(W.supervisor_definition(self.config)), before)
+
+    def parallel_plan(self, counts):
+        review = self.w.state['supervisions'][-1]
+        plan = self.plan(); plan['experiments'] = []
+        for problem, count in counts.items():
+            source = next(a for a in review['input']['catalog'] if a['problem'] == problem)
+            for index in range(count):
+                plan['experiments'].append({'id': 'parallel-' + str(len(plan['experiments'])),
+                    'problem': problem, 'sourceArtifactId': source['id'],
+                    'hypothesis': 'Independent bounded routing strategy number ' + str(index) + ' may change launch overhead.',
+                    'instructions': 'Implement the stated isolated strategy only, with a discriminating CPU falsifier and negative control.'})
+        return plan
+
+    def test_parallel_optin_twelve_four_preserves_control_and_legacy_bounds(self):
+        original = copy.deepcopy(self.config); self.parallel_capacity()
+        for changes, code in [({'maxPendingCandidates': 13}, 'CANDIDATE_CAPACITY'),
+                              ({'maxPipelinesPerProblem': 5}, 'BOARD_PIPELINE_CAPACITY'),
+                              ({'maxPendingCandidates': True}, 'CANDIDATE_CAPACITY'),
+                              ({'pipelineCapacityVersion': 3}, 'PIPELINE_CAPACITY_VERSION')]:
+            with self.subTest(changes=changes), self.assertRaisesRegex(ValueError, code):
+                W.validate_config({**self.config, **changes})
+        with self.assertRaisesRegex(ValueError, 'CANDIDATE_CAPACITY'):
+            W.validate_config({**original, 'maxPendingCandidates': 12})
+
+    def test_parallel_twelve_distinct_runs_are_isolated_and_hard_bounded(self):
+        self.parallel_capacity(); self.add_seed(); self.add_seed('muse_attention_decode', b'# attention\n')
+        self.w.tick(); plan = self.parallel_plan({p: 4 for p in W.PROBLEMS})
+        self.complete_review(plan); result = self.w.tick()
+        self.assertEqual(result['state'], 'experiments_dispatched')
+        self.assertEqual(len(result['dispatched']), 12)
+        self.assertEqual(len({r['cycleId'] for r in result['dispatched']}), 12)
+        self.assertEqual(len({r['occurrenceId'] for r in result['dispatched']}), 12)
+        for record in result['dispatched']:
+            detail = self.client.occurrences[record['occurrenceId']]
+            steps = detail['occurrence']['definition']['steps']
+            self.assertEqual([s['readOnly'] for s in steps], [True, True])
+            self.assertEqual(steps[1]['dependsOn'], ['produce'])
+            self.assertEqual(detail['occurrence']['definition']['allowedActions'], [])
+        observed = self.w.observe()
+        self.assertEqual(observed['pipelineUsed'], 12)
+        self.assertEqual(observed['nativePipelineUsed'], 12)
+        self.assertEqual(observed['waitingPipelineUsed'], 0)
+        self.assertEqual(observed['boardAvailableCandidateSlots'], {p: 0 for p in W.PROBLEMS})
+        self.assertEqual(observed['availableCandidateSlots'], 0)
+        self.assertEqual(self.w.tick()['state'], 'work_active')
+        self.assertEqual(len(self.client.posts), 25)
+
+    def test_parallel_fifth_same_board_and_thirteenth_total_rejected(self):
+        self.parallel_capacity(); self.add_seed(); self.add_seed('muse_attention_decode', b'# attention\n'); self.w.tick()
+        with self.assertRaisesRegex(ValueError, 'PLAN_BOARD_CAPACITY'):
+            W.validate_plan(self.parallel_plan({'muse_decode_layer': 5}), self.w.observe(), self.config)
+        with self.assertRaisesRegex(ValueError, 'PLAN_CAPACITY'):
+            W.validate_plan(self.parallel_plan({'muse_decode_layer': 5, 'muse_prefill_layer': 4, 'muse_attention_decode': 4}),
+                            self.w.observe(), self.config)
+
+    def test_parallel_normalized_duplicate_rejected_despite_renaming(self):
+        self.parallel_capacity(); self.w.tick(); plan = self.parallel_plan({'muse_decode_layer': 2})
+        plan['experiments'][1]['hypothesis'] = '  ' + plan['experiments'][0]['hypothesis'].upper().replace(' ', '  ') + ' '
+        plan['experiments'][1]['instructions'] += ' Different instruction wording cannot create a new hypothesis.'
+        with self.assertRaisesRegex(ValueError, 'PLAN_DUPLICATE_HYPOTHESIS'):
+            W.validate_plan(plan, self.w.observe(), self.config)
+        self.assertEqual(len(self.client.posts), 1)
+
+    def test_parallel_owned_hypothesis_remains_reserved_native_and_gpu_wait(self):
+        self.parallel_capacity(); self.w.tick(); plan = self.parallel_plan({'muse_decode_layer': 1})
+        self.complete_review(plan); self.w.tick(); record = self.w.state['experiments'][-1]
+        for stage in ['native', 'gpu']:
+            if stage == 'gpu':
+                candidate = b'# measured later\n'
+                self.client.complete(record['occurrenceId'], {'candidate.py': candidate, 'qa-verification.json': {
+                    'passed': True, 'candidateSHA256': W.digest(candidate), 'approvedForOfficialReview': True, 'gpuValidated': False}})
+                self.add_gpu_job('muse_decode_layer', W.digest(candidate), 'queued')
+            observed = self.w.observe()
+            self.assertEqual(observed['pipelineUsed'], 1)
+            self.assertEqual(observed['boardAvailableCandidateSlots']['muse_decode_layer'], 3)
+            self.assertEqual(len(observed['hypothesisReservations']), 1)
+            duplicate = copy.deepcopy(plan); duplicate['evidenceFingerprint'] = observed['fingerprint']
+            duplicate['experiments'][0]['id'] = 'renamed-owned-work'
+            with self.subTest(stage=stage), self.assertRaisesRegex(ValueError, 'PLAN_DUPLICATE_HYPOTHESIS'):
+                W.validate_plan(duplicate, observed, self.config)
+        self.assertEqual(observed['nativePipelineUsed'], 0)
+        self.assertEqual(observed['waitingPipelineUsed'], 1)
+
+    def test_parallel_three_gpu_waits_leave_nine_committed_slots(self):
+        self.parallel_capacity(); self.add_seed(); self.add_seed('muse_attention_decode', b'# attention\n')
+        for problem in W.PROBLEMS: self.add_gpu_job(problem)
+        observed = self.w.observe()
+        self.assertEqual(observed['availableCandidateSlots'], 9)
+        self.assertEqual(observed['boardAvailableCandidateSlots'], {p: 3 for p in W.PROBLEMS})
+        self.assertEqual(observed['waitingPipelineUsed'], 3)
+        self.w.tick(); self.complete_review(self.parallel_plan({p: 3 for p in W.PROBLEMS})); self.w.tick()
+        observed = self.w.observe()
+        self.assertEqual(observed['pipelineUsed'], 12)
+        self.assertEqual(observed['nativePipelineUsed'], 9)
+        self.assertEqual(observed['waitingPipelineUsed'], 3)
+        self.assertEqual(observed['eligibleProblems'], [])
+
+    def test_parallel_unknown_native_owner_blocks_only_its_board(self):
+        self.parallel_capacity(); self.add_seed()
+        detail = self.client.occurrences[self.seed]
+        detail['occurrence']['state'] = 'running'; detail['attempts'][0].update(state='running', receipt=None)
+        observed = self.w.observe()
+        self.assertEqual(observed['pipelineUsed'], 1)
+        self.assertEqual(observed['uncertainProblems'], ['muse_decode_layer'])
+        self.assertEqual(observed['boardAvailableCandidateSlots']['muse_decode_layer'], 0)
+        self.assertEqual(observed['eligibleProblems'], ['muse_prefill_layer'])
+
+    def test_parallel_partial_same_board_lost_ack_recovers_then_starts_remainder_once(self):
+        self.parallel_capacity(); self.w.tick(); self.complete_review(self.parallel_plan({'muse_decode_layer': 4}))
+        self.client.timeout_after_commit_number = 7
+        with self.assertRaises(TimeoutError): self.w.tick()
+        self.assertEqual(len(self.w.state['experiments']), 2)
+        self.reload(); self.assertEqual(self.w.tick()['state'], 'experiments_dispatched')
+        self.assertEqual(len(self.w.state['experiments']), 4)
+        self.assertEqual(len(self.client.posts), 9)
+        run_keys = [body['requestKey'] for route, body in self.client.posts if route.endswith('/run')]
+        self.assertEqual(len(run_keys), 5)
+        self.assertEqual(len(run_keys), len(set(run_keys)))
+        self.assertEqual(self.w.observe()['pipelineUsedByProblem']['muse_decode_layer'], 4)
+
+    def test_parallel_partial_unknown_does_not_start_remaining_branches(self):
+        self.parallel_capacity(); self.w.tick(); self.complete_review(self.parallel_plan({'muse_decode_layer': 4}))
+        self.client.timeout_before_commit_number = 7
+        with self.assertRaises(TimeoutError): self.w.tick()
+        self.reload()
+        with self.assertRaisesRegex(ValueError, 'POST_UNCERTAIN_RECONCILE_ONLY'): self.w.tick()
+        self.assertEqual(len(self.client.posts), 7)
+        reservation = self.w.state['supervisions'][-1]['pipelineReservation']
+        self.assertEqual(reservation, {'externalUsed': 0, 'acknowledged': 2, 'remaining': 2, 'total': 4})
+
+    def test_parallel_partial_new_owner_reconciles_without_overfilling_board(self):
+        self.parallel_capacity(); self.w.tick(); self.complete_review(self.parallel_plan({'muse_decode_layer': 4}))
+        self.client.timeout_after_commit_number = 7
+        with self.assertRaises(TimeoutError): self.w.tick()
+        external = self.add_seed('muse_decode_layer', b'# independently owned source\n')
+        self.client.occurrences[external]['occurrence']['state'] = 'running'
+        self.client.occurrences[external]['attempts'][0].update(state='running', receipt=None)
+        self.reload(); result = self.w.tick()
+        self.assertEqual(result['state'], 'changed_plan_reconciled')
+        self.assertEqual(len(self.client.posts), 7)
+        self.assertEqual(len(self.w.state['experiments']), 3)
+        self.assertEqual(len(result['unstartedRemainder']), 1)
+        self.assertEqual(self.w.observe()['pipelineUsedByProblem']['muse_decode_layer'], 4)
+
+    def test_parallel_input_exposes_productive_capacity_without_changing_control(self):
+        self.w.tick(); legacy_rules = self.w.state['supervisions'][-1]['input']['interpretationRules']
+        self.parallel_capacity(); self.w.submit_supervisor(self.w.observe()); inp = self.w.state['supervisions'][-1]['input']
+        self.assertEqual(inp['boardAvailableCandidateSlots']['muse_decode_layer'], 4)
+        self.assertEqual(inp['pipelinePerProblemLimit'], 4)
+        self.assertIn('SAME eligible problem', inp['interpretationRules'][0])
+        self.assertIn('confirmedSourceArtifactIds', inp['interpretationRules'][0])
+        self.assertIn('quota waits and official GPU work', inp['interpretationRules'][0])
+        self.assertIn('No new official authority', inp['interpretationRules'][1])
+        self.assertIn('owned EXPERIMENT cannot be replaced or duplicated', inp['interpretationRules'][1])
+        self.assertEqual(inp['interpretationRules'][2:-1], legacy_rules[2:])
+        self.assertIn('never invent filler sessions', inp['interpretationRules'][-1])
+        self.assertEqual(self.config['controlDefinitionSHA256'], W.digest(W.supervisor_definition(self.config)))
+
+    def test_parallel_repair_candidate_cannot_be_duplicated_with_new_hypothesis(self):
+        status = self.repairable_operation(); self.parallel_capacity(); self.install_diagnostic_fixture([status])
+        self.w.tick(); observed = self.w.observe()
+        plan = self.parallel_plan({'muse_decode_layer': 2}); plan['decision'] = 'repair_evidence'
+        target = observed['autoCheckDiagnostics']['repairableEvidence'][0]
+        for exp in plan['experiments']: exp['sourceArtifactId'] = target['candidateArtifactId']
+        observed['autoCheckDiagnostics']['repairableEvidence'].append(copy.deepcopy(target))
+        with self.assertRaisesRegex(ValueError, 'PLAN_DUPLICATE_REPAIR'):
+            W.validate_plan(plan, observed, self.config)
+
+    def test_parallel_repair_rejects_identical_candidate_already_in_ordinary_qa(self):
+        status = self.repairable_operation(); self.parallel_capacity(); self.install_diagnostic_fixture([status])
+        self.w.tick(); observed = self.w.observe()
+        target = observed['autoCheckDiagnostics']['repairableEvidence'][0]
+        plan = self.parallel_plan({'muse_decode_layer': 1}); plan['decision'] = 'repair_evidence'
+        plan['experiments'][0]['sourceArtifactId'] = target['candidateArtifactId']
+        source = next(a for a in observed['catalog'] if a['id'] == target['candidateArtifactId'])
+        other = uid(); observed['catalog'].append({**source, 'id': uid(), 'occurrenceId': other})
+        observed['pipelineOwners'].append({'problem': 'muse_decode_layer', 'ownerKey': 'occurrence:' + other,
+            'stages': ['native'], 'occurrenceIds': [other], 'jobIds': [], 'candidateSHA256': None})
+        with self.assertRaisesRegex(ValueError, 'PLAN_DUPLICATE_REPAIR'):
+            W.validate_plan(plan, observed, self.config)
+
+    def test_parallel_linked_repair_deduplicates_parent_but_not_two_native_actors(self):
+        status, record, detail = self.repair_capacity_fixture()
+        self.parallel_capacity(); self.install_diagnostic_fixture([status])
+        observed = self.w.observe()
+        self.assertEqual(observed['pipelineUsed'], 2)
+        self.assertEqual(observed['pipelineUsedByProblem']['muse_decode_layer'], 1)
+        other = self.client.make_occurrence(record['cycleId'], {'requestKey': 'second-owned-repair',
+            'input': copy.deepcopy(detail['occurrence']['input'])})
+        self.w.state['experiments'].append({**record, 'occurrenceId': other['id']})
+        observed = self.w.observe()
+        self.assertEqual(observed['pipelineUsed'], 3)
+        self.assertEqual(observed['pipelineUsedByProblem']['muse_decode_layer'], 2)
+
+    def test_parallel_partial_three_boards_including_gpu_reservations_stay_bounded(self):
+        self.parallel_capacity(); self.add_seed(); self.add_seed('muse_attention_decode', b'# attention\n')
+        for problem in W.PROBLEMS: self.add_gpu_job(problem)
+        self.w.tick(); self.complete_review(self.parallel_plan({p: 3 for p in W.PROBLEMS}))
+        self.client.timeout_after_commit_number = 17
+        with self.assertRaises(TimeoutError): self.w.tick()
+        self.assertEqual(self.w.state['supervisions'][-1]['pipelineReservation']['total'], 12)
+        self.reload(); self.assertEqual(self.w.tick()['state'], 'experiments_dispatched')
+        self.assertEqual(len(self.client.posts), 19)
+        self.assertEqual(self.w.observe()['pipelineUsed'], 12)
+        self.assertEqual(self.w.observe()['pipelineUsedByProblem'], {p: 4 for p in W.PROBLEMS})
+
+    def test_parallel_quota_or_uncertain_owner_keeps_board_reserved(self):
+        self.parallel_capacity(); observed = self.w.observe()
+        source = observed['catalog'][0]
+        for state in ['quota_wait', 'uncertain_owned', 'check_running']:
+            diagnostics = {'outcomes': [{'problem': source['problem'], 'occurrenceId': source['occurrenceId'],
+                                        'candidateSHA256': source['digest'], 'state': state}]}
+            admission = W.pipeline_admission(12, [], observed['catalog'], set(), [], diagnostics,
+                set(observed['confirmedSourceArtifactIds']), capacity_policy=self.config)
+            with self.subTest(state=state):
+                self.assertEqual(admission['pipelineUsed'], 1)
+                self.assertEqual(admission['boardAvailableCandidateSlots'][source['problem']], 0)
+                self.assertEqual(admission['uncertainProblems'], [source['problem']])
+
     def test_partial_dispatch_second_unknown_never_reposts(self):
         self.add_seed(); self.w.tick(); self.complete_review(self.plan(2))
         self.client.timeout_before_commit_number = 5

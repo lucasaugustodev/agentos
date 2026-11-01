@@ -389,3 +389,46 @@ complete cost estimate and caveats reach a diagnostic-only review. A separate
 causal trace confirms that terminal administrative handoff starts one new review
 within the same tick. These are controller qualification results, not evidence
 of successful model work, GPU performance or uninterrupted live autonomy.
+
+Parallel committed pipelines (explicit opt-in)
+
+pipelineCapacityVersion: 2 enables maxPendingCandidates up to12 and
+maxPipelinesPerProblem up to4. Without that opt-in, the existing total limit of
+1..3 and one owned pipeline per problem remain unchanged. These are HARD limits
+on committed pipelines: native production, its sequential QA, unmeasured output,
+quota reservations and official GPU waits share them. Waiting work does not vanish
+from accounting. Three waiting pipelines can leave nine native slots in a12-slot
+configuration; twelve waiting pipelines leave none. There is no hidden overshoot
+or claim that all12 are CPU sessions. nativePipelineUsed and waitingPipelineUsed
+are disjoint counts; their sum equals pipelineUsed.
+
+boardAvailableCandidateSlots exposes the per-problem remaining capacity in the
+supervisor input. Several independently useful hypotheses may share a confirmed
+source and problem, each in its own native occurrence/workspace with sequential
+independent QA. The current control definition and all delivery/official gates
+remain unchanged. New input rules replace only the obsolete one-per-problem
+instruction, preserve all other evidence and quality rules, and request useful
+parallel work instead of empty sessions. Provider request concurrency is separate
+and is not raised by this controller change; the deployed six-call semaphore and
+session limits still apply, including supervision calls.
+
+The controller rejects duplicate normalized hypothesis text for the same problem
+and exact base digest, including renamed actions and existing native/waiting work.
+This is a deterministic exact-duplicate check, NOT a proof of semantic novelty;
+the supervisor must distinguish genuine bottlenecks, tests and expected outputs.
+Two evidence repairs cannot target the same candidate in one plan, and a candidate
+already owned by native production/QA or another repair cannot acquire a second
+repair. Unknown native scope/boundary and uncertain/quota ownership keep the board
+reserved. Canonical repair-parent aliasing still counts one logical pipeline while
+two real native actors remain two owners.
+
+Partial plans reserve their full approved set, preserve immutable inputs and
+reconcile uncertain POSTs by GET only. New external ownership can invalidate an
+unstarted remainder; no attempt is silently replaced or repeated. Qualification
+has168 passing server-only tests, including12 distinct native runs,4 per problem,
+over-capacity/duplicate rejection, GPU waiting reservations, uncertain ownership,
+repair aliases and partial dispatch across one or three problems. A frozen native
+snapshot preserves its one running owner while exposing11 available slots (3/4/4)
+and a complete supervisor input below1MiB. That offline proof does not mean11 real
+agents were dispatched or that performance improved; live dispatch and accepted
+results remain separate observations.
