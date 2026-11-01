@@ -245,6 +245,13 @@ candidate, patch proof, input scope and predecessor artifacts. Missing or confli
 links retain conservative accounting. Equal bytes alone never merge actors, and
 two actual repair actors continue to occupy two native slots.
 
+The combined capacity and prior-QA-context revision has 125 server-only tests.
+A frozen operational replay reproduced three apparent owners before the fix and
+two after it, making the independent board eligible while preserving the active
+repair and unmeasured candidate. Queued, running, uncertain and terminal repairs,
+conflicting lineage, real multiple actors and legacy request reconciliation are
+covered. A counterfactual replay does not by itself prove a new live dispatch.
+
 Evidence repair carries the complete previous qa-verification.json in
 input.experiment.repairQADiagnostic, separate from repairTarget and the canonical
 materials list. The report is limited to32KiB and byte-checked against its artifact
