@@ -957,6 +957,70 @@ class WatchTests(unittest.TestCase):
         self.assertEqual(self.w.tick()['state'], 'paused_by_control_cycle')
         self.assertEqual(len(self.client.posts), 1)
 
+    def bind_source_qa_blockers(self, blockers):
+        detail = self.client.occurrences[self.seed]
+        row = next(a for a in detail['artifacts'] if a['name'] == 'qa-verification.json')
+        qa = json.loads(self.client.artifacts[row['id']])
+        qa['blockingFindings'] = blockers; qa['findings'] = blockers
+        raw = W.canonical(qa); self.client.artifacts[row['id']] = raw
+        row.update(digest=W.digest(raw), size=len(raw))
+        return row
+
+    def test_complete_qa_blockers_reach_supervisor_and_selected_worker(self):
+        blockers = [{'id': 'F01', 'severity': 'blocking', 'detail': 'First defect. ' + 'A' * 700},
+                    {'id': 'F02', 'severity': 'blocking', 'detail': 'Second distinct checker defect. ' + 'B' * 900}]
+        qa = self.bind_source_qa_blockers(blockers)
+        self.w.tick()
+        review = self.w.state['supervisions'][-1]['input']
+        artifact = next(a for o in review['outcomes'] for a in o['artifacts'] if a['id'] == qa['id'])
+        self.assertEqual(artifact['qaEvidence']['blockingFindings'], blockers)
+        self.assertEqual(artifact['qaEvidence']['artifact']['digest'], qa['digest'])
+        self.assertEqual(artifact['qaEvidence']['bindingState'], 'verified')
+        self.assertTrue(artifact['review']['findingsTruncated'])
+        self.complete_review(); self.w.tick()
+        experiment = self.w.state['experiments'][-1]
+        inp = self.client.occurrences[experiment['occurrenceId']]['occurrence']['input']['experiment']
+        self.assertEqual(inp['sourceQAEvidence'][0]['blockingFindings'], blockers)
+        self.assertEqual(inp['sourceQAEvidence'][0]['candidateSHA256'], inp['sourceArtifact']['digest'])
+        self.assertEqual({r['name'] for r in inp['materials']}, {'base-candidate.py', 'canonical-TASK.md', 'canonical-AGENTS.md'})
+
+    def test_source_qa_tampering_and_cross_candidate_text_never_injected(self):
+        row = self.bind_source_qa_blockers([{'id': 'F01', 'detail': 'untrusted-cross-candidate-text'}])
+        raw = self.client.artifacts[row['id']]
+        self.client.artifacts[row['id']] = raw + b' '
+        observed = self.w.observe()
+        artifact = next(a for o in observed['outcomes'] for a in o['artifacts'] if a['id'] == row['id'])
+        self.assertEqual(artifact['qaEvidence']['bindingState'], 'unavailable')
+        self.assertNotIn('untrusted-cross-candidate-text', W.canonical(W.compact_outcomes(observed['outcomes'])).decode())
+        qa = json.loads(raw); qa['candidateSHA256'] = 'f' * 64
+        raw = W.canonical(qa); self.client.artifacts[row['id']] = raw; row.update(digest=W.digest(raw), size=len(raw))
+        observed = self.w.observe()
+        artifact = next(a for o in observed['outcomes'] for a in o['artifacts'] if a['id'] == row['id'])
+        self.assertEqual(artifact['qaEvidence']['code'], 'QA_CONTEXT_CANDIDATE_BINDING')
+        self.assertNotIn('untrusted-cross-candidate-text', W.canonical(W.compact_outcomes(observed['outcomes'])).decode())
+
+    def test_source_qa_oversize_is_explicit_without_truncation_or_global_failure(self):
+        for size, code in [(34000, 'QA_CONTEXT_BLOCKERS_SIZE_EXCEEDED'), (70000, 'QA_CONTEXT_SIZE_EXCEEDED')]:
+            row = self.bind_source_qa_blockers([{'id': 'F01', 'detail': 'X' * size}])
+            value = json.loads(self.client.artifacts[row['id']]); value['findings'] = []
+            raw = W.canonical(value); self.client.artifacts[row['id']] = raw; row.update(digest=W.digest(raw), size=len(raw))
+            observed = self.w.observe()
+            context = next(a['qaEvidence'] for o in observed['outcomes'] for a in o['artifacts'] if a['id'] == row['id'])
+            with self.subTest(size=size):
+                self.assertEqual(context['bindingState'], 'unavailable')
+                self.assertEqual(context['code'], code)
+                self.assertNotIn('blockingFindings', context)
+                self.assertTrue(observed['catalog'])
+
+    def test_source_qa_old_attempt_and_wrong_parent_rejected(self):
+        row = self.bind_source_qa_blockers([{'id': 'F01', 'detail': 'bound to exact source'}])
+        detail = self.client.occurrences[self.seed]
+        context, review = self.w.qa_context(detail, row, 'muse_decode_layer', set())
+        self.assertEqual(context['code'], 'QA_CONTEXT_ATTEMPT'); self.assertIsNone(review)
+        detail['occurrence']['input'] = {'experiment': {'sourceArtifact': {'digest': 'a' * 64}}}
+        context, review = self.w.qa_context(detail, row, 'muse_decode_layer', {row['attempt_id']})
+        self.assertEqual(context['code'], 'QA_CONTEXT_SOURCE_BINDING'); self.assertIsNone(review)
+
     def late_candidate_binding(self):
         obs = self.w.observe()
         source = next(r for r in obs['catalog'] if r['name'] == 'candidate.py')

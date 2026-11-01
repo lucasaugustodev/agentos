@@ -158,3 +158,23 @@ navigation aids: providing bytes does not prove the model read them or establish
 semantic novelty, correctness or performance. Independent QA and the no-op GPU
 admission guard still apply. Measure the effect on redundant proposals and accepted
 executable candidates before claiming improved productivity.
+
+QA defects travel with their source
+
+qaEvidence preserves complete structured blockingFindings from an artifact whose
+bytes, hash, latest attempt and candidate identity have been checked. The parent
+source is checked when the native input supplies it. This is a bound QA report,
+not acceptance or a guarantee that its claims are correct. Missing blockers are
+marked not_reported; malformed, cross-candidate, corrupt or oversized reports
+produce an explicit local diagnostic with no unverified report text. Limits are
+64 KiB per QA report, 32 blockers and 32 KiB for the complete blocker array. No
+blocker is silently clipped. Legacy findings/limitations summaries explicitly
+mark truncation, while the complete blockers remain separately available.
+
+The planner receives that evidence with the outcome. When it selects a source,
+the same occurrence/candidate-bound structure is also delivered as
+input.experiment.sourceQAEvidence to its worker. Canonical source and policy
+materials remain unchanged. Workers report conflicts between the scoped task and
+known blockers instead of silently losing the report. External engineering notes
+are not relabeled as QA findings; they need separate pinned provenance before
+being included in a future context protocol.
