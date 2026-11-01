@@ -478,19 +478,29 @@ class NativeAudit:
                     and spec.get("workspace") == self.p["workspace"] and spec.get("model") == self.p["model"]
                     and spec.get("accountId") == self.p["accountId"] and spec.get("maxAttempts") == 1
                     and not spec.get("sourceStep"), "SOURCE_ORIGIN_EXECUTOR_SCOPE")
-        require(len(detail["steps"]) == 2 and len(detail["attempts"]) == 2, "SOURCE_ORIGIN_ATTEMPT_SET")
+        require(len(detail["steps"]) == 2 and len(detail["attempts"]) in {1, 2}, "SOURCE_ORIGIN_ATTEMPT_SET")
         identities, attempts, frozen = {}, {}, {}
         for spec in specs:
             key = spec["key"]
             steps = [s for s in detail["steps"] if s["key"] == key]
             require(len(steps) == 1 and steps[0].get("definition") == spec, "SOURCE_ORIGIN_STEP_BINDING")
             rows = [a for a in detail["attempts"] if a["step_id"] == steps[0]["id"]]
+            if key == "independent-qa" and not rows:
+                # The native engine leaves the downstream step queued when its
+                # only producer fails. No attempted/unknown QA may be treated as
+                # not_run, and a completed producer must wait for its QA.
+                require(len(detail["attempts"]) == 1 and attempts["produce"]["state"] == "failed"
+                        and steps[0]["state"] == "queued" and occurrence["state"] in {"attention", "failed"},
+                        "SOURCE_ORIGIN_QA_NOT_RUN_UNPROVEN")
+                identities[key] = {"state": "not_run", "stepId": steps[0]["id"], "stepState": steps[0]["state"], "attemptCount": 0}
+                continue
             require(len(rows) == 1, "SOURCE_ORIGIN_ATTEMPT_SET")
             a = rows[0]
             require(UUID.fullmatch(a["id"]) and UUID.fullmatch(a["fence"]) and a["number"] == 1
                     and a.get("finished_at") and a.get("model") == self.p["model"]
                     and a.get("account_id") == self.p["accountId"], "SOURCE_ORIGIN_ATTEMPT_BINDING")
-            require((key == "produce" and a["state"] == steps[0]["state"] == "completed")
+            require((key == "produce" and (a["state"] == steps[0]["state"] == "completed"
+                        or a["state"] == "failed" and steps[0]["state"] in {"failed", "attention"}))
                     or (key == "independent-qa" and a["state"] in {"completed", "failed"}
                         and steps[0]["state"] in {"completed", "failed", "attention"}), "SOURCE_ORIGIN_OWNER_UNCONFIRMED")
             stopped = (a.get("receipt") or {}).get("stopped") is True
@@ -518,7 +528,9 @@ class NativeAudit:
             frozen[key + "-input.json"] = raw
             frozen[key + "-identity.json"] = canonical({**identities[key], "accountId": a["account_id"],
                 "model": a["model"], "manifest": manifest, "receiptStopped": stopped, "stopEvents": stop_events})
-        require(attempts["produce"]["id"] != attempts["independent-qa"]["id"], "SOURCE_ORIGIN_QA_IDENTITY")
+        qa_attempt = attempts.get("independent-qa")
+        require(not qa_attempt or attempts["produce"]["state"] == "completed"
+                and attempts["produce"]["id"] != qa_attempt["id"], "SOURCE_ORIGIN_QA_IDENTITY")
         def artifact_for(key, name):
             matches = [r for r in detail["artifacts"] if r["attempt_id"] == attempts[key]["id"] and r["name"] == name]
             require(len(matches) == 1, "SOURCE_ORIGIN_ARTIFACT_SET")
@@ -532,11 +544,14 @@ class NativeAudit:
                 and self.artifact(selected[0]) == candidate, "SOURCE_ORIGIN_ARTIFACT_ALIAS")
         # A QA-published copy is a transport alias, not independent source. The
         # producer artifact and exact handed-off bytes must both be established.
-        qa_home = self.runs / attempts["independent-qa"]["id"] / "home"
-        handed = self.io.read_regular(qa_home / "inputs" / producer_row["id"] / "candidate.py", 1024 * 1024)
-        require(handed == candidate, "SOURCE_ORIGIN_HANDOFF_CHANGED")
-        qa_row, qa_raw = artifact_for("independent-qa", "qa-verification.json")
-        qa = strict_json(qa_raw)
+        if qa_attempt:
+            qa_home = self.runs / qa_attempt["id"] / "home"
+            handed = self.io.read_regular(qa_home / "inputs" / producer_row["id"] / "candidate.py", 1024 * 1024)
+            require(handed == candidate, "SOURCE_ORIGIN_HANDOFF_CHANGED")
+            qa_row, qa_raw = artifact_for("independent-qa", "qa-verification.json")
+            qa = strict_json(qa_raw)
+        else:
+            require(source_artifact["id"] == producer_row["id"], "SOURCE_ORIGIN_QA_ALIAS_WITHOUT_ATTEMPT")
         patch_row, patch = artifact_for("produce", "implementation.patch")
         experiment, materials = inp["experiment"], {}
         require(experiment.get("problem") == problem, "SOURCE_ORIGIN_BOARD_CHANGED")
@@ -552,20 +567,45 @@ class NativeAudit:
         base_sha = digest(base)
         require(parent["digest"] == base_sha and self.artifact(parent) == base, "SOURCE_ORIGIN_BASE_CHANGED")
         require(apply_single_file_patch(base, patch) == candidate, "SOURCE_ORIGIN_PATCH_CHANGED")
-        require(qa.get("sourceSHA256") == base_sha and qa.get("candidateSHA256") == source_sha
-                and type(qa.get("passed")) is bool and type(qa.get("approvedForOfficialReview")) is bool, "SOURCE_ORIGIN_QA_BINDING")
+        if qa_attempt:
+            require(qa.get("sourceSHA256") == base_sha and qa.get("candidateSHA256") == source_sha
+                    and type(qa.get("passed")) is bool and type(qa.get("approvedForOfficialReview")) is bool, "SOURCE_ORIGIN_QA_BINDING")
+            qa_evidence = {"artifactId": qa_row["id"], "sha256": qa_row["digest"], "state": qa_attempt["state"],
+                           "reportedPassed": qa["passed"], "reportedApprovedForOfficialReview": qa["approvedForOfficialReview"]}
+            frozen["qa-verification.json"] = qa_raw
+        else:
+            qa_evidence = {"artifactId": None, "sha256": None, "state": "not_run",
+                           "reportedPassed": None, "reportedApprovedForOfficialReview": None}
+        producer_reports = []
+        for name in ("verification.json", "cpu-result.json"):
+            rows = [r for r in detail["artifacts"] if r["attempt_id"] == attempts["produce"]["id"] and r["name"] == name]
+            require(len(rows) <= 1, "SOURCE_ORIGIN_REPORT_SET")
+            if not rows:
+                producer_reports.append({"name": name, "state": "not_published", "reportedPassed": None})
+                continue
+            row, raw = rows[0], self.artifact(rows[0])
+            value = strict_json(raw)
+            require(value.get("candidateSHA256") == source_sha and type(value.get("passed")) is bool,
+                    "SOURCE_ORIGIN_REPORT_BINDING")
+            if name == "verification.json":
+                require(value.get("sourceSHA256") == base_sha, "SOURCE_ORIGIN_REPORT_BINDING")
+            else:
+                checker_row, _ = artifact_for("produce", "cpu-checks.py")
+                require(value.get("checkerSHA256") == checker_row["digest"], "SOURCE_ORIGIN_REPORT_BINDING")
+            producer_reports.append({"name": name, "state": "producer_report_only", "artifactId": row["id"],
+                                     "sha256": row["digest"], "reportedPassed": value["passed"]})
+            frozen[name] = raw
         provenance = self.source_provenance(problem, base_sha, parent, (*ancestry, occurrence_id))
         for i, ref in enumerate(provenance): frozen["ancestor-" + str(i) + ".json"] = pinned(ref)
         frozen.update({"candidate.py": candidate, "base-candidate.py": base, "implementation.patch": patch,
-                       "qa-verification.json": qa_raw, "dispatch-run.json": receipts["run"], "dispatch-create.json": receipts["create"]})
-        report = {"version": 1, "authority": "authorized-native-source-origin", "qualityAccepted": False,
+                       "dispatch-run.json": receipts["run"], "dispatch-create.json": receipts["create"]})
+        report = {"version": 2, "authority": "authorized-native-source-origin", "qualityAccepted": False,
                   "gpuValidated": False, "candidateExecutedByController": False, "watchId": self.p["watchId"],
                   "problem": problem, "sourceSHA256": source_sha, "baseSHA256": base_sha, "occurrenceId": occurrence_id,
                   "cycleId": occurrence["cycle_id"], "occurrenceState": occurrence["state"], "selectedArtifactId": source_artifact["id"],
                   "producerArtifactId": producer_row["id"], "selectedArtifactAttemptId": selected[0]["attempt_id"],
                   "identities": identities, "patchSHA256": patch_row["digest"], "dispatchReceiptSHA256": digest(receipts["run"]),
-                  "qa": {"artifactId": qa_row["id"], "sha256": qa_row["digest"], "state": attempts["independent-qa"]["state"],
-                         "reportedPassed": qa["passed"], "reportedApprovedForOfficialReview": qa["approvedForOfficialReview"]},
+                  "qa": qa_evidence, "producerReports": producer_reports,
                   "provenance": provenance, "files": {k: digest(v) for k, v in sorted(frozen.items())}}
         directory = pathlib.Path(options["registryDirectory"])
         require(directory == pathlib.Path(self.p["stateDirectory"]) / "source-origins" and directory.resolve() == directory,
@@ -576,6 +616,10 @@ class NativeAudit:
                 info = part.lstat()
                 require(info.st_uid == 0 and not info.st_mode & 0o022 and not stat.S_ISLNK(info.st_mode), "SOURCE_ORIGIN_REGISTRY_PROTECTION")
         protected_directory(directory.parent)
+        directory.mkdir(mode=0o700, exist_ok=True)
+        protected_directory(directory)
+        # Preserve already frozen v1 origin receipts and their ancestry paths.
+        directory = directory / "v2"
         directory.mkdir(mode=0o700, exist_ok=True)
         protected_directory(directory)
         folder = directory / (problem + "-" + source_sha + "-" + source_artifact["id"])

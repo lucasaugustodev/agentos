@@ -207,7 +207,7 @@ native experiment without treating that rejection as acceptance:
 The directory must be exactly `stateDirectory/source-origins`. Existing seed and
 successful-audit provenance remains unchanged. Otherwise the controller follows
 the selected artifact's authorized native occurrence, at most eight acyclic hops
-to a seed or successful audit. Each hop verifies both actors have actually stopped,
+to a seed or successful audit. Each hop verifies every dispatched actor has stopped,
 their model/account/workspace, dispatch receipts, fenced input manifests, immutable
 canonical materials and a patch that reproduces the candidate byte for byte. A
 QA-published copy is permitted only as an explicit alias to the exact producer
@@ -223,6 +223,16 @@ immutable receipt. Missing source identity or inconsistent provenance produces a
 controller diagnostic; temporarily unavailable source files produce observation
 wait. Neither condition requests a kernel repair or releases an existing external
 job. Enabling this policy is a separate deployment decision; it is off by default.
+
+If the producer failed and QA never started, source origin can still be proved
+from that producer's complete dispatch/input/source/patch envelope. The only
+allowed unstarted QA state is the native engine's `queued` step with zero
+attempts, blocked by its failed producer. A missing or uncertain actor is not a
+confirmed stop. Such receipts explicitly record `qa.state: not_run`, null QA
+verdicts, the failed producer and any bound negative CPU reports. No QA alias is
+allowed without a QA attempt. Optional reports may be unpublished; required
+source, patch, dispatch and fenced input evidence cannot be omitted. Version 2
+receipts use a separate registry subdirectory and preserve existing v1 records.
 
 Run the isolated unit tests **on a development server**, with an explicitly
 provisioned root-owned test directory outside all live state:

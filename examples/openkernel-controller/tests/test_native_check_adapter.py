@@ -567,6 +567,83 @@ class Fixture(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "SOURCE_ORIGIN_REGISTRY_SCOPE"): self.origin(source)
         self.assertEqual(list(outside.iterdir()), [])
 
+    def failed_producer_without_qa(self, detail):
+        producer = detail["attempts"][0]
+        producer["state"] = "failed"; producer["receipt"] = None
+        detail["attempts"] = [producer]
+        detail["occurrence"]["state"] = "attention"
+        detail["steps"][0]["state"] = "attention"; detail["steps"][1]["state"] = "queued"
+        detail["artifacts"] = [r for r in detail["artifacts"] if r["attempt_id"] == producer["id"]]
+        detail["events"] = [{"kind": "HARNESS_STOPPED", "attempt_id": producer["id"], "occurrence_id": detail["occurrence"]["id"],
+            "payload": {"runFence": producer["fence"], "confirmed": True, "unit": "agentos-run-" + producer["id"],
+            "proof": {"stopped": True, "mainPid": 0, "populated": False, "activeState": "inactive"}}}]
+        for row in detail["artifacts"]:
+            if row["name"] in {"verification.json", "cpu-result.json"}:
+                value = A.strict_json((pathlib.Path(self.paths["artifactDirectory"]) / row["digest"]).read_bytes())
+                value["passed"] = False
+                raw = A.canonical(value); row.update(digest=A.digest(raw), size=len(raw))
+                self.put(pathlib.Path(self.paths["artifactDirectory"]) / row["digest"], raw)
+
+    def test_failed_producer_origin_records_qa_not_run_and_negative_cpu(self):
+        source = self.origin_fixture()
+        self.failed_producer_without_qa(self.detail)
+        report = A.strict_json(A.pinned(self.origin(source)[0]))
+        self.assertEqual(report["identities"]["produce"]["state"], "failed")
+        self.assertEqual(report["qa"], {"state": "not_run", "artifactId": None, "sha256": None,
+            "reportedPassed": None, "reportedApprovedForOfficialReview": None})
+        self.assertEqual([r["reportedPassed"] for r in report["producerReports"]], [False, False])
+        self.assertFalse(report["qualityAccepted"])
+        self.assertEqual(self.runtime.stopped.call_count, 1)
+        self.assertEqual(self.official.posts, 0)
+
+    def test_failed_producer_missing_optional_reports_stays_unaccepted(self):
+        source = self.origin_fixture(); self.failed_producer_without_qa(self.detail)
+        self.detail["artifacts"] = [r for r in self.detail["artifacts"] if r["name"] not in {"verification.json", "cpu-result.json", "cpu-checks.py"}]
+        report = A.strict_json(A.pinned(self.origin(source)[0]))
+        self.assertEqual([r["state"] for r in report["producerReports"]], ["not_published", "not_published"])
+        self.assertFalse(report["qualityAccepted"])
+        self.detail["artifacts"] = [r for r in self.detail["artifacts"] if r["name"] != "implementation.patch"]
+        with self.assertRaisesRegex(ValueError, "SOURCE_ORIGIN_ARTIFACT_SET"): self.origin(source)
+
+    def test_failed_producer_cannot_hide_qa_attempt_or_claim_qa_alias(self):
+        source = self.origin_fixture(alias=True)
+        hidden_qa = copy.deepcopy(self.detail["attempts"][1]); hidden_qa["state"] = "running"
+        self.failed_producer_without_qa(self.detail)
+        with self.assertRaisesRegex(ValueError, "SOURCE_ORIGIN_ARTIFACT_ALIAS"): self.origin(source)
+        producer_row = next(r for r in self.detail["artifacts"] if r["name"] == "candidate.py")
+        source = {**producer_row, "occurrenceId": OCC, "problem": BOARD}
+        self.detail["attempts"].append(hidden_qa)
+        with self.assertRaisesRegex(ValueError, "SOURCE_ORIGIN_OWNER_UNCONFIRMED"): self.origin(source)
+        self.detail["attempts"].pop()
+        self.detail["steps"][1]["state"] = "running"
+        with self.assertRaisesRegex(ValueError, "SOURCE_ORIGIN_QA_NOT_RUN_UNPROVEN"): self.origin(source)
+
+    def test_failed_producer_needs_physical_stop_and_report_bindings(self):
+        source = self.origin_fixture(); self.failed_producer_without_qa(self.detail)
+        self.detail["events"][0]["payload"]["runFence"] = IDS[1]
+        with self.assertRaisesRegex(ValueError, "SOURCE_ORIGIN_OWNER_UNCONFIRMED"): self.origin(source)
+        self.detail["events"][0]["payload"]["runFence"] = self.detail["attempts"][0]["fence"]
+        row = next(r for r in self.detail["artifacts"] if r["name"] == "cpu-result.json")
+        value = A.strict_json((pathlib.Path(self.paths["artifactDirectory"]) / row["digest"]).read_bytes()); value["candidateSHA256"] = "0" * 64
+        raw = A.canonical(value); row.update(digest=A.digest(raw), size=len(raw));self.put(pathlib.Path(self.paths["artifactDirectory"]) / row["digest"], raw)
+        with self.assertRaisesRegex(ValueError, "SOURCE_ORIGIN_REPORT_BINDING"): self.origin(source)
+
+    def test_completed_producer_must_wait_for_qa_instead_of_not_run(self):
+        source = self.origin_fixture(); self.failed_producer_without_qa(self.detail)
+        self.detail["attempts"][0]["state"] = self.detail["steps"][0]["state"] = "completed"
+        with self.assertRaisesRegex(ValueError, "SOURCE_ORIGIN_QA_NOT_RUN_UNPROVEN"): self.origin(source)
+
+    def test_corrected_child_of_failed_producer_needs_own_full_qa(self):
+        parent = self.derived_origin_fixture(); self.failed_producer_without_qa(parent)
+        report, _, _ = self.audit.audit(OCC)
+        origin = A.strict_json(A.pinned(report["provenance"][0]))
+        self.assertFalse(origin["qualityAccepted"])
+        self.assertEqual(origin["qa"]["state"], "not_run")
+        self.assertEqual(report["authority"], "delegated-policy-and-independent-native-QA")
+        self.detail["attempts"][1]["receipt"]["stopped"] = False
+        with self.assertRaisesRegex(ValueError, "ATTEMPT_NOT_STOPPED"): self.audit.audit(OCC)
+        self.assertEqual(self.official.posts, 0)
+
     def test_semantics_no_precision_trade_or_false_approval(self):
         for change in ({"canonicalPrecisionPreserved": False}, {"evaluatorIndependent": False}, {"upstreamAttributionPreserved": False},
                        {"approvedForOfficialReview": False}, {"blockingFindings": ["wrong rounding"]}, {"gpuValidated": True},
