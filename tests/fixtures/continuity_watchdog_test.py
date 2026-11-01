@@ -275,6 +275,146 @@ class WatchTests(unittest.TestCase):
         self.assertEqual(evidence['cpu']['failedCases'], ['pair-scheduling'])
         self.assertEqual(evidence['cpu']['failedCaseCount'], 1)
 
+    def failed_producer_diagnostics(self):
+        oid = self.complete_outcome_report(negative=False, cpu_passed=False)
+        detail = self.client.occurrences[oid]; attempt = detail['attempts'][0]
+        detail['occurrence']['state'] = 'attention'; attempt['state'] = 'failed'
+        attempt['context'] = {'manifest': {'cycleId': detail['occurrence']['cycle_id'],
+            'occurrenceId': oid, 'step': 'produce', 'cycleInput': {'attemptId': attempt['id'],
+            'occurrenceId': oid, 'runFence': attempt['fence'], 'digest': 'c' * 64}}}
+        self.replace_outcome_json(oid, 'cpu-result.json', lambda value: value.update(
+            cases=[{'name': 'cost-falsifier', 'passed': False,
+                    'detail': 'CPU estimate: candidate 7000 us vs base 4000 us; not a GPU measurement.'}],
+            details={'cost': {'model': {'memory_efficiency': 0.9, 'weight_passes': 8},
+                              'candidate_us': 7000, 'base_us': 4000, 'estimated': True}},
+            limitations=['No GPU or candidate execution; estimates depend on assumed bandwidth.'],
+            gpuValidated=False, officialActionsPerformed=False))
+        self.replace_outcome_json(oid, 'verification.json', lambda value: value.update(
+            whyPassedIsFalse='The stated cost falsifier fired.',
+            missingEvidence='Independent GPU measurement is absent.',
+            contractRisk='The producer reports a storage-format concern, not an authoritative ruling.'))
+        return oid
+
+    def test_failed_producer_diagnostics_reach_diagnostic_only_without_authority(self):
+        oid = self.failed_producer_diagnostics(); observation = self.w.observe()
+        observation.update(diagnosticOnly=True, availableCandidateSlots=0, eligibleProblems=[])
+        self.w.submit_supervisor(observation)
+        inp = self.w.state['supervisions'][-1]['input']
+        evidence = next(r for r in inp['outcomes'] if r['occurrenceId'] == oid)['executionEvidence']
+        diagnostic = evidence['producerDiagnostics']
+        sections = {(s['artifact'], s['pointer']): s['value'] for s in diagnostic['sections']}
+        self.assertIn('7000 us', sections['cpu-result.json', '/cases/0']['detail'])
+        self.assertEqual(sections['cpu-result.json', '/details/cost']['model']['weight_passes'], 8)
+        self.assertIn('No GPU', sections['cpu-result.json', '/limitations'][0])
+        self.assertEqual(diagnostic['authority'], 'producer_report_only_not_qa_or_performance_acceptance')
+        self.assertFalse(diagnostic['currentAcceptance']); self.assertFalse(diagnostic['officialAuthorization'])
+        self.assertEqual(diagnostic['runFence'], self.client.occurrences[oid]['attempts'][0]['fence'])
+        self.assertEqual(inp['sourceCapsules']['sources'], [])
+        self.assertNotIn('REPORT.txt', json.dumps(diagnostic))
+
+    def test_failed_producer_diagnostic_fence_and_emitter_mismatch_withhold_text(self):
+        oid = self.failed_producer_diagnostics(); original = copy.deepcopy(self.client.occurrences[oid])
+        self.add_seed()
+        for change in ['fence', 'attempt', 'occurrence', 'cycle', 'step', 'live']:
+            with self.subTest(change=change):
+                d = copy.deepcopy(original); self.client.occurrences[oid] = d
+                attempt = d['attempts'][0]; manifest = attempt['context']['manifest']
+                if change == 'fence': manifest['cycleInput']['runFence'] = uid()
+                if change == 'attempt': manifest['cycleInput']['attemptId'] = uid()
+                if change == 'occurrence': manifest['occurrenceId'] = uid()
+                if change == 'cycle': manifest['cycleId'] = uid()
+                if change == 'step': manifest['step'] = 'independent-qa'
+                if change == 'live': attempt.update(state='running', finished_at=None)
+                evidence = self.w.execution_evidence(d)['producerDiagnostics']
+                self.assertEqual(evidence['bindingState'], 'unavailable')
+                self.assertNotIn('7000', json.dumps(evidence))
+                self.assertIn('muse_prefill_layer', self.w.observe()['eligibleProblems'])
+
+    def test_failed_producer_diagnostics_hash_source_and_checker_mismatch_do_not_enter(self):
+        oid = self.failed_producer_diagnostics(); d = self.client.occurrences[oid]
+        original, blobs = copy.deepcopy(d), copy.deepcopy(self.client.artifacts)
+        for change in ['hash', 'sourceSHA256', 'candidateSHA256', 'checkerSHA256', 'attempt']:
+            self.client.occurrences[oid] = d = copy.deepcopy(original); self.client.artifacts = copy.deepcopy(blobs)
+            if change == 'hash':
+                row = next(a for a in d['artifacts'] if a['name'] == 'cpu-result.json')
+                self.client.artifacts[row['id']] = b'{"detail":"unbound injected report"}'
+            elif change == 'attempt':
+                next(a for a in d['artifacts'] if a['name'] == 'cpu-result.json')['attempt_id'] = uid()
+            else:
+                self.replace_outcome_json(oid, 'cpu-result.json', lambda value: value.update({change: 'f' * 64}))
+            evidence = self.w.execution_evidence(d)
+            self.assertEqual(evidence['bindingState'], 'invalid')
+            self.assertNotIn('producerDiagnostics', evidence)
+            self.assertNotIn('7000', json.dumps(evidence))
+
+    def test_failed_diagnostic_sections_are_whole_and_omissions_are_visible(self):
+        oid = self.failed_producer_diagnostics()
+        self.replace_outcome_json(oid, 'cpu-result.json', lambda value: value.update(
+            details={'oversized': '界' * 10000, 'small': {'assumption': 'reported, not inferred'}}))
+        diagnostic = self.w.execution_evidence(self.client.occurrences[oid])['producerDiagnostics']
+        self.assertLessEqual(len(W.canonical(diagnostic)), W.PRODUCER_DIAGNOSTIC_LIMIT)
+        self.assertGreater(diagnostic['omittedSectionCount'], 0)
+        self.assertIn('PRODUCER_DIAGNOSTIC_BUDGET', diagnostic['omissionReasons'])
+        self.assertNotIn('界', json.dumps(diagnostic, ensure_ascii=False))
+        self.assertTrue(any(s['pointer'] == '/details/small' for s in diagnostic['sections']))
+
+    def test_failed_diagnostic_total_budget_keeps_latest_and_marks_omission(self):
+        oid = self.failed_producer_diagnostics(); evidence = self.w.execution_evidence(self.client.occurrences[oid])
+        rows = []
+        for i in range(12):
+            e = copy.deepcopy(evidence); e['producerDiagnostics']['sections'] = [
+                {'artifact': 'cpu-result.json', 'pointer': '/details', 'value': 'x' * 14000}]
+            e['producerDiagnostics']['finishedAt'] = f'2026-11-01T18:{i:02}:00Z'
+            rows.append({'occurrenceId': str(i), 'problem': 'muse_decode_layer', 'state': 'attention',
+                'finishedAt': None, 'failures': [], 'artifacts': [], 'executionEvidence': e})
+        compact = W.compact_outcomes(rows)
+        diagnostics = [r['executionEvidence']['producerDiagnostics'] for r in compact]
+        self.assertLessEqual(sum(len(W.canonical(d)) for d in diagnostics if 'sections' in d),
+                             W.SUPERVISOR_DIAGNOSTIC_LIMIT)
+        self.assertNotIn('sections', diagnostics[0]); self.assertIn('sections', diagnostics[-1])
+        self.assertEqual(diagnostics[0]['code'], 'SUPERVISOR_DIAGNOSTIC_BUDGET')
+        self.assertIn('sections', rows[0]['executionEvidence']['producerDiagnostics'])  # No mutation.
+
+    def test_failed_diagnostic_does_not_invent_absent_model_or_contract(self):
+        oid = self.failed_producer_diagnostics()
+        self.replace_outcome_json(oid, 'cpu-result.json', lambda value: [value.pop(k, None)
+            for k in ['details', 'limitations', 'gpuValidated', 'officialActionsPerformed']])
+        self.replace_outcome_json(oid, 'verification.json', lambda value: [value.pop(k, None)
+            for k in ['whyPassedIsFalse', 'missingEvidence', 'contractRisk']])
+        diagnostic = self.w.execution_evidence(self.client.occurrences[oid])['producerDiagnostics']
+        self.assertEqual([s['pointer'] for s in diagnostic['sections']], ['/cases/0'])
+        self.assertNotIn('model', json.dumps(diagnostic))
+        self.assertNotIn('contractRisk', json.dumps(diagnostic))
+
+    def test_pending_supervisor_replay_keeps_old_diagnostics_exactly(self):
+        oid = self.failed_producer_diagnostics(); observation = self.w.observe()
+        self.client.timeout_after_commit_number = len(self.client.posts) + 1
+        with self.assertRaises(TimeoutError): self.w.submit_supervisor(observation)
+        before = copy.deepcopy(self.w.state['reviewRequests'])
+        posted = copy.deepcopy(self.client.posts[-1]); count = len(self.client.posts)
+        changed = copy.deepcopy(observation)
+        next(r for r in changed['outcomes'] if r['occurrenceId'] == oid)['executionEvidence']['producerDiagnostics'] = {
+            'bindingState': 'unavailable', 'code': 'FUTURE_READ_FAILED'}
+        self.w.submit_supervisor(changed)  # Same durable intent: GET reconciliation only.
+        self.assertEqual(self.w.state['reviewRequests'], before)
+        self.assertEqual(len(self.client.posts), count)
+        self.assertEqual(self.w.state['supervisions'][-1]['input'], posted[1]['input'])
+
+    def test_failed_report_io_error_is_local_and_does_not_stop_other_board(self):
+        oid = self.failed_producer_diagnostics(); self.add_seed()
+        row = next(a for a in self.client.occurrences[oid]['artifacts'] if a['name'] == 'cpu-result.json')
+        original_request = self.client.request
+        def unavailable(method, route, *args, **kwargs):
+            if route == '/api/cycle-artifacts/' + row['id']:
+                raise OSError('private transport detail must not be copied')
+            return original_request(method, route, *args, **kwargs)
+        self.client.request = unavailable
+        observation = self.w.observe()
+        evidence = next(r for r in observation['outcomes'] if r['occurrenceId'] == oid)['executionEvidence']
+        self.assertEqual(evidence['code'], 'OUTCOME_ARTIFACT_UNAVAILABLE')
+        self.assertNotIn('private transport', json.dumps(observation))
+        self.assertIn('muse_prefill_layer', observation['eligibleProblems'])
+
     def test_outcome_source_candidate_checker_and_attempt_mismatch_are_local_diagnostics(self):
         oid = self.complete_outcome_report(); self.add_seed()
         original = copy.deepcopy(self.client.occurrences[oid]); raw = copy.deepcopy(self.client.artifacts)

@@ -293,3 +293,37 @@ Qualification now contains 131 server-only tests, four causal failures on the
 previous controller and an offline replay of frozen native/official GET data.
 No kernel, provider call, official POST, acceptance or production state change
 is performed by that replay. Instruction changes do not prove model compliance.
+
+Failed producer diagnostics
+
+executionEvidence.producerDiagnostics preserves useful contents of verified
+cpu-result.json and verification.json when a producer reports failed cases or
+undetected negative controls. It reaches the supervisor even during diagnosticOnly
+reviews with no eligible source or free pipeline slot. It uses the existing
+artifact reads, not another API, credential or retrieval tool, and never sends the
+whole REPORT. The complete failed-case/control objects, explicitly supplied
+assumptions/model/details and limitations/reasons retain their values and JSON
+pointers. Detail keys remain opaque: no association between a section and a case
+is invented. Smaller complete detail-map entries take budget priority; arrays
+inside them retain their order. Missing values, rules and measurements are not inferred.
+
+The latest producer attempt, step definition, closed attempt boundary and native
+manifest occurrence/attempt/fence must match. Artifact bytes, source, candidate
+and checker identities use the existing execution-evidence checks. The input
+digest is the value recorded by the native manifest, not a claim of a new rehash
+of a worker's input file. The envelope remains producer_report_only, with
+currentAcceptance:false and officialAuthorization:false. Its reported estimates,
+contract opinions and arbitrary text are untrusted data, not instructions, QA,
+canonical rules, GPU measurements or permissions. Eligibility and acceptance
+gates remain unchanged.
+
+Limits: 16 KiB per diagnostic envelope, including a 3 KiB reserve for omission
+metadata; complete sections that do not fit are omitted with counts, reasons and
+up to eight bounded references. No numeric expression or caveat is silently
+truncated. Compact planning input allows 64 KiB of these diagnostic envelopes,
+favoring the most recent closed producer, with explicit hash/size omission markers
+for the others. The existing 2 MiB complete input limit still applies. Invalid
+bindings and unavailable artifact reads yield an occurrence-local diagnostic;
+unrelated boards remain observable and eligible. Existing persisted review
+requests and uncertain POST receipts are reconciled without rewriting their
+original input or adding new diagnostics retroactively.
