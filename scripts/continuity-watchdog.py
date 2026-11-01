@@ -560,7 +560,7 @@ class Watchdog:
                             "missedNegativeControls": missed[:12]},
                     "artifacts": [{k: by_name[name][k] for k in ["id", "name", "digest", "size"]}
                                   for name in ["verification.json", "cpu-result.json"]]}
-        except (ValueError, TypeError, KeyError, UnicodeError) as error:
+        except (ValueError, TypeError, KeyError, UnicodeError, RecursionError) as error:
             code = str(error) if isinstance(error, ValueError) and re.fullmatch(r"(?:OUTCOME_|ARTIFACT_)[A-Z_]+", str(error)) else "OUTCOME_JSON_SCHEMA"
             return {"bindingState": "invalid", "classification": "evidence_diagnosis_required",
                     "code": code, "authority": "no_report_content_admitted"}
@@ -862,8 +862,11 @@ class Watchdog:
             for row in observation["autoCheckDiagnostics"]["repairableEvidence"]]}
         isolated = [r for r in observation["autoCheckDiagnostics"]["outcomes"] if r.get("classification") == "repair_exhausted"
                     or r.get("classification") == "new_hypothesis_required" and r.get("code") in ["NO_EXECUTABLE_CHANGE", "NO_CANDIDATE_CHANGE"]]
-        isolated_sha = {r["candidateSHA256"] for r in isolated}
-        body["input"]["catalog"] = [a for a in observation["catalog"] if a["digest"] not in isolated_sha]
+        exhausted_sha = {r["candidateSHA256"] for r in isolated if r.get("classification") == "repair_exhausted"}
+        isolated_noops = {(r["occurrenceId"], r["candidateSHA256"]) for r in isolated
+                          if r.get("classification") == "new_hypothesis_required"}
+        body["input"]["catalog"] = [a for a in observation["catalog"] if a["digest"] not in exhausted_sha
+            and (a["occurrenceId"], a["digest"]) not in isolated_noops]
         body["input"]["isolatedCandidates"] = isolated
         body["input"]["controllerDispatchAgeSeconds"] = observation["controllerDispatchAgeSeconds"]
         body["input"]["materialAgeUsesPublishedArtifactsOnly"] = True

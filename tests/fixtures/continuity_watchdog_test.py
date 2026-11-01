@@ -295,7 +295,7 @@ class WatchTests(unittest.TestCase):
         evidence = self.w.execution_evidence(d)
         self.assertEqual(evidence['code'], 'ARTIFACT_CORRUPT')
         self.assertNotIn('UNBOUND', W.canonical(evidence).decode())
-        for raw in [b'[]', b'{"passed":true,"passed":false}', b'{"value":NaN}']:
+        for raw in [b'[]', b'{"passed":true,"passed":false}', b'{"value":NaN}', b'[' * 2000 + b']' * 2000]:
             self.client.artifacts[row['id']] = raw; row.update(digest=W.digest(raw), size=len(raw))
             self.assertEqual(self.w.execution_evidence(d)['bindingState'], 'invalid')
 
@@ -334,6 +334,27 @@ class WatchTests(unittest.TestCase):
         status = W.read_json(self.config['autoCheckStatusPath']); status['policySHA256'] = W.digest(policy)
         W.atomic(self.config['autoCheckStatusPath'], status)
         self.assertEqual(self.w.observe()['autoCheckDiagnostics']['outcomes'][0]['classification'], 'diagnostic_only')
+
+    def test_unchanged_candidate_rejection_preserves_distinct_original_source_identity(self):
+        status = self.repairable_operation(); oid = status['occurrenceId']
+        detail = self.client.occurrences[oid]
+        base = detail['occurrence']['input']['experiment']['sourceArtifact']
+        row = next(a for a in detail['artifacts'] if a['name'] == 'candidate.py')
+        source_raw = self.client.artifacts[base['id']]
+        self.client.artifacts[row['id']] = source_raw; row.update(digest=base['digest'], size=len(source_raw))
+        self.replace_outcome_json(oid, 'qa-verification.json', lambda value: value.update(candidateSHA256=base['digest']))
+        qa = next(a for a in detail['artifacts'] if a['name'] == 'qa-verification.json')
+        self.install_diagnostic_fixture([{**status, 'candidateSHA256': base['digest'],
+            'qaSHA256': qa['digest'], 'code': 'NO_CANDIDATE_CHANGE'}])
+        self.assertEqual(self.w.tick()['state'], 'supervisor_dispatched')
+        review = self.w.state['supervisions'][-1]; inp = review['input']
+        self.assertTrue(any(a['id'] == base['id'] for a in inp['catalog']))
+        self.assertFalse(any(a['id'] == row['id'] for a in inp['catalog']))
+        valid = self.plan(); valid['experiments'][0]['sourceArtifactId'] = base['id']
+        W.validate_plan(valid, {'fingerprint': review['fingerprint'], **inp}, self.config)
+        invalid = copy.deepcopy(valid); invalid['experiments'][0]['sourceArtifactId'] = row['id']
+        with self.assertRaisesRegex(ValueError, 'SOURCE_SCOPE'):
+            W.validate_plan(invalid, {'fingerprint': review['fingerprint'], **inp}, self.config)
 
     def test_protected_registry_rejects_writable_and_symlink_paths(self):
         path = self.root / 'unsafe.json'; path.write_bytes(b'{}'); path.chmod(0o666)
