@@ -650,8 +650,10 @@ def scan(lane, status_path, mode):
             elif isinstance(error, subprocess.TimeoutExpired):
                 status, remediation = "observation_wait", "retry_read_only_observation_preserve_owner"
             elif isinstance(error, ValueError) and (code.startswith(("CPU_", "QA_", "PATCH_"))
-                    or code in {"NO_CANDIDATE_CHANGE", "SOURCE_REQUIRES_MANUAL_REVIEW"}):
+                    or code in {"NO_CANDIDATE_CHANGE", "NO_EXECUTABLE_CHANGE", "SOURCE_REQUIRES_MANUAL_REVIEW"}):
                 status, remediation = "rejected_repairable", "supervisor_review_evidence_and_plan_native_correction"
+                if code in {"NO_CANDIDATE_CHANGE", "NO_EXECUTABLE_CHANGE"}:
+                    remediation = "supervisor_new_hypothesis"
             if code == "NATIVE_NOT_COMPLETED": status, remediation = "await_native", "preserve_active_native_owner"
             elif code in {"CHECK_QUOTA", "POLICY_DAILY_BUDGET", "LOCAL_RATE_WAIT", "EXTERNAL_RATE_WAIT", "TRACK_CLOSED"}:
                 status, remediation = "quota_wait", "await_official_quota_or_rate_window"

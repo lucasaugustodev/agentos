@@ -204,6 +204,11 @@ class Fixture(unittest.TestCase):
         self.assertTrue(self.qa["approvedForOfficialReview"])
         with self.assertRaisesRegex(ValueError, "NO_EXECUTABLE_CHANGE"):
             self.lane.run(OCC, "check")
+        row = A.scan(self.lane, self.root / "status.json", "check")["outcomes"][0]
+        self.assertEqual(row["state"], "rejected_repairable")
+        self.assertEqual(row["code"], "NO_EXECUTABLE_CHANGE")
+        self.assertEqual(row["proposedRemediation"], "supervisor_new_hypothesis")
+        self.assertEqual(row["candidateSHA256"], A.digest(self.candidate))
         self.assertEqual(self.official.posts, 0)
         self.assertEqual(list(pathlib.Path(self.paths["stateDirectory"]).iterdir()), [])
 
