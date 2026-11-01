@@ -12,9 +12,10 @@ const reviewerIdentity = (reviewer?: string) => reviewer ?? 'deterministic-contr
  * JSONB canonicalization and SHA256 are evaluated by PostgreSQL in both paths. */
 const inputsSql = (filter: string) => `
   WITH current_tasks AS MATERIALIZED (
-    SELECT t.id,t.goal_id,t.title,t.state,t.criteria,t.attempt_count,t.instruction_revision_id,t.stage,t.covers,
+    SELECT t.id,t.goal_id,t.title,t.state,t.criteria,t.attempt_count,t.instruction_revision_id,t.stage,t.covers,t.plan_revision,
       r.id run_id,r.fence run_fence,r.attempt run_attempt,r.state run_state,
       NULLIF(r.instruction_snapshot->'workerValidation','null'::jsonb) worker_validation,
+      NULLIF(r.instruction_snapshot->'workerValidationScope','null'::jsonb) worker_validation_scope,
       CASE WHEN r.instruction_snapshot->>'workerValidationContract'='2' THEN r.instruction_snapshot->'candidateReadiness' END candidate_readiness,
       r.instruction_snapshot->'candidateCiAdmission' candidate_ci,
       CASE WHEN COALESCE(t.execution ? 'sourceContract',false) OR
@@ -44,6 +45,19 @@ const inputsSql = (filter: string) => `
       'contract',jsonb_build_object('criteria',m.criteria,'revision',m.instruction_revision_id,
         'stage',m.stage,'covers',m.covers),'artifacts',m.artifacts)
       ||CASE WHEN m.source_output IS NULL THEN '{}'::jsonb ELSE jsonb_build_object('sourceOutput',m.source_output) END
+      ||CASE WHEN m.worker_validation_scope IS NULL THEN '{}'::jsonb ELSE jsonb_build_object('workerValidationScope',
+        jsonb_build_object('snapshot',m.worker_validation_scope,'currentPolicy',p.value,'currentMap',rm.value,
+          'planDigest',(SELECT encode(sha256(convert_to(pr.plan::text,'UTF8')),'hex') FROM plan_revisions pr
+            WHERE pr.objective_id=m.goal_id AND pr.revision=m.plan_revision AND pr.status='applied'),
+          'admissionBound',EXISTS(SELECT 1 FROM events re WHERE re.kind='WORKER_VALIDATION_SCOPE_ADMISSION_AUTHORIZED'
+            AND re.entity_id=m.id::text AND re.payload->>'runId'=m.run_id::text AND re.payload->>'fence'=m.run_fence::text
+            AND re.payload->>'attempt'=m.run_attempt::text AND re.payload->'proof'=m.worker_validation_scope),
+          'mapRegistered',EXISTS(SELECT 1 FROM events re WHERE re.kind='CANDIDATE_READINESS_MAP_REGISTERED'
+            AND re.entity_id=m.goal_id::text AND re.payload=rm.value),
+          'policyRegistered',EXISTS(SELECT 1 FROM events re WHERE re.kind='WORKER_VALIDATION_POLICY_REGISTERED'
+            AND re.entity_id=m.goal_id::text AND re.payload=p.value),
+          'planBound',EXISTS(SELECT 1 FROM events re WHERE re.kind='CANDIDATE_READINESS_PLAN_BOUND'
+            AND re.entity_id=m.goal_id::text AND re.payload->>'registrationId'=m.worker_validation_scope->>'registrationId'))) END
       ||CASE WHEN m.candidate_ci IS NULL THEN '{}'::jsonb ELSE jsonb_build_object('candidateCi',
         jsonb_build_object('snapshot',m.candidate_ci,'currentMap',rm.value,'currentPolicy',qp.value)) END
       ||CASE WHEN m.candidate_readiness IS NULL THEN '{}'::jsonb ELSE jsonb_build_object('candidateReadiness',
@@ -58,8 +72,8 @@ const inputsSql = (filter: string) => `
           'evidenceState',e.value->'state','evidenceDigest',encode(sha256(convert_to((e.value#>'{body,authority}')::text,'UTF8')),'hex')))
         END validation_input
     FROM manifests m
-    LEFT JOIN settings p ON m.worker_validation IS NOT NULL AND p.id='worker-validation:'||m.goal_id
-    LEFT JOIN settings rm ON (m.candidate_readiness IS NOT NULL OR m.candidate_ci IS NOT NULL) AND rm.id='candidate-readiness:'||m.goal_id
+    LEFT JOIN settings p ON (m.worker_validation IS NOT NULL OR m.worker_validation_scope IS NOT NULL) AND p.id='worker-validation:'||m.goal_id
+    LEFT JOIN settings rm ON (m.candidate_readiness IS NOT NULL OR m.candidate_ci IS NOT NULL OR m.worker_validation_scope IS NOT NULL) AND rm.id='candidate-readiness:'||m.goal_id
     LEFT JOIN settings qp ON m.candidate_ci IS NOT NULL AND qp.id='worker-validation:'||m.goal_id
     LEFT JOIN settings h ON m.worker_validation IS NOT NULL AND h.id='worker-validation-handoff:'||m.run_id
     LEFT JOIN settings j ON j.id='candidate-validation:'||(h.value->>'actionId')

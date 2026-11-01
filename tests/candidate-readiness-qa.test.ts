@@ -1,6 +1,7 @@
 import {config} from '../server/config.js';
 import * as consumerReadiness from '../server/objective-review-readiness.js';
 import * as service from '../server/service.js';
+import * as sourceOutput from '../server/source-output-validation.js';
 import {assembleContext} from '../server/memory.js';
 import {acceptedDependencyArtifacts} from '../server/recovery.js';
 import {bindCandidateReadinessQaPlan} from '../server/candidate-readiness-qa-contract.js';
@@ -12,7 +13,7 @@ import {pool,migrate,tx,lock} from '../server/db.js';
 import {seedRegistry} from '../server/registry.js';
 import {installManagement} from '../server/management.js';
 import {writeArtifact,completeRun,validateTask} from '../server/service.js';
-import {registerWorkerValidationPolicy,validationDigest,canonicalValidationValue,workerValidationInstruction,workerValidationGate} from '../server/worker-validation.js';
+import {registerWorkerValidationPolicy,validationDigest,canonicalValidationValue,workerValidationInstruction,workerValidationGate,workerValidationCommitIdentity} from '../server/worker-validation.js';
 import {registerCandidateReadinessMap,bindCandidateReadinessPlan,recordCandidateReadinessAdmission,readCandidateReadinessProof,
   verifyBoundCandidateReadinessPlan} from '../server/candidate-readiness.js';
 import {candidateReadinessMapSchema} from '../server/candidate-readiness-contract.js';
@@ -345,6 +346,43 @@ it('rechecks scoped join authority at acceptance and preserves its frozen snapsh
   await registerWorkerValidationPolicy(f.goal,{...f.policy.policy,enabled:false},{channel:'api-token'});
   expect(await workerValidationGate(pool,f.join.run)).toMatchObject({required:true,state:'failed'});
   expect((await pool.query('SELECT instruction_snapshot FROM runs WHERE id=$1',[f.join.run])).rows[0].instruction_snapshot).toEqual(before);
+});
+async function submitJoin(){
+  await scopedJoin();await admitJoin();
+  await writeArtifact(f.join.run,f.join.fence,'delivery.json',JSON.stringify({passed:true}));
+  await writeArtifact(f.join.run,f.join.fence,'candidate.json',JSON.stringify({baseDigest:f.candidateDigest,candidateDigest:f.candidateDigest,files:[]}));
+  await completeRun(f.join.run,f.join.fence,'Source join prepared for the final accumulated candidate.');
+}
+it('rejects actual join acceptance after its authenticated scope policy is revoked',async()=>{
+  await submitJoin();
+  await registerWorkerValidationPolicy(f.goal,{...f.policy.policy,enabled:false},{channel:'api-token'});
+  const result=await validateTask(f.join.task);
+  expect(result.passed).toBe(false);
+  expect(result.checks).toContainEqual(expect.objectContaining({id:'registered-ci',passed:false}));
+  expect((await pool.query('SELECT count(*)::int n FROM acceptances WHERE run_id=$1 AND passed',[f.join.run])).rows[0].n).toBe(0);
+});
+it('seals scoped join authority when policy registration commits between validation reads and acceptance CAS',async()=>{
+  await submitJoin();
+  const identityBefore=await workerValidationCommitIdentity(pool,f.join.run);let identityAfter:unknown;
+  let entered!:()=>void,release!:()=>void;
+  const atRead=new Promise<void>(r=>{entered=r;}),continueValidation=new Promise<void>(r=>{release=r;});
+  const actual=sourceOutput.sourceOutputValidation,sequence:string[]=[];
+  vi.spyOn(sourceOutput,'sourceOutputValidation').mockImplementation(async(...args)=>{
+    const result=await actual(...args);sequence.push('validator-read');entered();await continueValidation;return result;
+  });
+  const validation=validateTask(f.join.task).then(result=>({result,error:undefined}),error=>({result:undefined,error}));
+  await atRead;
+  try{
+    await registerWorkerValidationPolicy(f.goal,{...f.policy.policy,enabled:false},{channel:'api-token'});
+    expect((await pool.query('SELECT value FROM settings WHERE id=$1',['worker-validation:'+f.goal])).rows[0].value.policy.enabled).toBe(false);
+    identityAfter=await workerValidationCommitIdentity(pool,f.join.run);
+    sequence.push('policy-committed');
+  }finally{sequence.push('validator-resumed');release();}
+  const outcome=await validation;
+  expect(sequence).toEqual(['validator-read','policy-committed','validator-resumed']);
+  expect(validationDigest(identityAfter)).not.toBe(validationDigest(identityBefore));
+  expect(outcome.error).toMatchObject({code:'STATE_CHANGED'});
+  expect((await pool.query('SELECT count(*)::int n FROM acceptances WHERE run_id=$1 AND passed',[f.join.run])).rows[0].n).toBe(0);
 });
 it('keeps legacy policy wire shape unchanged and refuses readiness applicability on work or verify stages',async()=>{
   expect(f.policy.policy).not.toHaveProperty('applicability');

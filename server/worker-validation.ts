@@ -253,6 +253,30 @@ export async function workerValidationGate(db:DB,runId:string):Promise<WorkerVal
  * payload digests are calculated in PostgreSQL instead of returning their bytes. */
 export async function workerValidationCommitIdentity(db:DB,runId:string) {
   const run=await readWorkerValidationIdentity(db,runId);
+  if(run?.worker_validation_scope&&!run.worker_validation){
+    // The complete scope check runs outside the admission lock. Seal its DB
+    // inputs here; never recalculate the release filesystem digest in the CAS.
+    const authority=(await db.query(`SELECT
+      encode(sha256(convert_to(p.value::text,'UTF8')),'hex') policy,
+      encode(sha256(convert_to(rm.value::text,'UTF8')),'hex') map,
+      encode(sha256(convert_to(pr.plan::text,'UTF8')),'hex') plan,
+      encode(sha256(convert_to(jsonb_build_object('key',t.key,'revision',t.plan_revision,'criteria',t.criteria,
+        'stage',t.stage,'covers',t.covers,'kind',t.execution->'kind')::text,'UTF8')),'hex') task,
+      (SELECT encode(sha256(convert_to((latest.plan->'requirements')::text,'UTF8')),'hex') FROM plan_revisions latest
+        WHERE latest.objective_id=t.goal_id ORDER BY latest.revision DESC LIMIT 1) requirements,
+      EXISTS(SELECT 1 FROM events e WHERE e.kind='WORKER_VALIDATION_POLICY_REGISTERED' AND e.entity_id=t.goal_id::text AND e.payload=p.value) policy_registered,
+      EXISTS(SELECT 1 FROM events e WHERE e.kind='CANDIDATE_READINESS_MAP_REGISTERED' AND e.entity_id=t.goal_id::text AND e.payload=rm.value) map_registered,
+      EXISTS(SELECT 1 FROM events e WHERE e.kind='WORKER_VALIDATION_SCOPE_ADMISSION_AUTHORIZED' AND e.entity_id=t.id::text
+        AND e.payload->>'runId'=$1 AND e.payload->>'fence'=$2 AND e.payload->>'attempt'=$3 AND e.payload->'proof'=$4::jsonb) admission_bound,
+      (SELECT encode(sha256(convert_to(jsonb_agg(e.payload ORDER BY e.id)::text,'UTF8')),'hex') FROM events e
+        WHERE e.kind='CANDIDATE_READINESS_PLAN_BOUND' AND e.entity_id=t.goal_id::text AND e.payload->>'registrationId'=$5) plan_bound
+      FROM tasks t LEFT JOIN settings p ON p.id='worker-validation:'||t.goal_id
+        LEFT JOIN settings rm ON rm.id='candidate-readiness:'||t.goal_id
+        LEFT JOIN plan_revisions pr ON pr.objective_id=t.goal_id AND pr.revision=t.plan_revision AND pr.status='applied'
+      WHERE t.id=$6`,[runId,run.fence,String(run.attempt),JSON.stringify(run.worker_validation_scope),
+        run.worker_validation_scope.registrationId,run.task_id])).rows[0];
+    return {required:false,scope:run.worker_validation_scope,authority};
+  }
   if(!run?.worker_validation) return {required:false};
   let authority:any;
   try {
