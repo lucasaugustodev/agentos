@@ -215,3 +215,22 @@ references and context limits. A separate read-only replay used actual native QA
 and pinned engineering evidence to verify propagation without a POST or acceptance
 change. Live supervision received the new evidence; better candidate quality or GPU
 performance requires downstream measurement and is not established by these tests.
+
+Future producer and QA instructions distinguish three hash identities explicitly:
+sourceSHA256 hashes the base-candidate.py bytes supplied in experiment.materials
+and must match experiment.sourceArtifact.digest; candidateSHA256 hashes the final
+candidate.py bytes. The task-input file has a separate cycleInputSHA256 identity.
+QA must independently rehash these files, and a producer that substitutes the task
+input hash for the base remains rejected even when CPU tests pass. Evidence repair
+still preserves the original base and immutable candidate separately.
+QA is instructed to copy the complete replayed cases and negativeControls arrays,
+including extensions, instead of rebuilding name/flag-only rows. Producers must
+keep original-case diagnostics separate from mutant-control state. Inconsistent
+claims remain a failed review; this does not widen the adapter's accepted schema.
+
+This clarification changes only future worker instructions, not the supervisor
+definition, source-binding gates, native criteria, permissions or already persisted
+definitions/inputs. Qualification now includes 115 server-only tests: generated
+material bindings, the input-hash/source-hash counterexample, immutable repair
+criteria and GET reconciliation of existing create/run receipts. Instructions make
+the contract explicit; they do not prove model compliance or successful GPU work.

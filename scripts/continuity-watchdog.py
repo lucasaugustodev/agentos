@@ -1392,12 +1392,24 @@ to change scope. If they contradict the requested scope, report the conflict
 explicitly rather than silently discard a known defect. Publish candidate.py, implementation.patch, cpu-checks.py,
 cpu-result.json and verification.json. verification must state sourceSHA256,
 candidateSHA256, passed, scopePreserved, gpuValidated=false, officialActionsPerformed=false.
+HASH IDENTITIES: sourceSHA256 = SHA256 of the exact base-candidate.py file bytes,
+decoded from input.experiment.materials[name="base-candidate.py"].base64. Rehash
+those bytes and require equality with that material's sha256 AND
+input.experiment.sourceArtifact.digest. candidateSHA256 = SHA256 of the final
+candidate.py bytes after all edits. The cycle-input.json file describes the task;
+its file hash is a separate cycleInputSHA256, never sourceSHA256 or candidateSHA256.
+Do not hash JSON serialization, an artifact ID or a path as the source. A mismatch
+must be reported as a binding failure, never repaired by copying an unrelated hash.
 implementation.patch must be a pure one-file unified diff with exact headers
 --- base-candidate.py and +++ candidate.py. Generate from the actual UTF-8 source
 and candidate with difflib.unified_diff, preserve final newlines, and verify that
 applying it reproduces candidate.py byte for byte. No other paths or files in the patch.
 CPU tests must exercise the distinguishing arithmetic/indexing/dispatch behavior,
 include a negative control, and report limitations. Do not import CUDA candidates on CPU.
+Keep the unmodified candidate's diagnostics separate from mutant-control diagnostics.
+Freeze each candidate case result before running negative controls. Give each mutant
+a fresh isolated diagnostic state; do not reuse or overwrite a global details map
+and then publish that contaminated map as the original candidate's result.
 cpu-result.json must contain passed, candidateSHA256, checkerSHA256,
 cases [{name,passed}] and negativeControls [{name,detected}]. Execute the actual
 cpu-checks.py with this MANDATORY exact one-line bash structure:
@@ -1415,9 +1427,22 @@ sourceSHA256, cpuReplayPassed, scopePreserved, approvedForOfficialReview, gpuVal
 officialActionsPerformed=false, findings (array), and limitations (nonempty array stating
 CPU-only validation and unmeasured GPU correctness/performance). Fail candidly if wrong or missing evidence;
 never claim GPU validity or speed from CPU/static checks. Your review cannot submit anything.
+Independently rehash the actual base-candidate.py and final predecessor candidate.py
+bytes; sourceSHA256 must equal the base file hash, the base material's sha256 and
+input.experiment.sourceArtifact.digest. candidateSHA256 must equal the candidate
+file hash. Read the base from input.experiment.materials[name="base-candidate.py"],
+not from cycle-input.json. A cycle-input.json hash belongs only in cycleInputSHA256.
+Never copy the producer's hash claims without verifying these bytes. A producer
+sourceSHA256 bound to the task-input file instead of the base is a failure even
+when its CPU tests pass; do not relabel it as verified or silently rewrite it.
 Also explicitly report canonicalPrecisionPreserved, evaluatorIndependent,
 upstreamAttributionPreserved, blockingFindings (array), and cpuEvidence containing
-checkerSHA256, resultSHA256, cases [{name,passed}] and negativeControls [{name,detected}].
+checkerSHA256, resultSHA256, and the COMPLETE cases and negativeControls arrays from
+the actual predecessor cpu-result.json that you successfully replayed. Preserve every
+field and extension, row order, names, types and values; do not reconstruct reduced
+name/flag objects or omit diagnostics such as problems, note or detail. If the replay
+reveals inconsistent case claims or mutant-contaminated diagnostics, fail explicitly;
+copying a report does not establish that its assertions are true.
 Derive these from the actual replay and file bytes; never invent tool-call IDs or attestations.
 Replay the actual predecessor cpu-checks.py with python3 in one bash call that
 uses exactly: sha256sum ABS_CHECKER ABS_CANDIDATE && python3 ABS_CHECKER [args]
@@ -1425,7 +1450,7 @@ Both checker paths are the same absolute cpu-checks.py path, and candidate is th
 absolute candidate.py path. One line; no cd, newline, echo, redirection or appended
 exit-status command. The tool supplies exit status. Both real hashes must appear.
 Bind cpuEvidence.resultSHA256 to the actual
-predecessor cpu-result.json and repeat its cases/negativeControls only if replayed.
+predecessor cpu-result.json and copy its full cases/negativeControls only if replayed.
 """
         if repair:
             producer += """\nEVIDENCE REPAIR OVERRIDES CODE IMPLEMENTATION: input.experiment.repairTarget

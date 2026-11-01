@@ -290,6 +290,39 @@ class WatchTests(unittest.TestCase):
         next(a for a in self.client.occurrences[oid]['artifacts'] if a['name'] == 'cpu-result.json')['attempt_id'] = uid()
         self.assertEqual(self.w.execution_evidence(self.client.occurrences[oid])['code'], 'OUTCOME_EVIDENCE_SET')
 
+    def test_generated_hash_guidance_binds_source_bytes_not_task_input(self):
+        control = copy.deepcopy(W.supervisor_definition(self.config))
+        oid = self.complete_outcome_report(negative=False)
+        detail = self.client.occurrences[oid]
+        packet = detail['occurrence']['input']['experiment']
+        base = next(m for m in packet['materials'] if m['name'] == 'base-candidate.py')
+        raw = W.base64.b64decode(base['base64'], validate=True)
+        source_hash = W.digest(raw)
+        task_input_hash = W.digest(W.canonical(detail['occurrence']['input']))
+        self.assertEqual(source_hash, base['sha256'])
+        self.assertEqual(source_hash, packet['sourceArtifact']['digest'])
+        self.assertEqual(raw, self.client.artifacts[packet['sourceArtifact']['id']])
+        self.assertNotEqual(source_hash, task_input_hash)
+        steps = detail['occurrence']['definition']['steps']
+        self.assertEqual([s['key'] for s in steps], ['produce', 'independent-qa'])
+        for step in steps:
+            self.assertIn('cycleInputSHA256', step['instructions'])
+            self.assertIn('input.experiment.sourceArtifact.digest', step['instructions'])
+            self.assertTrue(step['readOnly'])
+        self.assertIn('Independently rehash', steps[1]['instructions'])
+        self.assertIn('Preserve every', steps[1]['instructions'])
+        self.assertNotIn('cases [{name,passed}]', steps[1]['instructions'])
+        self.assertIn('fresh isolated diagnostic state', steps[0]['instructions'])
+        self.assertEqual(W.supervisor_definition(self.config), control)
+        self.assertEqual(self.w.execution_evidence(detail)['bindingState'], 'verified')
+        self.replace_outcome_json(oid, 'verification.json', lambda value: value.update(
+            sourceSHA256=task_input_hash, cycleInputSHA256=task_input_hash))
+        rejected = self.w.execution_evidence(detail)
+        self.assertEqual(rejected['bindingState'], 'invalid')
+        self.assertEqual(rejected['code'], 'OUTCOME_VERIFICATION_BINDING')
+        self.assertEqual(rejected['authority'], 'no_report_content_admitted')
+        self.assertNotIn('cpu', rejected)
+
     def test_corrupt_or_malformed_outcome_never_injects_unbound_text(self):
         oid = self.complete_outcome_report(); d = self.client.occurrences[oid]
         row = next(a for a in d['artifacts'] if a['name'] == 'verification.json')
@@ -439,6 +472,43 @@ class WatchTests(unittest.TestCase):
         self.assertEqual(len({a['attemptId'] for a in target['materials']}), 1)
         self.assertEqual([s['key'] for s in detail['occurrence']['definition']['steps']], ['produce', 'independent-qa'])
         self.assertEqual(detail['occurrence']['definition']['allowedActions'], [])
+
+    def test_repair_hash_guidance_keeps_original_base_and_immutable_candidate_distinct(self):
+        status = self.repairable_operation()
+        self.assertEqual(self.submit_repair_plan()['state'], 'experiments_dispatched')
+        oid = self.w.state['experiments'][-1]['occurrenceId']
+        occurrence = self.client.occurrences[oid]['occurrence']
+        packet = occurrence['input']['experiment']
+        base = next(m for m in packet['materials'] if m['name'] == 'base-candidate.py')
+        target = next(m for m in packet['repairTarget']['materials'] if m['name'] == 'candidate.py')
+        self.assertEqual(W.digest(W.base64.b64decode(base['base64'])), packet['sourceArtifact']['digest'])
+        self.assertEqual(W.digest(W.base64.b64decode(target['base64'])), status['candidateSHA256'])
+        self.assertNotEqual(base['sha256'], target['sha256'])
+        for step in occurrence['definition']['steps']:
+            self.assertIn('cycleInputSHA256', step['instructions'])
+            criteria = [c for c in step['criteria'] if c['id'] == 'immutable-repair-candidate']
+            self.assertEqual(len(criteria), 1)
+            self.assertEqual(criteria[0]['equals'], target['sha256'])
+
+    def test_existing_native_definition_and_input_are_reconciled_without_reformulation(self):
+        legacy = W.definition(self.config, 'Already dispatched experiment', [
+            W.native_step(self.config, 'produce', 'Legacy producer', 'Persisted earlier contract.', ['candidate.py'])])
+        create_body = {'requestKey': 'legacy-create-key', 'definition': legacy}
+        self.client.timeout_after_commit_number = 1
+        with self.assertRaises(TimeoutError): self.w.post_once('create', 'legacy-create-key', create_body)
+        created = self.w.reconcile_existing_post('create', 'legacy-create-key')
+        self.assertEqual(created['definition'], legacy)
+        run_body = {'requestKey': 'legacy-run-key', 'input': {'version': 1, 'immutableLegacyContext': 'exact bytes'}}
+        self.client.timeout_after_commit_number = 2
+        with self.assertRaises(TimeoutError): self.w.post_once('run', 'legacy-run-key', run_body, created['id'])
+        recovered = self.w.reconcile_existing_post('run', 'legacy-run-key', created['id'])
+        self.assertEqual(recovered['input'], run_body['input'])
+        self.assertEqual(recovered['definition'], legacy)
+        altered = copy.deepcopy(create_body)
+        altered['definition']['steps'][0]['instructions'] += ' New hash guidance.'
+        with self.assertRaisesRegex(ValueError, 'POST_IDENTITY_CHANGED'):
+            self.w.post_once('create', 'legacy-create-key', altered)
+        self.assertEqual(len(self.client.posts), 2)
 
     def test_two_failed_repairs_isolate_candidate_without_blocking_other_work(self):
         status = self.repairable_operation(); rows = [status]
