@@ -456,6 +456,28 @@ class Watchdog:
         atomic(marker, {**prior, "state": "recorded", "result": result})
         return result
 
+    def reconcile_existing_post(self, kind, key, cycle_id=None):
+        """Recover an already attempted effect without creating any new intent."""
+        marker = self.directory / ("intent-" + digest(key) + ".json")
+        if not marker.exists():
+            return None
+        prior = read_json(marker)
+        require(prior.get("kind") == kind and prior.get("requestKey") == key
+                and prior.get("cycleId") == cycle_id, "RECONCILE_INTENT_IDENTITY")
+        result = prior.get("result") or self.find_post(kind, cycle_id, key)
+        require(result is not None, "POST_UNCERTAIN_RECONCILE_ONLY")
+        require(UUID.fullmatch(result.get("id", "")), "RECEIPT_ID")
+        if kind == "create":
+            require(result.get("request_key") == key and type(result.get("definition")) is dict, "CREATE_RECEIPT")
+            body = {"requestKey": key, "definition": result["definition"]}
+        else:
+            require(result.get("cycle_id") == cycle_id and result.get("source_key") == "manual:" + key
+                    and type(result.get("input")) is dict, "RUN_RECEIPT")
+            body = {"requestKey": key, "input": result["input"]}
+        require(digest(body) == prior["requestDigest"], "RECONCILE_RECEIPT_CHANGED")
+        atomic(marker, {**prior, "state": "recorded", "result": result})
+        return result
+
     def verified_artifact(self, row, limit=262144):
         require(UUID.fullmatch(row.get("id", "")) and re.fullmatch(r"[a-f0-9]{64}", row.get("digest", "")), "ARTIFACT_IDENTITY")
         require(type(row.get("size")) is int and 0 <= row["size"] <= limit, "ARTIFACT_SIZE")
@@ -897,21 +919,81 @@ Do not copy former attestations; inspect precision, attribution and replay yours
             "officialActionsAllowed": False, "productionActionsAllowed": False, "sourceWriteAllowed": False,
             "experiment": packet}}
         row = self.post_once("run", key + "-run", body, created["id"])
-        record = {"occurrenceId": row["id"], "cycleId": created["id"], "problem": experiment["problem"],
+        return self.record_experiment(experiment, supervisor, row, repair)
+
+    def record_experiment(self, experiment, supervisor, row, repair=None):
+        require(row["input"].get("watchId") == self.config["watchId"]
+                and row["input"].get("supervisorOccurrenceId") == supervisor["occurrenceId"]
+                and row["input"]["experiment"]["problem"] == experiment["problem"], "EXPERIMENT_RECEIPT_SCOPE")
+        record = {"occurrenceId": row["id"], "cycleId": row["cycle_id"], "problem": experiment["problem"],
                   "supervisorOccurrenceId": supervisor["occurrenceId"], "experimentId": experiment["id"]}
         if repair:
             record.update({"repairOf": repair["occurrenceId"], "repairCandidateSHA256": repair["candidateSHA256"],
                 "repairCode": repair["code"], "repairAttempt": repair["repairAttempt"],
                 "repairPatchSHA256": repair["canonicalPatch"]["sha256"],
                 "repairOriginalPatchSHA256": repair["patchNormalization"]["originalPatchSHA256"]})
-        if not any(r["occurrenceId"] == row["id"] for r in self.state["experiments"]):
+        existing = [r for r in self.state["experiments"] if r["occurrenceId"] == row["id"]]
+        require(not existing or existing == [record], "EXPERIMENT_RECEIPT_CONFLICT")
+        if not existing:
             self.state["experiments"].append(record)
         self.state["lastDispatchAt"] = self.clock()
         self.save()
         return record
 
+    def reconcile_changed_plan(self, pending, observation):
+        """Close only the unattempted remainder; attempted unknown effects stay owned."""
+        pending["reconcileOnly"] = True
+        self.save()
+        owned, unstarted, uncertain = [], [], []
+        for exp in pending["approvedPlan"]["experiments"]:
+            existing = [r for r in self.state["experiments"] if
+                        r["supervisorOccurrenceId"] == pending["occurrenceId"] and r["experimentId"] == exp["id"]]
+            require(len(existing) <= 1 and (not existing or existing[0]["problem"] == exp["problem"]), "DISPATCH_RESERVATION_CONFLICT")
+            if existing:
+                owned.append(existing[0]); continue
+            key = self.config["watchId"] + "-experiment-" + digest([pending["occurrenceId"], exp])[:32]
+            stage = "create"
+            try:
+                created = self.reconcile_existing_post("create", key)
+                if created is None:
+                    require(not (self.directory / ("intent-" + digest(key + "-run") + ".json")).exists(), "RUN_WITHOUT_CREATE_INTENT")
+                    unstarted.append({"experimentId": exp["id"], "reason": "CREATE_NOT_ATTEMPTED"}); continue
+                stage = "run"
+                row = self.reconcile_existing_post("run", key + "-run", created["id"])
+                if row is None:
+                    unstarted.append({"experimentId": exp["id"], "reason": "RUN_NOT_ATTEMPTED", "cycleId": created["id"]}); continue
+                repair = None
+                if pending["approvedPlan"]["decision"] == "repair_evidence":
+                    original = next(r for r in pending["input"]["autoCheckDiagnostics"]["repairableEvidence"]
+                                    if r["candidateArtifactId"] == exp["sourceArtifactId"])
+                    target = row["input"]["experiment"]["repairTarget"]
+                    require(target["occurrenceId"] == original["occurrenceId"]
+                            and target["candidateSHA256"] == original["candidateSHA256"]
+                            and target["canonicalPatch"]["sha256"] == original["patchNormalization"]["canonicalPatchSHA256"],
+                            "RECONCILE_REPAIR_BINDING")
+                    repair = {**original, "canonicalPatch": target["canonicalPatch"]}
+                owned.append(self.record_experiment(exp, pending, row, repair))
+            except ValueError as error:
+                if str(error) != "POST_UNCERTAIN_RECONCILE_ONLY":
+                    raise
+                uncertain.append({"experimentId": exp["id"], "problem": exp["problem"], "stage": stage,
+                                  "requestKey": key if stage == "create" else key + "-run"})
+        pending.update({"reconciledEffects": owned, "unstartedRemainder": unstarted,
+                        "uncertainEffects": uncertain, "automaticPostRetry": False})
+        if uncertain:
+            self.save()
+            return self.status("owned_dispatch_uncertain", occurrenceId=pending["occurrenceId"],
+                               acknowledgedExperiments=owned, uncertainEffects=uncertain, automaticPostRetry=False)
+        pending.update({"state": "consumed" if owned else "superseded", "errorCode": "PLAN_OBSERVATION_CHANGED",
+                        "reconciledAfterEvidenceChange": True})
+        self.save()
+        return self.status("changed_plan_reconciled", occurrenceId=pending["occurrenceId"],
+                           dispatched=owned, unstartedRemainder=unstarted, newPostRequests=0)
+
     def consume_plan(self, pending, observation):
         plan = pending["approvedPlan"]
+        if pending.get("reconcileOnly"):
+            return self.reconcile_changed_plan(pending, observation)
         owned = [r for r in self.state["experiments"] if r["supervisorOccurrenceId"] == pending["occurrenceId"]]
         keys = [self.config["watchId"] + "-experiment-" + digest([pending["occurrenceId"], exp])[:32]
                 for exp in plan["experiments"]]
@@ -919,8 +1001,7 @@ Do not copy former attestations; inspect precision, attribution and replay yours
                          for key in keys for suffix in ["", "-run"])
         if observation["fingerprint"] != pending["fingerprint"]:
             if has_intent or owned:
-                return self.status("owned_dispatch_evidence_changed", occurrenceId=pending["occurrenceId"],
-                                   automaticPostRetry=False, acknowledgedExperiments=owned)
+                return self.reconcile_changed_plan(pending, observation)
             pending.update({"state": "superseded", "errorCode": "PLAN_OBSERVATION_CHANGED"}); self.save()
             return self.status("stale_plan_superseded", occurrenceId=pending["occurrenceId"])
         # observe() excludes this plan's own ACKs to keep its immutable evidence

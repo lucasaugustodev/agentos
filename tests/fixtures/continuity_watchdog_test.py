@@ -6,6 +6,7 @@ import json
 import pathlib
 import tempfile
 import unittest
+from unittest import mock
 import uuid
 
 SOURCE = pathlib.Path(__file__).parents[2] / 'scripts' / 'continuity-watchdog.py'
@@ -23,7 +24,7 @@ class FakeClient:
         self.config = config
         self.cycles = {config['controlCycleId']: {'id': config['controlCycleId'], 'state': 'active',
             'definition': W.supervisor_definition(config), 'request_key': 'control-key'}}
-        self.occurrences, self.artifacts, self.posts = {}, {}, []
+        self.occurrences, self.artifacts, self.posts, self.gets = {}, {}, [], []
         self.timeout_after_commit_number = None
         self.timeout_before_commit_number = None
         self.official_states = {}
@@ -62,6 +63,7 @@ class FakeClient:
             if number == self.timeout_after_commit_number:
                 raise TimeoutError('response lost after committed request')
             return copy.deepcopy(result)
+        self.gets.append(route)
         if route == '/api/cycles':
             return {'cycles': list(self.cycles.values())}
         if route.startswith('/api/cycle-artifacts/'):
@@ -509,9 +511,134 @@ class WatchTests(unittest.TestCase):
         with self.assertRaises(TimeoutError): self.w.tick()
         self.client.complete(self.seed, {'candidate.py': b'# changed after first ACK\n'})
         self.reload(); result = self.w.tick()
-        self.assertEqual(result['state'], 'owned_dispatch_evidence_changed')
+        self.assertEqual(result['state'], 'owned_dispatch_uncertain')
+        self.assertEqual(result['uncertainEffects'][0]['stage'], 'run')
         self.assertEqual(self.w.state['supervisions'][-1]['state'], 'dispatching')
         self.assertEqual(len(self.client.posts), 5)
+        self.assertTrue(self.w.state['supervisions'][-1]['reconcileOnly'])
+        self.assertEqual(self.w.tick()['state'], 'owned_dispatch_uncertain')
+        self.assertEqual(len(self.client.posts), 5)
+
+    def test_changed_evidence_recovers_lost_run_response_only_by_get(self):
+        self.add_seed(); self.w.tick(); self.complete_review(self.plan(2))
+        self.client.timeout_after_commit_number = 5
+        with self.assertRaises(TimeoutError): self.w.tick()
+        self.client.complete(self.seed, {'candidate.py': b'# changed evidence after first ACK\n'})
+        before_gets = len(self.client.gets)
+        self.reload(); result = self.w.tick()
+        self.assertEqual(result['state'], 'changed_plan_reconciled')
+        self.assertEqual(len(result['dispatched']), 2)
+        self.assertEqual(len(self.w.state['experiments']), 2)
+        self.assertEqual(self.w.state['supervisions'][-1]['state'], 'consumed')
+        self.assertGreater(len(self.client.gets), before_gets)
+        self.assertEqual(len(self.client.posts), 5)
+        self.assertEqual(self.w.tick()['state'], 'work_active')
+        self.assertEqual(len(self.client.posts), 5)
+
+    def test_changed_evidence_create_ack_run_unattempted_is_closed(self):
+        self.w.tick(); self.complete_review()
+        original = self.w.post_once
+        def stop_before_run(kind, *args, **kwargs):
+            if kind == 'run': raise RuntimeError('interrupted before run intent')
+            return original(kind, *args, **kwargs)
+        with mock.patch.object(self.w, 'post_once', side_effect=stop_before_run):
+            with self.assertRaisesRegex(RuntimeError, 'before run intent'): self.w.tick()
+        self.assertEqual(len(self.client.posts), 2)  # Supervisor run and experiment create only.
+        self.client.complete(self.seed, {'candidate.py': b'# changed before run attempt\n'})
+        self.reload(); result = self.w.tick()
+        self.assertEqual(result['state'], 'changed_plan_reconciled')
+        self.assertEqual(result['dispatched'], [])
+        self.assertEqual(result['unstartedRemainder'][0]['reason'], 'RUN_NOT_ATTEMPTED')
+        self.assertEqual(self.w.state['supervisions'][-1]['state'], 'superseded')
+        self.assertEqual(len(self.client.posts), 2)
+        self.assertEqual(self.w.tick()['state'], 'supervisor_dispatched')
+
+    def test_changed_evidence_committed_create_response_lost_never_runs_it(self):
+        self.add_seed(); self.w.tick(); self.complete_review(self.plan(2))
+        self.client.timeout_after_commit_number = 4
+        with self.assertRaises(TimeoutError): self.w.tick()
+        self.client.complete(self.seed, {'candidate.py': b'# changed after second create\n'})
+        self.reload(); result = self.w.tick()
+        self.assertEqual(result['state'], 'changed_plan_reconciled')
+        self.assertEqual(len(result['dispatched']), 1)
+        self.assertEqual(result['unstartedRemainder'][0]['reason'], 'RUN_NOT_ATTEMPTED')
+        self.assertEqual(len(self.client.posts), 4)
+        self.assertEqual(self.w.state['supervisions'][-1]['state'], 'consumed')
+
+    def test_changed_evidence_unattempted_second_action_never_starts(self):
+        self.add_seed(); self.w.tick(); self.complete_review(self.plan(2))
+        original = self.w.dispatch_experiment
+        def stop_second(exp, *args, **kwargs):
+            if exp['id'] == 'experiment-1': raise RuntimeError('no second create intent')
+            return original(exp, *args, **kwargs)
+        with mock.patch.object(self.w, 'dispatch_experiment', side_effect=stop_second):
+            with self.assertRaises(RuntimeError): self.w.tick()
+        self.client.complete(self.seed, {'candidate.py': b'# changed before second create\n'})
+        self.reload(); result = self.w.tick()
+        self.assertEqual(result['state'], 'changed_plan_reconciled')
+        self.assertEqual(len(result['dispatched']), 1)
+        self.assertEqual(result['unstartedRemainder'][0]['reason'], 'CREATE_NOT_ATTEMPTED')
+        self.assertEqual(len(self.client.posts), 3)
+
+    def test_changed_evidence_unknown_create_keeps_precise_ownership(self):
+        self.w.tick(); self.complete_review()
+        self.client.timeout_before_commit_number = 2
+        with self.assertRaises(TimeoutError): self.w.tick()
+        self.client.complete(self.seed, {'candidate.py': b'# changed while create uncertain\n'})
+        self.reload(); result = self.w.tick()
+        self.assertEqual(result['state'], 'owned_dispatch_uncertain')
+        self.assertEqual(result['uncertainEffects'][0]['stage'], 'create')
+        self.assertEqual(result['acknowledgedExperiments'], [])
+        self.assertEqual(len(self.client.posts), 2)
+
+    def test_reconcile_receipt_cannot_hide_changed_run_body(self):
+        self.w.tick(); self.complete_review(); self.client.timeout_after_commit_number = 3
+        with self.assertRaises(TimeoutError): self.w.tick()
+        self.client.complete(self.seed, {'candidate.py': b'# changed parent evidence\n'})
+        attempted = next(d for d in self.client.occurrences.values()
+                         if d['occurrence'].get('input', {}).get('experiment'))
+        attempted['occurrence']['input']['experiment']['hypothesis'] = 'different unapproved hypothesis'
+        self.reload()
+        with self.assertRaisesRegex(ValueError, 'RECONCILE_RECEIPT_CHANGED'): self.w.tick()
+        self.assertEqual(self.w.state['supervisions'][-1]['state'], 'dispatching')
+        self.assertEqual(len(self.client.posts), 3)
+
+    def test_reconcile_only_latch_survives_evidence_returning_to_old_fingerprint(self):
+        self.w.tick(); self.complete_review(); original_seed = copy.deepcopy(self.client.occurrences[self.seed])
+        self.client.timeout_before_commit_number = 2
+        with self.assertRaises(TimeoutError): self.w.tick()
+        self.client.complete(self.seed, {'candidate.py': b'# temporary evidence change\n'})
+        self.reload(); self.assertEqual(self.w.tick()['state'], 'owned_dispatch_uncertain')
+        # The original POST completes late. Expose its result to GET, without a new POST.
+        body = self.client.posts[1][1]; cycle_id = uid()
+        self.client.cycles[cycle_id] = {'id': cycle_id, 'request_key': body['requestKey'],
+                                       'definition': body['definition'], 'state': 'draft'}
+        self.client.occurrences[self.seed] = original_seed
+        self.reload()
+        self.assertEqual(self.w.observe()['fingerprint'], self.w.state['supervisions'][-1]['fingerprint'])
+        result = self.w.tick()
+        self.assertEqual(result['state'], 'changed_plan_reconciled')
+        self.assertEqual(result['unstartedRemainder'][0]['reason'], 'RUN_NOT_ATTEMPTED')
+        self.assertEqual(len(self.client.posts), 2)
+        self.assertEqual(self.w.state['experiments'], [])
+
+    def test_changed_evidence_repair_run_recovery_preserves_repair_lineage(self):
+        status = self.repairable_operation()
+        self.assertEqual(self.w.tick()['state'], 'supervisor_dispatched')
+        review = self.w.state['supervisions'][-1]
+        target = review['input']['autoCheckDiagnostics']['repairableEvidence'][0]
+        plan = self.plan(); plan['decision'] = 'repair_evidence'
+        plan['experiments'][0]['sourceArtifactId'] = target['candidateArtifactId']
+        self.complete_review(plan); self.client.timeout_after_commit_number = len(self.client.posts) + 2
+        with self.assertRaises(TimeoutError): self.w.tick()
+        posts = len(self.client.posts)
+        self.client.complete(self.seed, {'candidate.py': b'# changed unrelated seed after repair dispatch\n'})
+        self.reload(); result = self.w.tick()
+        self.assertEqual(result['state'], 'changed_plan_reconciled')
+        self.assertEqual(result['dispatched'][0]['repairOf'], status['occurrenceId'])
+        self.assertEqual(result['dispatched'][0]['repairCandidateSHA256'], status['candidateSHA256'])
+        self.assertEqual(result['dispatched'][0]['repairAttempt'], 1)
+        self.assertEqual(len(self.client.posts), posts)
 
     def test_official_terminal_wins_over_adapter_running_label(self):
         source = 'a' * 64
