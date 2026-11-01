@@ -1098,7 +1098,12 @@ class Watchdog:
                 item["classification"] = "new_hypothesis_required"; continue
             if len(repairs) >= 2:
                 item["classification"] = "repair_exhausted"; continue
-            diagnostic = self.repair_qa_diagnostic(detail, qa, row["problem"], latest, source["digest"])
+            try:
+                diagnostic = self.repair_qa_diagnostic(detail, qa, row["problem"], latest, source["digest"])
+            except (ValueError, KeyError, TypeError, OSError, RecursionError) as error:
+                code = str(error) if isinstance(error, ValueError) and re.fullmatch(r"[A-Z][A-Z0-9_]+", str(error)) else "REPAIR_QA_DIAGNOSTIC_UNAVAILABLE"
+                item.update(classification="repair_context_unavailable", repairContextCode=code)
+                continue  # Withhold this repair's unbound report; other boards remain observable.
             item["classification"] = "repair_evidence"
             summary["repairableEvidence"].append({**item, "candidateArtifactId": source["id"],
                 "originalBaseArtifact": base, "producerArtifacts": producer_artifacts, "qaArtifact": qa,

@@ -673,6 +673,29 @@ class WatchTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, code):
                 self.w.repair_qa_diagnostic(d, qa, status['problem'], latest, status['candidateSHA256'])
 
+    def test_invalid_prior_qa_manifest_is_local_and_another_board_keeps_dispatching(self):
+        status, detail, qa, _, _ = self.prior_qa_diagnostic_fixture()
+        self.add_seed('muse_prefill_layer')
+        attempt = next(a for a in detail['attempts'] if a['id'] == qa['attempt_id'])
+        attempt['context']['manifest']['cycleInput']['runFence'] = uid()
+        self.install_diagnostic_fixture([status])
+        observation = self.w.observe()
+        diagnostics = observation['autoCheckDiagnostics']
+        self.assertEqual(diagnostics['repairableEvidence'], [])
+        row = next(r for r in diagnostics['outcomes'] if r['occurrenceId'] == status['occurrenceId'])
+        self.assertEqual(row['classification'], 'repair_context_unavailable')
+        self.assertEqual(row['repairContextCode'], 'REPAIR_QA_MANIFEST_BINDING')
+        self.assertEqual(self.w.tick()['state'], 'supervisor_dispatched')
+        inp = self.w.state['supervisions'][-1]['input']
+        self.assertIn('muse_prefill_layer', inp['eligibleProblems'])
+        self.assertNotIn('repairQADiagnostic', json.dumps(inp))
+        self.assertNotIn('"missing": 16', json.dumps(inp))  # Full old CPU control report stays withheld.
+        plan = self.plan(); self.assertEqual(plan['experiments'][0]['problem'], 'muse_prefill_layer')
+        self.complete_review(plan)
+        self.assertEqual(self.w.tick()['state'], 'experiments_dispatched')
+        self.assertEqual(self.w.state['experiments'][-1]['problem'], 'muse_prefill_layer')
+        self.assertNotIn('repairOf', self.w.state['experiments'][-1])
+
     def test_existing_native_definition_and_input_are_reconciled_without_reformulation(self):
         legacy = W.definition(self.config, 'Already dispatched experiment', [
             W.native_step(self.config, 'produce', 'Legacy producer', 'Persisted earlier contract.', ['candidate.py'])])
