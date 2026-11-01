@@ -30,6 +30,7 @@ JOB = re.compile(r"[a-f0-9]{16,64}")
 BOARDS = {"muse_decode_layer", "muse_prefill_layer", "muse_attention_decode"}
 PRODUCER_FILES = {"candidate.py", "implementation.patch", "cpu-checks.py", "cpu-result.json", "verification.json"}
 QA_FILES = {"qa-verification.json", "review.txt"}
+WATCHER_STATE_MAX_BYTES = 64 * 1024 * 1024
 
 
 def require(ok, code):
@@ -96,6 +97,22 @@ def pinned(ref, immutable=True):
     raw = protected(ref["path"], immutable=immutable)
     require(digest(raw) == ref["sha256"], "PIN_CHANGED")
     return raw
+
+
+def watcher_state(policy):
+    """Bounded recovery for accumulated controller history, never a generic limit.
+
+    Keep every input and intent intact. This is headroom for recovery, not a
+    retention strategy; immutable external payloads need a separate migration.
+    """
+    raw = protected(pathlib.Path(policy["watcherStateDirectory"]) / "state.json",
+                    maximum=WATCHER_STATE_MAX_BYTES)
+    state = strict_json(raw)
+    require(isinstance(state, dict), "WATCH_STATE_SCHEMA")
+    require(state.get("watchId") == policy["watchId"], "WATCH_STATE_SCOPE")
+    require(isinstance(state.get("experiments", []), list)
+            and all(isinstance(row, dict) for row in state.get("experiments", [])), "WATCH_STATE_SCHEMA")
+    return state
 
 
 def load_helper(ref, name):
@@ -304,8 +321,7 @@ class NativeAudit:
 
     def dispatch(self, occurrence):
         directory = pathlib.Path(self.p["watcherStateDirectory"])
-        state = strict_json(protected(directory / "state.json"))
-        require(state.get("watchId") == self.p["watchId"], "WATCH_STATE_SCOPE")
+        state = watcher_state(self.p)
         entries = [e for e in state.get("experiments", []) if e.get("occurrenceId") == occurrence["id"]]
         require(len(entries) == 1 and entries[0]["cycleId"] == occurrence["cycle_id"], "NOT_WATCHDOG_DISPATCHED")
         source_key = occurrence.get("source_key", "")
@@ -829,8 +845,7 @@ def official_client(helper, boards):
 def scan(lane, status_path, mode):
     """One bounded scan; terminal GET and supervisor continuation remain watcher-owned."""
     require(mode in ("inspect", "check"), "CHECK_ONLY")
-    state = strict_json(protected(pathlib.Path(lane.p["watcherStateDirectory"]) / "state.json"))
-    require(state.get("watchId") == lane.p["watchId"], "WATCH_STATE_SCOPE")
+    state = watcher_state(lane.p)
     outcomes = []
     registered = lane.registered_occurrences()
     started = time.monotonic()

@@ -818,6 +818,99 @@ class Fixture(unittest.TestCase):
         for raw in (b'{"passed":true,"passed":false}', b'{"value":NaN}'):
             with self.assertRaises(ValueError): A.strict_json(raw)
 
+    def padded_watcher_state(self, size):
+        path = pathlib.Path(self.paths["watcherStateDirectory"]) / "state.json"
+        state = A.strict_json(path.read_bytes())
+        state["supervisions"] = [{"input": {"preservedContext": ""}}]
+        overhead = len(A.canonical(state))
+        state["supervisions"][0]["input"]["preservedContext"] = "x" * (size - overhead)
+        raw = A.canonical(state)
+        self.assertEqual(len(raw), size)
+        self.put(path, raw)
+        return path, A.digest(raw)
+
+    def test_large_state_scan_and_dispatch_preserve_history_and_do_not_post(self):
+        path, before = self.padded_watcher_state(17 * 1024 * 1024)
+        with self.assertRaisesRegex(ValueError, "PROTECTED_FILE"):
+            A.protected(path)  # Generic policy/helper/intent ceiling stays 16 MiB.
+        entry, receipts = self.audit.dispatch(self.detail["occurrence"])
+        self.assertEqual(entry["occurrenceId"], OCC)
+        self.assertEqual(set(receipts), {"run", "create"})
+        result = A.scan(self.lane, self.root / "status.json", "inspect")
+        self.assertEqual(result["outcomes"][0]["state"], "eligible")
+        self.assertEqual(A.digest(path.read_bytes()), before)
+        self.assertEqual(self.official.posts, 0)
+
+    def test_watcher_state_accepts_exact_64_mib(self):
+        path, before = self.padded_watcher_state(64 * 1024 * 1024)
+        state = A.watcher_state(self.p)
+        self.assertEqual(state["watchId"], WATCH)
+        self.assertEqual(state["experiments"][0]["occurrenceId"], OCC)
+        self.assertEqual(A.digest(path.read_bytes()), before)
+        self.assertEqual(self.official.posts, 0)
+
+    def test_watcher_state_rejects_64_mib_plus_one_before_parse(self):
+        path = pathlib.Path(self.paths["watcherStateDirectory"]) / "state.json"
+        with path.open("wb") as stream:
+            stream.truncate(64 * 1024 * 1024 + 1)
+        with mock.patch.object(A, "strict_json", side_effect=AssertionError("must bound before parse")):
+            with self.assertRaisesRegex(ValueError, "PROTECTED_FILE"):
+                A.watcher_state(self.p)
+        self.assertEqual(self.official.posts, 0)
+
+    def test_large_state_preserves_dispatch_and_qa_authorities(self):
+        self.padded_watcher_state(17 * 1024 * 1024)
+        wrong = copy.deepcopy(self.detail["occurrence"])
+        wrong["source_key"] += "-changed"
+        with self.assertRaisesRegex(ValueError, "DISPATCH_SOURCE_KEY"):
+            self.audit.dispatch(wrong)
+        qa = next(row for row in self.detail["artifacts"] if row["name"] == "qa-verification.json")
+        path = pathlib.Path(self.paths["artifactDirectory"]) / qa["digest"]
+        path.write_bytes(path.read_bytes() + b" ")
+        result = A.scan(self.lane, self.root / "status.json", "inspect")
+        self.assertEqual(result["outcomes"][0]["code"], "ARTIFACT_BYTES_CHANGED")
+        self.assertEqual(self.official.posts, 0)
+
+    def test_watcher_state_preserves_file_and_parent_modes(self):
+        path = pathlib.Path(self.paths["watcherStateDirectory"]) / "state.json"
+        for target in [path, path.parent]:
+            before = target.stat().st_mode & 0o777
+            try:
+                target.chmod(before | 0o020)
+                with self.assertRaisesRegex(ValueError, "PROTECTED_OWNER_MODE"):
+                    A.watcher_state(self.p)
+            finally:
+                target.chmod(before)
+
+    def test_watcher_state_preserves_owner_and_symlink_guards(self):
+        path = pathlib.Path(self.paths["watcherStateDirectory"]) / "state.json"
+        try:
+            os.chown(path, 65534, -1)
+            with self.assertRaisesRegex(ValueError, "PROTECTED_OWNER_MODE"):
+                A.watcher_state(self.p)
+        finally:
+            os.chown(path, 0, -1)
+        moved = path.with_name("saved-state.json")
+        path.rename(moved); path.symlink_to(moved)
+        with self.assertRaisesRegex(ValueError, "PROTECTED_PATH"):
+            A.watcher_state(self.p)
+
+    def test_watcher_state_preserves_strict_json_and_scope(self):
+        path = pathlib.Path(self.paths["watcherStateDirectory"]) / "state.json"
+        for raw, error in [
+            (b'{"watchId":"a","watchId":"b"}', "JSON_DUPLICATE_KEY"),
+            (b'{"value":NaN}', "JSON_NONFINITE"),
+            (b'[]', "WATCH_STATE_SCHEMA"),
+            (A.canonical({"watchId": "other", "experiments": []}), "WATCH_STATE_SCOPE"),
+            (A.canonical({"watchId": WATCH, "experiments": {}}), "WATCH_STATE_SCHEMA"),
+            (A.canonical({"watchId": WATCH, "experiments": [None]}), "WATCH_STATE_SCHEMA"),
+        ]:
+            with self.subTest(error=error):
+                self.put(path, raw)
+                with self.assertRaisesRegex(ValueError, error):
+                    A.scan(self.lane, self.root / "status.json", "inspect")
+        self.assertEqual(self.official.posts, 0)
+
     def test_audit_change_between_preflight_and_submit_blocks(self):
         actual = self.audit.audit; calls = [0]
         def changing(occ):

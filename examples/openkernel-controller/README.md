@@ -257,3 +257,19 @@ These tests inject fake native/official transports; they never make a submission
 or read production credentials. Test receipts remain inside the isolated test
 directory. Do not copy deployment IDs, account data, policies, source artifacts
 or credentials into this public repository.
+
+### Accumulated watcher state
+
+The adapter admits the watcher's `state.json` up to 64 MiB in the dispatch audit
+and scan. All generic protected reads, including policies, helpers and intent
+receipts, retain their 16 MiB ceiling. Root ownership, ancestor permissions,
+symlink rejection, strict JSON parsing, watch identity and dispatch/QA authority
+remain required. Historical inputs are neither truncated nor rewritten.
+
+This is bounded recovery headroom, not indefinite retention. Track state bytes,
+supervision count and byte growth per review. The next migration should store
+immutable input payloads by content hash, keep bounded references in active state,
+and verify all referenced bytes before replay. It needs atomic publication,
+backward-compatible reads, crash/restart and rollback proofs, with an explicit
+retention policy that preserves historical inputs and uncertain intents. Do not
+silently raise every file ceiling or discard history when the state grows again.
