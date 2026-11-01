@@ -780,7 +780,8 @@ export async function validateTask(taskId: string, reviewer?: string) {
   if (!task)
     throw new DomainError('NOT_SUBMITTED', 'A tarefa ainda não está pronta para validação.');
   const {verifiedWorkerValidationGate,workerValidationCommitIdentity,validationDigest}=await import('./worker-validation.js');
-  const proof=task.validation_input.workerValidation?await verifiedWorkerValidationGate(pool,task.run_id):null;
+  const proof=task.validation_input.workerValidation||task.validation_input.workerValidationScope
+    ?await verifiedWorkerValidationGate(pool,task.run_id):null;
   const ci:import('./worker-validation.js').WorkerValidationGate=proof?.gate??{required:false,state:'legacy',detail:''};
   const hasCandidateQa=task.criteria.some((c:any)=>c.type==='candidate_ci')||!!task.validation_input.candidateCi?.snapshot;
   if(task.validation_input.candidateCi?.snapshot&&!task.criteria.some((c:any)=>c.type==='candidate_ci'))

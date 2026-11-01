@@ -30,6 +30,7 @@ import {stopUnit} from './process-stop.mjs';
 import {inspectUnitExit} from './unit-exit.mjs';
 import {harnessFailureCode,harnessTurnFailureCode} from './harness-termination.mjs';
 import {projectHarnessToolFailure,rememberHarnessToolCall,forgetHarnessToolCall} from './runtime-tool-failure.mjs';
+import {runtimeToolPolicy} from './runtime-tool-policy.mjs';
 
 const DATA = '/var/lib/agentos-bridge/worker-runs';
 const ROOT = '/srv/agentos/workspaces';
@@ -57,6 +58,10 @@ export async function runHarness(params, signal, generate, emit = () => {}) {
   catch(e){emit('HARNESS_NOT_STARTED',{confirmed:true,phase:'model_policy',code:e.code??'MODEL_POLICY_GLM_ONLY'});throw e;}
   try{params=await hydrateArtifactInputBundle(params,signal);}
   catch(e){emit('HARNESS_NOT_STARTED',{confirmed:true,phase:'input_bundle',code:e.code??'INPUT_BUNDLE_INVALID'});throw e;}
+  let toolPolicy;
+  try{toolPolicy=await runtimeToolPolicy(params);}
+  catch(e){emit('HARNESS_NOT_STARTED',{confirmed:true,phase:'tool_policy',code:'SUPERVISOR_TOOL_POLICY_INVALID'});throw e;}
+  if(toolPolicy.diagnostic)emit('HARNESS_TOOL_POLICY_DIAGNOSTIC',{code:toolPolicy.diagnostic,role:toolPolicy.role,bashTimeoutMs:toolPolicy.bashTimeoutMs});
   const retryGuidance=params.retryGuidance;
   const guidanceUuid=/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i;
   // Bind the controller's received prompt before legitimate runtime enrichment
@@ -122,6 +127,7 @@ export async function runHarness(params, signal, generate, emit = () => {}) {
         ...(params.runFence ? {runFence:params.runFence} : {}),
         workspace: params.workspace,
         runtime: 'harness',
+        toolPolicy,
         memoryMiB,
         ...(memory.reservationId ? {memoryReservationId: memory.reservationId} : {}),
         deliveryContract: outputContract,
@@ -391,6 +397,7 @@ export async function runHarness(params, signal, generate, emit = () => {}) {
     '--setenv',
     'LANG',
     'C.UTF-8',
+    ...(toolPolicy.role==='supervisor'?['--setenv','AGENTOS_SUPERVISOR_TOOL_PROFILE','supervisor-v1']:[]),
     ...(operationPolicy?['--setenv','AGENTOS_MANAGED_OPERATIONS','1']:[]),
     ...(guidanceIdentity ? ['--setenv','AGENTOS_RUN_ID',params.runId,'--setenv','AGENTOS_RUN_FENCE',params.runFence,
       '--setenv','AGENTOS_GUIDANCE_DEADLINE_NS',(process.hrtime.bigint()+600_000_000_000n).toString()] : []),
@@ -585,6 +592,7 @@ export async function runHarness(params, signal, generate, emit = () => {}) {
     emit('HARNESS_STARTED', {
       unit,
       runtime: 'dsh-0.1.6-alpha.2',
+      toolPolicy,
       isolation: 'mount+pid+network+cgroup',
       workspace: params.workspace,
       memoryMiB,

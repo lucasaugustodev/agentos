@@ -11,6 +11,7 @@ import {objectiveReviewControllerRelease,assertObjectiveReviewConsumerReady} fro
 import type {WorkerRelease} from './worker-rollout.js';
 import type {ProposedPlan} from './objective-contracts.js';
 import {bindCandidateReadinessQaPlan} from './candidate-readiness-qa-contract.js';
+import {finalCandidateIntegration} from './candidate-readiness-plan.js';
 
 const failure=(code:string)=>new DomainError(code,code,409);
 function require(ok:unknown,code:string):asserts ok {if(!ok)throw failure(code);}
@@ -68,8 +69,10 @@ function verifyPlanScope(plan:ProposedPlan,reg:Registration){
   require(!!plan.incremental&&same([...selected].sort(),reg.contract.requirements.map(r=>r.id).sort())&&
     selected.includes(plan.incremental.selectedRequirementId)&&new Set(partition).size===partition.length&&
     same([...partition].sort(),[...universe].sort()),'READINESS_BATCH_PARTITION_UNBOUND');
-  const integrations=plan.tasks.filter(t=>t.stage==='integrate');
-  require(integrations.length===1&&same([...integrations[0].covers].sort(),[...selected].sort()),'READINESS_OBLIGATIONS_UNMAPPED');
+  const integration=finalCandidateIntegration(plan);
+  require(same([...integration.covers].sort(),[...selected].sort()),'READINESS_OBLIGATIONS_UNMAPPED');
+  require(plan.tasks.filter(t=>t.stage==='work'||t.stage==='integrate')
+    .every(t=>t.covers.every(id=>selected.includes(id))),'READINESS_OBLIGATIONS_UNMAPPED');
 }
 export function readinessCriterion(reg:Registration){
   return candidateReadinessCriterionSchema.parse({id:'integrated-readiness',label:'Candidata integrada pronta; aceite depende de CI canônica',
@@ -122,10 +125,9 @@ export async function bindCandidateReadinessPlan(db:DB,goalId:string,plan:Propos
   const configured=(await db.query('SELECT value FROM settings WHERE id=$1',[mapId(goalId)])).rows[0]?.value;
   if(!configured?.contract?.enabled)return plan;
   const reg=await registration(db,goalId);await consumer(db,options);
-  const integrations=plan.tasks.filter(t=>t.stage==='integrate');
-  require(!!plan.incremental&&integrations.length===1,'READINESS_SCOPE_UNMAPPED');
+  require(!!plan.incremental,'READINESS_SCOPE_UNMAPPED');
+  const original=finalCandidateIntegration(plan);
   verifyPlanScope(plan,reg);
-  const original=integrations[0];
   require(same([...original.covers].sort(),reg.contract.requirements.map(r=>r.id).sort()),
     'READINESS_OBLIGATIONS_UNMAPPED');
   require(original.criteria.length===1&&original.criteria[0].type==='json_field'&&original.criteria[0].name==='delivery.json'&&
@@ -143,7 +145,18 @@ export async function bindCandidateReadinessPlan(db:DB,goalId:string,plan:Propos
     '\nIntegration dependencies: '+JSON.stringify(task.dependencies)+'\nOriginal integration description (historical context, superseded only for CI handoff wording): '+
     prior.replace(/Execute os controles combinados:[\s\S]*$/,'Combined validation obligations are prescribed by the registered map above.');
   require(task.description.length<=20000,'READINESS_CONTEXT_TOO_LARGE');
-  const withQa=bindCandidateReadinessQaPlan(result,{...reg,policyStages:(await policy(db,goalId)).policy.stages});
+  const applicablePolicy=(await policy(db,goalId)).policy;
+  if(applicablePolicy.applicability==='candidate_readiness')for(const join of result.tasks.filter(t=>t.stage==='integrate'&&t.key!==task.key)){
+    join.description='Prepare only the accumulated source inputs for the dependent delivery. Apply the accepted canonical patches in dependency order, '+
+      'check patch preimages, source preservation and available local controls, and publish the actual source delta and local results. '+
+      'The registered database CI obligations belong to the final integration '+task.key+'; do not provision a database or claim those tests ran here. '+
+      'This join cannot accept an objective requirement. delivery.json passed:true means only that source preparation and the available local checks passed; '+
+      'record deferred registered CI explicitly as pending at the final candidate, and report passed:false for a failed local/source check. '+
+      'The full original requirement controls remain mandatory at the final integrated candidate and independent QA. '+
+      '\nOriginal source preparation scope (only duplicate registered database execution is deferred): '+join.description;
+    require(join.description.length<=20000,'READINESS_CONTEXT_TOO_LARGE');
+  }
+  const withQa=bindCandidateReadinessQaPlan(result,{...reg,policyStages:applicablePolicy.stages});
   await event(db,'CANDIDATE_READINESS_PLAN_BOUND',goalId,{version:1,registrationId:reg.registrationId,
     criterion:task.criteria[0],qaCriteria:withQa.tasks.flatMap(t=>t.criteria.filter(c=>c.type==='candidate_ci')),
     covers:task.covers,requirements:reg.contract.requirements,acceptance:false});
@@ -184,17 +197,57 @@ export async function recordCandidateReadinessAdmission(db:DB,task:any,runId:str
     jsonb_build_object('kind',execution->'kind') execution FROM tasks WHERE id=$1 FOR UPDATE`,[task.id])).rows[0];
   require(current&&current.attempt_count===task.attempt_count,'READINESS_ADMISSION_UNBOUND');
   await assertCandidateReadinessTaskPlan(db,current);
+  const scope=await candidateValidationScope(db,current,options);
+  if(scope){
+    const transactionId=(await db.query('SELECT pg_current_xact_id()::text id')).rows[0].id;
+    await event(db,'WORKER_VALIDATION_SCOPE_ADMISSION_AUTHORIZED',current.id,
+      {version:1,runId,fence,attempt:current.attempt_count+1,transactionId,proof:scope});
+  }
   const proof=await verifyCandidateReadinessAdmission(db,current,options);if(!proof)return null;
   const transactionId=(await db.query('SELECT pg_current_xact_id()::text id')).rows[0].id;
   await event(db,'CANDIDATE_READINESS_ADMISSION_AUTHORIZED',task.id,
     {version:1,runId,fence,attempt:task.attempt_count+1,transactionId,proof});
   return proof;
 }
+async function candidateValidationScope(db:DB,task:any,options:{consumerRelease?:WorkerRelease}={}){
+  const p=(await db.query('SELECT value FROM settings WHERE id=$1',['worker-validation:'+task.goal_id])).rows[0]?.value;
+  if(p?.policy?.applicability!=='candidate_readiness'||task.stage!=='integrate')return null;
+  require(p.policy.enabled&&same(p.policy.stages,['integrate'])&&task.execution?.kind==='harness','VALIDATION_SCOPE_UNBOUND');
+  const reg=await registration(db,task.goal_id);await consumer(db,options);
+  const plan=(await db.query("SELECT plan FROM plan_revisions WHERE objective_id=$1 AND revision=$2 AND status='applied'",
+    [task.goal_id,task.plan_revision])).rows[0]?.plan as ProposedPlan|undefined;
+  require(plan,'VALIDATION_SCOPE_UNBOUND');verifyPlanScope(plan,reg);
+  const final=finalCandidateIntegration(plan),planned=plan.tasks.find(t=>'r'+task.plan_revision+'-'+t.key===task.key);
+  require(planned&&planned.stage===task.stage&&same(planned.criteria,task.criteria)&&same(planned.covers,task.covers),
+    'VALIDATION_SCOPE_UNBOUND');
+  require(final.criteria.length===1&&same(final.criteria[0],readinessCriterion(reg))&&
+    (await db.query("SELECT 1 FROM events WHERE kind='CANDIDATE_READINESS_PLAN_BOUND' AND entity_id=$1 AND payload->>'registrationId'=$2 AND payload->'criterion'=$3::jsonb",
+      [task.goal_id,reg.registrationId,JSON.stringify(final.criteria[0])])).rowCount,'VALIDATION_SCOPE_UNBOUND');
+  const required=planned.key===final.key;
+  require(required||!planned.criteria.some(c=>c.type==='candidate_readiness'||c.type==='candidate_ci'),'VALIDATION_SCOPE_UNBOUND');
+  return {version:1,kind:'candidate_readiness',taskId:task.id,goalId:task.goal_id,planRevision:task.plan_revision,
+    taskKey:task.key,finalTaskKey:final.key,required,registrationId:reg.registrationId,mapDigest:reg.contractDigest,
+    policyRegistration:p,acceptance:false};
+}
+/** A join exemption is admitted authority, never inferred from a missing
+ * criterion. Current acceptance rechecks the map, policy and applied DAG. */
+export async function verifyCandidateReadinessValidationScope(db:DB,run:any,mode:'current'|'historical_evidence'='current'){
+  const scope=run.worker_validation_scope;
+  require(scope?.version===1&&scope.kind==='candidate_readiness'&&typeof scope.required==='boolean'&&
+    scope.taskId===run.task_id&&scope.goalId===run.goal_id&&scope.acceptance===false,'VALIDATION_SCOPE_UNBOUND');
+  require((await db.query("SELECT 1 FROM events WHERE kind='WORKER_VALIDATION_SCOPE_ADMISSION_AUTHORIZED' AND entity_id=$1 AND payload->>'runId'=$2 AND payload->>'fence'=$3 AND payload->>'attempt'=$4 AND payload->'proof'=$5::jsonb",
+    [run.task_id,run.id,run.fence,String(run.attempt),JSON.stringify(scope)])).rowCount,'VALIDATION_SCOPE_UNBOUND');
+  if(mode==='current'){
+    const task=(await db.query("SELECT id,goal_id,key,plan_revision,stage,covers,criteria,jsonb_build_object('kind',execution->'kind') execution FROM tasks WHERE id=$1",[run.task_id])).rows[0];
+    require(task&&same(scope,await candidateValidationScope(db,task)),'VALIDATION_SCOPE_UNBOUND');
+  }
+  return scope;
+}
 export async function verifyBoundCandidateReadinessPlan(db:DB,goalId:string,plan:ProposedPlan){
   const configured=(await db.query('SELECT value FROM settings WHERE id=$1',[mapId(goalId)])).rows[0]?.value;
   if(configured?.contract?.enabled&&configured.contract.scope?.kind==='batch'){
     const reg=await registration(db,goalId);verifyPlanScope(plan,reg);
-    const integrate=plan.tasks.find(t=>t.stage==='integrate')!;
+    const integrate=finalCandidateIntegration(plan);
     require(integrate.criteria.length===1&&same(integrate.criteria[0],readinessCriterion(reg)),
       'READINESS_BATCH_CRITERION_REMOVED');
     const qa=plan.tasks.filter(t=>t.stage==='verify'&&t.sourceTask===integrate.key);

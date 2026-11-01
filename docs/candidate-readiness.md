@@ -96,6 +96,26 @@ Without `scope`, the original whole-objective contract and digest are unchanged.
 
 ## Blocked preparation
 
+Dependency DAGs may contain intermediate source joins. Readiness binds to the
+unique integration downstream of every source producer, rather than the first
+integration or a task with matching requirement labels. Original requirement
+identities, the selected batch and its pending/completed partition remain bound.
+
+An authenticated worker validation policy can explicitly set
+`applicability: "candidate_readiness"` with `stages: ["integrate"]`. This defers
+the complete registered CI obligations to that final accumulated candidate.
+Intermediate joins retain source preparation and local checks; they do not
+accept objective requirements or claim deferred database tests passed. The
+default policy, without this field, still applies to every selected stage.
+
+A join exclusion requires a registered map, the bound applied DAG and an
+admission authorization for the exact run, fence, attempt and transaction. The
+database rejects older consumers that omit this authorization. Acceptance
+rechecks the policy and map; revocation cannot reuse the frozen exclusion.
+Final integration still requires all registered CI, followed by independent QA
+of the same accepted source. Register the policy and its updated map together
+before requesting a future plan; existing attempts are never rewritten.
+
 An unadopted consumer waits in `waiting_resource` and is checked again by the
 existing scheduler. Other eligible tasks may still dispatch. An invalid map or
 policy preserves the task and records the precise cause and the owner

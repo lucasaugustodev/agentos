@@ -1,5 +1,7 @@
 import {config} from '../server/config.js';
+import * as consumerReadiness from '../server/objective-review-readiness.js';
 import * as service from '../server/service.js';
+import * as sourceOutput from '../server/source-output-validation.js';
 import {assembleContext} from '../server/memory.js';
 import {acceptedDependencyArtifacts} from '../server/recovery.js';
 import {bindCandidateReadinessQaPlan} from '../server/candidate-readiness-qa-contract.js';
@@ -11,7 +13,7 @@ import {pool,migrate,tx,lock} from '../server/db.js';
 import {seedRegistry} from '../server/registry.js';
 import {installManagement} from '../server/management.js';
 import {writeArtifact,completeRun,validateTask} from '../server/service.js';
-import {registerWorkerValidationPolicy,validationDigest,canonicalValidationValue,workerValidationInstruction,workerValidationGate} from '../server/worker-validation.js';
+import {registerWorkerValidationPolicy,validationDigest,canonicalValidationValue,workerValidationInstruction,workerValidationGate,workerValidationCommitIdentity} from '../server/worker-validation.js';
 import {registerCandidateReadinessMap,bindCandidateReadinessPlan,recordCandidateReadinessAdmission,readCandidateReadinessProof,
   verifyBoundCandidateReadinessPlan} from '../server/candidate-readiness.js';
 import {candidateReadinessMapSchema} from '../server/candidate-readiness-contract.js';
@@ -235,6 +237,158 @@ it('does not let a saved batch plan remove readiness and fall back to a legacy p
   await configureThreeOfSixBatch();const stripped=structuredClone(f.plan);
   stripped.tasks[0].criteria=structuredClone(f.originalPlan.tasks[0].criteria);
   await expect(tx(async db=>{await lock(db);return verifyBoundCandidateReadinessPlan(db,f.goal,stripped);})).rejects.toMatchObject({code:'READINESS_BATCH_CRITERION_REMOVED'});
+});
+it('binds only the final accumulated integration when intermediate source joins cover the same three-of-six batch',async()=>{
+  const {requirements,covers,pending}=await configureThreeOfSixBatch();
+  const plan=structuredClone(f.originalPlan),integration=plan.tasks.find((t:any)=>t.key==='integrate');
+  const producer={...structuredClone(integration),key:'source',stage:'work',agentId:'engineering.backend.node'};
+  const join={...structuredClone(integration),key:'source-join',dependencies:['source']};
+  const dependent={...structuredClone(producer),key:'dependent',sourceTask:'source-join',dependencies:['source-join']};
+  integration.dependencies=['source','dependent'];
+  plan.tasks.unshift(producer,join,dependent);
+  const before=structuredClone(plan);
+  const bound=await tx(async db=>{await lock(db);return bindCandidateReadinessPlan(db,f.goal,plan,{consumerRelease:expected});});
+  expect(plan).toEqual(before);
+  expect(bound.tasks.filter(t=>t.criteria.some(c=>c.type==='candidate_readiness')).map(t=>t.key)).toEqual(['integrate']);
+  expect(bound.tasks.find(t=>t.key==='source-join')).toEqual(join);
+  expect(bound.tasks.find(t=>t.key==='verify')?.criteria).toContainEqual(expect.objectContaining({type:'candidate_ci',sourceTaskKey:'integrate'}));
+  expect(bound.requirements).toEqual(requirements);
+  expect(bound.incremental).toMatchObject({selectedRequirementIds:covers,pendingRequirementIds:pending,completedRequirementIds:[]});
+  const stripped=structuredClone(bound);
+  stripped.tasks.find(t=>t.key==='integrate')!.criteria=integration.criteria;
+  await expect(tx(async db=>{await lock(db);return verifyBoundCandidateReadinessPlan(db,f.goal,stripped);})).rejects.toMatchObject({code:'READINESS_BATCH_CRITERION_REMOVED'});
+  expect((await pool.query('SELECT count(*)::int n FROM runs')).rows[0].n).toBe(0);
+});
+it('refuses an intermediate source branch outside the registered batch even when the final integration covers only that batch',async()=>{
+  await configureThreeOfSixBatch();const plan=structuredClone(f.originalPlan);
+  const integration=plan.tasks.find((t:any)=>t.key==='integrate');
+  plan.tasks.unshift({...structuredClone(integration),key:'foreign-source',stage:'work',agentId:'engineering.backend.node',covers:['req-4']});
+  integration.dependencies=['foreign-source'];
+  await expect(tx(async db=>{await lock(db);return bindCandidateReadinessPlan(db,f.goal,plan,{consumerRelease:expected});}))
+    .rejects.toMatchObject({code:'READINESS_OBLIGATIONS_UNMAPPED'});
+  expect((await pool.query('SELECT count(*)::int n FROM runs')).rows[0].n).toBe(0);
+});
+async function scopedJoin(){
+  await configureThreeOfSixBatch();
+  vi.spyOn(consumerReadiness,'objectiveReviewControllerRelease').mockResolvedValue(expected);
+  const tests=Array.from({length:13},(_,i)=>({file:'tests/transaction-pg.test.ts',name:`Preserve registered obligation ${i+1}`}));
+  f.policy=await registerWorkerValidationPolicy(f.goal,{...policy,applicability:'candidate_readiness',requiredDatabaseTests:tests},{channel:'api-token'});
+  f.map={...f.map,policyRegistrationId:f.policy.registrationId,obligations:[f.map.obligations[0],
+    ...tests.map((test,i)=>({id:'ci-'+i,kind:'registered_ci',requirements:['req-1','req-2','req-3'],...test}))]};
+  f.registration=await registerCandidateReadinessMap(f.goal,f.map,{channel:'operator-session'});
+  const plan=structuredClone(f.originalPlan),final=plan.tasks.find((t:any)=>t.key==='integrate');
+  const join={...structuredClone(final),key:'source-join',covers:['req-1']};
+  final.dependencies=['source-join'];plan.tasks.unshift(join);
+  f.plan=await tx(async db=>{await lock(db);return bindCandidateReadinessPlan(db,f.goal,plan,{consumerRelease:expected});});
+  f.criterion=f.plan.tasks.find((t:any)=>t.key==='integrate').criteria[0];
+  await pool.query('UPDATE plan_revisions SET plan=$2 WHERE id=$1',[f.revision,JSON.stringify(f.plan)]);
+  for(const [key,id] of [['integrate',f.task],['verify',f.qa.task]]){
+    const task=f.plan.tasks.find((t:any)=>t.key===key);
+    await pool.query('UPDATE tasks SET description=$2,criteria=$3,covers=$4 WHERE id=$1',[id,task.description,JSON.stringify(task.criteria),JSON.stringify(task.covers)]);
+  }
+  f.join={task:randomUUID(),run:randomUUID(),fence:randomUUID()};
+  await pool.query(`INSERT INTO tasks(id,goal_id,key,title,description,agent_id,state,stage,criteria,execution,attempt_count,covers,recovery,plan_revision)
+    VALUES($1,$2,'r1-source-join','Prepare source inputs',$3,'engineering.integration','ready','integrate',$4,$5,0,'["req-1"]','{"mode":"automatic"}',1)`,
+    [f.join.task,f.goal,f.plan.tasks.find((t:any)=>t.key==='source-join').description,JSON.stringify(join.criteria),JSON.stringify({kind:'harness',workspace:'agentos/oreadinessjoin',baseWorkspace:'agentos/base',readOnlySource:false})]);
+  await pool.query('INSERT INTO dependencies(task_id,depends_on) VALUES($1,$2)',[f.task,f.join.task]);
+  return tests;
+}
+async function admitJoin(){
+  await tx(async db=>{await lock(db);
+    await recordCandidateReadinessAdmission(db,{id:f.join.task,attempt_count:0},f.join.run,f.join.fence,{consumerRelease:expected});
+    await db.query("INSERT INTO runs(id,task_id,attempt,fence,runtime,agent_version,state) VALUES($1,$2,1,$3,'harness',1,'running')",[f.join.run,f.join.task,f.join.fence]);
+    await db.query("UPDATE tasks SET state='running',attempt_count=1 WHERE id=$1",[f.join.task]);
+  });
+}
+it('authenticates a partial-join CI exclusion while retaining all thirteen obligations on the final candidate and its independent QA',async()=>{
+  const tests=await scopedJoin();await admitJoin();
+  const join=(await pool.query('SELECT instruction_snapshot FROM runs WHERE id=$1',[f.join.run])).rows[0];
+  expect(join.instruction_snapshot.workerValidation).toBeNull();
+  expect(join.instruction_snapshot.workerValidationScope).toMatchObject({required:false,finalTaskKey:'integrate',acceptance:false});
+  expect(join.instruction_snapshot.task.criteria).toEqual(f.originalPlan.tasks[0].criteria);
+  expect(workerValidationInstruction(join)).toContain('REGISTERED SOURCE-JOIN SCOPE');
+  expect(await workerValidationGate(pool,f.join.run)).toMatchObject({required:false});
+  await writeArtifact(f.join.run,f.join.fence,'delivery.json',JSON.stringify({passed:true,ci:'Deferred to the final candidate; source preparation checked.'}));
+  await writeArtifact(f.join.run,f.join.fence,'candidate.json',JSON.stringify({baseDigest:f.candidateDigest,candidateDigest:f.candidateDigest,files:[]}));
+  await completeRun(f.join.run,f.join.fence,'Prepared source inputs; registered CI remains mandatory on the final candidate.');
+  expect((await validateTask(f.join.task)).passed).toBe(true);
+  await admit({submit:false});
+  const final=(await run()).instruction_snapshot;
+  expect(final.workerValidationScope).toMatchObject({required:true,finalTaskKey:'integrate'});
+  expect(final.workerValidation.policy.requiredDatabaseTests).toEqual(tests);
+  expect(final.candidateReadiness.registration.requiredDatabaseTests).toEqual(tests);
+  expect(f.plan.tasks.find((t:any)=>t.key==='verify').criteria).toContainEqual(expect.objectContaining({type:'candidate_ci',sourceTaskKey:'integrate'}));
+  expect(await workerValidationGate(pool,f.run)).toMatchObject({required:true,state:'pending'});
+  expect((await pool.query('SELECT count(*)::int n FROM acceptances WHERE task_id=$1',[f.task])).rows[0].n).toBe(0);
+});
+it('refuses an old consumer INSERT that would exempt a join without current transaction authorization',async()=>{
+  await scopedJoin();
+  await expect(pool.query("INSERT INTO runs(id,task_id,attempt,fence,runtime,agent_version) VALUES($1,$2,1,$3,'harness',1)",
+    [f.join.run,f.join.task,f.join.fence])).rejects.toThrow('VALIDATION_SCOPE_UNBOUND');
+  await tx(async db=>{await lock(db);await recordCandidateReadinessAdmission(db,{id:f.join.task,attempt_count:0},f.join.run,f.join.fence,{consumerRelease:expected});});
+  await expect(pool.query("INSERT INTO runs(id,task_id,attempt,fence,runtime,agent_version) VALUES($1,$2,1,$3,'harness',1)",
+    [f.join.run,f.join.task,f.join.fence])).rejects.toThrow('VALIDATION_SCOPE_UNBOUND');
+});
+it.each(['map-event','plan-event','final-criterion'])('refuses a join exclusion after losing its authenticated %s binding',async(mode)=>{
+  await scopedJoin();
+  if(mode==='map-event')await pool.query("DELETE FROM events WHERE kind='CANDIDATE_READINESS_MAP_REGISTERED' AND entity_id=$1",[f.goal]);
+  if(mode==='plan-event')await pool.query("DELETE FROM events WHERE kind='CANDIDATE_READINESS_PLAN_BOUND' AND entity_id=$1",[f.goal]);
+  if(mode==='final-criterion'){
+    const changed=structuredClone(f.plan);changed.tasks.find((t:any)=>t.key==='integrate').criteria=f.originalPlan.tasks[0].criteria;
+    await pool.query('UPDATE plan_revisions SET plan=$2 WHERE id=$1',[f.revision,JSON.stringify(changed)]);
+  }
+  await expect(admitJoin()).rejects.toBeDefined();
+  expect((await pool.query('SELECT count(*)::int n FROM runs')).rows[0].n).toBe(0);
+});
+it('rechecks scoped join authority at acceptance and preserves its frozen snapshot after policy revocation',async()=>{
+  await scopedJoin();await admitJoin();
+  const before=(await pool.query('SELECT instruction_snapshot FROM runs WHERE id=$1',[f.join.run])).rows[0].instruction_snapshot;
+  await registerWorkerValidationPolicy(f.goal,{...f.policy.policy,enabled:false},{channel:'api-token'});
+  expect(await workerValidationGate(pool,f.join.run)).toMatchObject({required:true,state:'failed'});
+  expect((await pool.query('SELECT instruction_snapshot FROM runs WHERE id=$1',[f.join.run])).rows[0].instruction_snapshot).toEqual(before);
+});
+async function submitJoin(){
+  await scopedJoin();await admitJoin();
+  await writeArtifact(f.join.run,f.join.fence,'delivery.json',JSON.stringify({passed:true}));
+  await writeArtifact(f.join.run,f.join.fence,'candidate.json',JSON.stringify({baseDigest:f.candidateDigest,candidateDigest:f.candidateDigest,files:[]}));
+  await completeRun(f.join.run,f.join.fence,'Source join prepared for the final accumulated candidate.');
+}
+it('rejects actual join acceptance after its authenticated scope policy is revoked',async()=>{
+  await submitJoin();
+  await registerWorkerValidationPolicy(f.goal,{...f.policy.policy,enabled:false},{channel:'api-token'});
+  const result=await validateTask(f.join.task);
+  expect(result.passed).toBe(false);
+  expect(result.checks).toContainEqual(expect.objectContaining({id:'registered-ci',passed:false}));
+  expect((await pool.query('SELECT count(*)::int n FROM acceptances WHERE run_id=$1 AND passed',[f.join.run])).rows[0].n).toBe(0);
+});
+it('seals scoped join authority when policy registration commits between validation reads and acceptance CAS',async()=>{
+  await submitJoin();
+  const identityBefore=await workerValidationCommitIdentity(pool,f.join.run);let identityAfter:unknown;
+  let entered!:()=>void,release!:()=>void;
+  const atRead=new Promise<void>(r=>{entered=r;}),continueValidation=new Promise<void>(r=>{release=r;});
+  const actual=sourceOutput.sourceOutputValidation,sequence:string[]=[];
+  vi.spyOn(sourceOutput,'sourceOutputValidation').mockImplementation(async(...args)=>{
+    const result=await actual(...args);sequence.push('validator-read');entered();await continueValidation;return result;
+  });
+  const validation=validateTask(f.join.task).then(result=>({result,error:undefined}),error=>({result:undefined,error}));
+  await atRead;
+  try{
+    await registerWorkerValidationPolicy(f.goal,{...f.policy.policy,enabled:false},{channel:'api-token'});
+    expect((await pool.query('SELECT value FROM settings WHERE id=$1',['worker-validation:'+f.goal])).rows[0].value.policy.enabled).toBe(false);
+    identityAfter=await workerValidationCommitIdentity(pool,f.join.run);
+    sequence.push('policy-committed');
+  }finally{sequence.push('validator-resumed');release();}
+  const outcome=await validation;
+  expect(sequence).toEqual(['validator-read','policy-committed','validator-resumed']);
+  expect(validationDigest(identityAfter)).not.toBe(validationDigest(identityBefore));
+  expect(outcome.error).toMatchObject({code:'STATE_CHANGED'});
+  expect((await pool.query('SELECT count(*)::int n FROM acceptances WHERE run_id=$1 AND passed',[f.join.run])).rows[0].n).toBe(0);
+});
+it('keeps legacy policy wire shape unchanged and refuses readiness applicability on work or verify stages',async()=>{
+  expect(f.policy.policy).not.toHaveProperty('applicability');
+  for(const stages of [['work'],['verify'],['integrate','verify']])
+    await expect(registerWorkerValidationPolicy(f.goal,{...policy,applicability:'candidate_readiness',stages},{channel:'api-token'}))
+      .rejects.toMatchObject({code:'VALIDATION_POLICY_FORMAT'});
 });
 it('preserves the canonical incremental authority: a batch cannot move an unverified outside requirement to completed',async()=>{
   await configureThreeOfSixBatch();const changed=structuredClone(f.originalPlan);

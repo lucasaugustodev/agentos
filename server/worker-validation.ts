@@ -15,6 +15,7 @@ export const requiredDatabaseTestSchema=z.object({file:z.string().max(300).regex
 export const workerValidationPolicySchema=z.object({version:z.literal(1),enabled:z.boolean(),
   project:z.string().regex(/^[a-z0-9_-]+$/),profile:z.literal('agentos.validate'),
   stages:z.array(z.enum(['work','integrate','verify'])).min(1).max(3),required:z.literal(true),
+  applicability:z.literal('candidate_readiness').optional(),
   requiredDatabaseTests:z.array(requiredDatabaseTestSchema).min(1).max(128)}).strict();
 const registrationSchema=z.object({version:z.literal(1),id:z.string(),registrationId:z.uuid(),goalId:z.uuid(),
   policy:workerValidationPolicySchema,policyDigest:z.string().regex(/^[a-f0-9]{64}$/),
@@ -28,6 +29,7 @@ export async function readWorkerValidationIdentity(db:DB,runId:string) {
   return (await db.query(`SELECT r.id,r.task_id,r.fence,r.context_id,r.attempt,r.state,r.finished_at,
     t.goal_id,t.state task_state,t.attempt_count,
     r.instruction_snapshot->'workerValidation' worker_validation,
+    r.instruction_snapshot->'workerValidationScope' worker_validation_scope,
     r.instruction_snapshot#>>'{task,id}' admitted_task_id,
     r.instruction_snapshot#>>'{task,goal_id}' admitted_goal_id,
     r.instruction_snapshot#>>'{task,stage}' admitted_stage,
@@ -40,6 +42,8 @@ export async function readWorkerValidationIdentity(db:DB,runId:string) {
 export async function registerWorkerValidationPolicy(goalId:string,raw:unknown,auth:{channel:'api-token'|'operator-session'}) {
   z.uuid().parse(goalId); const policy=workerValidationPolicySchema.parse(raw);
   if(new Set(policy.stages).size!==policy.stages.length) throw new DomainError('VALIDATION_POLICY_FORMAT','Etapas duplicadas.');
+  if(policy.applicability&&JSON.stringify(policy.stages)!==JSON.stringify(['integrate']))
+    throw new DomainError('VALIDATION_POLICY_FORMAT','Readiness applicability requires only the integration stage.');
   if(new Set(policy.requiredDatabaseTests.map(validationDigest)).size!==policy.requiredDatabaseTests.length)
     throw new DomainError('VALIDATION_POLICY_FORMAT','Casos obrigatórios duplicados.');
   const channel=z.enum(['api-token','operator-session']).parse(auth.channel);
@@ -111,12 +115,19 @@ export async function verifyWorkerValidationRegistration(db:DB,run:any,mode:'cur
     throw Error('VALIDATION_POLICY_UNREGISTERED');
   const project=(await db.query('SELECT project FROM goals WHERE id=$1',[run.admitted_goal_id])).rows[0]?.project;
   if(project!==registration.policy.project) throw Error('VALIDATION_POLICY_UNBOUND');
+  if(registration.policy.applicability){
+    const {verifyCandidateReadinessValidationScope}=await import('./candidate-readiness.js');
+    const scope=await verifyCandidateReadinessValidationScope(db,run,mode);
+    if(scope?.required!==true||!samePolicy(scope.policyRegistration,registration))throw Error('VALIDATION_SCOPE_UNBOUND');
+  }
   if(mode==='current') {
     await assertWorkerValidationOwner(db,run.admitted_goal_id,run.id);
     await frameworkProjectAuthorization(db,run.admitted_goal_id);
   }
   return registration;
 }
+
+const samePolicy=(a:any,b:any)=>validationDigest(a)===validationDigest(b);
 
 export async function workerValidationAuthority(db:DB,run:any,mode:'current'|'historical_evidence'='current') {
   const policyRegistration=await verifyWorkerValidationRegistration(db,run,mode);
@@ -179,6 +190,15 @@ export function workerValidationInstruction(run:any) {
       'Readiness is not passed:true and grants no acceptance. candidate.json/changes.patch are controller outputs; never fabricate them. '+
       'The existing controller CI protocol remains version 1. Independent QA follows verified CI. Registered obligations: '+JSON.stringify(frozen.registration.contract.obligations);
   }
+  if(run.instruction_snapshot?.workerValidationScope?.required===false){
+    const scope=run.instruction_snapshot.workerValidationScope;
+    if(scope.kind!=='candidate_readiness'||run.instruction_snapshot.workerValidation||run.instruction_snapshot.task?.stage!=='integrate')
+      throw new DomainError('VALIDATION_SCOPE_UNBOUND','Invalid source-join CI applicability.');
+    return 'REGISTERED SOURCE-JOIN SCOPE: Prepare and verify the canonical accumulated source inputs and available local checks. '+
+      'The controller authenticated that registered database CI applies to final integration '+scope.finalTaskKey+', not this intermediate join. '+
+      'Do not start databases, request duplicate CI or claim deferred tests passed. Publish actual source and local evidence; '+
+      'delivery.json passed:true covers source preparation only. The final integrated candidate must still pass every registered CI obligation and independent QA.';
+  }
   if(run.instruction_snapshot?.workerValidationContract!==1 || run.instruction_snapshot.task?.stage==='coordinate') return '';
   if(run.instruction_snapshot.workerValidation) return 'REGISTERED CI HANDOFF: request_validation is a manager action, not a worker tool. After local checks, write evidence/validation-intent.json with exactly {"version":1,"profile":"agentos.validate","reason":"Explain required candidate CI in at least 20 characters"} and include {"name":"validation-intent.json","path":"evidence/validation-intent.json","mime":"application/json"} in your final artifacts alongside the normal delivery artifacts. candidate.json is produced by the runtime; never list or forge that reserved artifact. Finish the attempt; the controller confirms stop, binds this candidate and runs the registered isolated CI. Do not access controller databases, credentials or start the validator yourself. Local passed:true is not registered CI proof. Report unavailable database coverage honestly; the controller keeps acceptance pending until canonical CI evidence exists.';
   return 'REGISTERED CI CAPABILITY: request_validation is a manager action and is not available as a worker tool. This attempt has no registered worker CI policy. Execute only available checks, report unavailable database tests and coverage as limitations, and never claim they ran or invent CI receipts.';
@@ -187,6 +207,17 @@ export function workerValidationInstruction(run:any) {
 export type WorkerValidationGate={required:boolean,state:'legacy'|'pending'|'failed'|'passed',detail:string,actionId?:string};
 export async function workerValidationGate(db:DB,runId:string):Promise<WorkerValidationGate> {
   const run=await readWorkerValidationIdentity(db,runId);
+  if(run?.worker_validation_scope){
+    try{
+      if(run.worker_validation_scope.required===false){
+        const {verifyCandidateReadinessValidationScope}=await import('./candidate-readiness.js');
+        const scope=await verifyCandidateReadinessValidationScope(db,run);
+        if(scope?.required!==false||run.worker_validation)throw Error('VALIDATION_SCOPE_UNBOUND');
+        return {required:false,state:'legacy',detail:'Registered CI applies to the final accumulated candidate; this authenticated source join retains its own local checks.'};
+      }
+      if(run.worker_validation_scope.required!==true||!run.worker_validation)throw Error('VALIDATION_SCOPE_UNBOUND');
+    }catch(e:any){return {required:true,state:'failed',detail:e.message};}
+  }
   if(!run?.worker_validation) return {required:false,state:'legacy',detail:''};
   try { await verifyWorkerValidationRegistration(db,run); }
   catch(e:any) { return {required:true,state:'failed',detail:e.message}; }
@@ -222,6 +253,30 @@ export async function workerValidationGate(db:DB,runId:string):Promise<WorkerVal
  * payload digests are calculated in PostgreSQL instead of returning their bytes. */
 export async function workerValidationCommitIdentity(db:DB,runId:string) {
   const run=await readWorkerValidationIdentity(db,runId);
+  if(run?.worker_validation_scope&&!run.worker_validation){
+    // The complete scope check runs outside the admission lock. Seal its DB
+    // inputs here; never recalculate the release filesystem digest in the CAS.
+    const authority=(await db.query(`SELECT
+      encode(sha256(convert_to(p.value::text,'UTF8')),'hex') policy,
+      encode(sha256(convert_to(rm.value::text,'UTF8')),'hex') map,
+      encode(sha256(convert_to(pr.plan::text,'UTF8')),'hex') plan,
+      encode(sha256(convert_to(jsonb_build_object('key',t.key,'revision',t.plan_revision,'criteria',t.criteria,
+        'stage',t.stage,'covers',t.covers,'kind',t.execution->'kind')::text,'UTF8')),'hex') task,
+      (SELECT encode(sha256(convert_to((latest.plan->'requirements')::text,'UTF8')),'hex') FROM plan_revisions latest
+        WHERE latest.objective_id=t.goal_id ORDER BY latest.revision DESC LIMIT 1) requirements,
+      EXISTS(SELECT 1 FROM events e WHERE e.kind='WORKER_VALIDATION_POLICY_REGISTERED' AND e.entity_id=t.goal_id::text AND e.payload=p.value) policy_registered,
+      EXISTS(SELECT 1 FROM events e WHERE e.kind='CANDIDATE_READINESS_MAP_REGISTERED' AND e.entity_id=t.goal_id::text AND e.payload=rm.value) map_registered,
+      EXISTS(SELECT 1 FROM events e WHERE e.kind='WORKER_VALIDATION_SCOPE_ADMISSION_AUTHORIZED' AND e.entity_id=t.id::text
+        AND e.payload->>'runId'=$1 AND e.payload->>'fence'=$2 AND e.payload->>'attempt'=$3 AND e.payload->'proof'=$4::jsonb) admission_bound,
+      (SELECT encode(sha256(convert_to(jsonb_agg(e.payload ORDER BY e.id)::text,'UTF8')),'hex') FROM events e
+        WHERE e.kind='CANDIDATE_READINESS_PLAN_BOUND' AND e.entity_id=t.goal_id::text AND e.payload->>'registrationId'=$5) plan_bound
+      FROM tasks t LEFT JOIN settings p ON p.id='worker-validation:'||t.goal_id
+        LEFT JOIN settings rm ON rm.id='candidate-readiness:'||t.goal_id
+        LEFT JOIN plan_revisions pr ON pr.objective_id=t.goal_id AND pr.revision=t.plan_revision AND pr.status='applied'
+      WHERE t.id=$6`,[runId,run.fence,String(run.attempt),JSON.stringify(run.worker_validation_scope),
+        run.worker_validation_scope.registrationId,run.task_id])).rows[0];
+    return {required:false,scope:run.worker_validation_scope,authority};
+  }
   if(!run?.worker_validation) return {required:false};
   let authority:any;
   try {

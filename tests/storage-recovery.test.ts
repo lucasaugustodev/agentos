@@ -1,13 +1,16 @@
 import {beforeAll,beforeEach,afterAll,it,expect,vi} from 'vitest';
 import {randomUUID} from 'node:crypto';
-import {pool,migrate,tx,lock,event} from '../server/db.js';
+import {pool,tx,lock,event} from '../server/db.js';
 import {seedRegistry} from '../server/registry.js';
-import {installSupervision} from '../server/supervision.js';
+import {prepareSchema} from '../server/schema-readiness.js';
+import {prepareBacklogSchema} from '../server/backlog-schema-readiness.js';
 import {reconcileStorageRecovery,validStorageObservation,recordStorageFailure} from '../server/storage-recovery.js';
 import {recordOpenCodeNotStarted,hasStoragePreflightReceipt} from '../server/not-started.js';
 import {prepareOpenCodeWorkspace} from '../bridge/opencode-preflight.mjs';
 import {stoppedRunProof} from '../bridge/stopped-run-proof.mjs';
-beforeAll(async()=>{await migrate();await installSupervision();});
+// Keep bounded NOWAIT conflict recovery and readiness receipts in the
+// canonical preparers; direct nested DDL can collide with a transient reader.
+beforeAll(async()=>{await prepareSchema();await prepareBacklogSchema();});
 beforeEach(async()=>{await pool.query('TRUNCATE goals,agents,accounts,events CASCADE');await pool.query("DELETE FROM settings WHERE id='storage:agentos-workspaces' OR id='autonomy:storage-test'");await seedRegistry();});
 afterAll(async()=>{await pool.query("DELETE FROM settings WHERE id='storage:agentos-workspaces' OR id='autonomy:storage-test'");await pool.end();});
 const available=()=>({version:1,resource:'agentos-workspaces',freeBytes:8*1024**3,reservedBytes:0,availableBytes:8*1024**3,headroomBytes:2*1024**3,available:true,checkedAt:new Date().toISOString()});

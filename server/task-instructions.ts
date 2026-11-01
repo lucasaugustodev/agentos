@@ -60,7 +60,7 @@ export async function installTaskInstructions(db: DB) {
     ALTER TABLE tasks ADD COLUMN IF NOT EXISTS instruction_revision_id uuid REFERENCES task_instruction_revisions(id);
     ALTER TABLE runs ADD COLUMN IF NOT EXISTS instruction_snapshot jsonb;
     CREATE OR REPLACE FUNCTION agentos_instruction_snapshot() RETURNS trigger LANGUAGE plpgsql AS $$
-    DECLARE t tasks; r task_instruction_revisions; item jsonb; prior jsonb; entries jsonb='[]'; bytes bytea; total bigint=0; ci jsonb; readiness jsonb; planned jsonb; BEGIN
+    DECLARE t tasks; r task_instruction_revisions; item jsonb; prior jsonb; entries jsonb='[]'; bytes bytea; total bigint=0; ci jsonb; readiness jsonb; planned jsonb; validation_scope jsonb; BEGIN
       IF TG_OP='UPDATE' THEN
         IF NEW.instruction_snapshot IS DISTINCT FROM OLD.instruction_snapshot THEN RAISE EXCEPTION 'INSTRUCTION_SNAPSHOT_IMMUTABLE'; END IF; RETURN NEW;
       END IF;
@@ -111,6 +111,27 @@ export async function installTaskInstructions(db: DB) {
         AND t.execution->>'kind' IN('harness','opencode');
       IF ci IS NOT NULL AND NOT EXISTS(SELECT 1 FROM events WHERE kind='WORKER_VALIDATION_POLICY_REGISTERED'
         AND entity_id=t.goal_id::text AND payload=ci) THEN RAISE EXCEPTION 'VALIDATION_POLICY_UNREGISTERED'; END IF;
+      IF ci#>>'{policy,applicability}'='candidate_readiness' THEN
+        SELECT payload->'proof' INTO validation_scope FROM events
+          WHERE kind='WORKER_VALIDATION_SCOPE_ADMISSION_AUTHORIZED' AND entity_id=t.id::text
+          AND payload->>'runId'=NEW.id::text AND payload->>'fence'=NEW.fence::text
+          AND payload->>'attempt'=NEW.attempt::text
+          AND payload->>'transactionId'=pg_current_xact_id()::text ORDER BY id DESC LIMIT 1;
+        IF validation_scope IS NULL OR validation_scope->'policyRegistration' IS DISTINCT FROM ci
+          OR validation_scope->>'taskId' IS DISTINCT FROM t.id::text
+          OR validation_scope->>'goalId' IS DISTINCT FROM t.goal_id::text
+          OR validation_scope->>'planRevision' IS DISTINCT FROM t.plan_revision::text
+          OR validation_scope->>'taskKey' IS DISTINCT FROM t.key
+          OR t.stage<>'integrate' OR t.execution->>'kind'<>'harness'
+          OR planned IS NULL OR t.criteria IS DISTINCT FROM planned->'criteria'
+          OR t.covers IS DISTINCT FROM planned->'covers' OR t.stage IS DISTINCT FROM planned->>'stage'
+          OR jsonb_typeof(validation_scope->'required') IS DISTINCT FROM 'boolean'
+          OR (validation_scope->>'required')::boolean IS DISTINCT FROM
+            EXISTS(SELECT 1 FROM jsonb_array_elements(t.criteria) c WHERE c->>'type'='candidate_readiness')
+          THEN RAISE EXCEPTION 'VALIDATION_SCOPE_UNBOUND'; END IF;
+        NEW.instruction_snapshot:=NEW.instruction_snapshot||jsonb_build_object('workerValidationScope',validation_scope);
+        IF validation_scope->>'required'='false' THEN ci:=NULL; END IF;
+      END IF;
       NEW.instruction_snapshot:=NEW.instruction_snapshot||jsonb_build_object('workerValidationContract',1,'workerValidation',ci);
       IF EXISTS(SELECT 1 FROM jsonb_array_elements(t.criteria) c WHERE c->>'type'='candidate_readiness') THEN
         SELECT payload->'proof' INTO readiness FROM events

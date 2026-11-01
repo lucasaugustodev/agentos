@@ -13,6 +13,7 @@ import * as transportFailures from '../bridge/model-transport-failure.mjs';
 import * as modelChannel from '../bridge/runtime-model-channel.mjs';
 import * as modelGateway from '../bridge/runtime-gateway.mjs';
 import {openAICompletionsFallback} from '../bridge/openai-completions-fallback.mjs';
+import {selectRuntimeToolPolicy} from '../bridge/runtime-tool-policy.mjs';
 
 const runnerUrl=new URL('../bridge/runtime-runner.mjs',import.meta.url);
 const forbidden=()=>{throw Error('UNEXPECTED_EXTERNAL_OPERATION');};
@@ -85,6 +86,8 @@ async function runFixture(events,{reason={kind:'completed'},noise=[],generationF
   const modules={
     './model-policy.mjs':{assertModelRoute(){},usesSharedRequestGate:()=>generationFailures!==undefined},
     './operator-model-profile.mjs':{workerModelSettings:()=>({reasoning:'high'})},
+    // Keep the real selector; this storage fixture has no private operator policy.
+    './runtime-tool-policy.mjs':{runtimeToolPolicy:async params=>selectRuntimeToolPolicy(params,null)},
     './runtime-guidance.mjs':{createRuntimeGuidanceServer:forbidden},
     './sandbox-localhost.mjs':{prepareSandboxLocalhost:async()=>({mount:[]})},
     './repair-finalizer.mjs':{prepareRepairFinalization:async()=>null,finalizeRepairArtifacts:async()=>{},repairFinalizationInstruction:()=>''},
@@ -182,7 +185,7 @@ async function runFixture(events,{reason={kind:'completed'},noise=[],generationF
   }
   catch(e){error=e;}
   finally{hooks.deregister();delete globalThis[symbol];child.stdout.end();child.stderr.end();}
-  assert.deepEqual(saved.slice(0,2).map(s=>s.state),['starting','running']);
+  assert.deepEqual(saved.slice(0,2).map(s=>s.state),['starting','running'],error?.stack);
   assert.equal(saved.at(-1).stopped,true,error?.stack);
   assert.equal(emitted.filter(e=>e.kind==='HARNESS_STOPPED').length,1);
   assert.equal(gateActive,0);
