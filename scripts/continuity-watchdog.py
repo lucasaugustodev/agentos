@@ -151,7 +151,7 @@ def case_counts(raw):
                                ("benchmarks", [r for r in records if r.get("event") == "benchmark"])]}
 
 
-def compact_outcomes(outcomes):
+def compact_outcomes(outcomes, diagnostic_omissions=None):
     rows = []
     for outcome in outcomes:
         row = {k: outcome[k] for k in ["occurrenceId", "problem", "state", "finishedAt", "failures"]}
@@ -180,19 +180,43 @@ def compact_outcomes(outcomes):
     diagnostics = []
     for row in rows:
         value = row.get("executionEvidence", {}).get("producerDiagnostics")
-        if value and "sections" in value:
-            omitted = {"version": 1, "bindingState": "omitted", "authority": value["authority"],
+        if value:
+            omitted = {"version": 1, "bindingState": "omitted",
+                "authority": "producer_report_only_not_qa_or_performance_acceptance",
                 "code": "SUPERVISOR_DIAGNOSTIC_BUDGET", "diagnosticSHA256": digest(value),
                 "diagnosticBytes": len(canonical(value))}
             diagnostics.append((row, value, omitted))
-    remaining = SUPERVISOR_DIAGNOSTIC_LIMIT - sum(len(canonical(o)) for _, _, o in diagnostics)
+    # The reserve covers the global summary, including its bounded references.
+    # Even omission markers consume budget; thousands cannot accumulate unchecked.
+    remaining = SUPERVISOR_DIAGNOSTIC_LIMIT - 4096
+    omitted_references, omitted_markers = [], 0
     for row, value, omitted in sorted(diagnostics, key=lambda x: (
             x[1].get("finishedAt", ""), x[0]["occurrenceId"]), reverse=True):
-        extra = len(canonical(value)) - len(canonical(omitted))
-        if extra <= remaining:
-            remaining -= extra
+        if len(canonical(value)) <= remaining:
+            remaining -= len(canonical(value))
         else:
-            row["executionEvidence"]["producerDiagnostics"] = omitted
+            ref = {"occurrenceId": row["occurrenceId"], "attemptId": row["executionEvidence"]["attemptId"],
+                   "diagnosticSHA256": digest(value), "diagnosticBytes": len(canonical(value))}
+            omitted_references.append(ref)
+            if len(canonical(omitted)) <= remaining:
+                row["executionEvidence"]["producerDiagnostics"] = omitted
+                remaining -= len(canonical(omitted))
+            else:
+                row["executionEvidence"].pop("producerDiagnostics")
+                omitted_markers += 1
+    summary = {}
+    if omitted_references:
+        references = [r for r in omitted_references if len(canonical(r)) <= 320][:8]
+        summary = {"version": 1, "code": "SUPERVISOR_DIAGNOSTIC_BUDGET",
+            "authority": "producer_report_only_not_qa_or_performance_acceptance",
+            "maxBytesIncludingMetadata": SUPERVISOR_DIAGNOSTIC_LIMIT,
+            "omittedEnvelopeCount": len(omitted_references), "omittedMarkerCount": omitted_markers,
+            "references": references, "omittedReferenceCount": len(omitted_references) - len(references),
+            "allOmissionsSHA256": digest(omitted_references),
+            "originalReportReferences": "outcomes[].executionEvidence.artifacts; keyed by occurrenceId and attemptId"}
+        require(len(canonical(summary)) <= 4096, "SUPERVISOR_DIAGNOSTIC_SUMMARY_SIZE")
+    if diagnostic_omissions is not None:
+        diagnostic_omissions.update(summary)
     return rows
 
 
@@ -1528,7 +1552,10 @@ class Watchdog:
              "pipelineLimit", "pipelineUsed", "pipelineOwners", "blockedProblems", "eligibleProblems", "confirmedSourceArtifactIds"]}}}
         body["input"]["priorDispatches"] = self.state["experiments"][-10:]
         body["input"]["actionEvidence"] = action_evidence(observation, self.config)
-        body["input"]["outcomes"] = compact_outcomes(observation["outcomes"])
+        diagnostic_omissions = {}
+        body["input"]["outcomes"] = compact_outcomes(observation["outcomes"], diagnostic_omissions)
+        if diagnostic_omissions:
+            body["input"]["producerDiagnosticOmissions"] = diagnostic_omissions
         body["input"]["autoCheckDiagnostics"] = observation["autoCheckDiagnostics"]
         body["input"]["autoCheckDiagnostics"] = {**observation["autoCheckDiagnostics"], "repairableEvidence": [
             {k: v for k, v in row.items() if k not in ["producerArtifacts", "qaArtifact", "originalBaseArtifact", "canonicalPatch", "repairQADiagnostic"]}

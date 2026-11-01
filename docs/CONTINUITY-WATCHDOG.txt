@@ -320,9 +320,14 @@ gates remain unchanged.
 Limits: 16 KiB per diagnostic envelope, including a 3 KiB reserve for omission
 metadata; complete sections that do not fit are omitted with counts, reasons and
 up to eight bounded references. No numeric expression or caveat is silently
-truncated. Compact planning input allows 64 KiB of these diagnostic envelopes,
-favoring the most recent closed producer, with explicit hash/size omission markers
-for the others. The existing 2 MiB complete input limit still applies. Invalid
+truncated. Compact planning input allows 64 KiB total for diagnostic envelopes,
+omission markers and metadata, favoring the most recent closed producer. Markers
+that cannot fit are aggregated into producerDiagnosticOmissions, with counts,
+up to eight occurrence/attempt/hash references and a digest of all omissions.
+The 4 KiB summary reserve is included in the total. Original report artifact
+IDs/hashes remain in every outcome's executionEvidence, and the original
+observation and persisted request are not mutated. The existing 2 MiB complete
+input limit still applies. Invalid
 bindings and unavailable artifact reads yield an occurrence-local diagnostic;
 unrelated boards remain observable and eligible. Existing persisted review
 requests and uncertain POST receipts are reconciled without rewriting their

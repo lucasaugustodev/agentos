@@ -369,11 +369,34 @@ class WatchTests(unittest.TestCase):
                 'finishedAt': None, 'failures': [], 'artifacts': [], 'executionEvidence': e})
         compact = W.compact_outcomes(rows)
         diagnostics = [r['executionEvidence']['producerDiagnostics'] for r in compact]
-        self.assertLessEqual(sum(len(W.canonical(d)) for d in diagnostics if 'sections' in d),
+        self.assertLessEqual(sum(len(W.canonical(d)) for d in diagnostics),
                              W.SUPERVISOR_DIAGNOSTIC_LIMIT)
         self.assertNotIn('sections', diagnostics[0]); self.assertIn('sections', diagnostics[-1])
         self.assertEqual(diagnostics[0]['code'], 'SUPERVISOR_DIAGNOSTIC_BUDGET')
         self.assertIn('sections', rows[0]['executionEvidence']['producerDiagnostics'])  # No mutation.
+
+    def test_three_hundred_diagnostics_include_all_metadata_in_global_budget(self):
+        oid = self.failed_producer_diagnostics(); evidence = self.w.execution_evidence(self.client.occurrences[oid])
+        rows = []
+        for i in range(300):
+            e = copy.deepcopy(evidence); e['producerDiagnostics']['sections'] = [
+                {'artifact': 'cpu-result.json', 'pointer': '/details', 'value': 'x' * 14000}]
+            rows.append({'occurrenceId': uid(), 'problem': 'muse_decode_layer', 'state': 'attention',
+                'finishedAt': None, 'failures': [], 'artifacts': [], 'executionEvidence': e})
+        original = W.canonical(rows)
+        compact = W.compact_outcomes(rows)
+        self.assertLessEqual(sum(len(W.canonical(r['executionEvidence']['producerDiagnostics']))
+            for r in compact if 'producerDiagnostics' in r['executionEvidence']), W.SUPERVISOR_DIAGNOSTIC_LIMIT)
+        summary = {}; compact = W.compact_outcomes(rows, summary)
+        self.assertLessEqual(len(W.canonical(summary)) + sum(len(W.canonical(r['executionEvidence']['producerDiagnostics']))
+            for r in compact if 'producerDiagnostics' in r['executionEvidence']), W.SUPERVISOR_DIAGNOSTIC_LIMIT)
+        self.assertGreater(summary['omittedEnvelopeCount'], 0)
+        self.assertGreater(summary['omittedMarkerCount'], 0)
+        self.assertLessEqual(len(summary['references']), 8)
+        self.assertEqual(summary['omittedReferenceCount'], summary['omittedEnvelopeCount'] - len(summary['references']))
+        self.assertEqual(W.canonical(rows), original)
+        self.assertEqual([r['executionEvidence']['artifacts'] for r in compact],
+                         [r['executionEvidence']['artifacts'] for r in rows])
 
     def test_failed_diagnostic_does_not_invent_absent_model_or_contract(self):
         oid = self.failed_producer_diagnostics()
