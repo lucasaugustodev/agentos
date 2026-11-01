@@ -30,7 +30,7 @@ EVIDENCE_REPAIR_CODES = {"PATCH_HEADER_SCOPE", "CPU_REPLAY_EXECUTION_UNPROVEN", 
     "QA_ATTESTATION_MISSING_canonicalPrecisionPreserved", "QA_ATTESTATION_MISSING_evaluatorIndependent",
     "QA_ATTESTATION_MISSING_upstreamAttributionPreserved"}
 SEMANTIC_REJECTION_CODES = {"QA_NOT_APPROVED", "QA_BLOCKING_FINDINGS", "QA_SOURCE_OR_SCOPE_MISMATCH",
-    "QA_OVERCLAIM", "SOURCE_REQUIRES_MANUAL_REVIEW"}
+    "QA_OVERCLAIM", "SOURCE_REQUIRES_MANUAL_REVIEW", "NO_EXECUTABLE_CHANGE", "NO_CANDIDATE_CHANGE"}
 
 
 def require(ok, code):
@@ -99,6 +99,8 @@ def compact_outcomes(outcomes):
     rows = []
     for outcome in outcomes:
         row = {k: outcome[k] for k in ["occurrenceId", "problem", "state", "finishedAt", "failures"]}
+        if outcome.get("executionEvidence"):
+            row["executionEvidence"] = outcome["executionEvidence"]
         row["artifacts"] = []
         for artifact in outcome["artifacts"]:
             if artifact["name"] not in ["candidate.py", "qa-verification.json", "cpu-result.json"]:
@@ -485,6 +487,84 @@ class Watchdog:
         require(len(raw) == row["size"] and digest(raw) == row["digest"], "ARTIFACT_CORRUPT")
         return raw
 
+    def execution_evidence(self, detail):
+        """Bounded producer reports, never an acceptance or a performance verdict.
+
+        Bad or incomplete reports are isolated to their occurrence. Native state,
+        QA ownership and the authenticated official admission gate remain authoritative.
+        """
+        experiment = detail["occurrence"].get("input", {}).get("experiment")
+        if not experiment:
+            return None  # Historical seeds have their existing provenance contract.
+        required = {"candidate.py", "cpu-checks.py", "cpu-result.json", "verification.json"}
+        reports = [a for a in detail["artifacts"] if a["name"] in {"verification.json", "cpu-result.json"}]
+        if not reports:
+            return None  # No published producer result yet; do not inspect live files.
+        try:
+            steps = [s for s in detail["steps"] if s.get("key") == "produce"]
+            require(len(steps) == 1, "OUTCOME_PRODUCER_STEP")
+            attempts = [a for a in detail["attempts"] if a["step_id"] == steps[0]["id"]
+                        and a["number"] == steps[0]["attempt"]]
+            require(len(attempts) == 1, "OUTCOME_PRODUCER_ATTEMPT")
+            aid = attempts[0]["id"]
+            rows = [a for a in detail["artifacts"] if a["attempt_id"] == aid and a["name"] in required]
+            by_name = {a["name"]: a for a in rows}
+            require(len(rows) == len(by_name) == 4, "OUTCOME_EVIDENCE_SET")
+            source = experiment.get("sourceArtifact", {}).get("digest")
+            require(isinstance(source, str) and re.fullmatch(r"[a-f0-9]{64}", source), "OUTCOME_SOURCE_BINDING")
+            raw = {name: self.verified_artifact(row, 131072 if name.endswith(".json") else 262144)
+                   for name, row in by_name.items()}
+            def unique_object(pairs):
+                value = {}
+                for key, item in pairs:
+                    require(key not in value, "OUTCOME_DUPLICATE_JSON_KEY")
+                    value[key] = item
+                return value
+            def reject_constant(value):
+                raise ValueError("OUTCOME_NONFINITE_JSON")
+            verification, cpu = (json.loads(raw[name], object_pairs_hook=unique_object, parse_constant=reject_constant)
+                                 for name in ["verification.json", "cpu-result.json"])
+            require(type(verification) is dict and type(cpu) is dict, "OUTCOME_JSON_SCHEMA")
+            candidate, checker = (by_name[name]["digest"] for name in ["candidate.py", "cpu-checks.py"])
+            require(verification.get("sourceSHA256") == source and verification.get("candidateSHA256") == candidate,
+                    "OUTCOME_VERIFICATION_BINDING")
+            require(cpu.get("candidateSHA256") == candidate and cpu.get("checkerSHA256") == checker
+                    and cpu.get("sourceSHA256", source) == source, "OUTCOME_CPU_BINDING")
+            booleans = ["hypothesisSupported", "semanticChangeVsSource", "officialCheckOrScoreRequested"]
+            require(all(k not in verification or type(verification[k]) is bool for k in booleans)
+                    and type(cpu.get("passed")) is bool, "OUTCOME_BOOLEAN_SCHEMA")
+            hypothesis = verification.get("hypothesisOutcome")
+            require(hypothesis is None or isinstance(hypothesis, str) and len(hypothesis) <= 160,
+                    "OUTCOME_HYPOTHESIS_SCHEMA")
+            cases, controls = cpu.get("cases"), cpu.get("negativeControls")
+            require(type(cases) is list and 0 < len(cases) <= 256 and type(controls) is list
+                    and 0 < len(controls) <= 64, "OUTCOME_CPU_CASE_SCHEMA")
+            for values, key in [(cases, "passed"), (controls, "detected")]:
+                require(all(type(v) is dict and isinstance(v.get("name"), str) and 0 < len(v["name"]) <= 160
+                            and type(v.get(key)) is bool for v in values), "OUTCOME_CPU_CASE_SCHEMA")
+            locators = verification.get("decisionLocators", [])
+            require(type(locators) is list and all(isinstance(v, str) for v in locators), "OUTCOME_LOCATOR_SCHEMA")
+            failed, missed = ([v["name"] for v in values if v[key] is False]
+                              for values, key in [(cases, "passed"), (controls, "detected")])
+            negative = verification.get("hypothesisSupported") is False or verification.get("semanticChangeVsSource") is False
+            classification = "negative_result_reported" if negative else (
+                "cpu_check_failed_reported" if cpu["passed"] is False or failed or missed else "candidate_reported")
+            return {"bindingState": "verified", "classification": classification,
+                    "authority": "producer_report_only_not_qa_or_performance_acceptance", "attemptId": aid,
+                    "sourceSHA256": source, "candidateSHA256": candidate, "hypothesisOutcome": hypothesis,
+                    **{k: verification[k] for k in booleans if k in verification},
+                    "decisionLocators": [value[:240] for value in locators[:4]],
+                    "cpu": {"reportedPassed": cpu["passed"], "caseCount": len(cases),
+                            "negativeControlCount": len(controls), "failedCaseCount": len(failed),
+                            "missedNegativeControlCount": len(missed), "failedCases": failed[:12],
+                            "missedNegativeControls": missed[:12]},
+                    "artifacts": [{k: by_name[name][k] for k in ["id", "name", "digest", "size"]}
+                                  for name in ["verification.json", "cpu-result.json"]]}
+        except (ValueError, TypeError, KeyError, UnicodeError) as error:
+            code = str(error) if isinstance(error, ValueError) and re.fullmatch(r"(?:OUTCOME_|ARTIFACT_)[A-Z_]+", str(error)) else "OUTCOME_JSON_SCHEMA"
+            return {"bindingState": "invalid", "classification": "evidence_diagnosis_required",
+                    "code": code, "authority": "no_report_content_admitted"}
+
     def registered_jobs(self):
         jobs = list(self.config.get("officialJobs", []))
         registry_path = self.config.get("officialRegistryPath")
@@ -718,6 +798,7 @@ class Watchdog:
                     pending.add(candidate["digest"])
             outcomes.append({"occurrenceId": oid, "problem": record["problem"], "state": occurrence["state"],
                 "artifacts": artifacts, "finishedAt": occurrence.get("finished_at"),
+                "executionEvidence": self.execution_evidence(detail),
                 "progress": progress_ref,
                 "failures": [{"attemptId": a["id"], "code": a.get("error_code")} for a in detail["attempts"] if a["state"] == "failed"]})
         jobs, pending_jobs = [], []
@@ -779,7 +860,8 @@ class Watchdog:
         body["input"]["autoCheckDiagnostics"] = {**observation["autoCheckDiagnostics"], "repairableEvidence": [
             {k: v for k, v in row.items() if k not in ["producerArtifacts", "qaArtifact", "originalBaseArtifact", "canonicalPatch"]}
             for row in observation["autoCheckDiagnostics"]["repairableEvidence"]]}
-        isolated = [r for r in observation["autoCheckDiagnostics"]["outcomes"] if r.get("classification") == "repair_exhausted"]
+        isolated = [r for r in observation["autoCheckDiagnostics"]["outcomes"] if r.get("classification") == "repair_exhausted"
+                    or r.get("classification") == "new_hypothesis_required" and r.get("code") in ["NO_EXECUTABLE_CHANGE", "NO_CANDIDATE_CHANGE"]]
         isolated_sha = {r["candidateSHA256"] for r in isolated}
         body["input"]["catalog"] = [a for a in observation["catalog"] if a["digest"] not in isolated_sha]
         body["input"]["isolatedCandidates"] = isolated
@@ -794,6 +876,8 @@ class Watchdog:
             "Use actual per-board caseCounts; do not copy Decode counts to Prefill or Attention.",
             "Official full receipts are preserved by path/SHA; their logs are omitted from this bounded planning input.",
             "Profile-based causal explanations and next hypotheses are inferences, not proof of performance."]
+        body["input"]["interpretationRules"].append(
+            "executionEvidence contains source-bound producer reports, not acceptance. negative_result_reported preserves a reported falsification or no-op; CPU passing does not imply a useful candidate or GPU gain. Respect active QA and use authenticated NO_EXECUTABLE_CHANGE to choose a different hypothesis, never evidence repair of the same no-op.")
         requests = self.state.setdefault("reviewRequests", {})
         if key not in requests:
             requests[key] = body

@@ -221,6 +221,120 @@ class WatchTests(unittest.TestCase):
         self.assertFalse(any(a['digest'] == 'a' * 64 for a in inp['catalog']))
         self.assertLess(len(W.canonical(inp)), 20000)
 
+    def complete_outcome_report(self, negative=True, cpu_passed=True):
+        self.w.tick(); self.complete_review(); self.w.tick()
+        oid = self.w.state['experiments'][-1]['occurrenceId']
+        source = self.client.occurrences[oid]['occurrence']['input']['experiment']['sourceArtifact']['digest']
+        candidate, checker = b'# a source-bound candidate\n', b'# a source-bound checker\n'
+        verification = {'sourceSHA256': source, 'candidateSHA256': W.digest(candidate), 'passed': True,
+            'hypothesisOutcome': 'falsified-before-implementation' if negative else 'implemented-awaiting-qa',
+            'hypothesisSupported': not negative, 'semanticChangeVsSource': not negative,
+            'officialCheckOrScoreRequested': False, 'decisionLocators': ['The base already contains the routed-pair operation.']}
+        cpu = {'passed': cpu_passed, 'candidateSHA256': W.digest(candidate), 'checkerSHA256': W.digest(checker),
+            'cases': [{'name': 'pair-scheduling', 'passed': cpu_passed}],
+            'negativeControls': [{'name': 'routing-mutant', 'detected': True}]}
+        self.client.complete(oid, {'candidate.py': candidate, 'cpu-checks.py': checker,
+                                  'verification.json': verification, 'cpu-result.json': cpu})
+        self.client.occurrences[oid]['steps'][0]['key'] = 'produce'
+        return oid
+
+    def replace_outcome_json(self, oid, name, mutate):
+        row = next(a for a in self.client.occurrences[oid]['artifacts'] if a['name'] == name)
+        value = json.loads(self.client.artifacts[row['id']]); mutate(value)
+        raw = W.canonical(value); self.client.artifacts[row['id']] = raw; row.update(digest=W.digest(raw), size=len(raw))
+
+    def test_negative_report_survives_real_input_compaction_without_becoming_acceptance(self):
+        oid = self.complete_outcome_report()
+        self.assertEqual(self.w.tick()['state'], 'supervisor_dispatched')
+        row = next(r for r in self.w.state['supervisions'][-1]['input']['outcomes'] if r['occurrenceId'] == oid)
+        evidence = row['executionEvidence']
+        self.assertEqual(evidence['classification'], 'negative_result_reported')
+        self.assertEqual(evidence['hypothesisOutcome'], 'falsified-before-implementation')
+        self.assertFalse(evidence['semanticChangeVsSource'])
+        self.assertTrue(evidence['cpu']['reportedPassed'])
+        self.assertEqual(evidence['authority'], 'producer_report_only_not_qa_or_performance_acceptance')
+        self.assertFalse(any(a['name'] == 'qa-verification.json' for a in row['artifacts']))
+
+    def test_reported_negative_does_not_release_live_qa_owner(self):
+        oid = self.complete_outcome_report(); d = self.client.occurrences[oid]
+        sid, aid = uid(), uid(); d['occurrence']['state'] = 'running'
+        d['steps'].append({'id': sid, 'key': 'independent-qa', 'state': 'running', 'attempt': 1})
+        d['attempts'].append({'id': aid, 'step_id': sid, 'number': 1, 'state': 'running', 'receipt': {'stopped': False}})
+        observation = self.w.observe()
+        self.assertIn('muse_decode_layer', observation['blockedProblems'])
+        self.assertTrue(any(aid in row['attemptIds'] for row in observation['active']))
+        self.assertEqual(self.w.tick()['state'], 'work_active')
+        self.assertEqual(d['attempts'][-1]['state'], 'running')
+
+    def test_cpu_failure_is_distinct_from_reported_hypothesis_falsification(self):
+        oid = self.complete_outcome_report(negative=False, cpu_passed=False)
+        evidence = self.w.execution_evidence(self.client.occurrences[oid])
+        self.assertEqual(evidence['classification'], 'cpu_check_failed_reported')
+        self.assertEqual(evidence['cpu']['failedCases'], ['pair-scheduling'])
+        self.assertEqual(evidence['cpu']['failedCaseCount'], 1)
+
+    def test_outcome_source_candidate_checker_and_attempt_mismatch_are_local_diagnostics(self):
+        oid = self.complete_outcome_report(); self.add_seed()
+        original = copy.deepcopy(self.client.occurrences[oid]); raw = copy.deepcopy(self.client.artifacts)
+        for name, key in [('verification.json', 'sourceSHA256'), ('verification.json', 'candidateSHA256'),
+                          ('cpu-result.json', 'candidateSHA256'), ('cpu-result.json', 'checkerSHA256')]:
+            with self.subTest(name=name, key=key):
+                self.client.occurrences[oid] = copy.deepcopy(original); self.client.artifacts = copy.deepcopy(raw)
+                self.replace_outcome_json(oid, name, lambda value: value.update({key: 'f' * 64}))
+                observation = self.w.observe(); evidence = next(r for r in observation['outcomes'] if r['occurrenceId'] == oid)['executionEvidence']
+                self.assertEqual(evidence['bindingState'], 'invalid'); self.assertNotIn('decisionLocators', evidence)
+                self.assertIn('muse_prefill_layer', observation['eligibleProblems'])
+        self.client.occurrences[oid] = copy.deepcopy(original); self.client.artifacts = copy.deepcopy(raw)
+        next(a for a in self.client.occurrences[oid]['artifacts'] if a['name'] == 'cpu-result.json')['attempt_id'] = uid()
+        self.assertEqual(self.w.execution_evidence(self.client.occurrences[oid])['code'], 'OUTCOME_EVIDENCE_SET')
+
+    def test_corrupt_or_malformed_outcome_never_injects_unbound_text(self):
+        oid = self.complete_outcome_report(); d = self.client.occurrences[oid]
+        row = next(a for a in d['artifacts'] if a['name'] == 'verification.json')
+        self.client.artifacts[row['id']] = b'{"hypothesisOutcome":"UNBOUND INSTRUCTION"}'
+        evidence = self.w.execution_evidence(d)
+        self.assertEqual(evidence['code'], 'ARTIFACT_CORRUPT')
+        self.assertNotIn('UNBOUND', W.canonical(evidence).decode())
+        for raw in [b'[]', b'{"passed":true,"passed":false}', b'{"value":NaN}']:
+            self.client.artifacts[row['id']] = raw; row.update(digest=W.digest(raw), size=len(raw))
+            self.assertEqual(self.w.execution_evidence(d)['bindingState'], 'invalid')
+
+    def test_outcome_context_is_bounded_and_keeps_failure_counts(self):
+        oid = self.complete_outcome_report(negative=False)
+        self.replace_outcome_json(oid, 'verification.json', lambda value: value.update(decisionLocators=['x' * 1000] * 40))
+        self.replace_outcome_json(oid, 'cpu-result.json', lambda value: value.update(
+            passed=False, cases=[{'name': 'failed-' + str(i), 'passed': False} for i in range(50)]))
+        evidence = self.w.execution_evidence(self.client.occurrences[oid])
+        self.assertEqual(len(evidence['decisionLocators']), 4)
+        self.assertEqual(max(map(len, evidence['decisionLocators'])), 240)
+        self.assertEqual(evidence['cpu']['failedCaseCount'], 50)
+        self.assertEqual(len(evidence['cpu']['failedCases']), 12)
+        self.assertLess(len(W.canonical(evidence)), 3000)
+
+    def test_authenticated_noop_rejection_isolates_only_candidate_and_never_repairs(self):
+        status = self.repairable_operation()
+        self.install_diagnostic_fixture([{**status, 'code': 'NO_CANDIDATE_CHANGE'}])
+        self.assertEqual(self.w.observe()['autoCheckDiagnostics']['outcomes'][0]['classification'], 'new_hypothesis_required')
+        self.install_diagnostic_fixture([{**status, 'code': 'NO_EXECUTABLE_CHANGE'}])
+        observation = self.w.observe()
+        self.assertEqual(observation['autoCheckDiagnostics']['outcomes'][0]['classification'], 'new_hypothesis_required')
+        self.assertEqual(observation['autoCheckDiagnostics']['repairableEvidence'], [])
+        self.assertEqual(observation['pendingOfficialCandidateSHA256'], [])
+        self.assertEqual(self.w.tick()['state'], 'supervisor_dispatched')
+        inp = self.w.state['supervisions'][-1]['input']
+        self.assertFalse(any(a['digest'] == status['candidateSHA256'] for a in inp['catalog']))
+        self.assertTrue(inp['catalog']); self.assertIn('muse_decode_layer', inp['eligibleProblems'])
+        self.assertEqual(inp['isolatedCandidates'][0]['code'], 'NO_EXECUTABLE_CHANGE')
+
+    def test_disabled_policy_noop_claim_does_not_isolate_candidate(self):
+        status_row = self.repairable_operation()
+        self.install_diagnostic_fixture([{**status_row, 'code': 'NO_EXECUTABLE_CHANGE'}])
+        policy = W.read_json(self.config['autoCheckPolicyPath']); policy['enabled'] = False
+        W.atomic(self.config['autoCheckPolicyPath'], policy)
+        status = W.read_json(self.config['autoCheckStatusPath']); status['policySHA256'] = W.digest(policy)
+        W.atomic(self.config['autoCheckStatusPath'], status)
+        self.assertEqual(self.w.observe()['autoCheckDiagnostics']['outcomes'][0]['classification'], 'diagnostic_only')
+
     def test_protected_registry_rejects_writable_and_symlink_paths(self):
         path = self.root / 'unsafe.json'; path.write_bytes(b'{}'); path.chmod(0o666)
         with self.assertRaisesRegex(ValueError, 'PROTECTED_OWNER_MODE'): W.protected_bytes(path, 32)

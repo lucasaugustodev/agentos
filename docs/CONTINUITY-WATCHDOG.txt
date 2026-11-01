@@ -99,3 +99,16 @@ control cycle or mutate active occurrence snapshots. Wait until no supervisor pl
 is pending, preserve prior config/code receipts, and validate the next actual native
 dispatch uses the new definition. Tests cover stale version rejection and preserved
 old snapshots; deployment still requires a separate live verification.
+
+Published producer verification and CPU results now carry bounded semantic evidence
+into the next supervisor input. The reader binds both reports to the latest produce
+attempt, its immutable input source, candidate and checker bytes. Invalid JSON,
+conflicting hashes or attempt identity produce a local diagnostic without copying
+unvalidated report text or stopping observations of unrelated work. A reported
+falsification remains negative_result_reported, never QA acceptance or GPU proof;
+CPU success alone does not imply a useful code change or measured improvement.
+
+Authenticated adapter NO_EXECUTABLE_CHANGE or NO_CANDIDATE_CHANGE rejections require
+a new hypothesis. Only that candidate is isolated from selection, while the original
+source and other eligible work remain available. Such rejections never authorize an
+evidence-only repair, override active QA, or change existing occurrence snapshots.
