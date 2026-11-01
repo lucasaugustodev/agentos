@@ -798,6 +798,7 @@ class Watchdog:
                 blockers = [{"id": "legacy-string-" + str(i) + "-" + digest(r.encode()),
                     "identityMethod": "derived_array_index_and_utf8_sha256_not_semantic_id", "text": r}
                     if isinstance(r, str) else r for i, r in enumerate(blockers)]
+                require(len(canonical(blockers)) <= 32768, "QA_CONTEXT_BLOCKERS_SIZE_EXCEEDED")
                 require(len({r["id"] for r in blockers}) == len(blockers), "QA_CONTEXT_BLOCKER_ID_DUPLICATE")
             envelope.update(bindingState="verified", candidateSHA256=candidate_sha, sourceSHA256=reported_base,
                 candidateArtifactIds=sorted(a["id"] for a in candidates),

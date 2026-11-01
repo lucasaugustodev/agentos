@@ -1035,6 +1035,10 @@ class WatchTests(unittest.TestCase):
         self.assertEqual(value['emitterProvenance'], 'legacy_report_independence_not_established')
         self.assertTrue(all(r['identityMethod'].endswith('not_semantic_id') for r in value['blockingFindings']))
         self.assertEqual(value['runFence'], self.client.occurrences[self.seed]['attempts'][0]['fence'])
+        self.bind_source_qa_blockers(['x' * 900 for _ in range(32)])
+        observed = self.w.observe()
+        value = next(a['qaEvidence'] for o in observed['outcomes'] for a in o['artifacts'] if a['name'] == 'qa-verification.json')
+        self.assertEqual(value['code'], 'QA_CONTEXT_BLOCKERS_SIZE_EXCEEDED')
 
     def registered_qa_detail(self):
         self.register_completed_job()
