@@ -381,3 +381,11 @@ The full repair packet must remain below the adapter's 2 MiB input bound and the
 API's 3 MiB body bound. A generic preflight needs durable prepared create/run bodies
 and recovery of those exact bytes before new validation; it is separate work and
 must not prevent GET-only reconciliation or discard an unstarted valid remainder.
+
+The combined controller revision has 152 passing server-only tests. Frozen native
+evidence replays confirm that the formatting-heavy repair becomes eligible with
+all raw materials intact, while the old QA remains rejected; the failed producer's
+complete cost estimate and caveats reach a diagnostic-only review. A separate
+causal trace confirms that terminal administrative handoff starts one new review
+within the same tick. These are controller qualification results, not evidence
+of successful model work, GPU performance or uninterrupted live autonomy.
