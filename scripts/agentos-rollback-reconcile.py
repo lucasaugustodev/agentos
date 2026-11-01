@@ -87,11 +87,32 @@ def fresh(path, value):
         stream.write(raw)
         stream.flush()
         os.fsync(stream.fileno())
-    fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    sync_directory(path.parent)
+
+
+def sync_directory(path):
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
         os.fsync(fd)
     finally:
         os.close(fd)
+
+
+def durable_directory(path):
+    """Repair interrupted mkdir durability before recording or dispatching work."""
+    path = pathlib.Path(path)
+    if not path.is_relative_to(STATE):
+        fail('RECOVERY_STATE_PATH')
+    parent = protected(STATE, directory=True)
+    for name in path.relative_to(STATE).parts:
+        child = parent / name
+        if not child.exists():
+            child.mkdir(mode=0o700)
+        protected(child, directory=True)
+        # An existing directory may be left by a crash before its first fsync.
+        sync_directory(parent)
+        sync_directory(child)
+        parent = child
 
 
 def parse_request(value):
@@ -244,8 +265,7 @@ class Runtime:
         if (STATE / 'pending-workers.json').exists():
             fail('RECOVERY_ADOPTION_PENDING')
         self.record = record
-        self.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        protected(self.parent, directory=True)
+        durable_directory(self.parent)
         owner = self.parent / 'owner.json'
         identity = {'operationId': request['operationId'], 'request': request,
                     'registrationSha256': self.registration['_sha256']}
@@ -254,8 +274,7 @@ class Runtime:
                 fail('RECOVERY_OWNER_CHANGED')
         else:
             fresh(owner, identity)
-        self.directory.mkdir(mode=0o700, exist_ok=True)
-        protected(self.directory, directory=True)
+        durable_directory(self.directory)
         return {**expected, 'request': request, 'registrationSha256': self.registration['_sha256'],
                 'environmentSha256': sha(read(ENV)), 'toolSha256': self.registration['toolSha256']}
 
@@ -305,7 +324,8 @@ class Runtime:
             fail('API_CHAT_STOP_UNCONFIRMED')
         if observed.get('maintenance', {}) and observed['maintenance'].get('draining'):
             fail('RECOVERY_FOREIGN_MAINTENANCE')
-        if observed.get('source', {}).get('release') != binding['base']:
+        if (observed.get('source') != expected.get('source') or
+                observed.get('source', {}).get('release') != binding['base']):
             fail('PUBLISHED_SOURCE_EFFECT_UNPROVEN')
         for name in SERVICES:
             ready = observed['readiness'].get('worker-readiness:' + name, {})
@@ -376,6 +396,7 @@ class Runtime:
         else:
             os.symlink(binding['base'], target)
         os.replace(target, ROOT / 'current')
+        sync_directory(ROOT)
 
     def verify_saved_swap(self, binding):
         proof, swap = self.get('readiness'), self.get('swap-intent')
@@ -385,6 +406,10 @@ class Runtime:
         self.check_readiness_record(proof, binding, schema)
         if swap != {'version': 1, 'binding': binding, 'readinessSha256': sha(canonical(proof))}:
             fail('ROLLBACK_SWAP_UNPROVEN')
+        if self.get('api-start-intent') is None:
+            # A response/fsync may have failed after rename. Complete that
+            # durability barrier before allowing an API start on replay.
+            sync_directory(ROOT)
 
     def after_swap(self, binding):
         if self.pointer() != binding['base']:
@@ -460,7 +485,7 @@ def load_authority():
             not isinstance(q.get('tests'), int) or q['tests'] < 20 or q.get('passed') != q['tests'] or
             q.get('skipped') != 0 or q.get('failed') != 0):
         fail('RECOVERY_QUALIFICATION_UNBOUND')
-    if set(registration.get('baselineObservation', {})) != {'scopePolicies', 'scopeEvents', 'scopeRuns'}:
+    if set(registration.get('baselineObservation', {})) != {'source', 'scopePolicies', 'scopeEvents', 'scopeRuns'}:
         fail('RECOVERY_BASELINE_REQUIRED')
     executor = CONTROL / 'agentos-release-action.py'
     raw = read(executor)

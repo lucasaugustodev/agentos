@@ -52,7 +52,7 @@ The registration contains these fields:
     occurrenceId, validationReceiptSha256,
     candidate, digest, base, baseDigest
   }
-  baselineObservation: {scopePolicies, scopeEvents, scopeRuns}
+  baselineObservation: {source, scopePolicies, scopeEvents, scopeRuns}
 
 The baseline observation must be collected and reviewed before publication,
 under the qualified publication boundary. It is not reconstructed after failure.
@@ -60,6 +60,8 @@ The tool preserves legitimate candidate_readiness/candidate_ci features already
 supported by the previous release. It compares only the new applicability
 registrations, scoped admission events, and immutable workerValidationScope
 snapshots. Removing the current policy cannot erase its historical event.
+The entire published source object is bound, including its workspace; keeping
+the old release string while changing the workspace is rejected as well.
 Controller readiness is checked against actual PID/cwd as well as DB metadata.
 
 No installer or registrar mutation is included in this change. In particular,
@@ -87,7 +89,10 @@ Requests cannot supply paths, shell commands, SQL, or readiness overrides.
    termination is SCHEMA_EFFECT_UNCONFIRMED, not permission to rerun migration.
 4. Require the existing unchanged require_rollback_readiness function to prove
    all five old-schema gates. Persist this proof and a swap intent before the
-   atomic pointer return. The failed historical rollback receipt stays intact.
+   atomic pointer return, then fsync the release parent before any API start.
+   New recovery directories and their parents are also fsynced before dispatch.
+   A replay after rename completes that durability barrier first. The failed
+   historical rollback receipt stays intact.
 5. Start the API once after the old schema and pointer are proved. Subsequent
    calls observe PID, cwd, role, invocation and health. They do not restart an
    already healthy API. New chats after that start do not cause a restart.
@@ -120,3 +125,12 @@ preserving older legitimate candidate-readiness history. Canonical old -> new
 -> old schema characterization proves trigger/fingerprint restoration and
 preservation of admitted legacy rows and immutable snapshots. These are distinct
 proofs; mocked service boundaries are never described as a live recovery.
+
+The current CPU suite contains 42 cases. Five causal regressions fail against
+the previous helper and pass against the corrected helper. The filesystem cases
+execute real mkdir, receipt writes, rename and fsync on isolated Linux paths,
+with injected fsync failures observed by file descriptor. They verify ordering
+and no repeated schema dispatch, pointer swap or API start. They do not simulate
+power loss or execute real service changes. The separate PostgreSQL proof and
+its exact helper identity must accompany qualification; the CPU count alone is
+not a proof of end-to-end recovery or permission to install this operation.

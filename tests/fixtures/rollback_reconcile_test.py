@@ -2,7 +2,9 @@
 import copy
 import importlib.util
 import json
+import os
 import pathlib
+import stat
 import tempfile
 import types
 import unittest
@@ -283,8 +285,8 @@ class ReceiptBindingTests(unittest.TestCase):
         self.guard = types.SimpleNamespace(digest=publisher.digest, _RECOVERY_PUBLISHER=self.publisher)
         for name, value in [('ROOT', self.root), ('STATE', self.state), ('CONTROL', self.control), ('ENV', self.environment)]:
             p = patch.object(g, name, value); p.start(); self.addCleanup(p.stop)
-        # Synthetic temp root is world-traversable. Production protection is
-        # separately exercised, and the real receipt/source code runs below.
+        # Synthetic temp root is world-traversable. This substitutes path
+        # protection only; real receipt/source and filesystem code runs below.
         p = patch.object(g, 'protected', side_effect=lambda path, **_: pathlib.Path(path)); p.start(); self.addCleanup(p.stop)
         self.io = g.Runtime(self.registration, self.guard, self.request)
 
@@ -343,6 +345,131 @@ class ReceiptBindingTests(unittest.TestCase):
         self.bind(); other = {**self.request, 'operationId': str(uuid.uuid4())}
         io = g.Runtime(self.registration, self.guard, other)
         with self.assertRaisesRegex(ValueError, 'OWNER_CHANGED'): io.bind(other)
+
+    def prepare_actual_filesystem_recovery(self):
+        """Use real receipts, rename and fsync; substitute only external IO."""
+        os.symlink(self.candidate, self.root / 'current')
+        effects = []
+        self.io.before_schema = lambda binding: None
+        self.io.require_api_stopped = lambda: None
+        self.io.launch_schema = lambda value: effects.append('schema')
+        self.io.compatibility = lambda binding, **kwargs: {}
+        self.guard.ROLLBACK_READINESS_JS = 'fixture-readonly-gates'
+        gates = ['base', 'backlog', 'taskExecution', 'runCriteria', 'panel']
+        self.guard.require_rollback_readiness = lambda base, record: {
+            'ok': True, 'source': base, 'digest': record['candidateOrigin']['published']['releaseDigest'],
+            'gates': gates}
+        self.io.node = lambda source, code: {'version': 1, 'ok': True, 'readOnly': True, 'gates': gates}
+        self.io.schema_result = lambda binding: self.io.get('schema-result')
+        self.io.start_api = lambda: effects.append('start')
+        return effects
+
+    def test_parent_fsync_failure_cannot_record_owner_or_dispatch_schema(self):
+        effects = self.prepare_actual_filesystem_recovery()
+        real_sync = os.fsync
+        def fail_parent(fd):
+            if pathlib.Path(os.readlink('/proc/self/fd/' + str(fd))) == self.state:
+                raise OSError('fixture parent fsync failure')
+            real_sync(fd)
+        with patch.object(g.os, 'fsync', side_effect=fail_parent):
+            with self.assertRaisesRegex(OSError, 'parent fsync'):
+                g.reconcile(self.io, self.request)
+        self.assertFalse((self.io.parent / 'owner.json').exists())
+        self.assertEqual(effects, [])
+        # The existing mkdir from the failed attempt must be flushed on replay.
+        synced = []
+        def record(fd):
+            synced.append(pathlib.Path(os.readlink('/proc/self/fd/' + str(fd))))
+            real_sync(fd)
+        with patch.object(g.os, 'fsync', side_effect=record):
+            self.assertEqual(g.reconcile(self.io, self.request)['state'], 'schema_pending')
+        self.assertIn(self.state, synced)
+        self.assertEqual(effects, ['schema'])
+
+    def test_all_recovery_directories_are_durable_before_schema_dispatch(self):
+        effects = self.prepare_actual_filesystem_recovery()
+        trace, real_sync = [], os.fsync
+        def record_sync(fd):
+            real_sync(fd)
+            if stat.S_ISDIR(os.fstat(fd).st_mode):
+                trace.append(('fsync', pathlib.Path(os.readlink('/proc/self/fd/' + str(fd)))))
+        self.io.launch_schema = lambda value: trace.append(('schema', None))
+        with patch.object(g.os, 'fsync', side_effect=record_sync):
+            self.assertEqual(g.reconcile(self.io, self.request)['state'], 'schema_pending')
+        self.assertEqual(trace[-1][0], 'schema')
+        first = [self.state, self.state / 'rollback-reconciliations', self.io.parent, self.io.directory]
+        for path in first:
+            self.assertIn(('fsync', path), trace)
+        positions = [next(i for i, item in enumerate(trace) if item == ('fsync', path)) for path in first]
+        self.assertEqual(positions, sorted(positions))
+        self.assertTrue(all(i < len(trace) - 1 for i in positions))
+        self.assertEqual(effects, [])
+
+    def test_real_rename_fsync_failure_preserves_no_start_then_replays_without_second_swap(self):
+        effects = self.prepare_actual_filesystem_recovery()
+        self.assertEqual(g.reconcile(self.io, self.request)['state'], 'schema_pending')
+        binding = self.bind()
+        self.io.put('schema-result', {'exitCode': 0, 'binding': binding})
+        trace, real_sync, real_replace = [], os.fsync, g.os.replace
+        fail_root = True
+        def sync(fd):
+            if pathlib.Path(os.readlink('/proc/self/fd/' + str(fd))) == self.root:
+                trace.append('root-fsync')
+                if fail_root: raise OSError('fixture release-parent fsync failure')
+            real_sync(fd)
+        def replace(source, destination):
+            real_replace(source, destination); trace.append('rename')
+        self.io.start_api = lambda: (trace.append('start'), effects.append('start'))
+        with patch.object(g.os, 'fsync', side_effect=sync), patch.object(g.os, 'replace', side_effect=replace):
+            with self.assertRaisesRegex(OSError, 'release-parent fsync'):
+                g.reconcile(self.io, self.request)
+            self.assertEqual(self.io.pointer(), str(self.base))
+            self.assertEqual(trace, ['rename', 'root-fsync'])
+            self.assertIsNone(self.io.get('api-start-intent'))
+            self.assertEqual(effects, ['schema'])
+            # Even with current==base, an unconfirmed directory fsync cannot start API.
+            with self.assertRaisesRegex(OSError, 'release-parent fsync'):
+                g.reconcile(self.io, self.request)
+            self.assertIsNone(self.io.get('api-start-intent'))
+            fail_root = False
+            self.assertEqual(g.reconcile(self.io, self.request)['state'], 'api_pending')
+        self.assertEqual(trace.count('rename'), 1)
+        self.assertEqual(trace[-2:], ['root-fsync', 'start'])
+        self.assertEqual(effects, ['schema', 'start'])
+        # A lost start response is observation only; no second start or rename.
+        self.io.api_result = lambda binding: {'healthy': True, 'source': binding['base'], 'digest': binding['baseDigest']}
+        self.assertEqual(g.reconcile(self.io, self.request)['state'], 'completed')
+        self.assertTrue(g.reconcile(self.io, self.request)['readOnlyReplay'])
+        self.assertEqual(effects, ['schema', 'start'])
+
+    def source_observation(self):
+        base = str(pathlib.Path.cwd())
+        binding = {'base': base, 'baseDigest': 'f' * 64}
+        baseline = {'source': {'release': base, 'workspace': 'agentos/original', 'digest': 'e' * 64},
+                    'scopePolicies': [], 'scopeEvents': [], 'scopeRuns': []}
+        self.registration['baselineObservation'] = copy.deepcopy(baseline)
+        observation = {**copy.deepcopy(baseline), 'chats': 0, 'maintenance': {}, 'readiness': {
+            'worker-readiness:' + name: {'pid': os.getpid(), 'candidate': base, 'digest': binding['baseDigest']}
+            for name in g.SERVICES}}
+        self.io.node = lambda source, code: copy.deepcopy(observation)
+        self.io.service = lambda name: {'ActiveState': 'active', 'MainPID': str(os.getpid())}
+        return binding, observation
+
+    def test_unchanged_entire_source_object_and_actual_fixture_pid_are_compatible(self):
+        binding, observation = self.source_observation()
+        self.assertEqual(self.io.compatibility(binding), observation)
+
+    def test_workspace_drift_with_identical_release_is_rejected(self):
+        binding, observation = self.source_observation()
+        observation['source']['workspace'] = 'agentos/foreign'
+        with self.assertRaisesRegex(ValueError, 'PUBLISHED_SOURCE_EFFECT_UNPROVEN'):
+            self.io.compatibility(binding)
+
+    def test_source_metadata_drift_is_rejected_even_with_same_release_and_workspace(self):
+        binding, observation = self.source_observation()
+        observation['source']['digest'] = 'a' * 64
+        with self.assertRaisesRegex(ValueError, 'PUBLISHED_SOURCE_EFFECT_UNPROVEN'):
+            self.io.compatibility(binding)
 
 
 class InputTests(unittest.TestCase):
