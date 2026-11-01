@@ -1403,8 +1403,9 @@ class WatchTests(unittest.TestCase):
 
     def test_invalid_plan_gets_bounded_corrective_supervisor(self):
         self.w.tick(); self.complete_review({})
-        self.assertEqual(self.w.tick()['state'], 'supervisor_plan_rejected')
-        self.assertEqual(self.w.tick()['state'], 'supervisor_dispatched')
+        result = self.w.tick()
+        self.assertEqual(result['state'], 'supervisor_dispatched')
+        self.assertEqual(result['continuation']['steps'][0]['state'], 'supervisor_plan_rejected')
         self.assertEqual(self.w.state['supervisions'][-1]['input']['priorReviewErrors'], ['PLAN_FIELDS'])
         self.complete_review({})
         self.w.tick()
@@ -1414,8 +1415,111 @@ class WatchTests(unittest.TestCase):
     def test_stale_plan_superseded_not_applied(self):
         self.w.tick(); self.complete_review()
         self.client.complete(self.seed, {'candidate.py': b'# changed material'})
-        self.assertEqual(self.w.tick()['state'], 'stale_plan_superseded')
+        result = self.w.tick()
+        self.assertEqual(result['state'], 'supervisor_dispatched')
+        self.assertEqual(result['continuation']['steps'][0]['state'], 'stale_plan_superseded')
+        self.assertEqual(self.w.state['supervisions'][-2]['state'], 'superseded')
+        self.assertFalse(self.w.state['experiments'])
+
+    def test_terminal_drain_stale_opens_exactly_one_fresh_review_in_same_tick(self):
+        self.w.tick(); self.complete_review(); old = self.w.state['supervisions'][-1]
+        self.client.complete(self.seed, {'candidate.py': b'# materially changed source\n'})
+        before_posts = len(self.client.posts); before_gets = len(self.client.gets)
+        result = self.w.tick()
+        self.assertEqual(result['state'], 'supervisor_dispatched')
+        self.assertEqual(result['continuation']['administrativeTransitions'], 1)
+        self.assertEqual(result['continuation']['steps'][0]['state'], 'stale_plan_superseded')
+        self.assertEqual(result['continuation']['nextAction'], 'await_supervisor_result')
+        self.assertEqual(old['state'], 'superseded')
+        self.assertEqual(len(self.client.posts), before_posts + 1)
+        self.assertFalse(self.w.state['experiments'])
+        self.assertGreaterEqual(self.client.gets[before_gets:].count('/api/cycles/' + self.config['controlCycleId']), 2)
+        self.assertGreaterEqual(self.client.gets[before_gets:].count('/api/cycle-runs/' + self.seed), 2)
+        self.assertEqual(self.w.tick()['state'], 'supervisor_running')
+        self.assertEqual(len(self.client.posts), before_posts + 1)
+
+    def test_terminal_drain_native_failure_retries_only_within_existing_limit(self):
+        self.w.tick(); oid = self.w.state['supervisions'][-1]['occurrenceId']
+        self.client.complete(oid, {}, state='failed')
+        result = self.w.tick()
+        self.assertEqual(result['state'], 'supervisor_dispatched')
+        self.assertEqual(result['continuation']['steps'][0]['state'], 'supervisor_failed')
+        self.assertEqual(self.w.state['supervisions'][-1]['input']['priorReviewErrors'], ['NATIVE_SUPERVISOR_FAILED'])
+        self.client.complete(self.w.state['supervisions'][-1]['occurrenceId'], {}, state='failed')
+        self.assertEqual(self.w.tick()['state'], 'supervisor_failure_needs_repair')
+        self.assertEqual(len(self.client.posts), 2)
+
+    def test_terminal_drain_pause_between_transitions_prevents_new_review(self):
+        self.w.tick(); self.complete_review({}); original = self.w.status
+        def pause_after_rejection(state, **facts):
+            result = original(state, **facts)
+            if state == 'supervisor_plan_rejected':
+                self.client.cycles[self.config['controlCycleId']]['state'] = 'paused'
+            return result
+        with mock.patch.object(self.w, 'status', side_effect=pause_after_rejection): result = self.w.tick()
+        self.assertEqual(result['state'], 'paused_by_control_cycle')
+        self.assertEqual(result['continuation']['administrativeTransitions'], 1)
+        self.assertEqual(result['continuation']['nextAction'], 'await_control_resume')
+        self.assertEqual(len(self.client.posts), 1)
+
+    def test_terminal_drain_reobserves_owner_before_retrying(self):
+        self.w.tick(); self.complete_review({}); original = self.w.status
+        def owner_after_rejection(state, **facts):
+            result = original(state, **facts)
+            if state == 'supervisor_plan_rejected':
+                d = self.client.occurrences[self.seed]
+                d['occurrence']['state'] = 'running'; d['attempts'][0].update(state='running', receipt=None)
+            return result
+        with mock.patch.object(self.w, 'status', side_effect=owner_after_rejection): result = self.w.tick()
+        self.assertEqual(result['state'], 'work_active')
+        self.assertEqual(result['continuation']['nextAction'], 'observe_owned_work')
+        self.assertEqual(len(self.client.posts), 1)
+
+    def test_terminal_drain_lost_retry_response_stops_and_reconciles_get_only(self):
+        self.w.tick(); self.complete_review({}); self.client.timeout_after_commit_number = 2
+        with self.assertRaises(TimeoutError): self.w.tick()
+        requests = copy.deepcopy(self.w.state['reviewRequests'])
+        self.assertEqual(len(self.client.posts), 2)
+        self.reload(); self.assertEqual(self.w.tick()['state'], 'supervisor_dispatched')
+        self.assertEqual(len(self.client.posts), 2)
+        self.assertEqual(self.w.state['reviewRequests'], requests)
+        self.assertEqual(self.w.tick()['state'], 'supervisor_running')
+
+    def test_terminal_drain_uncertain_retry_never_resends(self):
+        self.w.tick(); self.complete_review({}); self.client.timeout_before_commit_number = 2
+        with self.assertRaises(TimeoutError): self.w.tick()
+        self.reload()
+        with self.assertRaisesRegex(ValueError, 'POST_UNCERTAIN_RECONCILE_ONLY'): self.w.tick()
+        self.assertEqual(len(self.client.posts), 2)
+
+    def test_terminal_drain_limit_preserves_recoverable_persisted_state(self):
+        self.w.tick(); self.complete_review({})
+        with mock.patch.object(W, 'MAX_ADMINISTRATIVE_TRANSITIONS', 1): result = self.w.tick()
+        self.assertEqual(result['state'], 'administrative_transition_limit')
+        self.assertEqual(result['continuation']['administrativeTransitions'], 1)
+        self.assertEqual(result['continuation']['nextAction'], 'resume_controller_on_next_tick')
+        self.assertEqual(self.w.state['supervisions'][-1]['state'], 'failed')
+        self.assertEqual(len(self.client.posts), 1)
+        self.reload(); self.assertEqual(self.w.tick()['state'], 'supervisor_dispatched')
+        self.assertEqual(len(self.client.posts), 2)
+
+    def test_terminal_drain_known_prior_fingerprint_cannot_loop_or_repost(self):
+        original_seed = copy.deepcopy(self.client.occurrences[self.seed])
+        self.w.tick(); self.complete_review(); first = copy.deepcopy(self.w.state['supervisions'][-1])
+        self.client.complete(self.seed, {'candidate.py': b'# source B\n'})
         self.assertEqual(self.w.tick()['state'], 'supervisor_dispatched')
+        self.complete_review(); self.client.occurrences[self.seed] = original_seed
+        posts, records = len(self.client.posts), len(self.w.state['supervisions'])
+        result = self.w.tick()
+        self.assertEqual(result['state'], 'supervisor_dispatched')
+        self.assertEqual(result['continuation']['administrativeTransitions'], 1)
+        self.assertEqual(len(self.client.posts), posts)
+        self.assertEqual(len(self.w.state['supervisions']), records + 1)
+        self.assertFalse(self.w.state['experiments'])
+        # Existing request-key semantics can acknowledge the historical review.
+        # This patch stops there; changing that identity/recovery is separate work.
+        self.assertEqual(result['occurrenceId'], first['occurrenceId'])
+        self.assertEqual(self.w.state['supervisions'][-1]['input'], first['input'])
 
     def prefill_plan_while_decode_qa_runs(self):
         prefill = self.add_seed()
@@ -1446,21 +1550,31 @@ class WatchTests(unittest.TestCase):
         record = self.w.state['supervisions'][-1]
         record.pop('actionEvidence'); record['input'].pop('actionEvidence'); self.w.save()
         self.client.complete(self.seed, {'candidate.py': b'# rejected decode\n'}, state='attention')
-        self.assertEqual(self.w.tick()['state'], 'stale_plan_superseded')
-        self.assertEqual(len(self.client.posts), 1)
+        result = self.w.tick()
+        self.assertEqual(result['state'], 'supervisor_dispatched')
+        self.assertEqual(record['state'], 'superseded')
+        self.assertFalse(self.w.state['experiments'])
+        self.assertEqual(len(self.client.posts), 2)  # A fresh supervisor, never the stale action.
 
     def test_model_cannot_supply_action_evidence(self):
         self.w.tick(); plan = self.plan(); plan['actionEvidence'] = self.w.state['supervisions'][-1]['actionEvidence']
         self.complete_review(plan)
-        self.assertEqual(self.w.tick()['code'], 'PLAN_FIELDS')
-        self.assertEqual(len(self.client.posts), 1)
+        result = self.w.tick()
+        self.assertEqual(result['state'], 'supervisor_dispatched')
+        self.assertEqual(result['continuation']['steps'][0]['code'], 'PLAN_FIELDS')
+        self.assertFalse(self.w.state['experiments'])
+        self.assertEqual(len(self.client.posts), 2)
 
     def test_same_board_failure_or_source_change_invalidates_plan(self):
         prefill = self.prefill_plan_while_decode_qa_runs()
+        old = self.w.state['supervisions'][-1]
         self.client.complete(prefill, {'candidate.py': b'# new prefill source\n',
             'qa-verification.json': {'passed': False, 'findings': ['precision changed']}}, state='attention')
-        self.assertEqual(self.w.tick()['state'], 'stale_plan_superseded')
-        self.assertEqual(len(self.client.posts), 1)
+        result = self.w.tick()
+        self.assertEqual(result['state'], 'supervisor_dispatched')
+        self.assertEqual(old['state'], 'superseded')
+        self.assertFalse(self.w.state['experiments'])
+        self.assertEqual(len(self.client.posts), 2)
 
     def test_same_board_new_official_measurement_invalidates_plan(self):
         self.add_gpu_job(problem='muse_decode_layer', status='done')

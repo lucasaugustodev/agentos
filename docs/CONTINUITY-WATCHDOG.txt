@@ -279,6 +279,32 @@ artifact/hash/size and candidate/attempt/fence counterexamples, unchanged replay
 instructions/materials/criteria, and the existing ownership/reconciliation tests.
 An invalid QA manifest also has a causal red/green test proving that another
 board still reaches its supervisor and producer dispatch without that report.
+
+Immediate continuation after closed administrative transitions
+
+One tick can process up to three stale_plan_superseded, supervisor_failed or
+supervisor_plan_rejected transitions. After each, it checks the native control
+and observes current evidence/ownership again, under the same existing process
+lock. It can then dispatch one new supervisor review without waiting for another
+timer interval. A dispatch, active owner, real wait, pause or exception ends that
+invocation. Transport errors are not retried inside the drain. Existing review
+failure limits, request identities, uncertain-effect GET reconciliation, WIP,
+source/authority gates and official policy remain unchanged.
+
+POST reconciliation is deliberately not an administrative drain state: even a
+reconciled create with no run remains a separate boundary. The compact continuation
+status records the transition count, up to three state/occurrence/code references,
+the final wait reason and next action. Reaching the bound persists an explicit
+administrative_transition_limit status; already closed transitions remain saved
+and the next normal tick can resume. This is a scheduler-latency improvement,
+not evidence of useful kernel performance or complete autonomous recovery.
+
+Known separate limitation: when evidence returns to a historical fingerprint,
+the existing request key can acknowledge a formerly superseded review. The
+A-to-B-to-A regression test proves this patch stops after one acknowledgement,
+does not resend a POST or dispatch an experiment in that invocation, and does
+not loop. It does not claim to repair the broader historical-review identity
+problem. Changing those keys or recovery semantics requires a separate change.
 Native repair evidence is selected only from the authenticated current producer
 step/attempt, with its definition, manifest, fence and confirmed stop. An
 independent QA attachment named cpu-result.json cannot replace or duplicate the

@@ -31,6 +31,7 @@ SOURCE_RAW_LIMIT = 1024 * 1024
 SUPERVISOR_INPUT_LIMIT = 2 * 1024 * 1024
 PRODUCER_DIAGNOSTIC_LIMIT = 16 * 1024
 SUPERVISOR_DIAGNOSTIC_LIMIT = 64 * 1024
+MAX_ADMINISTRATIVE_TRANSITIONS = 3
 EVIDENCE_REPAIR_CODES = {"PATCH_HEADER_SCOPE", "CPU_REPLAY_EXECUTION_UNPROVEN", "QA_LIMITATIONS_MISSING", "QA_TEST_BINDING",
     "CPU_RESULT_BINDING", "CPU_MEANINGFUL_cases", "CPU_MEANINGFUL_negativeControls", "CPU_CASES_NOT_REPLAYED",
     "QA_ATTESTATION_MISSING_canonicalPrecisionPreserved", "QA_ATTESTATION_MISSING_evaluatorIndependent",
@@ -1895,6 +1896,36 @@ verify whether prior findings were resolved, and produce your own independent QA
                            isolatedCandidates=pending["input"].get("isolatedCandidates", []))
 
     def tick(self):
+        """Drain closed administrative transitions under the caller's existing lock.
+
+        Each pass repeats control and observation. Dispatch, real waits and any
+        exception stop immediately; uncertain effects never enter a retry loop.
+        """
+        transitions = []
+        while True:
+            result = self._tick_once()
+            administrative = result["state"] in {
+                "stale_plan_superseded", "supervisor_failed", "supervisor_plan_rejected"}
+            if administrative:
+                transitions.append({k: result[k] for k in ["state", "occurrenceId", "code"] if k in result})
+                if len(transitions) < MAX_ADMINISTRATIVE_TRANSITIONS:
+                    continue
+                result = self.status("administrative_transition_limit", code="MAX_ADMINISTRATIVE_TRANSITIONS")
+            if transitions:
+                next_action = {
+                    "supervisor_dispatched": "await_supervisor_result", "supervisor_running": "await_supervisor_result",
+                    "experiments_dispatched": "await_native_result", "work_active": "observe_owned_work",
+                    "changed_plan_reconciled": "observe_owned_work", "active_owner_preserved": "observe_owned_work",
+                    "paused_by_control_cycle": "await_control_resume", "owned_dispatch_uncertain": "reconcile_existing_intents_by_get",
+                    "awaiting_external": "await_external_evidence", "awaiting_changed_evidence": "await_material_change",
+                    "supervisor_failure_needs_repair": "diagnose_supervisor_failure",
+                    "administrative_transition_limit": "resume_controller_on_next_tick"}.get(result["state"], "inspect_status")
+                result = {**result, "continuation": {"administrativeTransitions": len(transitions),
+                    "steps": transitions, "waitReason": result["state"], "nextAction": next_action}}
+                atomic(self.directory / "latest.json", result)
+            return result  # Includes supervisor_dispatched: at most one new review per invocation.
+
+    def _tick_once(self):
         if self.control()["cycle"]["state"] != "active":
             return self.status("paused_by_control_cycle")
         pending = next((r for r in reversed(self.state["supervisions"]) if r["state"] in ["dispatched", "dispatching"]), None)
