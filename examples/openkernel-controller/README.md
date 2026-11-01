@@ -123,3 +123,75 @@ the existing submission lane, register fixed actions, and demonstrate a genuine
 check followed by observation and a scored run for the exact approved source.
 Then exercise restart and deduplication against its journal. This example has
 no serving submission, rules-acceptance or withdrawal endpoint.
+# Native diagnostic CHECK adapter
+
+`tools/native_check_adapter.py` adds a separate, opt-in authority lane for a
+watchdog's completed producer → independent QA experiment. It does not alter the
+existing manual approval path. An operator pins the adapter, qualified transport
+and runtime helpers, watcher/config, canonical official files, seed provenance,
+boards, workspace, model/account, expiry and account lock in an external policy.
+Workers receive no submission credential or controller capability. Only `check`
+is supported; scoring remains a separate decision. Quota and rate limits come
+from the official account, without an extra daily token/check budget.
+
+The controller requires actual terminal/stopped executions, matching fences and
+input bytes, read-only workspaces, actual predecessor files delivered to QA,
+source provenance, canonical material hashes, and a byte-reproducible single-file
+patch (`--- base-candidate.py` / `+++ candidate.py`). It freezes the candidate,
+evidence and policy identity before a single qualified transport call under the
+existing account lock. Durable intent is mirrored into the existing ledger;
+timeouts and uncertain receipts never trigger another POST. The legacy ledger is
+a compatibility veto, not authority for a new candidate.
+
+Both producer and QA must use one direct bash command:
+
+```text
+sha256sum /absolute/cpu-checks.py /absolute/candidate.py && python3 /absolute/cpu-checks.py [arguments]
+```
+
+Do not append `echo`, shell redirections, another command, `cd`, or a newline.
+The tool supplies its exit status. `cpu-result.json` records `passed`,
+`candidateSHA256`, `checkerSHA256`, named `cases` with `passed:true`, and named
+`negativeControls` with `detected:true`. QA binds the checker/result hashes and
+the same case arrays in `cpuEvidence`; it explicitly attests
+`canonicalPrecisionPreserved`, `evaluatorIndependent`,
+`upstreamAttributionPreserved`, `cpuReplayPassed`, `scopePreserved` and
+`approvedForOfficialReview`, with `blockingFindings:[]`, findings and limitations.
+Both reports preserve `gpuValidated:false` and `officialActionsPerformed:false`.
+QA judgement and transcript evidence are not a cryptographic proof of execution
+or GPU correctness. The controller never runs worker Python as root. Suspicious
+imports/reflection, missing evidence and semantic concerns require native repair
+or separate manual review; they do not weaken an existing guard.
+
+`scan-inspect` writes a diagnostic snapshot without a POST, even with a disabled
+policy. `scan-check` processes only authorized experiments. Confirmed registered
+receipts skip expensive native re-audit; a 45-second scan budget prevents starting
+another operation while the batch grows. The active operation is allowed to
+finish, so an external service timeout must exceed the bounded API/CLI calls
+(a 15-minute oneshot timeout is conservative). Do not kill the process at the scan
+budget. The native controller remains the pause switch, checked again before the
+intent is created. An expired policy produces an explicit `policy_expired`
+diagnostic and does not pause CPU workers.
+
+The root-owned registry records the confirmed job plus immutable native/QA,
+policy, audit, dispatch and transport receipt hashes. The watchdog reads it and
+owns terminal GET observation. A separate status snapshot distinguishes
+`await_native`, `eligible`, `check_running`, `rejected_repairable`, `quota_wait`
+and `uncertain_owned`, bound to occurrence and candidate/QA hashes. The watchdog
+must consume repairable rejections and wake its supervisor before activation;
+installing a timer that merely logs those errors would recreate the pending-queue
+stall. Do not activate only half of this integration.
+
+Run the isolated unit tests **on a development server**, with an explicitly
+provisioned root-owned test directory outside all live state:
+
+```sh
+OPENKERNEL_ADAPTER_TEST_ROOT=/var/lib/example-adapter-tests \
+  python3 -m unittest discover -s examples/openkernel-controller/tests \
+  -p test_native_check_adapter.py -v
+```
+
+These tests inject fake native/official transports; they never make a submission
+or read production credentials. Test receipts remain inside the isolated test
+directory. Do not copy deployment IDs, account data, policies, source artifacts
+or credentials into this public repository.
