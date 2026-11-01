@@ -392,15 +392,19 @@ of successful model work, GPU performance or uninterrupted live autonomy.
 
 Parallel committed pipelines (explicit opt-in)
 
-pipelineCapacityVersion: 2 enables maxPendingCandidates up to12 and
-maxPipelinesPerProblem up to4. Without that opt-in, the existing total limit of
+pipelineCapacityVersion: 2 enables maxPendingCandidates up to24 and
+maxPipelinesPerProblem up to8. Existing12/4 configurations remain valid. Without
+that opt-in, the existing total limit of
 1..3 and one owned pipeline per problem remain unchanged. These are HARD limits
 on committed pipelines: native production, its sequential QA, unmeasured output,
 quota reservations and official GPU waits share them. Waiting work does not vanish
 from accounting. Three waiting pipelines can leave nine native slots in a12-slot
 configuration; twelve waiting pipelines leave none. There is no hidden overshoot
-or claim that all12 are CPU sessions. nativePipelineUsed and waitingPipelineUsed
-are disjoint counts; their sum equals pipelineUsed.
+or claim that all24 are running CPU sessions. nativePipelineUsed and
+waitingPipelineUsed are disjoint counts; their sum equals pipelineUsed. Native
+claims include queued work, not just executing sessions. The deployed12-session
+and six-call admission limits remain unchanged;24 queued/owned pipelines do not
+authorize24 executing sessions or more than six simultaneous model requests.
 
 boardAvailableCandidateSlots exposes the per-problem remaining capacity in the
 supervisor input. Several independently useful hypotheses may share a confirmed
@@ -432,3 +436,49 @@ snapshot preserves its one running owner while exposing11 available slots (3/4/4
 and a complete supervisor input below1MiB. That offline proof does not mean11 real
 agents were dispatched or that performance improved; live dispatch and accepted
 results remain separate observations.
+
+Selected-source planning read sets
+
+New capacity-v2 reviews use actionEvidence version2. Each selectable artifact has
+an exact descriptor/boundary proof and separate experiment/repair read-set hashes.
+The experiment proof includes producer reports and verified QA describing the
+EXACT candidateSHA256, including independent QA from another origin for identical
+bytes. A child's sourceSHA256 matching the selected base is not equivalent to its
+candidateSHA256 matching that base. Unknown QA/report bindings at the selected
+origin remain relevant and conservative. Matching official results, local adapter
+diagnostics, supplied exact-source or board-history engineering findings and
+canonical material references remain part of the decision context.
+
+An unrelated producer on the same problem may publish a different candidate and
+advance to QA without invalidating an experiment against an unchanged older base.
+Global policy/configuration/repair authority still must match. Source eligibility,
+remaining total/per-problem capacity, owned hypotheses and uncertain ownership are
+rechecked at consumption. Repair proofs additionally bind the complete selected
+repair target, including QA, artifacts and canonical patch. A stale adapter status
+or withdrawn repair authority still invalidates a repair. Unknown POST intents use
+the unchanged GET reconciliation path; a model cannot supply its own scope proof.
+
+Only contract-defined inventories are normalized before projection. Failures,
+artifact inventories and producer-artifact inventories can change order without
+creating a false source change. Duplicate records and ordered findings, CPU cases,
+diagnostic sections and patch content remain significant. Existing version1 proofs
+retain their original board-wide semantics and are never upgraded in place.
+
+Canonical PIN changes invalidate scope immediately. Actual file bytes still pass
+the existing material_packet hash check before a new dispatch. The source proof
+does not add filesystem/network reads or claim a new recovery guarantee: if bytes
+drift while their pin stays unchanged, the preexisting body-reconstruction path
+can fail closed before reconciling an uncertain intent. That recovery limitation
+requires a separate prepared-body contract; it is not bypassed here.
+
+Qualification now has184 passing server-only tests. The new scenarios prove a
+same-problem producer-to-QA transition can preserve an independent selected-source
+plan, while relevant QA/results, boundary changes, repair-target changes, authority
+changes and fresh capacity/duplicate conflicts still reject it. Twenty-four
+distinct queued native occurrences retain eight reservations per problem, and the
+25th total or ninth per problem is rejected. The existing12/4 and legacy behavior
+remain covered. A frozen full-input replay keeps its existing owner and exposes23
+available slots (7/8/8) with an input below1MiB; its synthetic plan is never sent.
+Retrospective incident reconstruction is labelled as such and does not replace an
+old persisted review's proof or establish the cause of a later authority failure.
+These checks do not establish live dispatch, accepted work or GPU improvement.

@@ -1304,8 +1304,8 @@ class WatchTests(unittest.TestCase):
 
     def test_parallel_optin_twelve_four_preserves_control_and_legacy_bounds(self):
         original = copy.deepcopy(self.config); self.parallel_capacity()
-        for changes, code in [({'maxPendingCandidates': 13}, 'CANDIDATE_CAPACITY'),
-                              ({'maxPipelinesPerProblem': 5}, 'BOARD_PIPELINE_CAPACITY'),
+        for changes, code in [({'maxPendingCandidates': 25}, 'CANDIDATE_CAPACITY'),
+                              ({'maxPipelinesPerProblem': 9}, 'BOARD_PIPELINE_CAPACITY'),
                               ({'maxPendingCandidates': True}, 'CANDIDATE_CAPACITY'),
                               ({'pipelineCapacityVersion': 3}, 'PIPELINE_CAPACITY_VERSION')]:
             with self.subTest(changes=changes), self.assertRaisesRegex(ValueError, code):
@@ -1342,6 +1342,37 @@ class WatchTests(unittest.TestCase):
             W.validate_plan(self.parallel_plan({'muse_decode_layer': 5}), self.w.observe(), self.config)
         with self.assertRaisesRegex(ValueError, 'PLAN_CAPACITY'):
             W.validate_plan(self.parallel_plan({'muse_decode_layer': 5, 'muse_prefill_layer': 4, 'muse_attention_decode': 4}),
+                            self.w.observe(), self.config)
+
+    def test_parallel_twenty_four_queued_fronts_eight_per_board_preserve_hard_ownership(self):
+        self.parallel_capacity(); self.config.update(maxPendingCandidates=24, maxPipelinesPerProblem=8)
+        W.validate_config(self.config)
+        self.add_seed(); self.add_seed('muse_attention_decode', b'# attention\n')
+        self.w.tick(); inp = self.w.state['supervisions'][-1]['input']
+        self.assertIn('up to 8 independent hypotheses', inp['interpretationRules'][-1])
+        self.assertIn('24 committed pipelines', inp['interpretationRules'][-1])
+        self.assertIn('not a promise', inp['interpretationRules'][-1])
+        self.complete_review(self.parallel_plan({p: 8 for p in W.PROBLEMS}))
+        result = self.w.tick()
+        self.assertEqual(result['state'], 'experiments_dispatched')
+        self.assertEqual(len({r['occurrenceId'] for r in result['dispatched']}), 24)
+        self.assertEqual(len({r['cycleId'] for r in result['dispatched']}), 24)
+        self.assertTrue(all(self.client.occurrences[r['occurrenceId']]['occurrence']['state'] == 'queued'
+                            for r in result['dispatched']))
+        observed = self.w.observe()
+        self.assertEqual(observed['pipelineUsed'], 24)
+        self.assertEqual(observed['pipelineUsedByProblem'], {p: 8 for p in W.PROBLEMS})
+        self.assertEqual(observed['availableCandidateSlots'], 0)
+        self.assertEqual(self.w.tick()['state'], 'work_active')
+        self.assertEqual(len(self.client.posts), 49)
+
+    def test_parallel_ninth_per_board_and_twenty_fifth_total_rejected(self):
+        self.parallel_capacity(); self.config.update(maxPendingCandidates=24, maxPipelinesPerProblem=8)
+        self.add_seed(); self.add_seed('muse_attention_decode', b'# attention\n'); self.w.tick()
+        with self.assertRaisesRegex(ValueError, 'PLAN_BOARD_CAPACITY'):
+            W.validate_plan(self.parallel_plan({'muse_decode_layer': 9}), self.w.observe(), self.config)
+        with self.assertRaisesRegex(ValueError, 'PLAN_CAPACITY'):
+            W.validate_plan(self.parallel_plan({'muse_decode_layer': 9, 'muse_prefill_layer': 8, 'muse_attention_decode': 8}),
                             self.w.observe(), self.config)
 
     def test_parallel_normalized_duplicate_rejected_despite_renaming(self):
@@ -1507,6 +1538,205 @@ class WatchTests(unittest.TestCase):
                 self.assertEqual(admission['pipelineUsed'], 1)
                 self.assertEqual(admission['boardAvailableCandidateSlots'][source['problem']], 0)
                 self.assertEqual(admission['uncertainProblems'], [source['problem']])
+
+    def prepared_source_action(self):
+        self.parallel_capacity()
+        pending, observed = self.prepared_action()
+        self.assertEqual(pending['actionEvidence']['version'], 2)
+        return pending, observed
+
+    def test_selected_source_plan_survives_other_producer_to_qa_same_board(self):
+        self.parallel_capacity(); self.w.tick()
+        self.complete_review(self.parallel_plan({'muse_decode_layer': 1})); self.w.tick()
+        first = self.w.state['experiments'][-1]
+        self.w.tick(); plan = self.parallel_plan({'muse_decode_layer': 1})
+        plan['experiments'][0]['hypothesis'] = 'A second distinct normalization schedule may reduce independent launch overhead.'
+        pending = self.w.state['supervisions'][-1]
+        self.complete_review(plan)
+        self.client.complete(first['occurrenceId'], {'candidate.py': b'# new descendant, not the selected base\n'})
+        detail = self.client.occurrences[first['occurrenceId']]; sid, aid = uid(), uid()
+        detail['occurrence']['state'] = 'running'
+        detail['steps'].append({'id': sid, 'key': 'independent-qa', 'attempt': 1, 'state': 'running'})
+        detail['attempts'].append({'id': aid, 'step_id': sid, 'number': 1, 'state': 'running', 'receipt': None})
+        before = len(self.client.posts); result = self.w.tick()
+        self.assertEqual(result['state'], 'experiments_dispatched')
+        self.assertEqual(len(self.client.posts) - before, 2)
+        self.assertEqual(pending['state'], 'consumed')
+        self.assertTrue(pending['acceptedAcrossIndependentChange'])
+        self.assertEqual(detail['attempts'][-1]['state'], 'running')
+
+    def test_source_scope_child_report_parent_hash_does_not_mean_same_candidate(self):
+        pending, original = self.prepared_source_action()
+        selected = next(a for a in original['catalog'] if a['id'] == pending['approvedPlan']['experiments'][0]['sourceArtifactId'])
+        fresh = copy.deepcopy(original)
+        child = {'occurrenceId': uid(), 'problem': selected['problem'], 'state': 'running', 'finishedAt': None,
+                 'failures': [], 'artifacts': [], 'executionEvidence': {'bindingState': 'verified',
+                    'sourceSHA256': selected['digest'], 'candidateSHA256': 'c' * 64, 'classification': 'cpu_check_failed_reported'}}
+        fresh['outcomes'].append(child)
+        self.assertTrue(W.unchanged_action_scope(pending, fresh, self.config))
+        child['executionEvidence']['candidateSHA256'] = selected['digest']
+        self.assertFalse(W.unchanged_action_scope(pending, fresh, self.config))
+
+    def test_source_scope_matching_bytes_qa_from_other_origin_invalidates(self):
+        pending, original = self.prepared_source_action()
+        selected = next(a for a in original['catalog'] if a['id'] == pending['approvedPlan']['experiments'][0]['sourceArtifactId'])
+        fresh = copy.deepcopy(original)
+        qa = {'id': uid(), 'name': 'qa-verification.json', 'digest': 'd' * 64, 'size': 100,
+              'qaEvidence': {'bindingState': 'verified', 'candidateSHA256': selected['digest'],
+                             'blockingFindings': [{'id': 'new-blocker', 'detail': 'Exact bytes fail the independent check.'}]}}
+        fresh['outcomes'].append({'occurrenceId': uid(), 'problem': selected['problem'], 'state': 'completed',
+                                 'finishedAt': None, 'failures': [], 'artifacts': [qa]})
+        self.assertFalse(W.unchanged_action_scope(pending, fresh, self.config))
+        qa['qaEvidence']['candidateSHA256'] = 'a' * 64
+        self.assertTrue(W.unchanged_action_scope(pending, fresh, self.config))
+        qa['qaEvidence'] = {'bindingState': 'unavailable', 'code': 'QA_CONTEXT_SOURCE_BINDING'}
+        self.assertTrue(W.unchanged_action_scope(pending, fresh, self.config))
+
+    def test_source_scope_selected_origin_unknown_qa_and_boundary_fail_closed(self):
+        pending, original = self.prepared_source_action()
+        selected = next(a for a in original['catalog'] if a['id'] == pending['approvedPlan']['experiments'][0]['sourceArtifactId'])
+        for change in ['qa', 'boundary', 'descriptor', 'duplicate']:
+            fresh = copy.deepcopy(original)
+            if change == 'qa':
+                outcome = next(o for o in fresh['outcomes'] if o['occurrenceId'] == selected['occurrenceId'])
+                outcome['artifacts'].append({'id': uid(), 'name': 'qa-verification.json', 'digest': 'd' * 64, 'size': 100,
+                    'qaEvidence': {'bindingState': 'unavailable', 'code': 'QA_CONTEXT_SOURCE_BINDING'}})
+            elif change == 'boundary': fresh['confirmedSourceArtifactIds'].remove(selected['id'])
+            elif change == 'descriptor': next(a for a in fresh['catalog'] if a['id'] == selected['id'])['size'] += 1
+            else: fresh['catalog'].append(copy.deepcopy(selected))
+            with self.subTest(change=change): self.assertFalse(W.unchanged_action_scope(pending, fresh, self.config))
+
+    def test_source_scope_official_result_only_matches_exact_candidate(self):
+        pending, original = self.prepared_source_action()
+        selected = next(a for a in original['catalog'] if a['id'] == pending['approvedPlan']['experiments'][0]['sourceArtifactId'])
+        fresh = copy.deepcopy(original)
+        result = {'id': 'f' * 16, 'problem': selected['problem'], 'sourceSHA256': 'b' * 64, 'status': 'done',
+                  'result': {'passed': False}, 'caseCounts': {}}
+        fresh['officialJobs'].append(result)
+        self.assertTrue(W.unchanged_action_scope(pending, fresh, self.config))
+        result['sourceSHA256'] = selected['digest']
+        self.assertFalse(W.unchanged_action_scope(pending, fresh, self.config))
+
+    def test_source_scope_external_history_and_canonical_pins_remain_relevant(self):
+        pending, original = self.prepared_source_action()
+        fresh = copy.deepcopy(original)
+        fresh['sourceExternalEvidence'] = [{'problem': 'muse_decode_layer', 'bindingState': 'verified',
+                                          'candidateSHA256': 'b' * 64, 'findings': ['Historical defect requires revalidation.']}]
+        self.assertFalse(W.unchanged_action_scope(pending, fresh, self.config))
+        config = copy.deepcopy(self.config)
+        config['problemMaterials']['muse_decode_layer'][0]['sha256'] = 'a' * 64
+        self.assertFalse(W.unchanged_action_scope(pending, original, config))
+
+    def test_source_scope_same_bytes_do_not_bypass_fresh_capacity_or_duplicate_admission(self):
+        pending, original = self.prepared_source_action()
+        source = next(a for a in original['catalog'] if a['id'] == pending['approvedPlan']['experiments'][0]['sourceArtifactId'])
+        for change, code in [('capacity', 'PLAN_CAPACITY'), ('board', 'PLAN_BOARD_CAPACITY'),
+                             ('hypothesis', 'PLAN_DUPLICATE_HYPOTHESIS')]:
+            fresh = copy.deepcopy(original); fresh['fingerprint'] = 'f' * 64
+            if change == 'capacity': fresh['availableCandidateSlots'] = 0
+            elif change == 'board': fresh['boardAvailableCandidateSlots']['muse_decode_layer'] = 0
+            else: fresh['hypothesisReservations'].append({'key': W.hypothesis_identity(source['problem'], source['digest'],
+                                                                                     pending['approvedPlan']['experiments'][0]['hypothesis'])})
+            self.assertTrue(W.unchanged_action_scope(pending, fresh, self.config))
+            result = self.w.consume_plan(copy.deepcopy(pending), fresh)
+            with self.subTest(change=change):
+                self.assertEqual(result['state'], 'stale_plan_superseded')
+                self.assertEqual(result['code'], code)
+                self.assertEqual(len(self.client.posts), 1)
+
+    def test_source_scope_repair_target_changes_cannot_hide_behind_same_candidate(self):
+        status = self.repairable_operation(); self.parallel_capacity(); self.install_diagnostic_fixture([status])
+        self.w.tick(); pending = self.w.state['supervisions'][-1]; original = self.w.observe()
+        plan = self.parallel_plan({'muse_decode_layer': 1}); plan['decision'] = 'repair_evidence'
+        plan['experiments'][0]['sourceArtifactId'] = original['autoCheckDiagnostics']['repairableEvidence'][0]['candidateArtifactId']
+        pending['approvedPlan'] = plan
+        for field in ['qaSHA256', 'producerArtifacts', 'repairQADiagnostic', 'canonicalPatch']:
+            fresh = copy.deepcopy(original); target = fresh['autoCheckDiagnostics']['repairableEvidence'][0]
+            if field == 'qaSHA256': target[field] = 'a' * 64
+            elif field == 'producerArtifacts': target[field][0]['digest'] = 'b' * 64
+            elif field == 'canonicalPatch': target[field]['sha256'] = 'c' * 64
+            else: target[field]['report']['findings'] = ['Changed relevant repair finding.']
+            with self.subTest(field=field): self.assertFalse(W.unchanged_action_scope(pending, fresh, self.config))
+
+    def test_source_scope_legacy_board_proof_never_upgraded_in_place(self):
+        pending, original = self.prepared_source_action()
+        legacy = copy.deepcopy(pending); legacy['actionEvidence'] = W.action_evidence(original, self.config, version=1)
+        fresh = copy.deepcopy(original)
+        fresh['active'].append({'problem': 'muse_decode_layer', 'occurrenceId': uid(), 'state': 'running', 'attemptIds': []})
+        self.assertTrue(W.unchanged_action_scope(pending, fresh, self.config))
+        self.assertFalse(W.unchanged_action_scope(legacy, fresh, self.config))
+        self.assertEqual(legacy['actionEvidence']['version'], 1)
+
+    def test_source_scope_stale_controller_authority_still_invalidates(self):
+        pending, original = self.prepared_source_action()
+        fresh = copy.deepcopy(original)
+        fresh['autoCheckDiagnostics'].update(controllerState='observation_stale', repairAuthority=None)
+        self.assertFalse(W.unchanged_action_scope(pending, fresh, self.config))
+        self.assertEqual(self.w.consume_plan(pending, fresh)['state'], 'stale_plan_superseded')
+        self.assertEqual(len(self.client.posts), 1)
+
+    def test_source_scope_pin_change_with_uncertain_run_reconciles_by_get_only(self):
+        self.parallel_capacity(); self.w.tick(); self.complete_review(self.parallel_plan({'muse_decode_layer': 4}))
+        self.client.timeout_before_commit_number = 7
+        with self.assertRaises(TimeoutError): self.w.tick()
+        self.config['problemMaterials']['muse_decode_layer'][0]['sha256'] = 'f' * 64
+        before_gets = len(self.client.gets)
+        self.reload(); result = self.w.tick()
+        self.assertEqual(result['state'], 'owned_dispatch_uncertain')
+        self.assertGreater(len(self.client.gets), before_gets)
+        self.assertEqual(len(self.client.posts), 7)
+        self.assertEqual(self.w.state['supervisions'][-1]['state'], 'dispatching')
+
+    def test_source_scope_unpinned_material_drift_preserves_existing_fail_closed_limit(self):
+        # Known preexisting dispatch-body limitation, not a new recovery guarantee:
+        # unchanged pins do not preflight actual files in a source read-set hash.
+        self.parallel_capacity(); self.w.tick(); self.complete_review(self.parallel_plan({'muse_decode_layer': 4}))
+        self.client.timeout_before_commit_number = 7
+        with self.assertRaises(TimeoutError): self.w.tick()
+        pathlib.Path(self.config['problemMaterials']['muse_decode_layer'][0]['path']).write_bytes(b'Changed unpinned material\n')
+        self.reload()
+        with self.assertRaisesRegex(ValueError, 'MATERIAL_CHANGED'): self.w.tick()
+        self.assertEqual(len(self.client.posts), 7)
+        self.assertEqual(self.w.state['supervisions'][-1]['state'], 'dispatching')
+
+    def source_inventory_fixture(self):
+        pending, original = self.prepared_source_action()
+        source = next(a for a in original['catalog'] if a['id'] == pending['approvedPlan']['experiments'][0]['sourceArtifactId'])
+        row = next(o for o in original['outcomes'] if o['occurrenceId'] == source['occurrenceId'])
+        row['failures'] = [{'attemptId': uid(), 'code': 'A'}, {'attemptId': uid(), 'code': 'B'}]
+        row['executionEvidence'] = {'bindingState': 'verified', 'candidateSHA256': source['digest'],
+            'artifacts': [{'id': uid(), 'digest': 'a' * 64}, {'id': uid(), 'digest': 'b' * 64}],
+            'producerDiagnostics': {'sections': [{'pointer': '/cases/0'}, {'pointer': '/cases/1'}]}}
+        row['artifacts'].append({'id': uid(), 'name': 'qa-verification.json', 'digest': 'd' * 64, 'size': 100,
+            'qaEvidence': {'bindingState': 'verified', 'candidateSHA256': source['digest'],
+                          'blockingFindings': [{'id': 'F1'}, {'id': 'F2'}]}})
+        original['autoCheckDiagnostics']['repairableEvidence'] = [{
+            'problem': source['problem'], 'occurrenceId': source['occurrenceId'], 'candidateArtifactId': source['id'],
+            'producerArtifacts': [{'id': uid(), 'digest': 'c' * 64}, {'id': uid(), 'digest': 'e' * 64}],
+            'repairQADiagnostic': {'report': {'cases': [{'name': 'first'}, {'name': 'second'}]}}}]
+        return original, source
+
+    def test_source_scope_normalizes_only_contract_inventories(self):
+        original, source = self.source_inventory_fixture(); fresh = copy.deepcopy(original)
+        row = next(o for o in fresh['outcomes'] if o['occurrenceId'] == source['occurrenceId'])
+        row['failures'].reverse(); row['artifacts'].reverse(); row['executionEvidence']['artifacts'].reverse()
+        fresh['autoCheckDiagnostics']['repairableEvidence'][0]['producerArtifacts'].reverse()
+        before = copy.deepcopy(original)
+        self.assertEqual(W.action_evidence(original, self.config), W.action_evidence(fresh, self.config))
+        self.assertEqual(original, before)
+
+    def test_source_scope_keeps_sequences_and_duplicate_inventory_significant(self):
+        original, source = self.source_inventory_fixture()
+        for target in ['findings', 'diagnostic_sections', 'repair_cases', 'duplicate_artifact', 'duplicate_failure']:
+            fresh = copy.deepcopy(original)
+            row = next(o for o in fresh['outcomes'] if o['occurrenceId'] == source['occurrenceId'])
+            if target == 'findings': row['artifacts'][-1]['qaEvidence']['blockingFindings'].reverse()
+            elif target == 'diagnostic_sections': row['executionEvidence']['producerDiagnostics']['sections'].reverse()
+            elif target == 'repair_cases': fresh['autoCheckDiagnostics']['repairableEvidence'][0]['repairQADiagnostic']['report']['cases'].reverse()
+            elif target == 'duplicate_artifact': row['executionEvidence']['artifacts'].append(copy.deepcopy(row['executionEvidence']['artifacts'][0]))
+            else: row['failures'].append(copy.deepcopy(row['failures'][0]))
+            with self.subTest(target=target):
+                self.assertNotEqual(W.action_evidence(original, self.config), W.action_evidence(fresh, self.config))
 
     def test_partial_dispatch_second_unknown_never_reposts(self):
         self.add_seed(); self.w.tick(); self.complete_review(self.plan(2))

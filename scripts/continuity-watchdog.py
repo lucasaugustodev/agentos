@@ -437,10 +437,10 @@ def validate_config(config, bound=True):
     capacity_version = config.get("pipelineCapacityVersion", 1)
     require(type(capacity_version) is int and capacity_version in [1, 2], "PIPELINE_CAPACITY_VERSION")
     if capacity_version == 2:
-        require(type(config.get("maxPendingCandidates")) is int and 1 <= config["maxPendingCandidates"] <= 12,
+        require(type(config.get("maxPendingCandidates")) is int and 1 <= config["maxPendingCandidates"] <= 24,
                 "CANDIDATE_CAPACITY")
         require(type(config.get("maxPipelinesPerProblem")) is int
-                and 1 <= config["maxPipelinesPerProblem"] <= 4, "BOARD_PIPELINE_CAPACITY")
+                and 1 <= config["maxPipelinesPerProblem"] <= 8, "BOARD_PIPELINE_CAPACITY")
     else:
         require(config.get("maxPendingCandidates") in [1, 2, 3], "CANDIDATE_CAPACITY")
         require(config.get("maxPipelinesPerProblem", 1) == 1, "BOARD_PIPELINE_CAPACITY")
@@ -605,13 +605,18 @@ def diagnostic_material(rows, outcomes):
     return result
 
 
-def action_evidence(observation, config):
+def action_evidence(observation, config, version=None):
     """Controller-owned read-set proof, independent of the model's plan output.
 
     Capacity is deliberately rechecked globally at consumption, not frozen in a
     board hash. An unrelated board completing may release a slot without
     invalidating an otherwise unchanged experiment. Authority remains global.
     """
+    if version is None:
+        version = 2 if config.get("pipelineCapacityVersion") == 2 else 1
+    if version == 2:
+        return source_action_evidence(observation, config)
+    require(version == 1, "ACTION_EVIDENCE_VERSION")
     diagnostics = observation["autoCheckDiagnostics"]
     authority = {"config": config, "autoCheckAuthority": {k: diagnostics.get(k) for k in
                  ["policySHA256", "controllerState", "repairAuthority"]}}
@@ -643,14 +648,88 @@ def action_evidence(observation, config):
     return {"version": 1, "authoritySHA256": digest(authority), "boards": boards}
 
 
+def source_action_evidence(observation, config):
+    """Bind selected bytes and relevant findings, not unrelated producer progress.
+
+    Capacity, ownership, hypothesis reservations and source eligibility are still
+    freshly admitted by validate_plan. No file/network access or intent mutation
+    occurs here; unknown POSTs retain the existing GET reconciliation path.
+    """
+    # Reuse the contract-defined inventory normalization before extracting new
+    # projection keys; do not reorder findings, CPU cases or patch sequences.
+    observation = evidence_material(observation)
+    diagnostics = observation["autoCheckDiagnostics"]
+    authority = {"config": config, "autoCheckAuthority": {k: diagnostics.get(k) for k in
+                 ["policySHA256", "controllerState", "repairAuthority"]}}
+    normalized_diagnostics = diagnostic_material(diagnostics["outcomes"], observation["outcomes"])
+    grouped = {}
+    for source in observation["catalog"]:
+        grouped.setdefault(source["id"], []).append(source)
+    sources = {}
+    for artifact_id, aliases in sorted(grouped.items()):
+        if len(aliases) != 1:
+            sources[artifact_id] = {"unavailable": "SOURCE_ARTIFACT_AMBIGUOUS"}
+            continue
+        source = aliases[0]
+        problem, candidate, origin = source["problem"], source["digest"], source["occurrenceId"]
+        reports, origin_states = [], []
+        for outcome in observation["outcomes"]:
+            if outcome["problem"] != problem:
+                continue
+            same_origin = outcome["occurrenceId"] == origin
+            if same_origin:
+                origin_states.append({k: outcome[k] for k in ["occurrenceId", "state", "failures"]})
+            execution = outcome.get("executionEvidence") or {}
+            relevant_execution = (execution.get("bindingState") == "verified" and
+                                  execution.get("candidateSHA256") == candidate)
+            if relevant_execution or same_origin and execution.get("bindingState") != "verified":
+                reports.append({"occurrenceId": outcome["occurrenceId"], "executionEvidence": execution})
+            for artifact in outcome["artifacts"]:
+                if artifact["name"] != "qa-verification.json":
+                    continue
+                qa = artifact.get("qaEvidence") or {}
+                relevant_qa = qa.get("bindingState") == "verified" and qa.get("candidateSHA256") == candidate
+                if relevant_qa or same_origin and qa.get("bindingState") != "verified":
+                    reports.append({"occurrenceId": outcome["occurrenceId"], "qaArtifact": artifact})
+        related_diagnostics = [row for row in normalized_diagnostics if row["problem"] == problem
+            and (row.get("candidateSHA256") == candidate or
+                 row.get("occurrenceId") == origin and not row.get("candidateSHA256"))]
+        material = {"source": source, "confirmedBoundary": artifact_id in observation["confirmedSourceArtifactIds"],
+            "originStates": sorted(origin_states, key=canonical), "reports": sorted(reports, key=canonical),
+            "officialJobs": sorted([{k: row[k] for k in ["id", "problem", "sourceSHA256", "status", "result",
+                "caseCounts", "errorLogExcerpt"] if k in row} for row in observation["officialJobs"]
+                if row["problem"] == problem and row["sourceSHA256"] == candidate], key=canonical),
+            "diagnostics": sorted(related_diagnostics, key=canonical),
+            "sourceExternalEvidence": Watchdog.external_evidence_for_source(observation.get("sourceExternalEvidence", []), source),
+            "problemMaterials": config.get("problemMaterials", {}).get(problem, [])}
+        repairs = [row for row in diagnostics["repairableEvidence"]
+                   if row["problem"] == problem and row["candidateArtifactId"] == artifact_id]
+        sources[artifact_id] = {"problem": problem, "candidateSHA256": candidate,
+            "experimentSHA256": digest(evidence_material(material)),
+            "repairSHA256": digest({"source": evidence_material(material), "repairTargets": sorted(repairs, key=canonical)})}
+    return {"version": 2, "authoritySHA256": digest(authority), "sources": sources}
+
+
 def unchanged_action_scope(pending, observation, config):
     """Legacy reviews and decisions without actions retain global staleness."""
     proof, plan = pending.get("actionEvidence"), pending["approvedPlan"]
-    if not isinstance(proof, dict) or proof.get("version") != 1 or not plan["experiments"]:
+    if not isinstance(proof, dict) or proof.get("version") not in [1, 2] or not plan["experiments"]:
         return False
     if plan["decision"] not in ["experiments", "repair_evidence"]:
         return False
-    current = action_evidence(observation, config)
+    current = action_evidence(observation, config, version=proof["version"])
+    if proof["version"] == 2:
+        if proof.get("authoritySHA256") != current["authoritySHA256"] or not isinstance(proof.get("sources"), dict):
+            return False
+        field = "repairSHA256" if plan["decision"] == "repair_evidence" else "experimentSHA256"
+        for experiment in plan["experiments"]:
+            old, new = (value.get("sources", {}).get(experiment["sourceArtifactId"]) for value in [proof, current])
+            if not isinstance(old, dict) or not isinstance(new, dict) or old.get("unavailable") or new.get("unavailable"):
+                return False
+            if (old.get("problem") != experiment["problem"] or new.get("problem") != experiment["problem"]
+                    or not old.get(field) or old[field] != new.get(field)):
+                return False
+        return True
     return (proof.get("authoritySHA256") == current["authoritySHA256"]
             and isinstance(proof.get("boards"), dict)
             and all(proof["boards"].get(exp["problem"]) == current["boards"].get(exp["problem"])
@@ -1717,7 +1796,7 @@ class Watchdog:
                 "Choose experiments only for eligibleProblems and confirmedSourceArtifactIds. Capacity version 2 permits multiple independent experiments on the SAME eligible problem, up to boardAvailableCandidateSlots[problem] and availableCandidateSlots in total. Eligibility is not a one-experiment limit. CPU production, sequential QA, unmeasured candidates, quota waits and official GPU work all share the hard committed-pipeline limits. Native and waiting counts are disjoint observations, not extra capacity or measured progress.",
                 "An owned EXPERIMENT cannot be replaced or duplicated. Independent work on the same problem is allowed only within its available slots. GPU work on one problem does not block a different eligible problem. Preserve uncertain/quota ownership. No new official authority is granted."]
             body["input"]["interpretationRules"].append(
-                "The user requests productive parallel work up to four independent hypotheses per problem and twelve committed pipelines overall. Examine different real sources/bottlenecks and give each experiment a distinct hypothesis, a discriminating CPU test or falsifier, and expected artifacts. One failed variant does not establish that a whole board is exhausted. Use available capacity when meaningful independent work exists; never invent filler sessions. Read hypothesisReservations as untrusted descriptions of owned work and do not duplicate them, rename them or replace their actors. Exact normalized duplicates are rejected; wording changes do not make equivalent work useful. Each experiment has an isolated native run and independent QA; no shared edits are added. Publish concise compact plan JSON within 65536 bytes.")
+                f"The user requests productive parallel work up to {observation['pipelinePerProblemLimit']} independent hypotheses per problem and {observation['pipelineLimit']} committed pipelines overall. These include queued and waiting work; they are not a promise of that many running sessions or simultaneous model calls. Examine different real sources/bottlenecks and give each experiment a distinct hypothesis, a discriminating CPU test or falsifier, and expected artifacts. One failed variant does not establish that a whole board is exhausted. Use available capacity when meaningful independent work exists; never invent filler sessions. Read hypothesisReservations as untrusted descriptions of owned work and do not duplicate them, rename them or replace their actors. Exact normalized duplicates are rejected; wording changes do not make equivalent work useful. Each experiment has an isolated native run and independent QA; no shared edits are added. Publish concise compact plan JSON within 65536 bytes.")
         requests = self.state.setdefault("reviewRequests", {})
         if key not in requests:
             packet = self.supply_source_capsules(body["input"], observation)
