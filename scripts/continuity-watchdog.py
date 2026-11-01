@@ -749,6 +749,25 @@ class Watchdog:
             "attemptId": artifact["attempt_id"], "bindingState": "unavailable"}
         try:
             require(artifact["attempt_id"] in latest_attempts, "QA_CONTEXT_ATTEMPT")
+            attempts = [a for a in detail["attempts"] if a["id"] == artifact["attempt_id"]]
+            require(len(attempts) == 1, "QA_CONTEXT_ATTEMPT")
+            attempt = attempts[0]
+            steps = [s for s in detail["steps"] if s["id"] == attempt["step_id"] and s["attempt"] == attempt["number"]]
+            require(len(steps) == 1, "QA_CONTEXT_STEP_BINDING")
+            step = steps[0]
+            require(UUID.fullmatch(attempt.get("fence", "")), "QA_CONTEXT_FENCE")
+            envelope.update(stepId=step["id"], stepKey=step.get("key"), runFence=attempt["fence"],
+                emitterProvenance="legacy_report_independence_not_established")
+            registered = any(r["occurrenceId"] == detail["occurrence"]["id"] for r in self.state["experiments"])
+            if registered:
+                definition = step.get("definition") or {}
+                require(step.get("key") == definition.get("key") == "independent-qa"
+                    and definition.get("kind") == "agent", "QA_CONTEXT_NOT_INDEPENDENT_QA_STEP")
+                expected = [s for s in detail["occurrence"].get("definition", {}).get("steps", [])
+                            if s.get("key") == "independent-qa"]
+                require(len(expected) == 1 and expected[0] == definition, "QA_CONTEXT_DEFINITION_BINDING")
+                require(confirmed_boundary(detail), "QA_CONTEXT_STOP_UNCONFIRMED")
+                envelope["emitterProvenance"] = "registered_independent_qa_step"
             require(type(artifact["size"]) is int and 0 < artifact["size"] <= 65536, "QA_CONTEXT_SIZE_EXCEEDED")
             raw = self.verified_artifact(artifact, 65536)
             def unique(pairs):
@@ -770,9 +789,13 @@ class Watchdog:
             require(not base or reported_base == base, "QA_CONTEXT_SOURCE_BINDING")
             blockers = review.get("blockingFindings")
             if blockers is not None:
-                require(isinstance(blockers, list) and all(isinstance(r, dict) and isinstance(r.get("id"), str)
-                    and bool(r["id"].strip()) for r in blockers), "QA_CONTEXT_BLOCKERS_SCHEMA")
+                require(isinstance(blockers, list) and all(isinstance(r, str) and bool(r.strip())
+                    or isinstance(r, dict) and isinstance(r.get("id"), str) and bool(r["id"].strip())
+                    for r in blockers), "QA_CONTEXT_BLOCKERS_SCHEMA")
                 require(len(blockers) <= 32 and len(canonical(blockers)) <= 32768, "QA_CONTEXT_BLOCKERS_SIZE_EXCEEDED")
+                blockers = [{"id": "legacy-string-" + str(i) + "-" + digest(r.encode()),
+                    "identityMethod": "derived_array_index_and_utf8_sha256_not_semantic_id", "text": r}
+                    if isinstance(r, str) else r for i, r in enumerate(blockers)]
                 require(len({r["id"] for r in blockers}) == len(blockers), "QA_CONTEXT_BLOCKER_ID_DUPLICATE")
             envelope.update(bindingState="verified", candidateSHA256=candidate_sha, sourceSHA256=reported_base,
                 candidateArtifactIds=sorted(a["id"] for a in candidates),

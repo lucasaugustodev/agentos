@@ -40,7 +40,9 @@ class FakeClient:
         d = self.occurrences[oid]
         d['occurrence'].update({'state': state, 'finished_at': '2026-11-01T18:00:00Z'})
         sid, aid = uid(), uid()
-        d['steps'] = [{'id': sid, 'attempt': 1, 'state': state, 'definition': {'kind': 'agent'}}]
+        key = 'independent-qa' if 'qa-verification.json' in artifacts else 'produce'
+        definition = next((s for s in d['occurrence'].get('definition', {}).get('steps', []) if s.get('key') == key), {'kind': 'agent'})
+        d['steps'] = [{'id': sid, 'key': key, 'attempt': 1, 'state': state, 'definition': definition}]
         d['attempts'] = [{'id': aid, 'step_id': sid, 'number': 1, 'state': 'completed' if state == 'completed' else 'failed',
                          'finished_at': '2026-11-01T18:00:00Z', 'fence': uid(), 'receipt': {'stopped': stopped}}]
         d['artifacts'] = []
@@ -377,8 +379,11 @@ class WatchTests(unittest.TestCase):
                 'gpuValidated': False, 'officialActionsPerformed': False}})
         detail = self.client.occurrences[oid]
         qa = next(a for a in detail['artifacts'] if a['name'] == 'qa-verification.json')
+        defs = {s['key']: s for s in detail['occurrence']['definition']['steps']}
+        detail['steps'][0].update(key='produce', definition=defs['produce'])
         sid, aid = uid(), uid()
-        detail['steps'].append({'id': sid, 'attempt': 1, 'state': 'completed', 'definition': {'kind': 'agent'}})
+        detail['steps'].append({'id': sid, 'key': 'independent-qa', 'attempt': 1, 'state': 'completed',
+                                'definition': defs['independent-qa']})
         detail['attempts'].append({'id': aid, 'step_id': sid, 'number': 1, 'state': 'completed',
             'finished_at': '2026-11-01T18:00:00Z', 'fence': uid(), 'receipt': {'stopped': True}})
         qa['attempt_id'] = aid
@@ -1020,6 +1025,51 @@ class WatchTests(unittest.TestCase):
         detail['occurrence']['input'] = {'experiment': {'sourceArtifact': {'digest': 'a' * 64}}}
         context, review = self.w.qa_context(detail, row, 'muse_decode_layer', {row['attempt_id']})
         self.assertEqual(context['code'], 'QA_CONTEXT_SOURCE_BINDING'); self.assertIsNone(review)
+
+    def test_source_qa_legacy_strings_keep_full_text_and_explicit_identity(self):
+        blockers = ['First legacy blocker. ' + 'A' * 800, 'Second legacy blocker. ' + 'B' * 900]
+        row = self.bind_source_qa_blockers(blockers)
+        self.w.tick(); value = next(a['qaEvidence'] for o in self.w.state['supervisions'][-1]['input']['outcomes']
+                                   for a in o['artifacts'] if a['id'] == row['id'])
+        self.assertEqual([r['text'] for r in value['blockingFindings']], blockers)
+        self.assertEqual(value['emitterProvenance'], 'legacy_report_independence_not_established')
+        self.assertTrue(all(r['identityMethod'].endswith('not_semantic_id') for r in value['blockingFindings']))
+        self.assertEqual(value['runFence'], self.client.occurrences[self.seed]['attempts'][0]['fence'])
+
+    def registered_qa_detail(self):
+        self.register_completed_job()
+        detail = self.client.occurrences[self.w.state['experiments'][-1]['occurrenceId']]
+        artifact = next(a for a in detail['artifacts'] if a['name'] == 'qa-verification.json')
+        return detail, artifact
+
+    def test_registered_source_qa_rejects_producer_forgery_and_definition_change(self):
+        detail, artifact = self.registered_qa_detail()
+        latest = {artifact['attempt_id']}
+        value, review = self.w.qa_context(detail, artifact, 'muse_decode_layer', latest)
+        self.assertEqual(value['emitterProvenance'], 'registered_independent_qa_step')
+        detail['steps'][0]['key'] = 'produce'
+        value, review = self.w.qa_context(detail, artifact, 'muse_decode_layer', latest)
+        self.assertEqual(value['code'], 'QA_CONTEXT_NOT_INDEPENDENT_QA_STEP'); self.assertIsNone(review)
+        detail['steps'][0]['key'] = 'independent-qa'
+        detail['steps'][0]['definition'] = copy.deepcopy(detail['steps'][0]['definition'])
+        detail['steps'][0]['definition']['instructions'] = 'Different, unauthorized QA role.'
+        value, review = self.w.qa_context(detail, artifact, 'muse_decode_layer', latest)
+        self.assertEqual(value['code'], 'QA_CONTEXT_DEFINITION_BINDING'); self.assertIsNone(review)
+
+    def test_registered_source_qa_binds_fence_and_latest_step_attempt(self):
+        detail, artifact = self.registered_qa_detail()
+        attempt = detail['attempts'][0]; attempt['receipt'] = None
+        detail['events'] = [{'kind': 'HARNESS_STOPPED', 'attempt_id': attempt['id'], 'payload': {
+            'runFence': uid(), 'confirmed': True, 'unit': 'agentos-run-' + attempt['id'],
+            'proof': {'stopped': True, 'mainPid': 0, 'populated': False, 'activeState': 'inactive'}}}]
+        value, review = self.w.qa_context(detail, artifact, 'muse_decode_layer', {attempt['id']})
+        self.assertEqual(value['code'], 'QA_CONTEXT_STOP_UNCONFIRMED'); self.assertIsNone(review)
+        detail['events'][0]['payload']['runFence'] = attempt['fence']
+        value, review = self.w.qa_context(detail, artifact, 'muse_decode_layer', {attempt['id']})
+        self.assertEqual(value['bindingState'], 'verified')
+        detail['steps'][0]['attempt'] = 2
+        value, review = self.w.qa_context(detail, artifact, 'muse_decode_layer', {attempt['id']})
+        self.assertEqual(value['code'], 'QA_CONTEXT_STEP_BINDING'); self.assertIsNone(review)
 
     def late_candidate_binding(self):
         obs = self.w.observe()
