@@ -1,6 +1,7 @@
 // Runs inside a separate network and mount namespace; only this model socket leaves it.
 import http from 'node:http';
 import { spawn } from 'node:child_process';
+import {supervisorToolPatchArgs} from './runtime-tool-policy.mjs';
 const proxy = http.createServer((req, res) => {
   const upstream = http.request(
     {
@@ -31,6 +32,7 @@ const child = spawn(
     '--patch',
     '/opt/agentos-bridge/worker.patch.yml',
     ...(process.env.AGENTOS_RUN_ID && process.env.AGENTOS_RUN_FENCE ? ['--patch','/opt/agentos-bridge/sdk-control/worker-steering.patch.yml'] : []),
+    ...supervisorToolPatchArgs(process.env.AGENTOS_SUPERVISOR_TOOL_PROFILE),
   ],
   {
     cwd: '/workspace',

@@ -1,0 +1,5 @@
+# Only a controller-authenticated, locally registered supervisor gets this patch.
+# This is the persistent shell's runtime deadline, not a model-provided timeout.
+- id: persistent-bash
+  config:
+    timeoutMs: 60000

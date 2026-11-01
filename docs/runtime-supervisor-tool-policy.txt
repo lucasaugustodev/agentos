@@ -1,0 +1,75 @@
+Supervisor foreground shell deadline
+
+Purpose
+The persisted supervisor should choose the next work without spending the worker's
+five-minute shell deadline on a calculation. AgentOS can now register a supervisor
+cycle/version/step for a 60-second persistent-bash deadline. Ordinary workers keep
+the SDK's 300000 ms default. No provider quota, model limit or global request gate
+changes. This does not bound aggregate CPU or detached/background commands.
+
+Authority and evidence
+The private SSH controller builds context.manifest from the persisted occurrence,
+step and attempt. Agent text and occurrence.input do not select this profile.
+The bridge checks the locally registered cycle ID, definition version and step,
+read-only managed execution, derived workspace, occurrence, input artifact identity,
+attempt and fence. Only a proved binding selects supervisor-v1. An unproved binding
+uses the legacy deadline and records SUPERVISOR_BINDING_UNPROVEN. Missing policy
+preserves legacy behavior; unreadable/invalid policy records SUPERVISOR_POLICY_UNAVAILABLE.
+
+The existing controller does not send a definition digest. The operator registration
+therefore seals an API-observed definition snapshot and its canonical SHA-256 locally.
+The runtime checks that seal and the immutable cycle/version tuple. It does not claim
+an independent live definition-hash comparison. A new version needs a new registration.
+cycle_versions and cycle_occurrences preserve the definition used by each occurrence.
+
+Policy file: /var/lib/agentos-bridge/supervisor-tool-policy.json, root-owned mode 0600.
+Maximum size 256 KiB, no symlink, version 1. Example shape (identities are placeholders):
+{
+  "version": 1,
+  "supervisors": [{
+    "project": "example",
+    "cycleId": "00000000-0000-0000-0000-000000000001",
+    "definitionVersion": 2,
+    "step": "supervise",
+    "definitionSHA256": "<SHA-256 of canonical definition JSON>",
+    "definition": "<complete object returned by the canonical cycle API>"
+  }]
+}
+toolPolicyDefinitionDigest recursively sorts object keys, preserves array order and
+hashes UTF-8 JSON.stringify output. The definition must contain that read-only agent
+step. The policy cannot configure a larger timeout or add permissions.
+
+Runtime behavior
+sandbox-entry appends supervisor.patch.yml only for the bridge-generated profile.
+The SDK plugin ID is persistent-bash, not tool-bash-persistent. Its config.timeoutMs
+is not a tool argument: the model only supplies command and cannot raise the limit.
+On expiration the native SDK captures partial output, resets the owning terminal,
+and allows the same agent session to continue. Shell cwd/environment reset to a fresh
+shell; workspace files, session identity and controller fence remain. Shutdown can
+add the terminal's existing grace period. A tool timeout is neither task acceptance
+nor authority to cancel another actor or repeat an uncertain external action.
+
+Validation
+Server-only: node --test tests/runtime-tool-policy.test.mjs tests/sdk-supervisor-tool-policy.test.mjs
+The native SDK fixture uses an isolated mount/PID/network namespace, no account and
+no provider requests. It shortens only its disposable supervisor patch to 1000 ms,
+runs an unbounded foreground calculation, verifies terminal teardown and the next
+bash plus a second turn in the same session. A worker runs longer than that fixture
+deadline with the unchanged SDK 300000 ms configuration. Document, source snapshot,
+run identity and fence are checked unchanged. This is not a claim of a live rollout.
+
+Activation review
+1. Publish these bridge files through the qualified release path. Published controllers
+   use their own immutable release/bridge, so replacing the compatibility directory
+   alone does not activate this policy. Never edit a published release in place.
+2. Read the live control cycle through the canonical API. Verify its exact version,
+   step, complete definition and immutable occurrence/version behavior; seal those
+   bytes using toolPolicyDefinitionDigest. Install the private policy atomically as
+   root 0600 only after that review. Do not put private IDs or snapshots in Git.
+3. Adopt the new bridge for future processes at a safe boundary. Existing actors
+   retain their existing loaded SDK configuration; do not cancel or restart them.
+4. Confirm toolPolicy in the new run state and HARNESS_STARTED: supervisor, 60000,
+   exact policy/definition digests and attempt/fence. A worker must still show 300000.
+   Treat fallback diagnostics as non-activation, never as evidence of the 60s ceiling.
+5. Observe real work returning from a deadline and continuing without actor replacement.
+   Keep official submission authority, owner reconciliation, QA and six-call gate intact.
