@@ -175,6 +175,35 @@ The planner receives that evidence with the outcome. When it selects a source,
 the same occurrence/candidate-bound structure is also delivered as
 input.experiment.sourceQAEvidence to its worker. Canonical source and policy
 materials remain unchanged. Workers report conflicts between the scoped task and
-known blockers instead of silently losing the report. External engineering notes
-are not relabeled as QA findings; they need separate pinned provenance before
-being included in a future context protocol.
+known blockers instead of silently losing the report. Registered experiments require
+the exact independent-qa step definition, latest attempt and confirmed stop boundary;
+the envelope includes stepId, stepKey and runFence. A producer cannot publish a file
+with the QA name and acquire QA provenance. Legacy reports explicitly say that
+independence is not established. Legacy string blockers retain their full text and
+receive identities derived from array index and text hash, never invented semantic IDs.
+
+Separately pinned engineering reports
+
+Optional sourceEvidenceRefs configuration entries bind kind
+operator-reviewed-source-report, root-protected path/sha256, problem, occurrenceId,
+candidateArtifactId, candidateSHA256 and sourceSHA256. Reports must match the native
+catalog, original source and stopped occurrence. Every cited evidence file is byte
+verified. Rules identify kind official_contract, controller_admission or primary_source.
+An active_material rule must match the current canonical material name/hash and actual
+bytes; historical_provenance rules reference verified report evidence by refId/hash.
+Historical provenance is explicitly not proof of the active numerical or admission rule.
+
+sourceExternalEvidence is supplied to both the planner and the selected worker.
+It carries only source-bound findings, references and classification, never nextWork,
+permissions or acceptance. The worker receives exact_source when the selected bytes
+match the reported candidate; a different source on the same board receives board_history.
+That does not assert ancestry or a current defect: the model must revalidate relevant
+code. Other boards do not receive the report. Native QA and external engineering reports
+remain distinct, and every future candidate still needs its own QA and admission gates.
+
+Limits: eight report references, 24 KiB per report, 16 evidence files (512 KiB each,
+2 MiB total verified bytes), 32 findings (16 KiB total) and 64 KiB accepted context.
+Invalid bindings, changed references and omissions produce local diagnostics, without
+injecting unverified text or blocking observations of other boards. Material changes
+participate in that board's read-set proof. Existing persisted review inputs remain
+immutable; changing configuration requires a quiescent review boundary and normal rollout.

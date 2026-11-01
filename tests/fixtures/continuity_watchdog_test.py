@@ -1071,6 +1071,104 @@ class WatchTests(unittest.TestCase):
         value, review = self.w.qa_context(detail, artifact, 'muse_decode_layer', {attempt['id']})
         self.assertEqual(value['code'], 'QA_CONTEXT_STEP_BINDING'); self.assertIsNone(review)
 
+    def install_source_report(self):
+        detail = self.client.occurrences[self.seed]
+        source = next(a for a in detail['artifacts'] if a['name'] == 'candidate.py')
+        source_bytes = self.client.artifacts[source['id']]
+        candidate = self.root / 'reported-candidate.py'; candidate.write_bytes(source_bytes)
+        base = 'a' * 64
+        detail['occurrence']['input'] = {'experiment': {'sourceArtifact': {'digest': base}}}
+        self.replace_outcome_json(self.seed, 'qa-verification.json', lambda q: q.update(sourceSHA256=base))
+        primary = self.root / 'primary-source.txt'; primary.write_bytes(b'Historical precision implementation.\n')
+        report = {'version': 1, 'occurrenceId': self.seed, 'candidateSHA256': source['digest'], 'sourceSHA256': base,
+            'nextWork': {'scope': 'DO_NOT_COPY_THIS_INSTRUCTION'}, 'qualityAccepted': True,
+            'findings': [{'id': 'NUMERIC_BOUNDARY', 'fact': 'A source-specific numerical boundary must be checked.',
+                          'severity': 'source_confirmed_not_gpu_tested', 'nextWork': 'DO_NOT_COPY_NESTED_INSTRUCTION'}],
+            'evidence': {'candidate': {'path': str(candidate), 'sha256': W.digest(source_bytes), 'bytes': len(source_bytes)},
+                         'primary': {'path': str(primary), 'sha256': W.digest(primary.read_bytes()), 'bytes': primary.stat().st_size}}}
+        path = self.root / 'operator-report.json'; W.atomic(path, report)
+        material = self.config['problemMaterials']['muse_decode_layer'][0]
+        ref = {'path': str(path), 'sha256': W.digest(path.read_bytes()), 'kind': 'operator-reviewed-source-report',
+            'problem': 'muse_decode_layer', 'occurrenceId': self.seed, 'candidateArtifactId': source['id'],
+            'candidateSHA256': source['digest'], 'sourceSHA256': base,
+            'rules': [{'kind': 'official_contract', 'classification': 'active_material', 'name': material['name'],
+                       'sha256': material['sha256']}, {'kind': 'primary_source', 'classification': 'historical_provenance',
+                       'refId': 'primary', 'sha256': report['evidence']['primary']['sha256']}]}
+        self.config['sourceEvidenceRefs'] = [ref]
+        return ref, report
+
+    def test_operator_report_reaches_planner_and_worker_without_authority(self):
+        ref, report = self.install_source_report()
+        self.w.tick(); value = self.w.state['supervisions'][-1]['input']['sourceExternalEvidence'][0]
+        self.assertEqual(value['bindingState'], 'verified')
+        self.assertEqual(value['relationship'], 'exact_source_report')
+        self.assertFalse(value['qualityAccepted']); self.assertFalse(value['gpuValidated'])
+        self.assertNotIn('DO_NOT_COPY', W.canonical(value).decode())
+        self.complete_review(); self.w.tick()
+        detail = self.client.occurrences[self.w.state['experiments'][-1]['occurrenceId']]
+        worker = detail['occurrence']['input']['experiment']['sourceExternalEvidence'][0]
+        self.assertEqual(worker['relationship'], 'exact_source')
+        self.assertEqual(worker['findings'], value['findings'])
+        self.assertEqual(worker['rules'], value['rules'])
+        self.assertEqual(worker['reportSHA256'], value['reportSHA256'])
+        self.assertFalse(worker['currentSourceDefectsRevalidated'])
+
+    def test_operator_report_other_source_is_history_and_other_board_omitted(self):
+        self.install_source_report(); obs = self.w.observe()
+        original = obs['catalog'][0]
+        other = {**original, 'digest': 'b' * 64}
+        values = self.w.external_evidence_for_source(obs['sourceExternalEvidence'], other)
+        self.assertEqual(values[0]['relationship'], 'board_history')
+        self.assertFalse(values[0]['currentSourceDefectsRevalidated'])
+        self.assertEqual(self.w.external_evidence_for_source(obs['sourceExternalEvidence'], {**other, 'problem': 'muse_prefill_layer'}), [])
+
+    def test_operator_report_wrong_hash_parent_occurrence_and_board_are_local_diagnostics(self):
+        ref, report = self.install_source_report()
+        original = copy.deepcopy(ref)
+        for key, value in [('sha256', 'f' * 64), ('sourceSHA256', 'b' * 64), ('occurrenceId', uid()),
+                           ('candidateArtifactId', uid()), ('problem', 'muse_prefill_layer')]:
+            self.config['sourceEvidenceRefs'] = [{**original, key: value}]
+            obs = self.w.observe(); result = obs['sourceExternalEvidence'][0]
+            with self.subTest(key=key):
+                self.assertEqual(result['bindingState'], 'unavailable')
+                self.assertNotIn('findings', result); self.assertTrue(obs['catalog'])
+
+    def test_operator_report_rule_hash_is_not_active_authority_without_byte_match(self):
+        ref, report = self.install_source_report()
+        ref['rules'][0]['sha256'] = 'b' * 64
+        self.assertEqual(self.w.observe()['sourceExternalEvidence'][0]['code'], 'EXTERNAL_CONTEXT_ACTIVE_RULE_BINDING')
+        material = self.config['problemMaterials']['muse_decode_layer'][0]
+        ref['rules'][0]['sha256'] = material['sha256']
+        pathlib.Path(material['path']).write_bytes(b'Changed current rule.\n')
+        self.assertEqual(self.w.observe()['sourceExternalEvidence'][0]['code'], 'EXTERNAL_CONTEXT_ACTIVE_RULE_BYTES')
+
+    def test_operator_report_tampered_historical_reference_not_injected(self):
+        ref, report = self.install_source_report()
+        pathlib.Path(report['evidence']['primary']['path']).write_bytes(b'Unverified text.\n')
+        value = self.w.observe()['sourceExternalEvidence'][0]
+        self.assertEqual(value['bindingState'], 'unavailable'); self.assertNotIn('findings', value)
+
+    def test_operator_report_total_context_limit_and_oversize_are_explicit(self):
+        ref, report = self.install_source_report()
+        report['findings'][0]['fact'] = 'A' * 15000
+        W.atomic(ref['path'], report); ref['sha256'] = W.digest(pathlib.Path(ref['path']).read_bytes())
+        self.config['sourceEvidenceRefs'] = [copy.deepcopy(ref) for _ in range(8)]
+        obs = self.w.observe(); rows = obs['sourceExternalEvidence']
+        self.assertTrue(any(r.get('code') == 'EXTERNAL_CONTEXT_TOTAL_BYTES_EXCEEDED' for r in rows))
+        self.assertLessEqual(sum(len(W.canonical(r)) for r in rows if r['bindingState'] == 'verified'), 65536)
+        self.assertTrue(obs['catalog'])
+        report['findings'][0]['fact'] = 'A' * 30000
+        W.atomic(ref['path'], report); ref['sha256'] = W.digest(pathlib.Path(ref['path']).read_bytes())
+        self.config['sourceEvidenceRefs'] = [ref]
+        self.assertEqual(self.w.observe()['sourceExternalEvidence'][0]['bindingState'], 'unavailable')
+
+    def test_operator_report_change_invalidates_only_its_board_read_set(self):
+        self.install_source_report(); obs = self.w.observe(); changed = copy.deepcopy(obs)
+        changed['sourceExternalEvidence'][0]['findings'][0]['fact'] = 'Updated source-specific finding.'
+        before = W.action_evidence(obs, self.config); after = W.action_evidence(changed, self.config)
+        self.assertNotEqual(before['boards']['muse_decode_layer'], after['boards']['muse_decode_layer'])
+        self.assertEqual(before['boards']['muse_prefill_layer'], after['boards']['muse_prefill_layer'])
+
     def late_candidate_binding(self):
         obs = self.w.observe()
         source = next(r for r in obs['catalog'] if r['name'] == 'candidate.py')
