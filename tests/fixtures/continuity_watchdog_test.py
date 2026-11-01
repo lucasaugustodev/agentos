@@ -957,6 +957,59 @@ class WatchTests(unittest.TestCase):
         self.assertEqual(self.w.tick()['state'], 'paused_by_control_cycle')
         self.assertEqual(len(self.client.posts), 1)
 
+    def late_candidate_binding(self):
+        obs = self.w.observe()
+        source = next(r for r in obs['catalog'] if r['name'] == 'candidate.py')
+        row = {'occurrenceId': self.seed, 'problem': 'muse_decode_layer', 'state': 'await_native',
+               'code': 'NATIVE_NOT_COMPLETED', 'candidateSHA256': None, 'qaArtifactId': None, 'qaSHA256': None, 'jobId': None}
+        obs['autoCheckDiagnostics']['outcomes'] = [row]
+        changed = copy.deepcopy(obs); changed['autoCheckDiagnostics']['outcomes'][0]['candidateSHA256'] = source['digest']
+        return obs, changed
+
+    def test_late_adapter_binding_same_native_source_preserves_action_evidence(self):
+        before, after = self.late_candidate_binding()
+        snapshot = copy.deepcopy(before)
+        self.assertEqual(W.action_evidence(before, self.config), W.action_evidence(after, self.config))
+        self.assertEqual(before, snapshot)
+
+    def test_late_adapter_wrong_hash_or_other_occurrence_is_material(self):
+        before, after = self.late_candidate_binding()
+        after['autoCheckDiagnostics']['outcomes'][0]['candidateSHA256'] = 'f' * 64
+        self.assertNotEqual(W.action_evidence(before, self.config), W.action_evidence(after, self.config))
+        before, after = self.late_candidate_binding()
+        unrelated = uid()
+        for obs in (before, after): obs['autoCheckDiagnostics']['outcomes'][0]['occurrenceId'] = unrelated
+        self.assertNotEqual(W.action_evidence(before, self.config), W.action_evidence(after, self.config))
+
+    def test_late_adapter_binding_ambiguous_or_absent_native_source_remains_strict(self):
+        for mode in ['ambiguous', 'absent', 'wrong_scope', 'duplicate_outcome']:
+            before, after = self.late_candidate_binding()
+            for obs in (before, after):
+                outcome = next(o for o in obs['outcomes'] if o['occurrenceId'] == self.seed)
+                source = next(r for r in outcome['artifacts'] if r['name'] == 'candidate.py')
+                if mode == 'ambiguous': outcome['artifacts'].append({**source, 'id': 'ambiguous', 'digest': 'a' * 64})
+                elif mode == 'absent': outcome['artifacts'] = [r for r in outcome['artifacts'] if r['name'] != 'candidate.py']
+                elif mode == 'wrong_scope': source['occurrenceId'] = 'unrelated'
+                else: obs['outcomes'].append(copy.deepcopy(outcome))
+            with self.subTest(mode=mode):
+                self.assertNotEqual(W.action_evidence(before, self.config), W.action_evidence(after, self.config))
+
+    def test_late_adapter_binding_does_not_hide_status_qa_or_authority_changes(self):
+        for change in [{'state': 'controller_blocked'}, {'code': 'OTHER'}, {'qaArtifactId': 'new-qa'}, {'qaSHA256': 'e' * 64}]:
+            before, after = self.late_candidate_binding(); after['autoCheckDiagnostics']['outcomes'][0].update(change)
+            with self.subTest(change=change):
+                self.assertNotEqual(W.action_evidence(before, self.config), W.action_evidence(after, self.config))
+        before, after = self.late_candidate_binding(); after['autoCheckDiagnostics']['policySHA256'] = 'd' * 64
+        self.assertNotEqual(W.action_evidence(before, self.config), W.action_evidence(after, self.config))
+
+    def test_late_adapter_binding_duplicate_identical_bytes_is_not_ambiguity(self):
+        before, after = self.late_candidate_binding()
+        for obs in (before, after):
+            outcome = next(o for o in obs['outcomes'] if o['occurrenceId'] == self.seed)
+            source = next(r for r in outcome['artifacts'] if r['name'] == 'candidate.py')
+            outcome['artifacts'].append({**source, 'id': 'qa-copy'})
+        self.assertEqual(W.action_evidence(before, self.config), W.action_evidence(after, self.config))
+
     def test_scoped_fingerprint_ignores_observation_clocks_and_activity(self):
         pending, obs = self.prepared_action(); changed = copy.deepcopy(obs)
         changed['outcomes'][0]['progress'] = {'at': '2099-01-01T00:00:00Z', 'kind': 'heartbeat'}

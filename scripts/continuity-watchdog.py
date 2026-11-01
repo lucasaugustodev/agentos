@@ -415,6 +415,32 @@ def validate_plan(plan, observation, config, expected_fingerprint=None, source_i
     return plan
 
 
+def diagnostic_material(rows, outcomes):
+    """Complete only a redundant, late candidate binding from native evidence.
+
+    The adapter may still say await_native with a null candidate while the same
+    observation already contains its exact published source. Filling that field
+    later is not a new result. Ambiguous/mismatched sources, QA and state changes
+    remain part of the read set; this grants no acceptance or dispatch authority.
+    """
+    result = []
+    for row in rows:
+        item = dict(row)
+        if (row.get("state") == "await_native" and row.get("code") == "NATIVE_NOT_COMPLETED"
+                and row.get("candidateSHA256") is None):
+            matches = [o for o in outcomes if o.get("occurrenceId") == row.get("occurrenceId")
+                       and o.get("problem") == row.get("problem")]
+            if len(matches) == 1:
+                sources = [a for a in matches[0].get("artifacts", []) if a.get("name") == "candidate.py"]
+                valid = sources and all(isinstance(a.get("digest"), str) and re.fullmatch(r"[a-f0-9]{64}", a["digest"])
+                    and a.get("occurrenceId", row["occurrenceId"]) == row["occurrenceId"]
+                    and a.get("problem", row["problem"]) == row["problem"] for a in sources)
+                if valid and len({a["digest"] for a in sources}) == 1:
+                    item["candidateSHA256"] = sources[0]["digest"]
+        result.append(item)
+    return result
+
+
 def action_evidence(observation, config):
     """Controller-owned read-set proof, independent of the model's plan output.
 
@@ -442,7 +468,7 @@ def action_evidence(observation, config):
                 ["id", "problem", "sourceSHA256", "status", "result", "caseCounts", "errorLogExcerpt"]),
             "active": selected(observation["active"], ["occurrenceId", "problem", "state", "attemptIds"]),
             "pipelineOwners": selected(observation["pipelineOwners"]),
-            "diagnostics": selected(diagnostics["outcomes"]),
+            "diagnostics": selected(diagnostic_material(diagnostics["outcomes"], observation["outcomes"])),
             "repairableEvidence": selected(diagnostics["repairableEvidence"])}
         boards[problem] = digest(evidence_material(material))
     return {"version": 1, "authoritySHA256": digest(authority), "boards": boards}
