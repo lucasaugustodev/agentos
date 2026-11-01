@@ -26,6 +26,7 @@ class FakeClient:
         self.occurrences, self.artifacts, self.posts = {}, {}, []
         self.timeout_after_commit_number = None
         self.timeout_before_commit_number = None
+        self.official_states = {}
 
     def make_occurrence(self, cycle_id, body):
         oid = uid()
@@ -73,7 +74,7 @@ class FakeClient:
 
     def official(self, job):
         # Exact identity vocabulary observed in official okc status JSON 1717/b8d8.
-        return {'id': job['id'], 'board': job['problem'], 'status': 'done',
+        return {'id': job['id'], 'board': job['problem'], 'status': self.official_states.get(job['id'], 'done'),
                 'result': {'passed': True, 'speedup': 1.211222, 'log_tail': 'real tests complete'}}
 
 
@@ -105,12 +106,30 @@ class WatchTests(unittest.TestCase):
 
     def plan(self, n=1):
         review = self.w.state['supervisions'][-1]
-        source = review['input']['catalog'][0]
+        sources = {}
+        for source in review['input']['catalog']:
+            if source['problem'] in review['input']['eligibleProblems']:
+                sources.setdefault(source['problem'], source)
+        chosen = list(sources.values())
+        if not chosen: chosen = review['input']['catalog'][:1]  # Deliberately invalid plans for diagnostic tests.
         return {'version': 1, 'evidenceFingerprint': review['fingerprint'], 'decision': 'experiments',
             'reason': 'Measured bottleneck requires a discriminating CPU experiment.', 'experiments': [
-                {'id': 'experiment-' + str(i), 'problem': 'muse_decode_layer', 'sourceArtifactId': source['id'],
+                {'id': 'experiment-' + str(i), 'problem': chosen[i % len(chosen)]['problem'], 'sourceArtifactId': chosen[i % len(chosen)]['id'],
                  'hypothesis': 'A different tile size may reduce launch overhead while preserving arithmetic.',
                  'instructions': 'Change only tile configuration and add a dispatch truth table with a negative control.'} for i in range(n)]}
+
+    def add_seed(self, problem='muse_prefill_layer', raw=b'# independent prefill source\n'):
+        cycle = uid(); self.client.cycles[cycle] = {'id': cycle, 'state': 'draft', 'definition': {}}
+        row = self.client.make_occurrence(cycle, {'requestKey': 'seed-' + problem, 'input': {}})
+        self.client.complete(row['id'], {'candidate.py': raw})
+        self.config['seedOccurrences'].append({'id': row['id'], 'problem': problem})
+        self.config['problemMaterials'][problem] = self.config['problemMaterials']['muse_decode_layer']
+        return row['id']
+
+    def add_gpu_job(self, problem='muse_prefill_layer', source='a' * 64, status='running'):
+        job = {'id': uuid.uuid4().hex[:16], 'problem': problem, 'sourceSHA256': source}
+        self.config['officialJobs'].append(job); self.client.official_states[job['id']] = status
+        return job
 
     def complete_review(self, plan=None):
         self.client.complete(self.w.state['supervisions'][-1]['occurrenceId'], {'continuation-plan.json': self.plan() if plan is None else plan})
@@ -399,6 +418,7 @@ class WatchTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'REPAIR_IMMUTABLE_ARTIFACT_CHANGED'): self.w.observe()
 
     def test_recurrent_supervisor_dispatch_completion_new_supervisor(self):
+        self.add_seed()
         self.assertEqual(self.w.tick()['state'], 'supervisor_dispatched')
         self.complete_review(self.plan(2))
         result = self.w.tick()
@@ -416,6 +436,7 @@ class WatchTests(unittest.TestCase):
         self.assertEqual(len(self.w.state['supervisions']), 2)
 
     def test_restart_during_partial_dispatch_reconciles_without_duplicate(self):
+        self.add_seed()
         self.w.tick(); self.complete_review(self.plan(2))
         self.client.timeout_after_commit_number = 5  # supervisor + first(create/run) + second(create/run)
         with self.assertRaises(TimeoutError): self.w.tick()
@@ -424,6 +445,106 @@ class WatchTests(unittest.TestCase):
         self.assertEqual(self.w.tick()['state'], 'experiments_dispatched')
         self.assertEqual(len(self.client.posts), 5)
         self.assertEqual(len(self.w.state['experiments']), 2)
+
+    def test_prefill_gpu_does_not_block_decode_cpu_or_duplicate_prefill(self):
+        self.add_seed(); self.add_gpu_job()
+        observation = self.w.observe()
+        self.assertEqual(observation['pipelineUsed'], 1)
+        self.assertEqual(observation['availableCandidateSlots'], 1)
+        self.assertEqual(observation['eligibleProblems'], ['muse_decode_layer'])
+        self.assertEqual(self.w.tick()['state'], 'supervisor_dispatched')
+        bad = self.plan(); source = next(r for r in observation['catalog'] if r['problem'] == 'muse_prefill_layer')
+        bad['experiments'][0].update(problem='muse_prefill_layer', sourceArtifactId=source['id'])
+        with self.assertRaisesRegex(ValueError, 'BOARD_PIPELINE_OWNED'):
+            W.validate_plan(bad, observation, self.config)
+        self.complete_review(); result = self.w.tick()
+        self.assertEqual(result['state'], 'experiments_dispatched')
+        self.assertEqual([r['problem'] for r in result['dispatched']], ['muse_decode_layer'])
+        self.assertEqual(self.w.observe()['pipelineUsed'], 2)
+        self.assertEqual(self.w.observe()['availableCandidateSlots'], 0)
+        self.assertEqual(self.w.tick()['state'], 'work_active')
+
+    def test_cpu_qa_and_gpu_share_total_capacity(self):
+        prefill = self.add_seed(); self.add_seed('muse_attention_decode', b'# attention source\n')
+        detail = self.client.occurrences[prefill]
+        detail['occurrence']['state'] = 'running'
+        detail['attempts'][0].update(state='running', receipt=None)
+        self.add_gpu_job(problem='muse_attention_decode')
+        observation = self.w.observe()
+        self.assertEqual(observation['pipelineUsed'], 2)
+        self.assertEqual(observation['availableCandidateSlots'], 0)
+        self.assertEqual(observation['eligibleProblems'], [])
+        self.assertNotIn(detail['artifacts'][0]['id'], observation['confirmedSourceArtifactIds'])
+        self.assertEqual(self.w.tick()['state'], 'work_active')
+
+    def test_live_other_board_allows_one_terminal_source_experiment(self):
+        prefill = self.add_seed(); d = self.client.occurrences[prefill]
+        d['occurrence']['state'] = 'running'; d['attempts'][0].update(state='running', receipt=None)
+        self.assertEqual(self.w.tick()['state'], 'supervisor_dispatched')
+        self.assertFalse(self.w.state['supervisions'][-1]['input']['diagnosticOnly'])
+        self.complete_review(); result = self.w.tick()
+        self.assertEqual(result['dispatched'][0]['problem'], 'muse_decode_layer')
+        self.assertEqual(d['occurrence']['state'], 'running')
+
+    def test_same_board_two_experiments_rejected(self):
+        self.w.tick(); plan = self.plan(2)
+        with self.assertRaisesRegex(ValueError, 'PLAN_DUPLICATE_BOARD'):
+            W.validate_plan(plan, self.w.observe(), self.config)
+
+    def test_partial_dispatch_second_unknown_never_reposts(self):
+        self.add_seed(); self.w.tick(); self.complete_review(self.plan(2))
+        self.client.timeout_before_commit_number = 5
+        with self.assertRaises(TimeoutError): self.w.tick()
+        self.assertEqual(len(self.w.state['experiments']), 1)
+        self.reload()
+        with self.assertRaisesRegex(ValueError, 'POST_UNCERTAIN_RECONCILE_ONLY'): self.w.tick()
+        self.assertEqual(len(self.client.posts), 5)
+        self.assertEqual(self.w.state['supervisions'][-1]['state'], 'dispatching')
+        self.assertEqual(self.w.state['supervisions'][-1]['pipelineReservation'],
+                         {'externalUsed': 0, 'acknowledged': 1, 'remaining': 1, 'total': 2})
+
+    def test_partial_dispatch_changed_evidence_preserves_owned_intent(self):
+        self.add_seed(); self.w.tick(); self.complete_review(self.plan(2))
+        self.client.timeout_before_commit_number = 5
+        with self.assertRaises(TimeoutError): self.w.tick()
+        self.client.complete(self.seed, {'candidate.py': b'# changed after first ACK\n'})
+        self.reload(); result = self.w.tick()
+        self.assertEqual(result['state'], 'owned_dispatch_evidence_changed')
+        self.assertEqual(self.w.state['supervisions'][-1]['state'], 'dispatching')
+        self.assertEqual(len(self.client.posts), 5)
+
+    def test_official_terminal_wins_over_adapter_running_label(self):
+        source = 'a' * 64
+        diagnostics = {'outcomes': [{'problem': 'muse_prefill_layer', 'candidateSHA256': source,
+            'occurrenceId': uid(), 'state': 'check_running', 'jobId': '0123456789abcdef'}]}
+        jobs = [{'problem': 'muse_prefill_layer', 'sourceSHA256': source, 'id': '0123456789abcdef', 'status': 'done'}]
+        admission = W.pipeline_admission(2, [], [], set(), jobs, diagnostics, set())
+        self.assertEqual(admission['pipelineUsed'], 0)
+        jobs[0]['status'] = 'running'
+        self.assertEqual(W.pipeline_admission(2, [], [], set(), jobs, diagnostics, set())['pipelineUsed'], 1)
+
+    def test_quota_or_uncertain_source_occupies_one_slot_not_two(self):
+        source = 'b' * 64; occurrence = uid(); artifact = uid()
+        catalog = [{'id': artifact, 'problem': 'muse_prefill_layer', 'digest': source, 'occurrenceId': occurrence}]
+        for state in ['quota_wait', 'uncertain_owned']:
+            diagnostics = {'outcomes': [{'problem': 'muse_prefill_layer', 'candidateSHA256': source,
+                'occurrenceId': occurrence, 'state': state, 'jobId': None}]}
+            admission = W.pipeline_admission(2, [], catalog, {source}, [], diagnostics, {artifact})
+            self.assertEqual(admission['pipelineUsed'], 1)
+            self.assertEqual(admission['eligibleProblems'], [])
+            self.assertEqual(admission['blockedProblems'], ['muse_prefill_layer'])
+
+    def test_zero_capacity_still_allows_stale_owner_diagnosis(self):
+        self.config['maxPendingCandidates'] = 1
+        d = self.client.occurrences[self.seed]
+        d['occurrence'].update(state='running', created_at='1970-01-01T00:01:00Z')
+        d['attempts'][0].update(state='running', receipt=None)
+        self.assertEqual(self.w.tick()['state'], 'supervisor_dispatched')
+        plan = self.plan(); plan.update(decision='observe_active', experiments=[],
+            reason='Preserve existing native actor and inspect its missing progress: ' + self.seed)
+        self.complete_review(plan)
+        self.assertEqual(self.w.tick()['state'], 'active_owner_preserved')
+        self.assertEqual(len(self.client.posts), 1)
 
     def test_ambiguous_missing_receipt_never_resends(self):
         self.client.timeout_before_commit_number = 1

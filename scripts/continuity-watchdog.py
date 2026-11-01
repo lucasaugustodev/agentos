@@ -286,8 +286,8 @@ def validate_plan(plan, observation, config):
     experiments = plan["experiments"]
     require(type(experiments) is list, "PLAN_EXPERIMENTS")
     repairs = observation.get("autoCheckDiagnostics", {}).get("repairableEvidence", [])
-    capacity = min(config["maxPendingCandidates"], len(repairs) if plan["decision"] == "repair_evidence"
-                   else observation["availableCandidateSlots"])
+    capacity = min(config["maxPendingCandidates"], observation["availableCandidateSlots"],
+                   len(repairs) if plan["decision"] == "repair_evidence" else config["maxPendingCandidates"])
     require((plan["decision"] in ["await_external", "observe_active"] and not experiments) or
             (plan["decision"] in ["experiments", "repair_evidence"] and 1 <= len(experiments) <= capacity), "PLAN_CAPACITY")
     if observation.get("diagnosticOnly"):
@@ -298,7 +298,7 @@ def validate_plan(plan, observation, config):
     if plan["decision"] == "await_external":
         require(any(sha in plan["reason"] for sha in observation.get("pendingOfficialCandidateSHA256", [])),
                 "WAIT_DEPENDENCY_UNPROVEN")
-    seen = set()
+    seen, boards = set(), set()
     catalog = {r["id"]: r for r in observation["catalog"]}
     for exp in experiments:
         require(type(exp) is dict and set(exp) == {"id", "problem", "sourceArtifactId", "hypothesis", "instructions"}, "EXPERIMENT_FIELDS")
@@ -307,12 +307,58 @@ def validate_plan(plan, observation, config):
         require(exp["problem"] in PROBLEMS, "EXPERIMENT_SCOPE")
         source = catalog.get(exp["sourceArtifactId"])
         require(source and source["name"] == "candidate.py" and source["problem"] == exp["problem"], "SOURCE_SCOPE")
+        require(exp["sourceArtifactId"] in observation["confirmedSourceArtifactIds"], "SOURCE_BOUNDARY_UNCONFIRMED")
+        require(exp["problem"] in observation["eligibleProblems"], "BOARD_PIPELINE_OWNED")
+        require(exp["problem"] not in boards, "PLAN_DUPLICATE_BOARD")
+        boards.add(exp["problem"])
         if plan["decision"] == "repair_evidence":
             require(any(r["candidateArtifactId"] == exp["sourceArtifactId"] and r["problem"] == exp["problem"]
                         for r in repairs), "REPAIR_SCOPE_NOT_AUTHORIZED")
         require(type(exp["hypothesis"]) is str and 20 <= len(exp["hypothesis"]) <= 1200, "HYPOTHESIS")
         require(type(exp["instructions"]) is str and 50 <= len(exp["instructions"]) <= 12000, "INSTRUCTIONS")
     return plan
+
+
+def pipeline_admission(limit, active, catalog, pending, jobs, diagnostics, confirmed_sources):
+    """Count whole experiments, not sessions; official terminal evidence wins.
+
+    Native production and its sequential QA reserve one occurrence slot. A
+    completed unmeasured candidate, quota wait, or GPU job reserves one source
+    slot. Different boards can progress only inside the same total WIP limit.
+    """
+    owners = {}
+    def own(problem, key, stage, occurrence=None, source=None, job=None):
+        row = owners.setdefault((problem, key), {"problem": problem, "ownerKey": key,
+            "stages": set(), "occurrenceIds": set(), "jobIds": set(), "candidateSHA256": source})
+        row["stages"].add(stage)
+        if occurrence: row["occurrenceIds"].add(occurrence)
+        if job: row["jobIds"].add(job)
+    for row in active:
+        own(row["problem"], "occurrence:" + row["occurrenceId"], "native", row["occurrenceId"])
+    for row in catalog:
+        if row["digest"] in pending:
+            own(row["problem"], "source:" + row["digest"], "unmeasured", row["occurrenceId"], row["digest"])
+    registered = {(row["problem"], row["sourceSHA256"]) for row in jobs}
+    for row in jobs:
+        if row["status"] not in ["done", "failed"]:
+            own(row["problem"], "source:" + row["sourceSHA256"], "gpu", source=row["sourceSHA256"], job=row["id"])
+    for row in diagnostics["outcomes"]:
+        # An adapter's durable ACK can still say check_running after official
+        # GET has proved completion. Never turn that stale label into a lock.
+        source = row.get("candidateSHA256")
+        if (row["problem"], source) in registered:
+            continue
+        if row["state"] in ["quota_wait", "uncertain_owned", "check_running"]:
+            key = "source:" + source if source else "occurrence:" + row["occurrenceId"]
+            own(row["problem"], key, row["state"], row["occurrenceId"], source, row.get("jobId"))
+    frozen = [{**row, **{k: sorted(row[k]) for k in ["stages", "occurrenceIds", "jobIds"]}}
+              for _, row in sorted(owners.items())]
+    blocked = sorted({row["problem"] for row in frozen})
+    available = max(0, limit - len(frozen))
+    sources = {row["problem"] for row in catalog if row["id"] in confirmed_sources}
+    return {"pipelineLimit": limit, "pipelineUsed": len(frozen), "pipelineOwners": frozen,
+            "blockedProblems": blocked, "eligibleProblems": sorted(sources - set(blocked)) if available else [],
+            "availableCandidateSlots": available, "confirmedSourceArtifactIds": sorted(confirmed_sources)}
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -580,7 +626,7 @@ class Watchdog:
     def observe(self, exclude_supervisor=None):
         records = [*self.config["seedOccurrences"], *[r for r in self.state["experiments"]
                    if r["supervisorOccurrenceId"] != exclude_supervisor]]
-        outcomes, catalog, active, details, progress_epochs = [], [], [], {}, []
+        outcomes, catalog, active, details, progress_epochs, confirmed_sources = [], [], [], {}, [], set()
         registered_jobs = self.registered_jobs()
         tested = {job["sourceSHA256"] for job in registered_jobs}
         pending = set()
@@ -610,12 +656,12 @@ class Watchdog:
             progress_ref = {"eventId": str(latest["id"]) if latest else None, "at": progress_at,
                             "kind": latest["kind"] if latest else "occurrence_created"}
             if occurrence["state"] in LIVE or live_attempts:
-                active.append({"occurrenceId": oid, "state": occurrence["state"],
+                active.append({"occurrenceId": oid, "problem": record["problem"], "state": occurrence["state"],
                                "attemptIds": [a["id"] for a in live_attempts], "progress": progress_ref,
                                "activity": {"kind": activity["kind"], "at": activity["created_at"]} if activity else None,
                                "stale": self.clock() - progress_epoch >= 600})
             elif not confirmed_boundary(detail):
-                active.append({"occurrenceId": oid, "state": "boundary_unconfirmed_or_review_owned", "attemptIds": [],
+                active.append({"occurrenceId": oid, "problem": record["problem"], "state": "boundary_unconfirmed_or_review_owned", "attemptIds": [],
                                "progress": progress_ref, "stale": self.clock() - progress_epoch >= 600})
             artifacts, qa_reviews = [], []
             latest_attempts = {a["id"] for a in detail["attempts"] if any(
@@ -634,6 +680,8 @@ class Watchdog:
                     artifacts.append(item)
                     if row["name"] == "candidate.py":
                         catalog.append(item)
+                        if confirmed_boundary(detail):
+                            confirmed_sources.add(item["id"])
                     if row["name"] == "qa-verification.json":
                         review = json.loads(self.verified_artifact(item, 32768))
                         qa_reviews.append({k: review.get(k) for k in ["passed", "verificationPassed", "candidateSHA256",
@@ -674,13 +722,13 @@ class Watchdog:
             raw = protected_bytes(ref["path"], 12288)
             require(digest(raw) == ref["sha256"], "COMPARISON_CONTEXT_CHANGED")
             comparison_context = json.loads(raw)
-        slots = max(0, self.config["maxPendingCandidates"] - len(pending))
         diagnostics = self.auto_check_diagnostics(catalog, details, tested)
         for row in diagnostics["outcomes"]:
             if row.get("classification") in ["repair_evidence", "new_hypothesis_required", "repair_exhausted"]:
                 pending.discard(row["candidateSHA256"])
-        slots = max(0, self.config["maxPendingCandidates"] - len(pending))
-        material = {"outcomes": outcomes, "officialJobs": jobs, "availableCandidateSlots": slots,
+        admission = pipeline_admission(self.config["maxPendingCandidates"], active, catalog, pending,
+                                       jobs, diagnostics, confirmed_sources)
+        material = {"outcomes": outcomes, "officialJobs": jobs, **admission,
                     "pendingOfficialCandidateSHA256": sorted(pending), "autoCheckDiagnostics": diagnostics}
         if comparison_context:
             material["comparisonContext"] = comparison_context
@@ -690,7 +738,7 @@ class Watchdog:
                            for r in active if r["progress"].get("at")]
         material_at = min(active_progress) if active_progress else max(progress_epochs, default=self.clock())
         return {**material, "catalog": catalog, "fingerprint": fingerprint, "active": active,
-                "pendingOfficialJobs": pending_jobs, "diagnosticOnly": bool(active),
+                "pendingOfficialJobs": pending_jobs, "diagnosticOnly": bool(active) and not admission["eligibleProblems"],
                 "idleSeconds": max(0, int(self.clock() - material_at)),
                 "controllerDispatchAgeSeconds": max(0, int(self.clock() - self.state.get("lastDispatchAt", self.state["createdAt"])))}
 
@@ -701,7 +749,8 @@ class Watchdog:
         body = {"requestKey": key, "input": {"version": 1, "watchId": self.config["watchId"],
             "evidenceFingerprint": observation["fingerprint"], "trigger": "stale_progress_diagnostic" if observation["diagnosticOnly"] else "registered_work_reached_boundary",
             "observedIdleSeconds": observation["idleSeconds"], "priorReviewErrors": [r.get("errorCode", "NATIVE_SUPERVISOR_FAILED") for r in failures], **{k: observation[k] for k in
-            ["outcomes", "catalog", "officialJobs", "availableCandidateSlots", "pendingOfficialCandidateSHA256", "active", "diagnosticOnly"]}}}
+            ["outcomes", "catalog", "officialJobs", "availableCandidateSlots", "pendingOfficialCandidateSHA256", "active", "diagnosticOnly",
+             "pipelineLimit", "pipelineUsed", "pipelineOwners", "blockedProblems", "eligibleProblems", "confirmedSourceArtifactIds"]}}}
         body["input"]["priorDispatches"] = self.state["experiments"][-10:]
         body["input"]["outcomes"] = compact_outcomes(observation["outcomes"])
         body["input"]["autoCheckDiagnostics"] = observation["autoCheckDiagnostics"]
@@ -717,6 +766,8 @@ class Watchdog:
         if observation.get("comparisonContext"):
             body["input"]["comparisonContext"] = observation["comparisonContext"]
         body["input"]["interpretationRules"] = [
+            "Choose experiments only for eligibleProblems and confirmedSourceArtifactIds, at most one per problem. CPU, sequential QA, unmeasured candidates, quota waits and official GPU work share the total pipeline limit.",
+            "An owned problem cannot be replaced or duplicated. GPU work on one problem does not block a different eligible problem. No new official authority is granted.",
             "Known incumbent benchmarks and available source catalog are different sets. Never call the best available source the global best.",
             "Use actual per-board caseCounts; do not copy Decode counts to Prefill or Attention.",
             "Official full receipts are preserved by path/SHA; their logs are omitted from this bounded planning input.",
@@ -860,13 +911,34 @@ Do not copy former attestations; inspect precision, attribution and replay yours
         return record
 
     def consume_plan(self, pending, observation):
+        plan = pending["approvedPlan"]
+        owned = [r for r in self.state["experiments"] if r["supervisorOccurrenceId"] == pending["occurrenceId"]]
+        keys = [self.config["watchId"] + "-experiment-" + digest([pending["occurrenceId"], exp])[:32]
+                for exp in plan["experiments"]]
+        has_intent = any((self.directory / ("intent-" + digest(key + suffix) + ".json")).exists()
+                         for key in keys for suffix in ["", "-run"])
         if observation["fingerprint"] != pending["fingerprint"]:
+            if has_intent or owned:
+                return self.status("owned_dispatch_evidence_changed", occurrenceId=pending["occurrenceId"],
+                                   automaticPostRetry=False, acknowledgedExperiments=owned)
             pending.update({"state": "superseded", "errorCode": "PLAN_OBSERVATION_CHANGED"}); self.save()
             return self.status("stale_plan_superseded", occurrenceId=pending["occurrenceId"])
-        if (observation["active"] and pending["approvedPlan"]["decision"] != "observe_active") or observation["pendingOfficialJobs"]:
-            return self.status("waiting_active_evidence", active=observation["active"], officialJobs=observation["pendingOfficialJobs"])
-        plan = pending["approvedPlan"]
-        dispatched = [self.dispatch_experiment(exp, observation, pending) for exp in plan["experiments"]]
+        # observe() excludes this plan's own ACKs to keep its immutable evidence
+        # cursor stable. Reserve the whole approved set, count ACKs explicitly,
+        # and let post_once reconcile an ambiguous remaining intent via GET only.
+        validate_plan(plan, observation, self.config)
+        require(len(owned) <= len(plan["experiments"]), "DISPATCH_RESERVATION_CONFLICT")
+        pending["pipelineReservation"] = {"externalUsed": observation["pipelineUsed"],
+            "acknowledged": len(owned), "remaining": len(plan["experiments"]) - len(owned),
+            "total": observation["pipelineUsed"] + len(plan["experiments"])}
+        require(pending["pipelineReservation"]["total"] <= self.config["maxPendingCandidates"]
+                or not plan["experiments"], "DISPATCH_PIPELINE_CAPACITY")
+        self.save()
+        dispatched = []
+        for exp in plan["experiments"]:
+            existing = [r for r in owned if r["experimentId"] == exp["id"]]
+            require(len(existing) <= 1 and (not existing or existing[0]["problem"] == exp["problem"]), "DISPATCH_RESERVATION_CONFLICT")
+            dispatched.append(existing[0] if existing else self.dispatch_experiment(exp, observation, pending))
         pending.update({"state": "consumed", "decision": plan["decision"], "reason": plan["reason"]})
         self.state["outcomes"][pending["fingerprint"]] = {"supervisorOccurrenceId": pending["occurrenceId"],
             "decision": plan["decision"], "reason": plan["reason"], "dispatched": dispatched,
@@ -905,7 +977,8 @@ Do not copy former attestations; inspect precision, attribution and replay yours
             # Own successful dispatches do not invalidate the remaining cursor.
             pending.update({"state": "dispatching", "approvedPlan": plan, "planArtifactId": rows[0]["id"]}); self.save()
             return self.consume_plan(pending, observation)
-        if (observation["active"] and not any(r["stale"] for r in observation["active"])) or observation["pendingOfficialJobs"]:
+        if not observation["eligibleProblems"] and ((observation["active"] and not any(r["stale"] for r in observation["active"]))
+                                                   or observation["pendingOfficialJobs"] and not observation["diagnosticOnly"]):
             return self.status("work_active", active=observation["active"], officialJobs=observation["pendingOfficialJobs"])
         previous = self.state["outcomes"].get(observation["fingerprint"])
         if previous:
