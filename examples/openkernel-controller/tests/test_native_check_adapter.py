@@ -190,6 +190,38 @@ class Fixture(unittest.TestCase):
         self.assertEqual(len(list(pathlib.Path(self.paths["stateDirectory"]).iterdir())), 0)
         self.assertEqual(self.runtime.stopped.call_count, 2)
 
+    def test_documentation_only_candidate_cannot_consume_check_quota(self):
+        self.candidate = b'"""The proposed optimization was already present."""\n' + self.source
+        self.patch = "".join(difflib.unified_diff(self.source.decode().splitlines(keepends=True),
+            self.candidate.decode().splitlines(keepends=True), fromfile="base-candidate.py", tofile="candidate.py")).encode()
+        self.cpu["candidateSHA256"] = A.digest(self.candidate)
+        self.verify["candidateSHA256"] = A.digest(self.candidate)
+        self.qa["candidateSHA256"] = A.digest(self.candidate)
+        self.qa["cpuEvidence"]["resultSHA256"] = A.digest(A.canonical(self.cpu))
+        self.detail = self.native_fixture()
+        # Even a mistakenly positive independent report cannot promote a new
+        # source hash whose only difference is documentation.
+        self.assertTrue(self.qa["approvedForOfficialReview"])
+        with self.assertRaisesRegex(ValueError, "NO_EXECUTABLE_CHANGE"):
+            self.lane.run(OCC, "check")
+        self.assertEqual(self.official.posts, 0)
+        self.assertEqual(list(pathlib.Path(self.paths["stateDirectory"]).iterdir()), [])
+
+    def test_kernel_structure_ignores_only_comments_formatting_and_declared_docs(self):
+        before = b'"""module old"""\nclass C:\n    """class old"""\n    async def run(self, x):\n        """method old"""\n        return x + 1\n'
+        after = b'# A different comment\n"""module new"""\n\nclass C:\n    """class new"""\n    async def run(self,x):\n        """method new"""\n        return x+1  # same arithmetic\n'
+        self.assertNotEqual(A.digest(before), A.digest(after))
+        self.assertEqual(A.kernel_code_structure(before), A.kernel_code_structure(after))
+
+    def test_kernel_structure_preserves_runtime_literals_and_launch_config(self):
+        for before, after in [
+            (b'def kernel(x):\n    return x + 1\n', b'def kernel(x):\n    return x + 2\n'),
+            (b'def kernel():\n    return "old"\n', b'def kernel():\n    return "new"\n'),
+            (b'@jit(num_warps=4)\ndef kernel(x):\n    return x\n',
+             b'@jit(num_warps=8)\ndef kernel(x):\n    return x\n')]:
+            with self.subTest(before=before):
+                self.assertNotEqual(A.kernel_code_structure(before), A.kernel_code_structure(after))
+
     def test_one_post_registry_and_no_resend(self):
         first = self.lane.run(OCC, "check"); second = self.lane.run(OCC, "check")
         self.assertEqual(first["state"], "job_recorded"); self.assertEqual(second["state"], "existing_job")

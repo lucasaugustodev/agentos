@@ -45,6 +45,23 @@ def digest(value):
     return hashlib.sha256(value if isinstance(value, bytes) else canonical(value)).hexdigest()
 
 
+def kernel_code_structure(raw):
+    """Inspect syntax only; never run a candidate to decide CHECK admission.
+
+    Comments, formatting and declared docstrings are not a new kernel experiment.
+    This comparison does not claim general semantic equivalence: all executable
+    expressions, constants, decorators and ordinary string literals are retained.
+    """
+    tree = ast.parse(raw)
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            if (node.body and isinstance(node.body[0], ast.Expr)
+                    and isinstance(node.body[0].value, ast.Constant)
+                    and isinstance(node.body[0].value.value, str)):
+                node.body = node.body[1:]
+    return ast.dump(tree, include_attributes=False)
+
+
 def strict_json(raw):
     def pairs(rows):
         value = {}
@@ -375,6 +392,8 @@ class NativeAudit:
         require(candidate_sha != base_sha and bool(producer["implementation.patch"].strip()), "NO_CANDIDATE_CHANGE")
         require(apply_single_file_patch(materials["base-candidate.py"], producer["implementation.patch"]) == producer["candidate.py"], "PATCH_CANDIDATE_MISMATCH")
         source_screen(producer["candidate.py"])
+        require(kernel_code_structure(materials["base-candidate.py"]) != kernel_code_structure(producer["candidate.py"]),
+                "NO_EXECUTABLE_CHANGE")
         qa = strict_json(files["independent-qa"]["qa-verification.json"])
         semantic_qa(strict_json(producer["verification.json"]), qa, strict_json(producer["cpu-result.json"]), base_sha, candidate_sha, checker_sha, result_sha)
         commands = {key: replay_commands(files[key]["transcript"], checker_sha, candidate_sha) for key in files}

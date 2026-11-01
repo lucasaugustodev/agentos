@@ -43,6 +43,13 @@ the local SHA256. Raw results are stored privately with known credentials and
 headers scrubbed; returned summaries contain bounded status and receipt hashes.
 Treat the result directory as sensitive operational data even after scrubbing.
 
+The native adapter also rejects candidates whose syntax differs from their base
+only in comments, formatting or declared docstrings (`NO_EXECUTABLE_CHANGE`).
+That result should return to planning as a negative experiment, without consuming
+an official check. This comparison does not prove general semantic equivalence
+or speedup; executable expressions, constants and launch decorators remain part
+of the comparison, and changed code still needs independent review and testing.
+
 ## Configure an operator-owned action
 
 Use fixed action profiles pointing at an approved copy of the script:
