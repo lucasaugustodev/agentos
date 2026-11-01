@@ -1,0 +1,136 @@
+AgentOS: bounded reconciliation of a blocked publication rollback
+
+This operator tool is a separate, versioned operation. It does not replace
+agentos-release-action.py, candidate_origin.py, their registrar, or any helper
+pinned by an existing execution snapshot. Qualification of this tool does not
+qualify an application candidate, register the tool, or authorize publication.
+
+Scope of version 1
+
+The existing registered publisher must have recorded a blocked rollback after
+API restart/health failed. Its immutable .rollback.json must bind the original
+validation receipt, candidate, previous release, and registered publisher.
+The publisher records that failure before publish_source. Consequently this
+operation also requires the source workspace to remain on the old release,
+no pending worker adoption, and no publishedAt marker.
+
+A crash between pointer swap and the blocked observation is outside this scope
+(PUBLICATION_PHASE_UNPROVEN). This is not universal publication crash recovery.
+An API still active, stopping, or uncertain is outside this scope too. The API
+must already be inactive/failed, PID zero, and its cgroup empty, with no pending
+assistant chats. API_STOP_REQUIRED does not authorize an operator or another
+agent to kill it. The operation never signals native actors or worker services.
+
+The current chat admission path does not honor maintenance and close() aborts
+active chats. A zero-chat snapshot followed by SIGTERM would have a race. A new
+API admission/quiescence protocol is a separate follow-up; this tool deliberately
+does not manufacture one or hold a scheduler lock during shutdown.
+
+Authority and installation
+
+Only a separately reviewed installation may place these files under:
+
+  /opt/agentos-control/rollback-tools/<40-character-source-commit>/
+    agentos-rollback-reconcile.py
+    registration.json
+
+Files and every parent must be root-owned, not group/world writable, and not
+symlinks. The registration binds the exact script, source commit, qualification
+receipt, existing publisher bundle, and ONE application transition. Its
+qualification document must identify suite agentos.rollback-reconcile.v1,
+the same tool hash/commit, at least twenty passed cases, and zero failures/skips.
+The registration contains these fields:
+
+  version: 1
+  operation: agentos.rollback-reconcile
+  sourceCommit: immutable installation directory name
+  toolSha256: exact script bytes
+  executorSha256: pinned registered publisher identity
+  originSha256: pinned origin module identity
+  qualification: {path, sha256}
+  transition: {
+    occurrenceId, validationReceiptSha256,
+    candidate, digest, base, baseDigest
+  }
+  baselineObservation: {source, scopePolicies, scopeEvents, scopeRuns}
+
+The baseline observation must be collected and reviewed before publication,
+under the qualified publication boundary. It is not reconstructed after failure.
+The tool preserves legitimate candidate_readiness/candidate_ci features already
+supported by the previous release. It compares only the new applicability
+registrations, scoped admission events, and immutable workerValidationScope
+snapshots. Removing the current policy cannot erase its historical event.
+The entire published source object is bound, including its workspace; keeping
+the old release string while changing the workspace is rejected as well.
+Controller readiness is checked against actual PID/cwd as well as DB metadata.
+
+No installer or registrar mutation is included in this change. In particular,
+do not overwrite the current publisher or its registration pointer to activate
+this helper. An old snapshot must keep resolving its exact old helper bytes.
+
+Invocation and stages
+
+The authenticated operator submits JSON containing only occurrenceId,
+operationId, validationReceiptSha256, and blockedReceiptSha256 to:
+
+  python3 <immutable-tool-path> reconcile
+
+The tool acquires the existing publisher's shared registration authority, then
+the publication lock. It reserves one immutable operation per occurrence.
+Requests cannot supply paths, shell commands, SQL, or readiness overrides.
+
+1. Bind the original receipts and qualified transition; require API stop and
+   compatible old controllers. Persist the operation and schema intent.
+2. Launch one named systemd schema unit. That unit takes the same publication
+   lock, rechecks authority/state, and invokes the PREVIOUS release's canonical
+   prepare-schema.ts with its existing bounded defaults. It writes a start
+   fence before dispatch and an immutable result with output hashes afterward.
+3. While that unit is alive, return schema_pending. A missing final result after
+   termination is SCHEMA_EFFECT_UNCONFIRMED, not permission to rerun migration.
+4. Require the existing unchanged require_rollback_readiness function to prove
+   all five old-schema gates. Persist this proof and a swap intent before the
+   atomic pointer return, then fsync the release parent before any API start.
+   New recovery directories and their parents are also fsynced before dispatch.
+   A replay after rename completes that durability barrier first. The failed
+   historical rollback receipt stays intact.
+5. Start the API once after the old schema and pointer are proved. Subsequent
+   calls observe PID, cwd, role, invocation and health. They do not restart an
+   already healthy API. New chats after that start do not cause a restart.
+6. Append completion. Completed replay is read-only and revalidates its saved
+   identity. No task acceptance, worker rollout, or candidate publication is
+   fabricated by this recovery.
+
+After a lost pointer-swap response, the old guard cannot simply be called again:
+it correctly requires current==candidate. Recovery instead checks the durable
+pre-swap proof plus the unchanged old-source read-only readiness script, current
+pointer and API adoption. It never forges a replacement record for the guard.
+
+Publication is still a separate gate
+
+The unchanged publisher takes publication.lock itself. Holding that lock in a
+parent and then invoking its main publish action would deadlock: flock is not
+reentrant across those separate open-file descriptions. A qualified handoff for
+prepare-schema -> publish remains a separate publication prerequisite. Do not
+add a free --lock-held switch or infer atomicity from two adjacent commands.
+This helper, its tests, and reversible database migration evidence do not
+authorize such a handoff or a production rollout.
+
+Validation boundaries
+
+The Python suite exercises durable phase transitions, lost replies, immutable
+receipt binding, drift, ownership, and rejection of live/uncertain actors with
+isolated external IO. A separate private PostgreSQL proof exercises actual
+observation SQL and rejects a removed opt-in through its retained event, while
+preserving older legitimate candidate-readiness history. Canonical old -> new
+-> old schema characterization proves trigger/fingerprint restoration and
+preservation of admitted legacy rows and immutable snapshots. These are distinct
+proofs; mocked service boundaries are never described as a live recovery.
+
+The current CPU suite contains 42 cases. Five causal regressions fail against
+the previous helper and pass against the corrected helper. The filesystem cases
+execute real mkdir, receipt writes, rename and fsync on isolated Linux paths,
+with injected fsync failures observed by file descriptor. They verify ordering
+and no repeated schema dispatch, pointer swap or API start. They do not simulate
+power loss or execute real service changes. The separate PostgreSQL proof and
+its exact helper identity must accompany qualification; the CPU count alone is
+not a proof of end-to-end recovery or permission to install this operation.
