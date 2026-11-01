@@ -128,3 +128,33 @@ Authenticated adapter NO_EXECUTABLE_CHANGE or NO_CANDIDATE_CHANGE rejections req
 a new hypothesis. Only that candidate is isolated from selection, while the original
 source and other eligible work remain available. Such rejections never authorize an
 evidence-only repair, override active QA, or change existing occurrence snapshots.
+
+New supervisor inputs include sourceCapsules in the existing local cycle-input.json.
+The model prompt contains the input path and hash, not the source bytes. The controller
+fetches and verifies selectable terminal sources; the supervisor decodes only needed
+files into data/sources and navigates a bounded static AST index. The old workspace
+baseline/submission is not a substitute for the selected artifact. No network,
+credentials, new agent stage, backend change or native control version is needed.
+
+Capsules preserve artifact aliases while sharing bytes by problem and digest. They
+prioritize the best measured available source, its known parent, and the most recent
+available candidate and its known parent, followed by other confirmed sources.
+Recency uses verified material progress as well as completion time, since failed
+deliveries can have no occurrence completion timestamp. Recency does not imply
+usefulness, acceptance or correctness. A benchmark with unknown
+source remains a benchmark, never an available incumbent. Limits are 256 KiB per
+source, 1 MiB total raw source and 2 MiB for the complete input, including existing
+context and metadata. Omitted sources have explicit identities, counts and reasons;
+they are removed from that review's selectable catalog. Missing/corrupt sources do
+not grant inspection or dispatch authority. If no eligible source can be supplied,
+the controller reports supervisor_sources_unavailable without spending a model call.
+
+Plan validation checks the selected artifact against the exact capsule bytes and
+hash stored in the review input, then checks the current catalog, ownership and
+capacity before dispatch. A retry reuses the original persisted POST body. Existing
+pending reviews retain their original input contract; their effects are reconciled
+using the existing ownership rules. Sources and AST indexes are untrusted data and
+navigation aids: providing bytes does not prove the model read them or establish
+semantic novelty, correctness or performance. Independent QA and the no-op GPU
+admission guard still apply. Measure the effect on redundant proposals and accepted
+executable candidates before claiming improved productivity.

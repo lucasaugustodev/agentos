@@ -113,7 +113,7 @@ class WatchTests(unittest.TestCase):
             if source['problem'] in review['input']['eligibleProblems']:
                 sources.setdefault(source['problem'], source)
         chosen = sorted(sources.values(), key=lambda r: ['muse_decode_layer', 'muse_prefill_layer', 'muse_attention_decode'].index(r['problem']))
-        if not chosen: chosen = review['input']['catalog'][:1]  # Deliberately invalid plans for diagnostic tests.
+        if not chosen: chosen = self.w.observe()['catalog'][:1]  # Deliberately invalid plans for diagnostic tests.
         return {'version': 1, 'evidenceFingerprint': review['fingerprint'], 'decision': 'experiments',
             'reason': 'Measured bottleneck requires a discriminating CPU experiment.', 'experiments': [
                 {'id': 'experiment-' + str(i), 'problem': chosen[i % len(chosen)]['problem'], 'sourceArtifactId': chosen[i % len(chosen)]['id'],
@@ -1082,6 +1082,162 @@ class WatchTests(unittest.TestCase):
         self.client.artifacts[candidate['id']] = b'corrupt'
         with self.assertRaisesRegex(ValueError, 'ARTIFACT_CORRUPT'): self.w.tick()
         self.assertEqual(len(self.client.posts), 1)
+
+    def test_capsules_supply_actual_selected_source_not_workspace_baseline(self):
+        raw = b'\n' * 950 + b'def kernel_fn(batch, length):\n    if length == 8 and batch in (16, 32):\n        return "already_gated"\n'
+        self.client.complete(self.seed, {'candidate.py': raw})
+        self.w.tick()
+        inp = self.w.state['supervisions'][-1]['input']; cap = inp['sourceCapsules']['sources'][0]
+        self.assertEqual(W.base64.b64decode(cap['base64']), raw)
+        self.assertEqual(cap['sha256'], W.digest(raw))
+        self.assertEqual(cap['index']['entries'][0]['startLine'], 951)
+        self.assertEqual(cap['index']['entries'][0]['name'], 'kernel_fn')
+        self.assertNotEqual(cap['sha256'], W.digest(b'\n' * 345 + b'# old baseline\n'))
+        self.assertIn(cap['artifactIds'][0], inp['confirmedSourceArtifactIds'])
+        self.complete_review(); self.assertEqual(self.w.tick()['state'], 'experiments_dispatched')
+        material = self.client.posts[-1][1]['input']['experiment']['materials'][0]
+        self.assertEqual(W.base64.b64decode(material['base64']), raw)
+
+    def test_capsule_aliases_deduplicate_bytes_but_preserve_identity(self):
+        self.add_seed(problem='muse_decode_layer', raw=b'# candidate source\n')
+        self.w.tick(); inp = self.w.state['supervisions'][-1]['input']
+        caps = inp['sourceCapsules']['sources']
+        self.assertEqual(len(caps), 1); self.assertEqual(len(caps[0]['artifactIds']), 2)
+        self.assertEqual(len(inp['catalog']), 2)
+        self.assertEqual(inp['sourceCapsules']['rawBytes'], len(b'# candidate source\n'))
+
+    def test_same_bytes_different_boards_have_distinct_capsules(self):
+        self.add_seed(raw=b'# candidate source\n')
+        self.w.tick(); caps = self.w.state['supervisions'][-1]['input']['sourceCapsules']['sources']
+        self.assertEqual(len(caps), 2)
+        self.assertEqual({c['problem'] for c in caps}, {'muse_decode_layer', 'muse_prefill_layer'})
+
+    def test_capsules_only_include_eligible_terminal_sources(self):
+        self.prefill_plan_while_decode_qa_runs()
+        inp = self.w.state['supervisions'][-1]['input']
+        self.assertEqual({c['problem'] for c in inp['sourceCapsules']['sources']}, {'muse_prefill_layer'})
+        self.assertTrue(all(a['problem'] == 'muse_prefill_layer' for a in inp['catalog']))
+        self.assertEqual(inp['sourceCapsules']['omitted'][0]['reason'], 'BOARD_NOT_ELIGIBLE')
+
+    def test_capsule_corrupt_or_missing_source_omitted_without_dispatch(self):
+        row = self.client.occurrences[self.seed]['artifacts'][0]
+        for corruption in [b'wrong-source', None]:
+            with self.subTest(corruption=corruption):
+                if corruption is None: self.client.artifacts.pop(row['id'])
+                else: self.client.artifacts[row['id']] = corruption
+                result = self.w.tick()
+                self.assertEqual(result['state'], 'supervisor_sources_unavailable')
+                self.assertEqual(result['newPostRequests'], 0)
+        self.assertEqual(len(self.client.posts), 0)
+
+    def test_capsule_missing_or_wrong_bytes_cannot_authorize_plan(self):
+        self.w.tick(); original = self.w.state['supervisions'][-1]['input']; plan = self.plan()
+        for mutation, code in [
+            (lambda x: x.pop('sourceCapsules'), 'SOURCE_CAPSULES_MISSING'),
+            (lambda x: x['sourceCapsules'].update(sources=[]), 'SOURCE_NOT_PROVIDED'),
+            (lambda x: x['sourceCapsules']['sources'][0].update(sha256='0' * 64), 'SOURCE_CAPSULE_BINDING'),
+            (lambda x: x['sourceCapsules']['sources'][0].update(problem='muse_prefill_layer'), 'SOURCE_CAPSULE_BINDING'),
+            (lambda x: x['sourceCapsules']['sources'][0].update(base64=W.base64.b64encode(b'other').decode()), 'SOURCE_CAPSULE_BYTES')]:
+            inp = copy.deepcopy(original); mutation(inp)
+            with self.subTest(code=code), self.assertRaisesRegex(ValueError, code):
+                W.validate_plan(plan, {'fingerprint': plan['evidenceFingerprint'], **inp}, self.config)
+
+    def test_capsule_exact_current_catalog_hash_revalidated_before_dispatch(self):
+        self.w.tick(); self.complete_review()
+        pending = self.w.state['supervisions'][-1]
+        plan = self.plan(); pending.update(approvedPlan=plan, state='dispatching')
+        obs = self.w.observe()
+        obs['catalog'][0]['digest'] = '0' * 64
+        with mock.patch.object(W, 'unchanged_action_scope', return_value=True):
+            result = self.w.consume_plan(pending, obs)
+        self.assertEqual(result['code'], 'SOURCE_CAPSULE_BINDING')
+        self.assertEqual(len(self.client.posts), 1)
+
+    def test_capsule_file_and_total_raw_budgets_are_explicit(self):
+        self.client.complete(self.seed, {'candidate.py': b'#' + b'x' * W.SOURCE_FILE_LIMIT})
+        self.assertEqual(self.w.tick()['omitted'][0]['reason'], 'SOURCE_FILE_LIMIT')
+        self.client.complete(self.seed, {'candidate.py': b'#' + b'a' * (W.SOURCE_FILE_LIMIT - 1)})
+        for letter in b'bcde': self.add_seed(problem='muse_decode_layer', raw=b'#' + bytes([letter]) * (W.SOURCE_FILE_LIMIT - 1))
+        self.w.tick(); inp = self.w.state['supervisions'][-1]['input']; caps = inp['sourceCapsules']
+        self.assertEqual(caps['rawBytes'], W.SOURCE_RAW_LIMIT)
+        self.assertEqual(len(caps['sources']), 4)
+        self.assertEqual(caps['omittedCount'], 1)
+        self.assertEqual(caps['omitted'][0]['reason'], 'SOURCE_RAW_BUDGET')
+        self.assertLessEqual(len(W.canonical(inp)), W.SUPERVISOR_INPUT_LIMIT)
+
+    def test_complete_input_budget_counts_context_not_only_sources(self):
+        obs = self.w.observe(); inp = {'catalog': copy.deepcopy(obs['catalog']), 'context': 'x' * (W.SUPERVISOR_INPUT_LIMIT - 1000)}
+        raw = b'#' + b'a' * 2000
+        row = obs['catalog'][0]; row.update(digest=W.digest(raw), size=len(raw)); inp['catalog'] = copy.deepcopy(obs['catalog'])
+        self.client.artifacts[row['id']] = raw
+        packet = self.w.supply_source_capsules(inp, obs)
+        self.assertFalse(packet['sources']); self.assertEqual(packet['omitted'][0]['reason'], 'SOURCE_INPUT_BUDGET')
+        self.assertLessEqual(len(W.canonical(inp)), W.SUPERVISOR_INPUT_LIMIT)
+        inp['context'] = 'x' * W.SUPERVISOR_INPUT_LIMIT
+        with self.assertRaisesRegex(ValueError, 'SUPERVISOR_INPUT_SIZE'):
+            self.w.supply_source_capsules(inp, obs)
+
+    def test_capsule_priority_uses_available_measured_source_parent_and_latest(self):
+        parent = self.client.occurrences[self.seed]['artifacts'][0]
+        best_oid = self.add_seed(problem='muse_decode_layer', raw=b'# measured best\n')
+        best = self.client.occurrences[best_oid]['artifacts'][0]
+        recent_oid = self.add_seed(problem='muse_decode_layer', raw=b'# later available\n')
+        self.client.occurrences[recent_oid]['occurrence']['finished_at'] = '2026-11-01T19:00:00Z'
+        obs = self.w.observe()
+        obs['officialJobs'] = [
+            {'id': 'known', 'problem': 'muse_decode_layer', 'sourceSHA256': best['digest'], 'status': 'done', 'result': {'passed': True, 'speedup': 1.2}},
+            {'id': 'unknown-incumbent', 'problem': 'muse_decode_layer', 'sourceSHA256': 'f' * 64, 'status': 'done', 'result': {'passed': True, 'speedup': 9.9}}]
+        next(o for o in obs['outcomes'] if o['occurrenceId'] == best_oid)['executionEvidence'] = {
+            'bindingState': 'verified', 'candidateSHA256': best['digest'], 'sourceSHA256': parent['digest']}
+        inp = {'catalog': copy.deepcopy(obs['catalog'])}; self.w.supply_source_capsules(inp, obs)
+        self.assertEqual([c['selectionReason'] for c in inp['sourceCapsules']['sources']],
+                         ['best_measured_available', 'known_parent', 'latest_available'])
+        self.assertNotIn('f' * 64, [c['sha256'] for c in inp['sourceCapsules']['sources']])
+
+    def test_latest_attention_uses_verified_material_time_and_supplies_its_parent(self):
+        recent = self.add_seed(problem='muse_decode_layer', raw=b'# latest failed candidate\n')
+        detail = self.client.occurrences[recent]
+        detail['occurrence'].update(state='attention', finished_at=None)
+        detail['attempts'][0].update(state='failed')
+        detail['artifacts'][0]['created_at'] = '2026-11-01T19:30:00Z'
+        parent = self.client.occurrences[self.seed]['artifacts'][0]
+        obs = self.w.observe(); result = next(o for o in obs['outcomes'] if o['occurrenceId'] == recent)
+        result['executionEvidence'] = {'bindingState': 'verified', 'candidateSHA256': detail['artifacts'][0]['digest'],
+                                      'sourceSHA256': parent['digest']}
+        inp = {'catalog': copy.deepcopy(obs['catalog'])}; self.w.supply_source_capsules(inp, obs)
+        self.assertEqual([c['selectionReason'] for c in inp['sourceCapsules']['sources']], ['latest_available', 'latest_parent'])
+        self.assertIn(detail['artifacts'][0]['id'], inp['sourceCapsules']['sources'][0]['artifactIds'])
+
+    def test_legacy_pending_review_keeps_original_input_and_contract(self):
+        self.w.tick(); row = self.w.state['supervisions'][-1]
+        row['input'].pop('sourceAccessVersion'); row['input'].pop('sourceCapsules')
+        self.complete_review(); self.assertEqual(self.w.tick()['state'], 'experiments_dispatched')
+        self.assertEqual(len(self.client.posts), 3)
+
+    def test_source_index_does_not_execute_or_claim_semantics(self):
+        raw = b'raise RuntimeError("must not execute")\n\ndef selected():\n    return 1\n'
+        index = W.source_index(raw)
+        self.assertEqual(index['kind'], 'python_ast_locations_only')
+        self.assertEqual(index['entries'][0]['startLine'], 3)
+        self.assertEqual(W.source_index(b'def broken(:')['kind'], 'python_ast_unavailable')
+
+    def test_capsule_inventory_is_stable_under_catalog_permutation(self):
+        self.add_seed(problem='muse_decode_layer', raw=b'# second source\n')
+        obs = self.w.observe(); first = {'catalog': copy.deepcopy(obs['catalog'])}
+        self.w.supply_source_capsules(first, obs)
+        shuffled = copy.deepcopy(obs); shuffled['catalog'].reverse(); shuffled['outcomes'].reverse()
+        second = {'catalog': copy.deepcopy(shuffled['catalog'])}; self.w.supply_source_capsules(second, shuffled)
+        self.assertEqual(first['sourceCapsules'], second['sourceCapsules'])
+
+    def test_pending_request_retry_never_fetches_or_reformulates_source_capsules(self):
+        self.client.timeout_after_commit_number = 1
+        with self.assertRaises(TimeoutError): self.w.tick()
+        original = copy.deepcopy(self.client.posts[0][1]); self.reload()
+        source = self.client.occurrences[self.seed]['artifacts'][0]
+        self.client.artifacts[source['id']] = b'changed after intent'
+        self.assertEqual(self.w.tick()['state'], 'supervisor_dispatched')
+        self.assertEqual(len(self.client.posts), 1)
+        self.assertEqual(self.w.state['supervisions'][-1]['input'], original['input'])
 
     def test_fresh_heartbeat_does_not_hide_stale_progress_diagnostic_only(self):
         d = self.client.occurrences[self.seed]
