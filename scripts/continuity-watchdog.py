@@ -225,8 +225,10 @@ Report any isolated/exhausted candidate explicitly and choose useful work from o
 eligible sources; one candidate's evidence failure must not pause unrelated boards.
 When verified autoCheckDiagnostics contains repairableEvidence, you may instead use
 decision="repair_evidence" and experiments naming its exact candidate sourceArtifactId.
-This fixed action preserves the existing candidate/base/patch byte for byte, replays
-and repairs only evidence, then performs a new independent QA. It cannot fix semantic
+This fixed action preserves candidate and base byte for byte and keeps the original
+patch immutable. canonicalPatch may differ ONLY in its two approved transport headers,
+with every hunk already proven to reproduce the exact candidate. It replays and
+repairs only evidence, then performs a new independent QA. It cannot fix semantic
 or numerical defects. Use a new experiment hypothesis for an actual code defect.
 Quota, paused policy and uncertain POST ownership are never repair authority.
 Do not build a plan validator, validation script, plan test suite or extra report:
