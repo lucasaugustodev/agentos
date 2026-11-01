@@ -1000,6 +1000,37 @@ class Watchdog:
             jobs.append({k: row[k] for k in ["id", "problem", "sourceSHA256"]})
         return jobs
 
+    def repair_producer_artifacts(self, detail, qa):
+        """Select evidence from the authenticated producer, never by name across roles."""
+        steps = [s for s in detail["steps"] if s.get("key") == "produce"]
+        expected = [s for s in detail["occurrence"].get("definition", {}).get("steps", [])
+                    if s.get("key") == "produce"]
+        require(len(steps) == len(expected) == 1, "REPAIR_PRODUCER_STEP")
+        step = steps[0]
+        require(step.get("definition") == expected[0] and expected[0].get("kind") == "agent",
+                "REPAIR_PRODUCER_DEFINITION")
+        attempts = [a for a in detail["attempts"] if a["step_id"] == step["id"]
+                    and a["number"] == step["attempt"]]
+        require(len(attempts) == 1, "REPAIR_PRODUCER_ATTEMPT")
+        attempt = attempts[0]
+        require(attempt["id"] != qa["attempt_id"] and attempt.get("state") == "completed"
+                and attempt.get("finished_at") and UUID.fullmatch(attempt.get("fence", ""))
+                and confirmed_boundary(detail), "REPAIR_PRODUCER_STOP_OR_FENCE")
+        manifest = (attempt.get("context") or {}).get("manifest") or {}
+        binding = manifest.get("cycleInput") or {}
+        require(manifest.get("cycleId") == detail["occurrence"]["cycle_id"]
+                and manifest.get("occurrenceId") == detail["occurrence"]["id"]
+                and manifest.get("step") == "produce"
+                and binding.get("attemptId") == attempt["id"]
+                and binding.get("occurrenceId") == detail["occurrence"]["id"]
+                and binding.get("runFence") == attempt["fence"]
+                and re.fullmatch(r"[a-f0-9]{64}", binding.get("digest", "")),
+                "REPAIR_PRODUCER_MANIFEST")
+        artifacts = [a for a in detail["artifacts"] if a["attempt_id"] == attempt["id"] and
+                     a["name"] in ["candidate.py", "implementation.patch", "cpu-checks.py", "cpu-result.json", "verification.json"]]
+        require(len(artifacts) == len({a["name"] for a in artifacts}) == 5, "REPAIR_PRODUCER_EVIDENCE_SET")
+        return artifacts
+
     def auto_check_diagnostics(self, catalog, details, tested):
         path = self.config.get("autoCheckStatusPath")
         if not path or not pathlib.Path(path).exists():
@@ -1055,62 +1086,68 @@ class Watchdog:
                 continue
             require(row.get("jobId") is None and row.get("postAttempted") is not True,
                     "AUTO_CHECK_UNCERTAIN_EFFECT")
-            detail = details[oid]
-            require(detail["occurrence"]["state"] == "completed" and confirmed_boundary(detail), "REPAIR_BOUNDARY_UNCONFIRMED")
-            source = next((r for r in catalog if r["occurrenceId"] == oid and r["digest"] == row.get("candidateSHA256")), None)
-            latest = {a["id"] for a in detail["attempts"] if any(s["id"] == a["step_id"]
-                      and s["attempt"] == a["number"] for s in detail["steps"])}
-            qa = next((a for a in detail["artifacts"] if a["id"] == row.get("qaArtifactId") and
-                       a["digest"] == row.get("qaSHA256") and a["name"] == "qa-verification.json"
-                       and a["attempt_id"] in latest), None)
-            require(source and qa, "REPAIR_ARTIFACT_BINDING")
-            repairs = [r for r in self.state["experiments"] if r.get("repairCandidateSHA256") == source["digest"]
-                       and r["problem"] == row["problem"] and r["occurrenceId"] in details]
-            if repairs and repairs[-1]["occurrenceId"] != oid:
-                item["classification"] = "superseded_by_native_repair"; continue
-            review = json.loads(self.verified_artifact(qa, 32768))
-            base = detail["occurrence"].get("input", {}).get("experiment", {}).get("sourceArtifact", {})
-            require(review.get("candidateSHA256") == source["digest"] and review.get("sourceSHA256") == base.get("digest")
-                    and bool(base.get("digest")), "REPAIR_SOURCE_LINEAGE")
-            code = row.get("code") or ""
-            semantic_failure = any(review.get(k) is False for k in ["passed", "scopePreserved", "cpuReplayPassed",
-                "canonicalPrecisionPreserved", "evaluatorIndependent", "upstreamAttributionPreserved"])
-            semantic_failure = semantic_failure or bool(review.get("blockingFindings"))
-            item["classification"] = "new_hypothesis_required" if semantic_failure or code in SEMANTIC_REJECTION_CODES else "diagnosis_required"
-            if code not in EVIDENCE_REPAIR_CODES or semantic_failure:
-                continue
-            producer_artifacts = [a for a in detail["artifacts"] if a["attempt_id"] in latest and
-                                  a["name"] in ["candidate.py", "implementation.patch", "cpu-checks.py", "cpu-result.json", "verification.json"]]
-            by_name = {a["name"]: a for a in producer_artifacts}
-            require(len(producer_artifacts) == len(by_name) == 5, "REPAIR_PRODUCER_EVIDENCE_SET")
-            require(len({a["attempt_id"] for a in producer_artifacts}) == 1 and qa["attempt_id"] not in
-                    {a["attempt_id"] for a in producer_artifacts}, "REPAIR_INDEPENDENT_LINEAGE")
-            canonical_patch, patch_proof = normalized_repair_patch(self.verified_artifact(base),
-                self.verified_artifact(by_name["candidate.py"]), self.verified_artifact(by_name["implementation.patch"]), row["problem"])
-            cpu = json.loads(self.verified_artifact(by_name["cpu-result.json"], 131072))
-            evidence = review.get("cpuEvidence") or {}
-            for container, key, expected in [(cpu, "candidateSHA256", source["digest"]),
-                    (cpu, "checkerSHA256", by_name["cpu-checks.py"]["digest"]),
-                    (evidence, "checkerSHA256", by_name["cpu-checks.py"]["digest"]),
-                    (evidence, "resultSHA256", by_name["cpu-result.json"]["digest"])]:
-                require(container.get(key) in [None, expected], "REPAIR_EVIDENCE_HASH_CONFLICT")
-            if cpu.get("passed") is not True:
-                item["classification"] = "new_hypothesis_required"; continue
-            if len(repairs) >= 2:
-                item["classification"] = "repair_exhausted"; continue
             try:
-                diagnostic = self.repair_qa_diagnostic(detail, qa, row["problem"], latest, source["digest"])
+                detail = details[oid]
+                require(detail["occurrence"]["state"] == "completed" and confirmed_boundary(detail), "REPAIR_BOUNDARY_UNCONFIRMED")
+                source = next((r for r in catalog if r["occurrenceId"] == oid and r["digest"] == row.get("candidateSHA256")), None)
+                latest = {a["id"] for a in detail["attempts"] if any(s["id"] == a["step_id"]
+                          and s["attempt"] == a["number"] for s in detail["steps"])}
+                qa = next((a for a in detail["artifacts"] if a["id"] == row.get("qaArtifactId") and
+                           a["digest"] == row.get("qaSHA256") and a["name"] == "qa-verification.json"
+                           and a["attempt_id"] in latest), None)
+                require(source and qa, "REPAIR_ARTIFACT_BINDING")
+                repairs = [r for r in self.state["experiments"] if r.get("repairCandidateSHA256") == source["digest"]
+                           and r["problem"] == row["problem"] and r["occurrenceId"] in details]
+                if repairs and repairs[-1]["occurrenceId"] != oid:
+                    item["classification"] = "superseded_by_native_repair"; continue
+                review = json.loads(self.verified_artifact(qa, 32768))
+                require(isinstance(review, dict), "REPAIR_QA_REPORT_SCHEMA")
+                base = detail["occurrence"].get("input", {}).get("experiment", {}).get("sourceArtifact", {})
+                require(review.get("candidateSHA256") == source["digest"] and review.get("sourceSHA256") == base.get("digest")
+                        and bool(base.get("digest")), "REPAIR_SOURCE_LINEAGE")
+                code = row.get("code") or ""
+                semantic_failure = any(review.get(k) is False for k in ["passed", "scopePreserved", "cpuReplayPassed",
+                    "canonicalPrecisionPreserved", "evaluatorIndependent", "upstreamAttributionPreserved"])
+                semantic_failure = semantic_failure or bool(review.get("blockingFindings"))
+                item["classification"] = "new_hypothesis_required" if semantic_failure or code in SEMANTIC_REJECTION_CODES else "diagnosis_required"
+                if code not in EVIDENCE_REPAIR_CODES or semantic_failure:
+                    continue
+                producer_artifacts = self.repair_producer_artifacts(detail, qa)
+                by_name = {a["name"]: a for a in producer_artifacts}
+                canonical_patch, patch_proof = normalized_repair_patch(self.verified_artifact(base),
+                    self.verified_artifact(by_name["candidate.py"]), self.verified_artifact(by_name["implementation.patch"]), row["problem"])
+                cpu = json.loads(self.verified_artifact(by_name["cpu-result.json"], 131072))
+                require(isinstance(cpu, dict), "REPAIR_CPU_REPORT_SCHEMA")
+                evidence = review.get("cpuEvidence", {})
+                require(isinstance(evidence, dict), "REPAIR_CPU_EVIDENCE_SCHEMA")
+                for container, key, expected in [(cpu, "candidateSHA256", source["digest"]),
+                        (cpu, "checkerSHA256", by_name["cpu-checks.py"]["digest"]),
+                        (evidence, "checkerSHA256", by_name["cpu-checks.py"]["digest"]),
+                        (evidence, "resultSHA256", by_name["cpu-result.json"]["digest"])]:
+                    require(container.get(key) in [None, expected], "REPAIR_EVIDENCE_HASH_CONFLICT")
+                if cpu.get("passed") is not True:
+                    item["classification"] = "new_hypothesis_required"; continue
+                if len(repairs) >= 2:
+                    item["classification"] = "repair_exhausted"; continue
+                try:
+                    diagnostic = self.repair_qa_diagnostic(detail, qa, row["problem"], latest, source["digest"])
+                except (ValueError, KeyError, TypeError, OSError, RecursionError) as error:
+                    code = str(error) if isinstance(error, ValueError) and re.fullmatch(r"[A-Z][A-Z0-9_]+", str(error)) else "REPAIR_QA_DIAGNOSTIC_UNAVAILABLE"
+                    item.update(classification="repair_context_unavailable", repairContextCode=code)
+                    continue  # Withhold this repair's unbound report; other boards remain observable.
+                item["classification"] = "repair_evidence"
+                summary["repairableEvidence"].append({**item, "candidateArtifactId": source["id"],
+                    "originalBaseArtifact": base, "producerArtifacts": producer_artifacts, "qaArtifact": qa,
+                    "repairQADiagnostic": diagnostic,
+                    "repairAttempt": len(repairs) + 1, "patchNormalization": patch_proof,
+                    "canonicalPatch": {"sha256": digest(canonical_patch), "bytes": len(canonical_patch),
+                                       "base64": base64.b64encode(canonical_patch).decode()}})
             except (ValueError, KeyError, TypeError, OSError, RecursionError) as error:
-                code = str(error) if isinstance(error, ValueError) and re.fullmatch(r"[A-Z][A-Z0-9_]+", str(error)) else "REPAIR_QA_DIAGNOSTIC_UNAVAILABLE"
+                code = str(error) if isinstance(error, ValueError) and re.fullmatch(r"[A-Z][A-Z0-9_]+", str(error)) else "REPAIR_NATIVE_ENVELOPE_UNAVAILABLE"
                 item.update(classification="repair_context_unavailable", repairContextCode=code)
-                continue  # Withhold this repair's unbound report; other boards remain observable.
-            item["classification"] = "repair_evidence"
-            summary["repairableEvidence"].append({**item, "candidateArtifactId": source["id"],
-                "originalBaseArtifact": base, "producerArtifacts": producer_artifacts, "qaArtifact": qa,
-                "repairQADiagnostic": diagnostic,
-                "repairAttempt": len(repairs) + 1, "patchNormalization": patch_proof,
-                "canonicalPatch": {"sha256": digest(canonical_patch), "bytes": len(canonical_patch),
-                                   "base64": base64.b64encode(canonical_patch).decode()}})
+                # Keep this candidate's reservation and guards. A bad native
+                # envelope cannot authorize repair or stop unrelated boards.
+                continue
         return summary
 
     def repair_ownership(self, details):

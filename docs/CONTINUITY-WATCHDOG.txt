@@ -279,3 +279,17 @@ artifact/hash/size and candidate/attempt/fence counterexamples, unchanged replay
 instructions/materials/criteria, and the existing ownership/reconciliation tests.
 An invalid QA manifest also has a causal red/green test proving that another
 board still reaches its supervisor and producer dispatch without that report.
+Native repair evidence is selected only from the authenticated current producer
+step/attempt, with its definition, manifest, fence and confirmed stop. An
+independent QA attachment named cpu-result.json cannot replace or duplicate the
+producer's report. Missing, ambiguous, oversized or malformed native envelopes
+withhold only that repair action and keep its reservation; other boards and
+their pending plans can continue. Global policy, configuration and external
+owner checks remain strict. The qualified snapshot includes a QA report with
+an independently produced CPU result and a producer report above the existing
+size limit: selection is corrected, the limit remains enforced locally.
+
+Qualification now contains 131 server-only tests, four causal failures on the
+previous controller and an offline replay of frozen native/official GET data.
+No kernel, provider call, official POST, acceptance or production state change
+is performed by that replay. Instruction changes do not prove model compliance.

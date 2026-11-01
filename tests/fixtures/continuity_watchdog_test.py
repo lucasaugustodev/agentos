@@ -414,6 +414,10 @@ class WatchTests(unittest.TestCase):
         qa = next(a for a in detail['artifacts'] if a['name'] == 'qa-verification.json')
         defs = {s['key']: s for s in detail['occurrence']['definition']['steps']}
         detail['steps'][0].update(key='produce', definition=defs['produce'])
+        producer = detail['attempts'][0]
+        producer['context'] = {'manifest': {'cycleId': detail['occurrence']['cycle_id'],
+            'occurrenceId': oid, 'step': 'produce', 'cycleInput': {
+                'attemptId': producer['id'], 'occurrenceId': oid, 'runFence': producer['fence'], 'digest': 'b' * 64}}}
         sid, aid = uid(), uid()
         detail['steps'].append({'id': sid, 'key': 'independent-qa', 'attempt': 1, 'state': 'completed',
                                 'definition': defs['independent-qa']})
@@ -476,6 +480,116 @@ class WatchTests(unittest.TestCase):
         self.assertEqual(len({a['attemptId'] for a in target['materials']}), 1)
         self.assertEqual([s['key'] for s in detail['occurrence']['definition']['steps']], ['produce', 'independent-qa'])
         self.assertEqual(detail['occurrence']['definition']['allowedActions'], [])
+
+    def test_qa_cpu_result_cannot_replace_or_duplicate_producer_evidence(self):
+        status = self.repairable_operation()
+        detail = self.client.occurrences[status['occurrenceId']]
+        qa = next(a for a in detail['artifacts'] if a['name'] == 'qa-verification.json')
+        original = next(a for a in detail['artifacts'] if a['name'] == 'cpu-result.json')
+        raw = W.canonical({'passed': True, 'independentQARecheck': True})
+        extra = {**original, 'id': uid(), 'attempt_id': qa['attempt_id'], 'digest': W.digest(raw), 'size': len(raw)}
+        detail['artifacts'].append(extra); self.client.artifacts[extra['id']] = raw
+        result = self.w.observe()['autoCheckDiagnostics']['repairableEvidence'][0]
+        selected = result['producerArtifacts']
+        self.assertEqual(len(selected), 5)
+        self.assertEqual(next(a['id'] for a in selected if a['name'] == 'cpu-result.json'), original['id'])
+        self.assertNotIn(extra['id'], {a['id'] for a in selected})
+        self.assertEqual(self.submit_repair_plan()['state'], 'experiments_dispatched')
+
+    def test_producer_envelope_failures_are_local_and_cannot_borrow_qa_evidence(self):
+        status = self.repairable_operation()
+        self.add_seed('muse_prefill_layer')
+        self.install_diagnostic_fixture([status])
+        original = copy.deepcopy(self.client.occurrences[status['occurrenceId']])
+        posts = len(self.client.posts)
+        cases = ['missing', 'duplicate', 'wrong-role', 'definition', 'obsolete', 'duplicate-attempt',
+                 'fence', 'manifest-attempt', 'manifest-cycle', 'manifest-step', 'stop']
+        for mutation in cases:
+            with self.subTest(mutation=mutation):
+                detail = copy.deepcopy(original); self.client.occurrences[status['occurrenceId']] = detail
+                producer = detail['attempts'][0]; qa = next(a for a in detail['artifacts'] if a['name'] == 'qa-verification.json')
+                row = next(a for a in detail['artifacts'] if a['name'] == 'cpu-result.json')
+                if mutation == 'missing': detail['artifacts'].remove(row)
+                elif mutation == 'duplicate': detail['artifacts'].append({**row, 'id': uid()})
+                elif mutation == 'wrong-role': row['attempt_id'] = qa['attempt_id']
+                elif mutation == 'definition': detail['steps'][0]['definition']['kind'] = 'action'
+                elif mutation == 'obsolete': detail['steps'][0]['attempt'] += 1
+                elif mutation == 'duplicate-attempt': detail['attempts'].append({**producer, 'id': uid()})
+                elif mutation == 'fence': producer['fence'] = uid()
+                elif mutation == 'manifest-attempt': producer['context']['manifest']['cycleInput']['attemptId'] = uid()
+                elif mutation == 'manifest-cycle': producer['context']['manifest']['cycleId'] = uid()
+                elif mutation == 'manifest-step': producer['context']['manifest']['step'] = 'independent-qa'
+                else: producer['receipt']['stopped'] = False
+                observation = self.w.observe()
+                diagnostics = observation['autoCheckDiagnostics']
+                self.assertFalse(diagnostics['repairableEvidence'])
+                self.assertEqual(diagnostics['outcomes'][0]['classification'], 'repair_context_unavailable')
+                self.assertIn('muse_prefill_layer', observation['eligibleProblems'])
+                self.assertEqual(len(self.client.posts), posts)
+
+    def test_bad_producer_envelope_does_not_prevent_pending_other_board_plan_consumption(self):
+        status = self.repairable_operation(); self.add_seed('muse_prefill_layer')
+        self.install_diagnostic_fixture([status])
+        self.assertEqual(self.w.tick()['state'], 'supervisor_dispatched')
+        plan = self.plan(); plan['experiments'] = [dict(plan['experiments'][0], problem='muse_prefill_layer',
+            sourceArtifactId=next(a['id'] for a in self.w.state['supervisions'][-1]['input']['catalog']
+                                  if a['problem'] == 'muse_prefill_layer'))]
+        self.complete_review(plan)
+        detail = self.client.occurrences[status['occurrenceId']]
+        detail['artifacts'].append(copy.deepcopy(next(a for a in detail['artifacts'] if a['name'] == 'cpu-result.json')))
+        self.assertEqual(self.w.tick()['state'], 'experiments_dispatched')
+        self.assertEqual(self.w.state['experiments'][-1]['problem'], 'muse_prefill_layer')
+        self.assertNotIn('repairOf', self.w.state['experiments'][-1])
+
+    def test_producer_null_receipt_uses_only_exact_fenced_native_stop_proof(self):
+        status = self.repairable_operation()
+        detail = self.client.occurrences[status['occurrenceId']]; producer = detail['attempts'][0]
+        producer['receipt'] = None
+        detail['events'] = [{'kind': 'HARNESS_STOPPED', 'attempt_id': producer['id'], 'payload': {
+            'runFence': producer['fence'], 'confirmed': True, 'unit': 'agentos-run-' + producer['id'],
+            'proof': {'stopped': True, 'mainPid': 0, 'populated': False, 'activeState': 'inactive'}}}]
+        self.assertEqual(len(self.w.observe()['autoCheckDiagnostics']['repairableEvidence']), 1)
+        detail['events'][0]['payload']['runFence'] = uid()
+        diagnostics = self.w.observe()['autoCheckDiagnostics']
+        self.assertEqual(diagnostics['repairableEvidence'], [])
+        self.assertEqual(diagnostics['outcomes'][0]['repairContextCode'], 'REPAIR_BOUNDARY_UNCONFIRMED')
+
+    def test_oversized_producer_cpu_report_is_local_without_weakening_limit(self):
+        status = self.repairable_operation(); self.add_seed('muse_prefill_layer')
+        self.install_diagnostic_fixture([status])
+        detail = self.client.occurrences[status['occurrenceId']]
+        row = next(a for a in detail['artifacts'] if a['name'] == 'cpu-result.json')
+        raw = W.canonical({'passed': True, 'details': 'x' * 131072})
+        self.client.artifacts[row['id']] = raw; row.update(digest=W.digest(raw), size=len(raw))
+        observation = self.w.observe(); diagnostics = observation['autoCheckDiagnostics']
+        self.assertEqual(diagnostics['repairableEvidence'], [])
+        self.assertEqual(diagnostics['outcomes'][0]['repairContextCode'], 'ARTIFACT_SIZE')
+        self.assertIn('muse_prefill_layer', observation['eligibleProblems'])
+
+    def test_untrusted_native_json_shapes_are_local_and_other_board_continues(self):
+        status = self.repairable_operation(); self.add_seed('muse_prefill_layer')
+        original = copy.deepcopy(self.client.occurrences[status['occurrenceId']])
+        artifacts = dict(self.client.artifacts)
+        for target, value, code in [('qa', None, 'REPAIR_QA_REPORT_SCHEMA'), ('qa', [], 'REPAIR_QA_REPORT_SCHEMA'),
+                ('cpu', None, 'REPAIR_CPU_REPORT_SCHEMA'), ('cpu', [], 'REPAIR_CPU_REPORT_SCHEMA'),
+                ('evidence', [], 'REPAIR_CPU_EVIDENCE_SCHEMA'), ('evidence', 'invalid', 'REPAIR_CPU_EVIDENCE_SCHEMA'),
+                ('evidence', None, 'REPAIR_CPU_EVIDENCE_SCHEMA')]:
+            with self.subTest(target=target, value=value):
+                detail = copy.deepcopy(original); self.client.occurrences[status['occurrenceId']] = detail
+                self.client.artifacts = dict(artifacts)
+                name = 'cpu-result.json' if target == 'cpu' else 'qa-verification.json'
+                row = next(a for a in detail['artifacts'] if a['name'] == name)
+                if target == 'evidence':
+                    report = json.loads(self.client.artifacts[row['id']]); report['cpuEvidence'] = value
+                else: report = value
+                raw = W.canonical(report); self.client.artifacts[row['id']] = raw
+                row.update(digest=W.digest(raw), size=len(raw))
+                bound = {**status, **({'qaSHA256': row['digest']} if target != 'cpu' else {})}
+                self.install_diagnostic_fixture([bound])
+                observation = self.w.observe(); diagnostics = observation['autoCheckDiagnostics']
+                self.assertEqual(diagnostics['repairableEvidence'], [])
+                self.assertEqual(diagnostics['outcomes'][0]['repairContextCode'], code)
+                self.assertIn('muse_prefill_layer', observation['eligibleProblems'])
 
     def test_repair_hash_guidance_keeps_original_base_and_immutable_candidate_distinct(self):
         status = self.repairable_operation()
@@ -737,14 +851,18 @@ class WatchTests(unittest.TestCase):
     def test_diagnostic_hash_or_source_lineage_conflict_cannot_authorize_repair(self):
         status = self.repairable_operation()
         self.install_diagnostic_fixture([{**status, 'candidateSHA256': 'f' * 64}])
-        with self.assertRaisesRegex(ValueError, 'REPAIR_ARTIFACT_BINDING'): self.w.observe()
+        row = self.w.observe()['autoCheckDiagnostics']['outcomes'][0]
+        self.assertEqual((row['classification'], row['repairContextCode']),
+                         ('repair_context_unavailable', 'REPAIR_ARTIFACT_BINDING'))
         self.install_diagnostic_fixture([status])
         detail = self.client.occurrences[status['occurrenceId']]
         qa = next(a for a in detail['artifacts'] if a['id'] == status['qaArtifactId'])
         value = json.loads(self.client.artifacts[qa['id']]); value['sourceSHA256'] = 'f' * 64
         raw = W.canonical(value); self.client.artifacts[qa['id']] = raw; qa.update(digest=W.digest(raw), size=len(raw))
         self.install_diagnostic_fixture([{**status, 'qaSHA256': qa['digest']}])
-        with self.assertRaisesRegex(ValueError, 'REPAIR_SOURCE_LINEAGE'): self.w.observe()
+        row = self.w.observe()['autoCheckDiagnostics']['outcomes'][0]
+        self.assertEqual((row['classification'], row['repairContextCode']),
+                         ('repair_context_unavailable', 'REPAIR_SOURCE_LINEAGE'))
 
     def test_controller_quota_uncertain_and_stale_diagnostics_never_authorize_repair(self):
         status = self.repairable_operation()
