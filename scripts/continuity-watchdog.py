@@ -494,7 +494,8 @@ def unchanged_action_scope(pending, observation, config):
                     for exp in plan["experiments"]))
 
 
-def pipeline_admission(limit, active, catalog, pending, jobs, diagnostics, confirmed_sources):
+def pipeline_admission(limit, active, catalog, pending, jobs, diagnostics, confirmed_sources,
+                       pending_origins=None, repair_owners=None):
     """Count whole experiments, not sessions; official terminal evidence wins.
 
     Native production and its sequential QA reserve one occurrence slot. A
@@ -508,10 +509,23 @@ def pipeline_admission(limit, active, catalog, pending, jobs, diagnostics, confi
         row["stages"].add(stage)
         if occurrence: row["occurrenceIds"].add(occurrence)
         if job: row["jobIds"].add(job)
+    repair_owners = repair_owners or {}
+    repair_counts = {}
     for row in active:
-        own(row["problem"], "occurrence:" + row["occurrenceId"], "native", row["occurrenceId"])
+        binding = repair_owners.get(row["occurrenceId"])
+        if binding:
+            key = (row["problem"], binding["candidateSHA256"])
+            repair_counts[key] = repair_counts.get(key, 0) + 1
+    for row in active:
+        binding = repair_owners.get(row["occurrenceId"])
+        source = binding["candidateSHA256"] if binding else None
+        # One repair and its pending candidate are one pipeline owner. Never
+        # hide two actual native actors behind an equal source digest.
+        key = "source:" + source if source and repair_counts[(row["problem"], source)] == 1 else "occurrence:" + row["occurrenceId"]
+        own(row["problem"], key, "native", row["occurrenceId"], source)
     for row in catalog:
-        if row["digest"] in pending:
+        if row["digest"] in pending and (pending_origins is None or
+                (row["problem"], row["occurrenceId"], row["digest"]) in pending_origins):
             own(row["problem"], "source:" + row["digest"], "unmeasured", row["occurrenceId"], row["digest"])
     registered = {(row["problem"], row["sourceSHA256"]) for row in jobs}
     for row in jobs:
@@ -1065,13 +1079,58 @@ class Watchdog:
                                    "base64": base64.b64encode(canonical_patch).decode()}})
         return summary
 
+    def repair_ownership(self, details):
+        """Capacity aliases require an existing canonical repair, not equal bytes.
+
+        This establishes ownership only. It never accepts a candidate or changes
+        an execution, and malformed links conservatively keep separate owners.
+        """
+        owners = {}
+        for record in self.state["experiments"]:
+            if not record.get("repairOf") or record["occurrenceId"] not in details:
+                continue
+            child, parent = details[record["occurrenceId"]], details.get(record["repairOf"])
+            try:
+                occurrence = child["occurrence"]; inp = occurrence["input"]; exp = inp["experiment"]
+                target = exp["repairTarget"]; source = exp["sourceArtifact"]
+                require(parent is not None and confirmed_boundary(parent), "REPAIR_OWNER_PARENT")
+                prior = parent["occurrence"]["input"]["experiment"]
+                require(occurrence["id"] == record["occurrenceId"] and occurrence["cycle_id"] == record["cycleId"]
+                        and inp["watchId"] == self.config["watchId"]
+                        and inp["supervisorOccurrenceId"] == record["supervisorOccurrenceId"]
+                        and exp["problem"] == prior["problem"] == record["problem"]
+                        and target["occurrenceId"] == parent["occurrence"]["id"] == record["repairOf"], "REPAIR_OWNER_SCOPE")
+                candidate = record["repairCandidateSHA256"]
+                require(re.fullmatch(r"[a-f0-9]{64}", candidate) and target["candidateSHA256"] == candidate
+                        and all(source[k] == prior["sourceArtifact"][k] for k in ["id", "digest"]), "REPAIR_OWNER_SOURCE")
+                proof = target["patchNormalization"]
+                require(proof["appliedExactly"] is True and proof["candidateSHA256"] == candidate
+                        and proof["baseSHA256"] == source["digest"]
+                        and proof["canonicalPatchSHA256"] == target["canonicalPatch"]["sha256"] == record["repairPatchSHA256"]
+                        and proof["originalPatchSHA256"] == record["repairOriginalPatchSHA256"], "REPAIR_OWNER_PATCH")
+                latest = {a["id"] for a in parent["attempts"] if any(s["id"] == a["step_id"]
+                          and s["attempt"] == a["number"] for s in parent["steps"])}
+                material = [a for a in target["materials"] if a["name"] == "candidate.py"]
+                require(len(material) == 1 and material[0]["sha256"] == candidate
+                        and any(a["id"] == material[0]["artifactId"] and a["name"] == "candidate.py"
+                            and a["digest"] == candidate and a["attempt_id"] == material[0]["attemptId"]
+                            and a["attempt_id"] in latest for a in parent["artifacts"])
+                        and any(a["id"] == target["qaArtifactId"] and a["name"] == "qa-verification.json"
+                            and a["digest"] == target["qaSHA256"] and a["attempt_id"] in latest
+                            for a in parent["artifacts"]), "REPAIR_OWNER_ARTIFACTS")
+                owners[record["occurrenceId"]] = {"parentOccurrenceId": record["repairOf"],
+                    "problem": record["problem"], "candidateSHA256": candidate}
+            except (ValueError, KeyError, TypeError):
+                continue
+        return owners
+
     def observe(self, exclude_supervisor=None):
         records = [*self.config["seedOccurrences"], *[r for r in self.state["experiments"]
                    if r["supervisorOccurrenceId"] != exclude_supervisor]]
         outcomes, catalog, active, details, progress_epochs, confirmed_sources = [], [], [], {}, [], set()
         registered_jobs = self.registered_jobs()
         tested = {job["sourceSHA256"] for job in registered_jobs}
-        pending = set()
+        pending_origins = set()
         for record in records:
             oid = record.get("occurrenceId", record.get("id"))
             detail = self.client.request("GET", "/api/cycle-runs/" + oid)
@@ -1138,7 +1197,7 @@ class Watchdog:
                     (q.get("approvedForOfficialReview") is True or q.get("approvedForRootCheckReview") is True)
                     and q.get("gpuValidated") is False for q in qa_reviews)
                 if occurrence["state"] == "completed" and eligible and candidate["digest"] not in tested:
-                    pending.add(candidate["digest"])
+                    pending_origins.add((record["problem"], oid, candidate["digest"]))
             outcomes.append({"occurrenceId": oid, "problem": record["problem"], "state": occurrence["state"],
                 "artifacts": artifacts, "finishedAt": occurrence.get("finished_at"),
                 "executionEvidence": self.execution_evidence(detail),
@@ -1174,9 +1233,16 @@ class Watchdog:
         diagnostics = self.auto_check_diagnostics(catalog, details, tested)
         for row in diagnostics["outcomes"]:
             if row.get("classification") in ["repair_evidence", "new_hypothesis_required", "repair_exhausted"]:
-                pending.discard(row["candidateSHA256"])
+                pending_origins.discard((row["problem"], row["occurrenceId"], row["candidateSHA256"]))
+        repair_owners = self.repair_ownership(details)
+        for binding in repair_owners.values():
+            # Supersession removes this predecessor's pending claim only. The
+            # child can remain active/uncertain or await GPU after its own QA;
+            # a stopped failed child cannot revive its rejected predecessor.
+            pending_origins.discard((binding["problem"], binding["parentOccurrenceId"], binding["candidateSHA256"]))
+        pending = {source for _, _, source in pending_origins}
         admission = pipeline_admission(self.config["maxPendingCandidates"], active, catalog, pending,
-                                       jobs, diagnostics, confirmed_sources)
+                                       jobs, diagnostics, confirmed_sources, pending_origins, repair_owners)
         material = {"outcomes": outcomes, "officialJobs": jobs, **admission,
                     "pendingOfficialCandidateSHA256": sorted(pending), "autoCheckDiagnostics": diagnostics}
         if comparison_context:

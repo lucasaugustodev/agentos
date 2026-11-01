@@ -234,3 +234,13 @@ definitions/inputs. Qualification now includes 115 server-only tests: generated
 material bindings, the input-hash/source-hash counterexample, immutable repair
 criteria and GET reconciliation of existing create/run receipts. Instructions make
 the contract explicit; they do not prove model compliance or successful GPU work.
+
+Pipeline capacity tracks pending candidates by their originating occurrence, not
+only by source digest. A canonical evidence repair supersedes its predecessor's
+pending claim and retains one native reservation while queued, running or uncertain.
+Its own successful QA retains a reservation until official measurement; confirmed
+failure releases capacity for a new supervised plan without reviving the rejected
+predecessor. The alias requires matching persisted repair identity, original base,
+candidate, patch proof, input scope and predecessor artifacts. Missing or conflicting
+links retain conservative accounting. Equal bytes alone never merge actors, and
+two actual repair actors continue to occupy two native slots.

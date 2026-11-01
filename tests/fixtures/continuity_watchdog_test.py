@@ -490,6 +490,105 @@ class WatchTests(unittest.TestCase):
             self.assertEqual(len(criteria), 1)
             self.assertEqual(criteria[0]['equals'], target['sha256'])
 
+    def repair_capacity_fixture(self):
+        self.config['maxPendingCandidates'] = 3
+        status = self.repairable_operation()
+        self.add_seed(problem='muse_prefill_layer')
+        self.add_gpu_job(problem='muse_attention_decode')
+        self.install_diagnostic_fixture([status])
+        self.assertEqual(self.submit_repair_plan()['state'], 'experiments_dispatched')
+        record = self.w.state['experiments'][-1]
+        return status, record, self.client.occurrences[record['occurrenceId']]
+
+    def test_linked_queued_running_and_uncertain_repair_use_one_slot_and_release_other_board(self):
+        status, record, detail = self.repair_capacity_fixture()
+        queued = copy.deepcopy(detail)
+        for state in ['queued', 'running', 'uncertain']:
+            with self.subTest(state=state):
+                detail.clear(); detail.update(copy.deepcopy(queued))
+                if state != 'queued':
+                    sid, aid = uid(), uid()
+                    detail['occurrence']['state'] = 'running' if state == 'running' else 'attention'
+                    detail['steps'] = [{'id': sid, 'key': 'produce', 'attempt': 1, 'state': 'running'}]
+                    detail['attempts'] = [{'id': aid, 'step_id': sid, 'number': 1, 'fence': uid(),
+                        'state': 'running' if state == 'running' else 'failed', 'receipt': {'stopped': False}}]
+                observation = self.w.observe()
+                self.assertEqual(observation['pipelineUsed'], 2)
+                self.assertEqual(observation['availableCandidateSlots'], 1)
+                self.assertEqual(observation['eligibleProblems'], ['muse_prefill_layer'])
+                owners = [x for x in observation['pipelineOwners'] if x['problem'] == 'muse_decode_layer']
+                self.assertEqual(len(owners), 1)
+                self.assertEqual(owners[0]['occurrenceIds'], [record['occurrenceId']])
+                self.assertEqual(owners[0]['candidateSHA256'], status['candidateSHA256'])
+                self.assertNotIn(status['candidateSHA256'], observation['pendingOfficialCandidateSHA256'])
+        self.assertEqual(self.w.tick()['state'], 'supervisor_dispatched')
+        valid = self.plan(); self.assertEqual(valid['experiments'][0]['problem'], 'muse_prefill_layer')
+        invalid = copy.deepcopy(valid)
+        invalid['experiments'][0].update(problem='muse_decode_layer', sourceArtifactId=
+            next(a['id'] for a in self.client.occurrences[status['occurrenceId']]['artifacts'] if a['name'] == 'candidate.py'))
+        with self.assertRaisesRegex(ValueError, 'BOARD_PIPELINE_OWNED'):
+            W.validate_plan(invalid, self.w.observe(), self.config)
+        self.complete_review(valid)
+        result = self.w.tick()
+        self.assertEqual(result['state'], 'experiments_dispatched')
+        self.assertEqual(result['dispatched'][0]['problem'], 'muse_prefill_layer')
+        self.assertEqual(len([r for r in self.w.state['experiments'] if r.get('repairOf') == status['occurrenceId']]), 1)
+
+    def test_stopped_failed_repair_does_not_revive_rejected_parent_and_wakes_supervisor(self):
+        status, record, detail = self.repair_capacity_fixture()
+        self.client.complete(record['occurrenceId'], {'candidate.py': b'# fixed candidate source\n'}, state='attention')
+        observation = self.w.observe()
+        self.assertEqual(observation['pipelineUsed'], 1)  # Independent official GPU job only.
+        self.assertNotIn(status['candidateSHA256'], observation['pendingOfficialCandidateSHA256'])
+        self.assertIn('muse_decode_layer', observation['eligibleProblems'])
+        self.assertEqual(self.w.tick()['state'], 'supervisor_dispatched')
+        outcome = next(x for x in self.w.state['supervisions'][-1]['input']['outcomes'] if x['occurrenceId'] == record['occurrenceId'])
+        self.assertEqual(outcome['state'], 'attention')
+        self.assertTrue(outcome['failures'])
+
+    def test_completed_approved_repair_keeps_exactly_one_unmeasured_reservation(self):
+        status, record, detail = self.repair_capacity_fixture()
+        self.complete_repair_source(record['occurrenceId'])
+        observation = self.w.observe()
+        self.assertEqual(observation['pipelineUsed'], 2)
+        owners = [x for x in observation['pipelineOwners'] if x['problem'] == 'muse_decode_layer']
+        self.assertEqual(len(owners), 1)
+        self.assertEqual(owners[0]['stages'], ['unmeasured'])
+        self.assertEqual(owners[0]['occurrenceIds'], [record['occurrenceId']])
+        self.assertEqual(observation['pendingOfficialCandidateSHA256'], [status['candidateSHA256']])
+        self.assertNotIn('muse_decode_layer', observation['eligibleProblems'])
+        self.assertIn('muse_prefill_layer', observation['eligibleProblems'])
+
+    def test_wrong_repair_input_parent_hash_or_artifact_cannot_release_capacity(self):
+        status, record, detail = self.repair_capacity_fixture()
+        original = copy.deepcopy(detail['occurrence']['input'])
+        for field in ['parent', 'candidate', 'base', 'artifact', 'patch']:
+            with self.subTest(field=field):
+                detail['occurrence']['input'] = copy.deepcopy(original)
+                packet = detail['occurrence']['input']['experiment']; target = packet['repairTarget']
+                if field == 'parent': target['occurrenceId'] = uid()
+                elif field == 'candidate': target['candidateSHA256'] = 'f' * 64
+                elif field == 'base': packet['sourceArtifact']['digest'] = 'f' * 64
+                elif field == 'patch': target['canonicalPatch']['sha256'] = 'f' * 64
+                else: next(a for a in target['materials'] if a['name'] == 'candidate.py')['artifactId'] = uid()
+                observation = self.w.observe()
+                self.assertEqual(observation['pipelineUsed'], 3)
+                self.assertEqual(observation['availableCandidateSlots'], 0)
+                self.assertEqual(observation['eligibleProblems'], [])
+                self.assertIn(status['candidateSHA256'], observation['pendingOfficialCandidateSHA256'])
+
+    def test_two_actual_repair_actors_are_not_hidden_by_equal_candidate_hash(self):
+        status, record, detail = self.repair_capacity_fixture()
+        other = self.client.make_occurrence(record['cycleId'], {'requestKey': 'second-real-repair',
+            'input': copy.deepcopy(detail['occurrence']['input'])})
+        self.w.state['experiments'].append({**record, 'occurrenceId': other['id']})
+        observation = self.w.observe()
+        self.assertEqual(observation['pipelineUsed'], 3)
+        owners = [x for x in observation['pipelineOwners'] if x['problem'] == 'muse_decode_layer']
+        self.assertEqual(len(owners), 2)
+        self.assertEqual({x['occurrenceIds'][0] for x in owners}, {record['occurrenceId'], other['id']})
+        self.assertEqual(observation['eligibleProblems'], [])
+
     def test_existing_native_definition_and_input_are_reconciled_without_reformulation(self):
         legacy = W.definition(self.config, 'Already dispatched experiment', [
             W.native_step(self.config, 'produce', 'Legacy producer', 'Persisted earlier contract.', ['candidate.py'])])
