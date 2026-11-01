@@ -141,6 +141,16 @@ Workers receive no submission credential or controller capability. Only `check`
 is supported; scoring remains a separate decision. Quota and rate limits come
 from the official account, without an extra daily token/check budget.
 
+CPU evidence binds the actual checker and result hashes. The producer's cases
+and negative controls must match QA in order, count, unique names and true
+boolean `passed`/`detected` flags. QA may omit only a textual `detail` diagnostic;
+if present, it must match the producer's text. Other fields remain exact, so
+omitting or changing an additional requirement is rejected. This comparison is
+an evidence contract, not proof that a command ran: the controller separately
+checks each producer/QA transcript for the actual pinned `sha256sum ... &&
+python3 ...` call and its successful tool result. Report claims cannot replace
+those execution records, source provenance or physical-stop confirmation.
+
 The controller requires actual terminal/stopped executions, matching fences and
 input bytes, read-only workspaces, actual predecessor files delivered to QA,
 source provenance, canonical material hashes, and a byte-reproducible single-file

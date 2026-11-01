@@ -190,6 +190,134 @@ class Fixture(unittest.TestCase):
         self.assertEqual(len(list(pathlib.Path(self.paths["stateDirectory"]).iterdir())), 0)
         self.assertEqual(self.runtime.stopped.call_count, 2)
 
+    def projected_cpu_evidence(self):
+        # Sanitized shape of a real 23-case/9-control report: the producer added
+        # diagnostic detail, while QA followed the instructed name/flag schema.
+        self.cpu['cases'] = [{'name': f'case-{i:02d}', 'passed': True,
+                              'detail': 'Bounded arithmetic diagnostic'} for i in range(23)]
+        self.cpu['negativeControls'] = [{'name': f'control-{i:02d}', 'detected': True,
+                                         'detail': 'Mutated input rejected'} for i in range(9)]
+        evidence = self.qa['cpuEvidence']
+        evidence['resultSHA256'] = A.digest(A.canonical(self.cpu))
+        for name, flag in [('cases', 'passed'), ('negativeControls', 'detected')]:
+            evidence[name] = [{'name': row['name'], flag: row[flag]} for row in self.cpu[name]]
+
+    def semantic_check(self):
+        A.semantic_qa(self.verify, self.qa, self.cpu, A.digest(self.source), A.digest(self.candidate),
+                      A.digest(self.checker), A.digest(A.canonical(self.cpu)))
+
+    def test_projected_cpu_diagnostics_pass_actual_native_audit_without_post(self):
+        self.projected_cpu_evidence()
+        self.detail = self.native_fixture()
+        self.assertEqual(self.lane.run(OCC, 'inspect')['state'], 'eligible')
+        self.assertEqual(self.runtime.stopped.call_count, 2)
+        self.assertEqual(self.official.posts, 0)
+        self.assertEqual(list(pathlib.Path(self.paths['stateDirectory']).iterdir()), [])
+
+    def test_identical_optional_diagnostics_remain_valid(self):
+        self.projected_cpu_evidence()
+        self.qa['cpuEvidence']['cases'] = copy.deepcopy(self.cpu['cases'])
+        self.qa['cpuEvidence']['negativeControls'] = copy.deepcopy(self.cpu['negativeControls'])
+        self.semantic_check()
+
+    def test_case_and_control_projection_rejects_omission_addition_reorder_and_name_drift(self):
+        for name in ['cases', 'negativeControls']:
+            for mutation in ['omit', 'add', 'reorder', 'rename']:
+                with self.subTest(name=name, mutation=mutation):
+                    self.projected_cpu_evidence()
+                    rows = self.qa['cpuEvidence'][name]
+                    if mutation == 'omit': rows.pop()
+                    elif mutation == 'add': rows.append({**rows[0], 'name': 'unexpected'})
+                    elif mutation == 'reorder': rows.reverse()
+                    else: rows[0]['name'] += '-different'
+                    with self.assertRaisesRegex(ValueError, 'CPU_CASES_NOT_REPLAYED'):
+                        self.semantic_check()
+
+    def test_duplicate_case_or_control_identity_is_rejected_even_when_both_reports_match(self):
+        for name in ['cases', 'negativeControls']:
+            with self.subTest(name=name):
+                self.projected_cpu_evidence()
+                self.cpu[name][1]['name'] = self.cpu[name][0]['name']
+                self.qa['cpuEvidence'][name][1]['name'] = self.cpu[name][0]['name']
+                self.qa['cpuEvidence']['resultSHA256'] = A.digest(A.canonical(self.cpu))
+                with self.assertRaisesRegex(ValueError, 'CPU_MEANINGFUL_'):
+                    self.semantic_check()
+
+    def test_projected_flags_are_boolean_and_true_in_both_reports(self):
+        for name, flag in [('cases', 'passed'), ('negativeControls', 'detected')]:
+            for value in [False, 1, 'true', None]:
+                for which in ['producer', 'qa']:
+                    with self.subTest(name=name, value=value, which=which):
+                        self.projected_cpu_evidence()
+                        rows = self.cpu[name] if which == 'producer' else self.qa['cpuEvidence'][name]
+                        rows[0][flag] = value
+                        self.qa['cpuEvidence']['resultSHA256'] = A.digest(A.canonical(self.cpu))
+                        with self.assertRaisesRegex(ValueError, 'CPU_MEANINGFUL_'):
+                            self.semantic_check()
+
+    def test_projection_never_relaxes_checker_result_or_candidate_hash(self):
+        for where, field in [('qa', 'checkerSHA256'), ('qa', 'resultSHA256'),
+                              ('cpu', 'checkerSHA256'), ('cpu', 'candidateSHA256')]:
+            with self.subTest(where=where, field=field):
+                self.projected_cpu_evidence()
+                target = self.qa['cpuEvidence'] if where == 'qa' else self.cpu
+                target[field] = 'f' * 64
+                with self.assertRaisesRegex(ValueError, 'QA_TEST_BINDING|CPU_RESULT_BINDING'):
+                    self.semantic_check()
+
+    def test_optional_detail_cannot_conflict_or_carry_ambiguous_structured_claims(self):
+        for name in ['cases', 'negativeControls']:
+            for detail in ['contradictory diagnostic', {'passed': False}, [], None, True]:
+                with self.subTest(name=name, detail=detail):
+                    self.projected_cpu_evidence()
+                    self.qa['cpuEvidence'][name][0]['detail'] = detail
+                    with self.assertRaisesRegex(ValueError, 'CPU_CASES_NOT_REPLAYED'):
+                        self.semantic_check()
+            self.projected_cpu_evidence()
+            self.cpu[name][0]['detail'] = {'blocking': True}
+            self.qa['cpuEvidence']['resultSHA256'] = A.digest(A.canonical(self.cpu))
+            with self.assertRaisesRegex(ValueError, 'CPU_CASES_NOT_REPLAYED'):
+                self.semantic_check()
+
+    def test_only_text_detail_may_be_omitted_no_other_extra_field(self):
+        for name in ['cases', 'negativeControls']:
+            for which in ['producer', 'qa']:
+                with self.subTest(name=name, which=which):
+                    self.projected_cpu_evidence()
+                    rows = self.cpu[name] if which == 'producer' else self.qa['cpuEvidence'][name]
+                    rows[0]['additionalRequirement'] = 'must not disappear'
+                    self.qa['cpuEvidence']['resultSHA256'] = A.digest(A.canonical(self.cpu))
+                    with self.assertRaisesRegex(ValueError, 'CPU_CASES_NOT_REPLAYED'):
+                        self.semantic_check()
+
+    def test_projected_report_does_not_replace_actual_replay_call_result_pair(self):
+        self.projected_cpu_evidence()
+        self.detail = self.native_fixture()
+        path = pathlib.Path(self.paths['workerRunsDirectory']) / IDS[1] / 'home/sessions/--workspace--' / IDS[1] / 'session.v3.jsonl'
+        self.put(path, A.canonical({'type': 'assistant', 'data': {'text': 'CPU replay passed'}}) + b'\n')
+        with self.assertRaisesRegex(ValueError, 'CPU_REPLAY_EXECUTION_UNPROVEN'):
+            self.lane.run(OCC, 'inspect')
+        self.assertEqual(self.official.posts, 0)
+
+    def test_additional_fields_keep_exact_json_types_despite_python_equality(self):
+        for name in ['cases', 'negativeControls']:
+            for original, claimed in [(1, True), (True, 1), ({'count': 1}, {'count': True}), (1, 1.0)]:
+                with self.subTest(name=name, original=original, claimed=claimed):
+                    self.projected_cpu_evidence()
+                    self.cpu[name][0]['extra'] = original
+                    self.qa['cpuEvidence'][name][0]['extra'] = claimed
+                    self.qa['cpuEvidence']['resultSHA256'] = A.digest(A.canonical(self.cpu))
+                    with self.assertRaisesRegex(ValueError, 'CPU_CASES_NOT_REPLAYED'):
+                        self.semantic_check()
+
+    def test_projected_report_cannot_bypass_unconfirmed_stop(self):
+        self.projected_cpu_evidence()
+        self.detail = self.native_fixture()
+        self.runtime.stopped.side_effect = ValueError('STOP_UNCONFIRMED')
+        with self.assertRaisesRegex(ValueError, 'STOP_UNCONFIRMED'):
+            self.lane.run(OCC, 'inspect')
+        self.assertEqual(self.official.posts, 0)
+
     def test_documentation_only_candidate_cannot_consume_check_quota(self):
         self.candidate = b'"""The proposed optimization was already present."""\n' + self.source
         self.patch = "".join(difflib.unified_diff(self.source.decode().splitlines(keepends=True),

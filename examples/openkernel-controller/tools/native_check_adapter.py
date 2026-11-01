@@ -227,10 +227,18 @@ def semantic_qa(verification, qa, cpu, source_sha, candidate_sha, checker_sha, r
     require(cpu.get("passed") is True and cpu.get("candidateSHA256") == candidate_sha
             and cpu.get("checkerSHA256") == checker_sha, "CPU_RESULT_BINDING")
     for name, flag in (("cases", "passed"), ("negativeControls", "detected")):
-        rows = evidence.get(name)
-        require(isinstance(rows, list) and bool(rows) and all(isinstance(r, dict)
-                and isinstance(r.get("name"), str) and r["name"].strip() and r.get(flag) is True for r in rows), "CPU_MEANINGFUL_" + name)
-        require(cpu.get(name) == rows, "CPU_CASES_NOT_REPLAYED")
+        original, rows = cpu.get(name), evidence.get(name)
+        for report in (original, rows):
+            require(isinstance(report, list) and bool(report) and all(isinstance(r, dict)
+                    and isinstance(r.get("name"), str) and r["name"].strip() and r.get(flag) is True for r in report)
+                    and len({r["name"] for r in report}) == len(report), "CPU_MEANINGFUL_" + name)
+            require(all("detail" not in r or isinstance(r["detail"], str) for r in report), "CPU_CASES_NOT_REPLAYED")
+        # QA is instructed to report name/flag rows. A textual diagnostic may
+        # be omitted; all other fields, identities, order and flags stay exact.
+        require(canonical([{k: v for k, v in r.items() if k != "detail"} for r in original]) ==
+                canonical([{k: v for k, v in r.items() if k != "detail"} for r in rows]), "CPU_CASES_NOT_REPLAYED")
+        require(all("detail" not in review or review["detail"] == source.get("detail")
+                    for source, review in zip(original, rows)), "CPU_CASES_NOT_REPLAYED")
 
 
 def apply_single_file_patch(base, patch):
