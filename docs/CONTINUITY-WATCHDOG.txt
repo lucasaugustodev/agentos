@@ -207,3 +207,11 @@ Invalid bindings, changed references and omissions produce local diagnostics, wi
 injecting unverified text or blocking observations of other boards. Material changes
 participate in that board's read-set proof. Existing persisted review inputs remain
 immutable; changing configuration requires a quiescent review boundary and normal rollout.
+
+Qualification for this context protocol includes 112 server-only tests. They cover
+emitter forgery, fence and attempt mismatches, complete long blockers, legacy strings,
+external report corruption, source/board mismatches, active rule bytes, historical
+references and context limits. A separate read-only replay used actual native QA
+and pinned engineering evidence to verify propagation without a POST or acceptance
+change. Live supervision received the new evidence; better candidate quality or GPU
+performance requires downstream measurement and is not established by these tests.
