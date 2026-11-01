@@ -280,9 +280,10 @@ def validate_config(config, bound=True):
     return config
 
 
-def validate_plan(plan, observation, config):
+def validate_plan(plan, observation, config, expected_fingerprint=None):
     require(type(plan) is dict and set(plan) == {"version", "evidenceFingerprint", "decision", "reason", "experiments"}, "PLAN_FIELDS")
-    require(plan["version"] == 1 and plan["evidenceFingerprint"] == observation["fingerprint"], "PLAN_EVIDENCE")
+    require(plan["version"] == 1 and plan["evidenceFingerprint"] ==
+            (observation["fingerprint"] if expected_fingerprint is None else expected_fingerprint), "PLAN_EVIDENCE")
     require(plan["decision"] in ["experiments", "repair_evidence", "await_external", "observe_active"] and type(plan["reason"]) is str
             and 20 <= len(plan["reason"]) <= 1200, "PLAN_DECISION")
     experiments = plan["experiments"]
@@ -319,6 +320,53 @@ def validate_plan(plan, observation, config):
         require(type(exp["hypothesis"]) is str and 20 <= len(exp["hypothesis"]) <= 1200, "HYPOTHESIS")
         require(type(exp["instructions"]) is str and 50 <= len(exp["instructions"]) <= 12000, "INSTRUCTIONS")
     return plan
+
+
+def action_evidence(observation, config):
+    """Controller-owned read-set proof, independent of the model's plan output.
+
+    Capacity is deliberately rechecked globally at consumption, not frozen in a
+    board hash. An unrelated board completing may release a slot without
+    invalidating an otherwise unchanged experiment. Authority remains global.
+    """
+    diagnostics = observation["autoCheckDiagnostics"]
+    authority = {"config": config, "autoCheckAuthority": {k: diagnostics.get(k) for k in
+                 ["policySHA256", "controllerState", "repairAuthority"]}}
+    boards = {}
+    for problem in PROBLEMS:
+        def selected(rows, fields=None):
+            values = [{k: r[k] for k in fields if k in r} if fields else r
+                      for r in rows if r["problem"] == problem]
+            return sorted(values, key=canonical)
+        catalog = selected(observation["catalog"])
+        ids, hashes = {r["id"] for r in catalog}, {r["digest"] for r in catalog}
+        material = {"problem": problem, "catalog": catalog,
+            "confirmedSourceArtifactIds": sorted(ids & set(observation["confirmedSourceArtifactIds"])),
+            "pendingOfficialCandidateSHA256": sorted(hashes & set(observation["pendingOfficialCandidateSHA256"])),
+            "outcomes": selected(observation["outcomes"],
+                ["occurrenceId", "problem", "state", "failures", "artifacts", "executionEvidence"]),
+            "officialJobs": selected(observation["officialJobs"],
+                ["id", "problem", "sourceSHA256", "status", "result", "caseCounts", "errorLogExcerpt"]),
+            "active": selected(observation["active"], ["occurrenceId", "problem", "state", "attemptIds"]),
+            "pipelineOwners": selected(observation["pipelineOwners"]),
+            "diagnostics": selected(diagnostics["outcomes"]),
+            "repairableEvidence": selected(diagnostics["repairableEvidence"])}
+        boards[problem] = digest(material)
+    return {"version": 1, "authoritySHA256": digest(authority), "boards": boards}
+
+
+def unchanged_action_scope(pending, observation, config):
+    """Legacy reviews and decisions without actions retain global staleness."""
+    proof, plan = pending.get("actionEvidence"), pending["approvedPlan"]
+    if not isinstance(proof, dict) or proof.get("version") != 1 or not plan["experiments"]:
+        return False
+    if plan["decision"] not in ["experiments", "repair_evidence"]:
+        return False
+    current = action_evidence(observation, config)
+    return (proof.get("authoritySHA256") == current["authoritySHA256"]
+            and isinstance(proof.get("boards"), dict)
+            and all(proof["boards"].get(exp["problem"]) == current["boards"].get(exp["problem"])
+                    for exp in plan["experiments"]))
 
 
 def pipeline_admission(limit, active, catalog, pending, jobs, diagnostics, confirmed_sources):
@@ -855,6 +903,7 @@ class Watchdog:
             ["outcomes", "catalog", "officialJobs", "availableCandidateSlots", "pendingOfficialCandidateSHA256", "active", "diagnosticOnly",
              "pipelineLimit", "pipelineUsed", "pipelineOwners", "blockedProblems", "eligibleProblems", "confirmedSourceArtifactIds"]}}}
         body["input"]["priorDispatches"] = self.state["experiments"][-10:]
+        body["input"]["actionEvidence"] = action_evidence(observation, self.config)
         body["input"]["outcomes"] = compact_outcomes(observation["outcomes"])
         body["input"]["autoCheckDiagnostics"] = observation["autoCheckDiagnostics"]
         body["input"]["autoCheckDiagnostics"] = {**observation["autoCheckDiagnostics"], "repairableEvidence": [
@@ -888,7 +937,8 @@ class Watchdog:
         body = requests[key]
         row = self.post_once("run", key, body, self.config["controlCycleId"])
         record = {"occurrenceId": row["id"], "fingerprint": observation["fingerprint"], "input": body["input"],
-                  "createdAt": self.clock(), "state": "dispatched"}
+                  "createdAt": self.clock(), "state": "dispatched",
+                  "actionEvidence": body["input"].get("actionEvidence")}
         self.state["supervisions"].append(record)
         self.state["lastDispatchAt"] = self.clock()
         self.save()
@@ -1086,7 +1136,10 @@ Do not copy former attestations; inspect precision, attribution and replay yours
                 for exp in plan["experiments"]]
         has_intent = any((self.directory / ("intent-" + digest(key + suffix) + ".json")).exists()
                          for key in keys for suffix in ["", "-run"])
-        if observation["fingerprint"] != pending["fingerprint"]:
+        changed = observation["fingerprint"] != pending["fingerprint"]
+        scope_current = unchanged_action_scope(pending, observation, self.config)
+        if ((changed and not scope_current) or
+                (pending.get("actionEvidence") and not scope_current and plan["experiments"])):
             if has_intent or owned:
                 return self.reconcile_changed_plan(pending, observation)
             pending.update({"state": "superseded", "errorCode": "PLAN_OBSERVATION_CHANGED"}); self.save()
@@ -1094,7 +1147,17 @@ Do not copy former attestations; inspect precision, attribution and replay yours
         # observe() excludes this plan's own ACKs to keep its immutable evidence
         # cursor stable. Reserve the whole approved set, count ACKs explicitly,
         # and let post_once reconcile an ambiguous remaining intent via GET only.
-        validate_plan(plan, observation, self.config)
+        # A scoped proof permits only the original selected boards. Capacity,
+        # ownership, eligibility, source boundaries and repair authority are all
+        # checked against the fresh observation below, including partial plans.
+        try:
+            validate_plan(plan, observation, self.config, expected_fingerprint=pending["fingerprint"])
+        except ValueError as error:
+            pending["freshAdmissionError"] = str(error)
+            if has_intent or owned:
+                return self.reconcile_changed_plan(pending, observation)
+            pending.update({"state": "superseded", "errorCode": "PLAN_ADMISSION_CHANGED"}); self.save()
+            return self.status("stale_plan_superseded", occurrenceId=pending["occurrenceId"], code=str(error))
         require(len(owned) <= len(plan["experiments"]), "DISPATCH_RESERVATION_CONFLICT")
         pending["pipelineReservation"] = {"externalUsed": observation["pipelineUsed"],
             "acknowledged": len(owned), "remaining": len(plan["experiments"]) - len(owned),
@@ -1102,12 +1165,18 @@ Do not copy former attestations; inspect precision, attribution and replay yours
         require(pending["pipelineReservation"]["total"] <= self.config["maxPendingCandidates"]
                 or not plan["experiments"], "DISPATCH_PIPELINE_CAPACITY")
         self.save()
+        # Preserve the immutable request body across an unrelated-board change;
+        # post_once must still reconcile an attempted request using GET only.
+        dispatch_observation = {**observation, "fingerprint": pending["fingerprint"]}
         dispatched = []
         for exp in plan["experiments"]:
             existing = [r for r in owned if r["experimentId"] == exp["id"]]
             require(len(existing) <= 1 and (not existing or existing[0]["problem"] == exp["problem"]), "DISPATCH_RESERVATION_CONFLICT")
-            dispatched.append(existing[0] if existing else self.dispatch_experiment(exp, observation, pending))
+            dispatched.append(existing[0] if existing else self.dispatch_experiment(exp, dispatch_observation, pending))
         pending.update({"state": "consumed", "decision": plan["decision"], "reason": plan["reason"]})
+        if changed:
+            pending["acceptedAcrossIndependentChange"] = {"from": pending["fingerprint"], "to": observation["fingerprint"],
+                "problems": sorted({exp["problem"] for exp in plan["experiments"]}), "freshAdmission": pending["pipelineReservation"]}
         self.state["outcomes"][pending["fingerprint"]] = {"supervisorOccurrenceId": pending["occurrenceId"],
             "decision": plan["decision"], "reason": plan["reason"], "dispatched": dispatched,
             "isolatedCandidates": pending["input"].get("isolatedCandidates", [])}

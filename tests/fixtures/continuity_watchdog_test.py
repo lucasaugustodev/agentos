@@ -855,6 +855,139 @@ class WatchTests(unittest.TestCase):
         self.assertEqual(self.w.tick()['state'], 'stale_plan_superseded')
         self.assertEqual(self.w.tick()['state'], 'supervisor_dispatched')
 
+    def prefill_plan_while_decode_qa_runs(self):
+        prefill = self.add_seed()
+        d = self.client.occurrences[self.seed]
+        d['occurrence']['state'] = 'running'; d['attempts'][0].update(state='running', receipt=None)
+        self.assertEqual(self.w.tick()['state'], 'supervisor_dispatched')
+        self.assertEqual(self.w.state['supervisions'][-1]['input']['availableCandidateSlots'], 1)
+        self.complete_review()
+        return prefill
+
+    def test_prefill_plan_survives_other_board_qa_failure_and_dispatches_once(self):
+        self.prefill_plan_while_decode_qa_runs()
+        self.client.complete(self.seed, {'candidate.py': b'# rejected decode\n', 'qa-verification.json': {
+            'passed': False, 'approvedForOfficialReview': False, 'findings': ['prepare has an unbound name']}}, state='attention')
+        result = self.w.tick()
+        self.assertEqual(result['state'], 'experiments_dispatched')
+        self.assertEqual([r['problem'] for r in result['dispatched']], ['muse_prefill_layer'])
+        record = self.w.state['supervisions'][-1]
+        self.assertEqual(record['acceptedAcrossIndependentChange']['freshAdmission']['externalUsed'], 0)
+        self.assertNotEqual(record['acceptedAcrossIndependentChange']['from'], record['acceptedAcrossIndependentChange']['to'])
+        self.assertEqual(len(self.client.posts), 3)
+        self.reload(); self.w.tick()
+        self.assertEqual(sum('/run' in path and body['input'].get('experiment', {}).get('problem') == 'muse_prefill_layer'
+                             for path, body in self.client.posts), 1)
+
+    def test_legacy_plan_without_controller_proof_stays_stale(self):
+        self.prefill_plan_while_decode_qa_runs()
+        record = self.w.state['supervisions'][-1]
+        record.pop('actionEvidence'); record['input'].pop('actionEvidence'); self.w.save()
+        self.client.complete(self.seed, {'candidate.py': b'# rejected decode\n'}, state='attention')
+        self.assertEqual(self.w.tick()['state'], 'stale_plan_superseded')
+        self.assertEqual(len(self.client.posts), 1)
+
+    def test_model_cannot_supply_action_evidence(self):
+        self.w.tick(); plan = self.plan(); plan['actionEvidence'] = self.w.state['supervisions'][-1]['actionEvidence']
+        self.complete_review(plan)
+        self.assertEqual(self.w.tick()['code'], 'PLAN_FIELDS')
+        self.assertEqual(len(self.client.posts), 1)
+
+    def test_same_board_failure_or_source_change_invalidates_plan(self):
+        prefill = self.prefill_plan_while_decode_qa_runs()
+        self.client.complete(prefill, {'candidate.py': b'# new prefill source\n',
+            'qa-verification.json': {'passed': False, 'findings': ['precision changed']}}, state='attention')
+        self.assertEqual(self.w.tick()['state'], 'stale_plan_superseded')
+        self.assertEqual(len(self.client.posts), 1)
+
+    def test_same_board_new_official_measurement_invalidates_plan(self):
+        self.add_gpu_job(problem='muse_decode_layer', status='done')
+        pending, obs = self.prepared_action()
+        obs['officialJobs'][0]['result']['speedup'] = 0.9
+        obs['fingerprint'] = W.digest(obs['officialJobs'])
+        self.assertEqual(self.w.consume_plan(pending, obs)['state'], 'stale_plan_superseded')
+        self.assertEqual(len(self.client.posts), 1)
+
+    def prepared_action(self):
+        self.w.tick(); self.complete_review()
+        pending = self.w.state['supervisions'][-1]
+        pending.update(approvedPlan=self.plan(), state='dispatching'); self.w.save()
+        return pending, self.w.observe(exclude_supervisor=pending['occurrenceId'])
+
+    def test_fresh_global_capacity_rejects_scoped_plan_without_post(self):
+        pending, obs = self.prepared_action()
+        obs.update(fingerprint='f' * 64, pipelineUsed=2, availableCandidateSlots=0, eligibleProblems=[])
+        result = self.w.consume_plan(pending, obs)
+        self.assertEqual(result['state'], 'stale_plan_superseded')
+        self.assertEqual(result['code'], 'PLAN_CAPACITY')
+        self.assertEqual(pending['errorCode'], 'PLAN_ADMISSION_CHANGED')
+        self.assertEqual(len(self.client.posts), 1)
+
+    def test_fresh_eligible_problem_rechecked_even_with_equal_scoped_proof(self):
+        pending, obs = self.prepared_action(); obs['eligibleProblems'] = []
+        result = self.w.consume_plan(pending, obs)
+        self.assertEqual(result['code'], 'BOARD_PIPELINE_OWNED')
+        self.assertEqual(len(self.client.posts), 1)
+
+    def test_owner_source_boundary_and_isolation_change_invalidate_scope(self):
+        pending, original = self.prepared_action()
+        variants = []
+        owner = copy.deepcopy(original); owner['pipelineOwners'].append({'problem': 'muse_decode_layer', 'ownerKey': 'new-owner'})
+        variants.append(owner)
+        boundary = copy.deepcopy(original); boundary['confirmedSourceArtifactIds'] = []; variants.append(boundary)
+        isolated = copy.deepcopy(original); isolated['autoCheckDiagnostics']['outcomes'].append({
+            'problem': 'muse_decode_layer', 'state': 'rejected_repairable', 'code': 'NO_EXECUTABLE_CHANGE',
+            'classification': 'new_hypothesis_required', 'occurrenceId': self.seed,
+            'candidateSHA256': original['catalog'][0]['digest']}); variants.append(isolated)
+        for obs in variants:
+            self.assertFalse(W.unchanged_action_scope(pending, obs, self.config))
+        self.assertEqual(len(self.client.posts), 1)
+
+    def test_policy_and_canonical_authority_change_reject_without_post(self):
+        pending, obs = self.prepared_action(); obs['autoCheckDiagnostics']['policySHA256'] = 'a' * 64
+        self.assertEqual(self.w.consume_plan(pending, obs)['state'], 'stale_plan_superseded')
+        self.assertEqual(len(self.client.posts), 1)
+        config = copy.deepcopy(self.config); config['problemMaterials']['muse_decode_layer'][0]['sha256'] = 'b' * 64
+        self.assertFalse(W.unchanged_action_scope(pending, self.w.observe(), config))
+
+    def test_pause_after_plan_never_dispatches(self):
+        self.prefill_plan_while_decode_qa_runs()
+        self.client.complete(self.seed, {'candidate.py': b'# stopped decode\n'}, state='attention')
+        self.client.cycles[self.config['controlCycleId']]['state'] = 'paused'
+        self.assertEqual(self.w.tick()['state'], 'paused_by_control_cycle')
+        self.assertEqual(len(self.client.posts), 1)
+
+    def test_scoped_fingerprint_ignores_observation_clocks_and_activity(self):
+        pending, obs = self.prepared_action(); changed = copy.deepcopy(obs)
+        changed['outcomes'][0]['progress'] = {'at': '2099-01-01T00:00:00Z', 'kind': 'heartbeat'}
+        changed['outcomes'][0]['finishedAt'] = '2099-01-01T00:00:00Z'
+        changed.update(idleSeconds=200, controllerDispatchAgeSeconds=999, fingerprint='f' * 64)
+        changed['autoCheckDiagnostics']['observedAt'] = 999999
+        self.assertEqual(W.action_evidence(obs, self.config), W.action_evidence(changed, self.config))
+        self.assertTrue(W.unchanged_action_scope(pending, changed, self.config))
+
+    def test_partial_ack_other_board_change_recovers_unknown_run_by_get(self):
+        self.add_seed(); attention = self.add_seed('muse_attention_decode', b'# independent attention\n')
+        self.w.tick(); self.complete_review(self.plan(2)); self.client.timeout_after_commit_number = 5
+        with self.assertRaises(TimeoutError): self.w.tick()
+        self.client.complete(attention, {'candidate.py': b'# unrelated attention outcome\n'})
+        self.reload(); result = self.w.tick()
+        self.assertEqual(result['state'], 'experiments_dispatched')
+        self.assertEqual(len(self.client.posts), 5)
+        self.assertEqual(len(self.w.state['experiments']), 2)
+        self.assertEqual(self.w.state['supervisions'][-1]['pipelineReservation']['acknowledged'], 1)
+
+    def test_partial_ack_other_board_change_keeps_uncertain_run_get_only(self):
+        self.add_seed(); attention = self.add_seed('muse_attention_decode', b'# independent attention\n')
+        self.w.tick(); self.complete_review(self.plan(2)); self.client.timeout_before_commit_number = 5
+        with self.assertRaises(TimeoutError): self.w.tick()
+        self.client.complete(attention, {'candidate.py': b'# unrelated attention outcome\n'})
+        self.reload()
+        with self.assertRaisesRegex(ValueError, 'POST_UNCERTAIN_RECONCILE_ONLY'): self.w.tick()
+        self.assertEqual(len(self.client.posts), 5)
+        self.assertEqual(len(self.w.state['experiments']), 1)
+        self.assertEqual(self.w.state['supervisions'][-1]['state'], 'dispatching')
+
     def test_empty_plan_and_unverified_wait_and_cross_scope_rejected(self):
         self.w.tick(); obs = self.w.observe()
         for edit, code in [(lambda p: p.update(experiments=[]), 'PLAN_CAPACITY'),
