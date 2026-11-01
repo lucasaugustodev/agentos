@@ -347,6 +347,226 @@ class Fixture(unittest.TestCase):
         self.p["boards"][BOARD]["seedSources"] = {}
         with self.assertRaises(OSError): self.audit.audit(OCC)
 
+    def origin_fixture(self, failed_qa=True, alias=False):
+        self.p["nativeSourceOrigins"] = {"enabled": True, "maxDepth": 8,
+            "registryDirectory": str(pathlib.Path(self.paths["stateDirectory"]) / "source-origins")}
+        for a, key in zip(self.detail["attempts"], ("produce", "independent-qa")):
+            a["context"]["manifest"].update(cycleId=CYCLE, occurrenceId=OCC, step=key)
+        if failed_qa:
+            self.detail["occurrence"]["state"] = "attention"
+            self.detail["steps"][1]["state"] = "attention"
+            a = self.detail["attempts"][1]
+            a["state"] = "failed"; a["receipt"] = None
+            self.detail["events"] = [{"kind": "HARNESS_STOPPED", "attempt_id": a["id"], "occurrence_id": OCC,
+                "payload": {"runFence": a["fence"], "confirmed": True, "unit": "agentos-run-" + a["id"],
+                "proof": {"stopped": True, "mainPid": 0, "populated": False, "activeState": "inactive"}}}]
+            self.qa.update(passed=False, approvedForOfficialReview=False, blockingFindings=["synthetic NameError"])
+            qa_row = next(r for r in self.detail["artifacts"] if r["name"] == "qa-verification.json")
+            raw = A.canonical(self.qa); qa_row.update(digest=A.digest(raw), size=len(raw))
+            self.put(pathlib.Path(self.paths["artifactDirectory"]) / qa_row["digest"], raw)
+        row = next(r for r in self.detail["artifacts"] if r["name"] == "candidate.py" and r["attempt_id"] == IDS[0])
+        if alias:
+            row = self.artifact("candidate.py", self.candidate, IDS[1])
+            self.detail["artifacts"].append(row)
+        return {**row, "occurrenceId": OCC, "problem": BOARD}
+
+    def origin(self, source):
+        return self.audit.source_provenance(BOARD, source["digest"], source)
+
+    def test_failed_source_origin_keeps_quality_false_and_qa_state(self):
+        source = self.origin_fixture()
+        refs = self.origin(source)
+        report = A.strict_json(A.pinned(refs[0]))
+        self.assertEqual(report["authority"], "authorized-native-source-origin")
+        self.assertFalse(report["qualityAccepted"])
+        self.assertFalse(report["qa"]["reportedPassed"])
+        self.assertFalse(report["qa"]["reportedApprovedForOfficialReview"])
+        self.assertEqual(report["qa"]["state"], "failed")
+        self.assertEqual(report["baseSHA256"], A.digest(self.source))
+        self.assertEqual(self.origin(source), refs)
+        self.assertEqual(self.official.posts, 0)
+        self.assertFalse(list(pathlib.Path(self.paths["stateDirectory"]).glob("*-audit.json")))
+
+    def test_qa_copy_resolves_exact_producer_and_handoff(self):
+        source = self.origin_fixture(alias=True)
+        report = A.strict_json(A.pinned(self.origin(source)[0]))
+        self.assertEqual(report["selectedArtifactId"], source["id"])
+        self.assertNotEqual(report["selectedArtifactId"], report["producerArtifactId"])
+        self.assertEqual(report["identities"]["produce"]["attemptId"], IDS[0])
+        path = pathlib.Path(self.paths["workerRunsDirectory"]) / IDS[1] / "home/inputs" / report["producerArtifactId"] / "candidate.py"
+        self.put(path, b"wrong bytes")
+        with self.assertRaisesRegex(ValueError, "SOURCE_ORIGIN_HANDOFF_CHANGED"): self.origin(source)
+
+    def test_source_origin_rejects_arbitrary_alias_same_hash(self):
+        source = self.origin_fixture()
+        source["id"] = "99999999-9999-9999-9999-999999999999"
+        with self.assertRaisesRegex(ValueError, "SOURCE_ORIGIN_ARTIFACT_ALIAS"): self.origin(source)
+
+    def test_source_origin_no_live_or_uncertain_parent_reuse(self):
+        source = self.origin_fixture()
+        for mutation in ("live", "wrong_fence", "populated"):
+            detail = copy.deepcopy(self.detail)
+            if mutation == "live": self.detail["attempts"][1]["state"] = "running"
+            elif mutation == "wrong_fence": self.detail["events"][0]["payload"]["runFence"] = IDS[0]
+            else: self.detail["events"][0]["payload"]["proof"]["populated"] = True
+            with self.subTest(mutation=mutation), self.assertRaisesRegex(ValueError, "SOURCE_ORIGIN_OWNER_UNCONFIRMED"):
+                self.origin(source)
+            self.detail = detail
+        self.runtime.stopped.side_effect = ValueError("ACTUAL_UNIT_STILL_RUNNING")
+        with self.assertRaisesRegex(ValueError, "SOURCE_ORIGIN_INCONSISTENT:ACTUAL_UNIT"): self.origin(source)
+
+    def test_source_origin_wrong_attempt_model_and_manifest_rejected(self):
+        source = self.origin_fixture()
+        for key in ("account_id", "model", "number"):
+            original = self.detail["attempts"][0][key]
+            self.detail["attempts"][0][key] = 2 if key == "number" else "wrong"
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, "SOURCE_ORIGIN_ATTEMPT_BINDING"): self.origin(source)
+            self.detail["attempts"][0][key] = original
+        self.detail["attempts"][0]["context"]["manifest"]["cycleInput"]["digest"] = "0" * 64
+        with self.assertRaisesRegex(ValueError, "SOURCE_ORIGIN_INPUT_CHANGED"): self.origin(source)
+
+    def test_source_origin_dispatch_binding_cannot_be_skipped(self):
+        source = self.origin_fixture()
+        directory = pathlib.Path(self.paths["watcherStateDirectory"])
+        state = A.strict_json((directory / "state.json").read_bytes())
+        state["experiments"][0]["supervisorOccurrenceId"] = IDS[0]
+        self.put(directory / "state.json", A.canonical(state))
+        with self.assertRaisesRegex(ValueError, "SOURCE_ORIGIN_INCONSISTENT:SUPERVISOR_LINEAGE"): self.origin(source)
+
+    def test_source_origin_patch_replay_and_qa_hash_binding(self):
+        source = self.origin_fixture()
+        patch = next(r for r in self.detail["artifacts"] if r["name"] == "implementation.patch")
+        raw = self.patch.replace(b"return x + 1", b"return x + 2")
+        patch.update(digest=A.digest(raw), size=len(raw)); self.put(pathlib.Path(self.paths["artifactDirectory"]) / patch["digest"], raw)
+        with self.assertRaisesRegex(ValueError, "SOURCE_ORIGIN_PATCH_CHANGED"): self.origin(source)
+        patch.update(digest=A.digest(self.patch), size=len(self.patch))
+        qa = next(r for r in self.detail["artifacts"] if r["name"] == "qa-verification.json")
+        raw = A.canonical({**self.qa, "candidateSHA256": "0" * 64})
+        qa.update(digest=A.digest(raw), size=len(raw)); self.put(pathlib.Path(self.paths["artifactDirectory"]) / qa["digest"], raw)
+        with self.assertRaisesRegex(ValueError, "SOURCE_ORIGIN_QA_BINDING"): self.origin(source)
+
+    def test_source_origin_depth_cycle_and_optional_policy(self):
+        source = self.origin_fixture()
+        with self.assertRaisesRegex(ValueError, "SOURCE_ORIGIN_CYCLE"):
+            self.audit.source_provenance(BOARD, source["digest"], source, (OCC,))
+        with self.assertRaisesRegex(ValueError, "SOURCE_ORIGIN_DEPTH"):
+            self.audit.source_provenance(BOARD, source["digest"], source, tuple(str(n) for n in range(8)))
+        self.p["nativeSourceOrigins"]["enabled"] = False
+        with self.assertRaises(FileNotFoundError): self.origin(source)
+        for change in ({"maxDepth": 9}, {"maxDepth": True}, {"registryDirectory": "/tmp/origins"}):
+            p = copy.deepcopy(self.p); p["nativeSourceOrigins"].update(change)
+            with self.assertRaisesRegex(ValueError, "SOURCE_ORIGIN_POLICY_SCOPE"): A.validate_policy(p, NOW, "a" * 64)
+
+    def test_source_origin_missing_reads_are_not_kernel_repairs(self):
+        source = self.origin_fixture()
+        home = pathlib.Path(self.paths["workerRunsDirectory"]) / IDS[0] / "home/inputs" / IDS[0] / "cycle-input.json"
+        home.unlink()
+        with self.assertRaisesRegex(ValueError, "SOURCE_ORIGIN_READ_UNAVAILABLE"): self.origin(source)
+        self.detail["occurrence"]["state"] = "completed"
+        self.lane.audit.audit = mock.Mock(side_effect=ValueError("SOURCE_ORIGIN_READ_UNAVAILABLE"))
+        row = A.scan(self.lane, self.root / "status.json", "inspect")["outcomes"][0]
+        self.assertEqual(row["state"], "observation_wait")
+        self.lane.audit.audit.side_effect = ValueError("SOURCE_ORIGIN_PATCH_CHANGED")
+        row = A.scan(self.lane, self.root / "status.json", "inspect")["outcomes"][0]
+        self.assertEqual(row["state"], "controller_blocked")
+        self.assertEqual(self.official.posts, 0)
+
+    def test_source_origin_error_cannot_disown_external_post(self):
+        self.lane.run(OCC, "check")
+        pathlib.Path(self.paths["registryPath"]).unlink()
+        self.audit.audit = mock.Mock(side_effect=ValueError("SOURCE_ORIGIN_PATCH_CHANGED"))
+        row = A.scan(self.lane, self.root / "status.json", "check")["outcomes"][0]
+        self.assertEqual(row["state"], "check_running")
+        self.assertEqual(self.official.posts, 1)
+
+    def test_source_origin_does_not_relax_final_candidate_qa(self):
+        self.origin_fixture(failed_qa=False)
+        self.qa["approvedForOfficialReview"] = False
+        row = next(r for r in self.detail["artifacts"] if r["name"] == "qa-verification.json")
+        raw = A.canonical(self.qa); row.update(size=len(raw), digest=A.digest(raw))
+        self.put(pathlib.Path(self.paths["artifactDirectory"]) / row["digest"], raw)
+        with self.assertRaisesRegex(ValueError, "QA_NOT_APPROVED"): self.audit.audit(OCC)
+        self.assertEqual(self.official.posts, 0)
+
+    def derived_origin_fixture(self):
+        """A real two-occurrence fixture: rejected parent -> corrected child."""
+        self.origin_fixture()
+        parent_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        mapping = {OCC: parent_id, CYCLE: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+                   IDS[0]: "cccccccc-cccc-cccc-cccc-cccccccccccc", IDS[1]: "dddddddd-dddd-dddd-dddd-dddddddddddd"}
+        for i, row in enumerate(self.detail["artifacts"]): mapping[row["id"]] = f"eeeeeeee-eeee-eeee-eeee-{i:012d}"
+        raw = A.canonical(self.detail).decode()
+        for old, new in mapping.items(): raw = raw.replace(old, new)
+        parent = A.strict_json(raw)
+        for old, new in zip(self.detail["attempts"], parent["attempts"]):
+            home = pathlib.Path(self.paths["workerRunsDirectory"]) / new["id"] / "home"
+            input_raw = A.canonical(parent["occurrence"]["input"])
+            self.put(home / "inputs" / new["id"] / "cycle-input.json", input_raw)
+            new["context"]["manifest"]["cycleInput"].update(digest=A.digest(input_raw), size=len(input_raw))
+        parent_qa_home = pathlib.Path(self.paths["workerRunsDirectory"]) / mapping[IDS[1]] / "home"
+        for row in parent["artifacts"]:
+            if row["attempt_id"] == mapping[IDS[0]]:
+                self.put(parent_qa_home / "inputs" / row["id"] / row["name"], (pathlib.Path(self.paths["artifactDirectory"]) / row["digest"]).read_bytes())
+        parent_key = WATCH + "-experiment-" + "e" * 32 + "-run"
+        parent["occurrence"]["source_key"] = "manual:" + parent_key
+        directory = pathlib.Path(self.paths["watcherStateDirectory"])
+        def receipts(detail, key):
+            o = detail["occurrence"]
+            for kind, k, result, body in (("run", key, o, {"requestKey": key, "input": o["input"]}),
+                    ("create", key[:-4], {"id": o["cycle_id"], "definition": o["definition"]}, {"requestKey": key[:-4], "definition": o["definition"]})):
+                self.put(directory / ("intent-" + A.digest(k) + ".json"), A.canonical({"state": "recorded", "kind": kind,
+                    "requestKey": k, "requestDigest": A.digest(body), "result": result}))
+        receipts(parent, parent_key)
+        self.source = self.candidate; self.candidate = b"def kernel(x):\n    return x + 2\n"
+        self.patch = "".join(difflib.unified_diff(self.source.decode().splitlines(keepends=True), self.candidate.decode().splitlines(keepends=True), fromfile="base-candidate.py", tofile="candidate.py")).encode()
+        self.cpu["candidateSHA256"] = A.digest(self.candidate)
+        self.verify.update(sourceSHA256=A.digest(self.source), candidateSHA256=A.digest(self.candidate))
+        self.qa.update(self.verify); self.qa.update(passed=True, approvedForOfficialReview=True, blockingFindings=[])
+        self.qa["cpuEvidence"]["resultSHA256"] = A.digest(A.canonical(self.cpu))
+        self.detail = self.native_fixture()
+        source = next(r for r in parent["artifacts"] if r["name"] == "candidate.py" and r["attempt_id"] == mapping[IDS[0]])
+        self.detail["occurrence"]["input"]["experiment"]["sourceArtifact"] = {**source, "occurrenceId": parent_id, "problem": BOARD}
+        for a, key in zip(self.detail["attempts"], ("produce", "independent-qa")):
+            raw = A.canonical(self.detail["occurrence"]["input"])
+            self.put(pathlib.Path(self.paths["workerRunsDirectory"]) / a["id"] / "home/inputs" / a["id"] / "cycle-input.json", raw)
+            a["context"]["manifest"].update(cycleId=CYCLE, occurrenceId=OCC, step=key)
+            a["context"]["manifest"]["cycleInput"].update(digest=A.digest(raw), size=len(raw))
+        receipts(self.detail, self.detail["occurrence"]["source_key"][7:])
+        state = A.strict_json((directory / "state.json").read_bytes())
+        state["experiments"].append({"occurrenceId": parent_id, "cycleId": parent["occurrence"]["cycle_id"], "problem": BOARD, "supervisorOccurrenceId": SUPERVISOR})
+        self.put(directory / "state.json", A.canonical(state))
+        self.runtime.api = lambda method, path: copy.deepcopy(parent if path.endswith(parent_id) else self.detail)
+        return parent
+
+    def test_corrected_child_passes_own_qa_without_accepting_parent(self):
+        self.derived_origin_fixture()
+        report, _, candidate = self.audit.audit(OCC)
+        parent = A.strict_json(A.pinned(report["provenance"][0]))
+        self.assertEqual(candidate, self.candidate)
+        self.assertFalse(parent["qualityAccepted"])
+        self.assertFalse(parent["qa"]["reportedPassed"])
+        self.assertEqual(report["authority"], "delegated-policy-and-independent-native-QA")
+        self.assertEqual(self.official.posts, 0)
+
+    def test_source_origin_walks_two_hops_to_seed_and_rechecks_parent(self):
+        parent = self.derived_origin_fixture()
+        row = next(r for r in self.detail["artifacts"] if r["name"] == "candidate.py")
+        source = {**row, "occurrenceId": OCC, "problem": BOARD}
+        refs = self.origin(source)
+        self.assertEqual(len(refs), 3)
+        self.assertEqual(A.strict_json(A.pinned(refs[0]))["baseSHA256"], A.digest(self.source))
+        self.assertFalse(A.strict_json(A.pinned(refs[1]))["qa"]["reportedPassed"])
+        parent["attempts"][1]["state"] = "running"
+        with self.assertRaisesRegex(ValueError, "SOURCE_ORIGIN_OWNER_UNCONFIRMED"): self.origin(source)
+
+    def test_source_origin_registry_protection_before_writing(self):
+        source = self.origin_fixture()
+        directory = pathlib.Path(self.p["nativeSourceOrigins"]["registryDirectory"])
+        outside = self.root / "wrong-origin-directory"; outside.mkdir(mode=0o700)
+        directory.symlink_to(outside)
+        with self.assertRaisesRegex(ValueError, "SOURCE_ORIGIN_REGISTRY_SCOPE"): self.origin(source)
+        self.assertEqual(list(outside.iterdir()), [])
+
     def test_semantics_no_precision_trade_or_false_approval(self):
         for change in ({"canonicalPrecisionPreserved": False}, {"evaluatorIndependent": False}, {"upstreamAttributionPreserved": False},
                        {"approvedForOfficialReview": False}, {"blockingFindings": ["wrong rounding"]}, {"gpuValidated": True},

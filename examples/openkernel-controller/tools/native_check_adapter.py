@@ -124,6 +124,12 @@ def validate_policy(policy, now, adapter_sha, allow_disabled=False):
     require(type(policy.get("minimumChecksRemaining")) is int and policy["minimumChecksRemaining"] >= 0, "QUOTA_RESERVE")
     for key in ("accountId", "model", "stateDirectory", "legacyLedger", "accountLock", "watcherStateDirectory", "registryPath", "artifactDirectory", "workerRunsDirectory"):
         require(isinstance(policy.get(key), str) and policy[key], "POLICY_FIELD_" + key)
+    origins = policy.get("nativeSourceOrigins")
+    if origins is not None:
+        require(isinstance(origins, dict) and type(origins.get("enabled")) is bool
+                and type(origins.get("maxDepth")) is int and 1 <= origins["maxDepth"] <= 8
+                and origins.get("registryDirectory") == str(pathlib.Path(policy["stateDirectory"]) / "source-origins")
+                and pathlib.Path(origins["registryDirectory"]).is_absolute(), "SOURCE_ORIGIN_POLICY_SCOPE")
     require(SHA.fullmatch(policy.get("rulesEvidence", {}).get("llmsSha256", ""))
             and isinstance(policy["rulesEvidence"].get("version"), str), "RULES_BINDING")
     for board in policy["boards"]:
@@ -384,7 +390,7 @@ class NativeAudit:
         base_sha = digest(materials["base-candidate.py"])
         source_artifact = experiment["sourceArtifact"]
         require(source_artifact["digest"] == base_sha and self.artifact(source_artifact) == materials["base-candidate.py"], "BASE_SOURCE_CHANGED")
-        provenance = self.source_provenance(problem, base_sha)
+        provenance = self.source_provenance(problem, base_sha, source_artifact)
         for i, ref in enumerate(provenance):
             frozen["provenance--" + str(i) + ".json"] = pinned(ref)
         producer = files["produce"]
@@ -409,17 +415,177 @@ class NativeAudit:
                   "files": {name: digest(raw) for name, raw in sorted(frozen.items())}}
         return report, frozen, producer["candidate.py"]
 
-    def source_provenance(self, problem, source_sha):
+    def source_provenance(self, problem, source_sha, source_artifact=None, ancestry=()):
         seed = self.p["boards"][problem]["seedSources"].get(source_sha)
         if seed:
             return seed["provenance"]
         # Completed automatic derivatives retain the entire frozen ancestry.
         path = pathlib.Path(self.p["stateDirectory"]) / (problem + "-" + source_sha + "-audit.json")
-        raw = protected(path, immutable=True)
+        try:
+            raw = protected(path, immutable=True)
+        except FileNotFoundError:
+            if self.p.get("nativeSourceOrigins", {}).get("enabled") is not True:
+                raise
+            return self.source_origin(problem, source_sha, source_artifact, ancestry)
         audit = strict_json(raw)
         require(audit.get("watchId") == self.p["watchId"] and audit.get("problem") == problem
                 and audit.get("sourceSHA256") == source_sha, "BASE_PROVENANCE_SCOPE")
         return [{"path": str(path), "sha256": digest(raw)}] + audit["provenance"]
+
+    def source_origin(self, problem, source_sha, source_artifact, ancestry):
+        """Prove where source bytes came from; never promote a failed QA.
+
+        A rejected experiment can be corrected from its own source. Its origin
+        receipt is separate from an acceptance audit and cannot authorize CHECK.
+        Every hop is reread, including the current stopped boundary and immutable
+        dispatch/input/material bindings. No worker code executes in this lane.
+        """
+        try:
+            return self._source_origin(problem, source_sha, source_artifact, ancestry)
+        except FileNotFoundError as error:
+            raise ValueError("SOURCE_ORIGIN_READ_UNAVAILABLE") from error
+        except (KeyError, TypeError, RecursionError) as error:
+            raise ValueError("SOURCE_ORIGIN_INCONSISTENT_SCHEMA") from error
+        except ValueError as error:
+            if str(error).startswith("SOURCE_ORIGIN_"):
+                raise
+            raise ValueError("SOURCE_ORIGIN_INCONSISTENT:" + str(error)[:100]) from error
+
+    def _source_origin(self, problem, source_sha, source_artifact, ancestry):
+        options = self.p["nativeSourceOrigins"]
+        require(len(ancestry) < options["maxDepth"], "SOURCE_ORIGIN_DEPTH")
+        require(isinstance(source_artifact, dict) and UUID.fullmatch(source_artifact.get("occurrenceId", ""))
+                and source_artifact.get("problem") == problem and source_artifact.get("name") == "candidate.py"
+                and source_artifact.get("digest") == source_sha, "SOURCE_ORIGIN_ABSENT")
+        occurrence_id = source_artifact["occurrenceId"]
+        require(occurrence_id not in ancestry, "SOURCE_ORIGIN_CYCLE")
+        detail = self.runtime.api("GET", "/api/cycle-runs/" + occurrence_id)
+        occurrence = detail["occurrence"]
+        require(occurrence.get("id") == occurrence_id and occurrence.get("state") in {"completed", "attention", "failed"},
+                "SOURCE_ORIGIN_OWNER_UNCONFIRMED")
+        dispatch, receipts = self.dispatch(occurrence)
+        inp, definition = occurrence["input"], occurrence["definition"]
+        require(dispatch["problem"] == problem and inp.get("watchId") == self.p["watchId"]
+                and all(inp.get(k) is False for k in ("officialActionsAllowed", "productionActionsAllowed", "sourceWriteAllowed")),
+                "SOURCE_ORIGIN_CAPABILITY_SCOPE")
+        require(definition.get("project") == "openkernel" and definition.get("allowedActions") == []
+                and definition.get("allowedAccounts") == [self.p["accountId"]], "SOURCE_ORIGIN_DEFINITION_SCOPE")
+        specs = definition["steps"]
+        require(len(specs) == 2 and [s["key"] for s in specs] == ["produce", "independent-qa"]
+                and specs[0].get("dependsOn") == [] and specs[1].get("dependsOn") == ["produce"], "SOURCE_ORIGIN_DAG")
+        for spec in specs:
+            require(spec.get("kind") == "agent" and spec.get("readOnly") is True
+                    and spec.get("workspace") == self.p["workspace"] and spec.get("model") == self.p["model"]
+                    and spec.get("accountId") == self.p["accountId"] and spec.get("maxAttempts") == 1
+                    and not spec.get("sourceStep"), "SOURCE_ORIGIN_EXECUTOR_SCOPE")
+        require(len(detail["steps"]) == 2 and len(detail["attempts"]) == 2, "SOURCE_ORIGIN_ATTEMPT_SET")
+        identities, attempts, frozen = {}, {}, {}
+        for spec in specs:
+            key = spec["key"]
+            steps = [s for s in detail["steps"] if s["key"] == key]
+            require(len(steps) == 1 and steps[0].get("definition") == spec, "SOURCE_ORIGIN_STEP_BINDING")
+            rows = [a for a in detail["attempts"] if a["step_id"] == steps[0]["id"]]
+            require(len(rows) == 1, "SOURCE_ORIGIN_ATTEMPT_SET")
+            a = rows[0]
+            require(UUID.fullmatch(a["id"]) and UUID.fullmatch(a["fence"]) and a["number"] == 1
+                    and a.get("finished_at") and a.get("model") == self.p["model"]
+                    and a.get("account_id") == self.p["accountId"], "SOURCE_ORIGIN_ATTEMPT_BINDING")
+            require((key == "produce" and a["state"] == steps[0]["state"] == "completed")
+                    or (key == "independent-qa" and a["state"] in {"completed", "failed"}
+                        and steps[0]["state"] in {"completed", "failed", "attention"}), "SOURCE_ORIGIN_OWNER_UNCONFIRMED")
+            stopped = (a.get("receipt") or {}).get("stopped") is True
+            stop_events = [e for e in detail.get("events", []) if e.get("kind") == "HARNESS_STOPPED"
+                           and e.get("attempt_id") == a["id"] and e.get("occurrence_id") == occurrence_id
+                           and e.get("payload", {}).get("runFence") == a["fence"]
+                           and e["payload"].get("confirmed") is True
+                           and e["payload"].get("unit") == "agentos-run-" + a["id"]
+                           and e["payload"].get("proof", {}).get("stopped") is True
+                           and e["payload"]["proof"].get("mainPid") == 0
+                           and e["payload"]["proof"].get("populated") is False
+                           and e["payload"]["proof"].get("activeState") == "inactive"]
+            require(stopped or bool(stop_events), "SOURCE_ORIGIN_OWNER_UNCONFIRMED")
+            self.runtime.stopped(a["id"])
+            raw = self.io.read_regular(self.runs / a["id"] / "home/inputs" / a["id"] / "cycle-input.json", 2 * 1024 * 1024)
+            manifest = a["context"]["manifest"]
+            binding = manifest["cycleInput"]
+            require(manifest.get("cycleId") == occurrence["cycle_id"] and manifest.get("occurrenceId") == occurrence_id
+                    and manifest.get("step") == key and binding["attemptId"] == a["id"] and binding["runFence"] == a["fence"]
+                    and binding["digest"] == digest(raw) and binding["size"] == len(raw) and strict_json(raw) == inp,
+                    "SOURCE_ORIGIN_INPUT_CHANGED")
+            attempts[key] = a
+            identities[key] = {"attemptId": a["id"], "fence": a["fence"], "state": a["state"], "finishedAt": a["finished_at"],
+                               "inputSHA256": digest(raw), "manifestSHA256": digest(manifest), "stopConfirmed": True}
+            frozen[key + "-input.json"] = raw
+            frozen[key + "-identity.json"] = canonical({**identities[key], "accountId": a["account_id"],
+                "model": a["model"], "manifest": manifest, "receiptStopped": stopped, "stopEvents": stop_events})
+        require(attempts["produce"]["id"] != attempts["independent-qa"]["id"], "SOURCE_ORIGIN_QA_IDENTITY")
+        def artifact_for(key, name):
+            matches = [r for r in detail["artifacts"] if r["attempt_id"] == attempts[key]["id"] and r["name"] == name]
+            require(len(matches) == 1, "SOURCE_ORIGIN_ARTIFACT_SET")
+            row = matches[0]
+            return row, self.artifact(row)
+        producer_row, candidate = artifact_for("produce", "candidate.py")
+        require(digest(candidate) == source_sha, "SOURCE_ORIGIN_CANDIDATE_CHANGED")
+        selected = [r for r in detail["artifacts"] if r["id"] == source_artifact["id"]]
+        require(len(selected) == 1 and all(selected[0].get(k) == source_artifact.get(k) for k in ("id", "name", "digest", "size"))
+                and selected[0]["attempt_id"] in {a["id"] for a in attempts.values()}
+                and self.artifact(selected[0]) == candidate, "SOURCE_ORIGIN_ARTIFACT_ALIAS")
+        # A QA-published copy is a transport alias, not independent source. The
+        # producer artifact and exact handed-off bytes must both be established.
+        qa_home = self.runs / attempts["independent-qa"]["id"] / "home"
+        handed = self.io.read_regular(qa_home / "inputs" / producer_row["id"] / "candidate.py", 1024 * 1024)
+        require(handed == candidate, "SOURCE_ORIGIN_HANDOFF_CHANGED")
+        qa_row, qa_raw = artifact_for("independent-qa", "qa-verification.json")
+        qa = strict_json(qa_raw)
+        patch_row, patch = artifact_for("produce", "implementation.patch")
+        experiment, materials = inp["experiment"], {}
+        require(experiment.get("problem") == problem, "SOURCE_ORIGIN_BOARD_CHANGED")
+        for row in experiment["materials"]:
+            require(row["name"] not in materials, "SOURCE_ORIGIN_MATERIAL_DUPLICATE")
+            raw = base64.b64decode(row["base64"], validate=True)
+            require(len(raw) == row["bytes"] and digest(raw) == row["sha256"], "SOURCE_ORIGIN_MATERIAL_CHANGED")
+            materials[row["name"]] = raw
+        contract = self.p["boards"][problem]
+        require(set(materials) == {"base-candidate.py", *contract["materials"]}
+                and all(digest(materials[n]) == sha for n, sha in contract["materials"].items()), "SOURCE_ORIGIN_CANONICAL_CHANGED")
+        base, parent = materials["base-candidate.py"], experiment["sourceArtifact"]
+        base_sha = digest(base)
+        require(parent["digest"] == base_sha and self.artifact(parent) == base, "SOURCE_ORIGIN_BASE_CHANGED")
+        require(apply_single_file_patch(base, patch) == candidate, "SOURCE_ORIGIN_PATCH_CHANGED")
+        require(qa.get("sourceSHA256") == base_sha and qa.get("candidateSHA256") == source_sha
+                and type(qa.get("passed")) is bool and type(qa.get("approvedForOfficialReview")) is bool, "SOURCE_ORIGIN_QA_BINDING")
+        provenance = self.source_provenance(problem, base_sha, parent, (*ancestry, occurrence_id))
+        for i, ref in enumerate(provenance): frozen["ancestor-" + str(i) + ".json"] = pinned(ref)
+        frozen.update({"candidate.py": candidate, "base-candidate.py": base, "implementation.patch": patch,
+                       "qa-verification.json": qa_raw, "dispatch-run.json": receipts["run"], "dispatch-create.json": receipts["create"]})
+        report = {"version": 1, "authority": "authorized-native-source-origin", "qualityAccepted": False,
+                  "gpuValidated": False, "candidateExecutedByController": False, "watchId": self.p["watchId"],
+                  "problem": problem, "sourceSHA256": source_sha, "baseSHA256": base_sha, "occurrenceId": occurrence_id,
+                  "cycleId": occurrence["cycle_id"], "occurrenceState": occurrence["state"], "selectedArtifactId": source_artifact["id"],
+                  "producerArtifactId": producer_row["id"], "selectedArtifactAttemptId": selected[0]["attempt_id"],
+                  "identities": identities, "patchSHA256": patch_row["digest"], "dispatchReceiptSHA256": digest(receipts["run"]),
+                  "qa": {"artifactId": qa_row["id"], "sha256": qa_row["digest"], "state": attempts["independent-qa"]["state"],
+                         "reportedPassed": qa["passed"], "reportedApprovedForOfficialReview": qa["approvedForOfficialReview"]},
+                  "provenance": provenance, "files": {k: digest(v) for k, v in sorted(frozen.items())}}
+        directory = pathlib.Path(options["registryDirectory"])
+        require(directory == pathlib.Path(self.p["stateDirectory"]) / "source-origins" and directory.resolve() == directory,
+                "SOURCE_ORIGIN_REGISTRY_SCOPE")
+        def protected_directory(path):
+            require(path.is_dir() and path.resolve() == path, "SOURCE_ORIGIN_REGISTRY_SCOPE")
+            for part in (path, *path.parents):
+                info = part.lstat()
+                require(info.st_uid == 0 and not info.st_mode & 0o022 and not stat.S_ISLNK(info.st_mode), "SOURCE_ORIGIN_REGISTRY_PROTECTION")
+        protected_directory(directory.parent)
+        directory.mkdir(mode=0o700, exist_ok=True)
+        protected_directory(directory)
+        folder = directory / (problem + "-" + source_sha + "-" + source_artifact["id"])
+        folder.mkdir(mode=0o700, exist_ok=True)
+        protected_directory(folder)
+        for name, raw in frozen.items(): self.io.immutable_snapshot(folder / name, raw)
+        path, raw = folder / "origin.json", canonical(report)
+        self.io.immutable_snapshot(path, raw)
+        require(protected(path, immutable=True) == raw, "SOURCE_ORIGIN_REGISTRY_CHANGED")
+        return [{"path": str(path), "sha256": digest(raw)}, *provenance]
 
 
 class OfficialLane:
@@ -649,6 +815,12 @@ def scan(lane, status_path, mode):
                 status, remediation = "observation_wait", "retry_read_only_observation_preserve_owner"
             elif isinstance(error, subprocess.TimeoutExpired):
                 status, remediation = "observation_wait", "retry_read_only_observation_preserve_owner"
+            elif code == "SOURCE_ORIGIN_READ_UNAVAILABLE":
+                status, remediation = "observation_wait", "retry_source_origin_observation_preserve_owner"
+            elif code == "SOURCE_ORIGIN_OWNER_UNCONFIRMED":
+                status, remediation = "await_native", "preserve_source_native_owner"
+            elif code.startswith("SOURCE_ORIGIN_"):
+                status, remediation = "controller_blocked", "reconcile_source_origin_without_replacing_candidate"
             elif isinstance(error, ValueError) and (code.startswith(("CPU_", "QA_", "PATCH_"))
                     or code in {"NO_CANDIDATE_CHANGE", "NO_EXECUTABLE_CHANGE", "SOURCE_REQUIRES_MANUAL_REVIEW"}):
                 status, remediation = "rejected_repairable", "supervisor_review_evidence_and_plan_native_correction"

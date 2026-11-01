@@ -191,6 +191,39 @@ must consume repairable rejections and wake its supervisor before activation;
 installing a timer that merely logs those errors would recreate the pending-queue
 stall. Do not activate only half of this integration.
 
+An optional `nativeSourceOrigins` policy permits correcting code from a rejected
+native experiment without treating that rejection as acceptance:
+
+```json
+{
+  "nativeSourceOrigins": {
+    "enabled": true,
+    "maxDepth": 8,
+    "registryDirectory": "/var/lib/example-controller/source-origins"
+  }
+}
+```
+
+The directory must be exactly `stateDirectory/source-origins`. Existing seed and
+successful-audit provenance remains unchanged. Otherwise the controller follows
+the selected artifact's authorized native occurrence, at most eight acyclic hops
+to a seed or successful audit. Each hop verifies both actors have actually stopped,
+their model/account/workspace, dispatch receipts, fenced input manifests, immutable
+canonical materials and a patch that reproduces the candidate byte for byte. A
+QA-published copy is permitted only as an explicit alias to the exact producer
+artifact, with identical bytes and the actual predecessor handoff established.
+
+Origin receipts use `authority: authorized-native-source-origin` and always retain
+`qualityAccepted:false`, the parent's actual QA verdict, and both artifact IDs.
+They never replace a successful acceptance audit. A corrected child still needs
+all its own independent QA, replay, precision, source-screen, executable-change
+and official policy gates. Candidate code is not executed by this controller.
+Each lookup revalidates the chain and physical stop boundary before reusing an
+immutable receipt. Missing source identity or inconsistent provenance produces a
+controller diagnostic; temporarily unavailable source files produce observation
+wait. Neither condition requests a kernel repair or releases an existing external
+job. Enabling this policy is a separate deployment decision; it is off by default.
+
 Run the isolated unit tests **on a development server**, with an explicitly
 provisioned root-owned test directory outside all live state:
 
