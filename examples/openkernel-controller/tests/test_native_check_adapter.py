@@ -2255,6 +2255,56 @@ class UncertainCheckReservationTests(unittest.TestCase):
         self.assertEqual(len(value['uncertainCheckReservations']),1)
         self.assertEqual(self.native.read_bytes(),before);self.assertEqual(self.official.posts,1)
 
+    def test_owned_marker_is_cpu_only_and_preserves_original_uncertainty(self):
+        self.reserve(own=True);before=self.native.read_bytes()
+        outcome=A.scan(self.lane,self.f.root/'proof-status.json','check')['outcomes'][0]
+        self.assertEqual((outcome['state'],outcome['code'],outcome['postAttempted'],outcome['jobId']),
+            ('uncertain_owned','UNCERTAIN_RECONCILE_NO_RESEND',None,None))
+        proof=outcome['uncertainCheckReservation']
+        self.assertEqual(set(proof),{'version','slots','verifiedAt','detailSHA256','policySHA256','ownSourceUnretryable','effectReconciled','intent'})
+        self.assertEqual(proof['detailSHA256'],A.digest(self.f.detail));self.assertEqual(proof['policySHA256'],self.lane.policy_sha)
+        self.assertTrue(proof['ownSourceUnretryable']);self.assertFalse(proof['effectReconciled'])
+        self.assertEqual(proof['intent'],self.p['uncertainCheckReservations']['intents'][0])
+        self.assertEqual(self.native.read_bytes(),before);self.assertEqual(self.official.posts,0)
+
+    def test_alias_marker_binds_current_detail_and_original_intent(self):
+        self.reserve(own=True);row=A.strict_json(self.native.read_bytes());pin=self.p['uncertainCheckReservations']['intents'][0]
+        row['identity']['occurrenceId']=SUPERVISOR;pin['occurrenceId']=SUPERVISOR
+        stem=self.native.name[:-11];audit_path=self.native.parent/(stem+'-audit.json');audit=A.strict_json(audit_path.read_bytes())
+        audit['occurrenceId']=SUPERVISOR;raw=A.canonical(audit);audit_path.chmod(0o600);audit_path.write_bytes(raw);audit_path.chmod(0o400)
+        row['identity']['auditSHA256']=A.digest(raw);IO.atomic_record(self.native,row);IO.atomic_record(self.mirror,row)
+        pin['ledgerSHA256']=A.digest(self.native.read_bytes())
+        outcome=A.scan(self.lane,self.f.root/'alias-status.json','check')['outcomes'][0]
+        self.assertEqual(outcome['code'],'SOURCE_PREVIOUS_PROVENANCE');self.assertIsNone(outcome['postAttempted'])
+        self.assertEqual(outcome['uncertainCheckReservation']['intent']['occurrenceId'],SUPERVISOR)
+        self.assertEqual(outcome['uncertainCheckReservation']['detailSHA256'],A.digest(self.f.detail));self.assertEqual(self.official.posts,0)
+
+    def test_changed_native_detail_or_new_unknown_suppresses_marker(self):
+        self.reserve(own=True);original=self.f.runtime.api;calls=[]
+        def changed(method,path):
+            value=original(method,path);calls.append(path)
+            if getattr(self.f.audit,'_completed_audit_detail_sha',None):value['occurrence']['state']='attention'
+            return value
+        self.f.runtime.api=changed
+        outcome=A.scan(self.lane,self.f.root/'changed-status.json','check')['outcomes'][0]
+        self.assertEqual(outcome['state'],'uncertain_owned');self.assertNotIn('uncertainCheckReservation',outcome)
+        self.f.runtime.api=original
+        IO.atomic_record(pathlib.Path(self.p['legacyLedger'])/(BOARD+'-'+'e'*64+'-check.json'),{'state':'submission_intent'})
+        outcome=A.scan(self.lane,self.f.root/'unknown-status.json','check')['outcomes'][0]
+        self.assertEqual(outcome['state'],'uncertain_owned');self.assertNotIn('uncertainCheckReservation',outcome)
+        self.assertEqual(self.official.posts,0)
+
+    def test_failed_audit_or_untyped_marker_cannot_authorize_cpu_reservation(self):
+        self.reserve(own=True)
+        self.lane.audit.audit=mock.Mock(side_effect=ValueError('QA_TEST_BINDING'))
+        outcome=A.scan(self.lane,self.f.root/'bad-audit.json','check')['outcomes'][0]
+        self.assertNotIn('uncertainCheckReservation',outcome)
+        forged=ValueError('UNCERTAIN_RECONCILE_NO_RESEND');forged.uncertain_check_reservation={'version':1}
+        self.lane.run=mock.Mock(side_effect=forged)
+        outcome=A.scan(self.lane,self.f.root/'forged-marker.json','check')['outcomes'][0]
+        self.assertEqual(outcome['state'],'uncertain_owned');self.assertNotIn('uncertainCheckReservation',outcome)
+        self.assertIsNone(outcome['postAttempted']);self.assertEqual(self.official.posts,0)
+
 
 if __name__ == "__main__":
     unittest.main()

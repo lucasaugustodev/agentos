@@ -128,6 +128,10 @@ class AccountPreflightWait(ValueError):
     """Another account effect is unresolved; this candidate has no new intent."""
 
 
+class ReservedUncertainEffect(ValueError):
+    """Internal proof of a reviewed reservation, never proof of no effect."""
+
+
 class NativeDiagnosticError(ValueError):
     """A native audit rejected before this call could create a POST intent."""
     def __init__(self, error):
@@ -743,6 +747,7 @@ class NativeAudit:
         return entries[0], {"run": run_raw, "create": create_raw}
 
     def audit(self, occurrence_id):
+        self._completed_audit_detail_sha = None
         require(UUID.fullmatch(occurrence_id), "OCCURRENCE_ID")
         detail = self.runtime.api("GET", "/api/cycle-runs/" + occurrence_id)
         occurrence = detail["occurrence"]
@@ -844,6 +849,7 @@ class NativeAudit:
                   "gpuValidated": False, "performanceGainProven": False, "candidateExecutedByController": False,
                   "files": {name: digest(raw) for name, raw in sorted(frozen.items())},
                   **({"nativeQAContractVersion": 2, "qaAttemptHistory": qa_history} if v2 else {})}
+        self._completed_audit_detail_sha = digest(detail)
         return report, frozen, producer["candidate.py"]
 
     def source_provenance(self, problem, source_sha, source_artifact=None, ancestry=()):
@@ -1209,6 +1215,38 @@ class OfficialLane:
             raise PreflightQuotaError("CHECK_QUOTA_SYNC_PENDING")
         return jobs
 
+    def own_uncertainty_error(self, code, occurrence_id, audit):
+        """Attach CPU-only provenance; the existing uncertain effect is intact.
+
+        Called only after a successful native audit, inside the account lock.
+        The marker does not authorize CHECK, reconcile an effect, or release WIP.
+        """
+        error = ValueError(code)
+        try:
+            options = reservation_policy(self.p)
+            require(options is not None, "RESERVATION_DISABLED")
+            reservations = self.uncertain_reservations(self.records())
+            selected = [r for r in reservations if r["problem"] == audit["problem"]
+                        and r["sourceSHA256"] == audit["sourceSHA256"]]
+            require(len(selected) == 1, "RESERVATION_OWN_SOURCE")
+            detail_sha = getattr(self.audit, "_completed_audit_detail_sha", None)
+            require(type(detail_sha) is str and SHA.fullmatch(detail_sha), "RESERVATION_NATIVE_AUDIT")
+            detail = self.audit.runtime.api("GET", "/api/cycle-runs/" + occurrence_id)
+            require(digest(detail) == detail_sha and detail["occurrence"]["id"] == occurrence_id,
+                    "RESERVATION_NATIVE_DETAIL_CHANGED")
+            require(self.uncertain_reservations(self.records()) == reservations, "RESERVATION_SET_CHANGED")
+            pin = next(r for r in options["intents"] if r["problem"] == selected[0]["problem"]
+                       and r["sourceSHA256"] == selected[0]["sourceSHA256"])
+            now = self.clock()
+            require(type(now) in (int, float) and math.isfinite(now), "RESERVATION_TIME")
+            error = ReservedUncertainEffect(code)
+            error.uncertain_check_reservation = {"version": 1, "slots": 1, "verifiedAt": now,
+                "detailSHA256": detail_sha, "policySHA256": self.policy_sha, "ownSourceUnretryable": True,
+                "effectReconciled": False, "intent": copy.deepcopy(pin)}
+        except (ValueError, KeyError, TypeError, OSError, StopIteration):
+            pass  # Missing proof preserves the original, fully blocked outcome.
+        return error
+
     def quota_observation(self, previous, jobs, problem, quota, now):
         """A lagging quota GET cannot erase CHECKs acknowledged by this lane.
 
@@ -1347,9 +1385,11 @@ class OfficialLane:
             intent, mirror = self.state / (key + "-check.json"), self.legacy / (key + "-check.json")
             if intent.exists():
                 prior = strict_json(protected(intent))
-                require(prior.get("identity", {}).get("occurrenceId") == occurrence_id
-                        and prior["identity"].get("sourceSha256") == sha, "SOURCE_PREVIOUS_PROVENANCE")
-                require(prior.get("state") == "job_recorded", "UNCERTAIN_RECONCILE_NO_RESEND")
+                if (prior.get("identity", {}).get("occurrenceId") != occurrence_id
+                        or prior["identity"].get("sourceSha256") != sha):
+                    raise self.own_uncertainty_error("SOURCE_PREVIOUS_PROVENANCE", occurrence_id, audit)
+                if prior.get("state") != "job_recorded":
+                    raise self.own_uncertainty_error("UNCERTAIN_RECONCILE_NO_RESEND", occurrence_id, audit)
                 frozen_receipt = self.state / (key + "-receipt.json")
                 self.io.immutable_snapshot(frozen_receipt, canonical(self.receipt_document(prior, audit)))
                 registered = self.register(frozen_receipt, prior, audit) if mode == "check" else None
@@ -1658,6 +1698,13 @@ def scan(lane, status_path, mode):
                              "proposedRemediation": remediation,
                              **({"accountWaitReason": error.reservation_reason} if getattr(error, "reservation_reason", None) else {}),
                              **({"evidenceErrors": error.evidence_errors} if getattr(error, "evidence_errors", None) else {})}
+            reservation = getattr(error, "uncertain_check_reservation", None)
+            if (isinstance(error, ReservedUncertainEffect) and status == "uncertain_owned"
+                    and code in {"UNCERTAIN_RECONCILE_NO_RESEND", "SOURCE_PREVIOUS_PROVENANCE"}
+                    and job_id is None and outcome["postAttempted"] is None and type(reservation) is dict
+                    and reservation["intent"]["problem"] == row["problem"]
+                    and reservation["intent"]["sourceSHA256"] == binding["candidateSHA256"]):
+                outcome["uncertainCheckReservation"] = reservation
             if (isinstance(error, NativeDiagnosticError) and status == "rejected_repairable"
                     and job_id is None and terminal_diagnostic_code(code)
                     and getattr(lane.audit, "_diagnostic_identity", None)):

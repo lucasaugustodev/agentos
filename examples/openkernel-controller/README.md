@@ -427,3 +427,13 @@ existing minimum quota margin, rate checks, lock and pre-intent rechecks remain.
 Changed ledgers, stale observations, UTC rollover or an incomplete/ambiguous jobs
 window require a new observation. A full 50-job window entirely inside the current
 UTC day is deliberately insufficient; availability may wait for adequate coverage.
+
+After a complete native audit, the scanner can attach a current, authenticated
+`uncertainCheckReservation` proof to the original source and its aliases. A
+compatible continuity consumer may then admit CPU work on other sources. The
+original source remains `uncertain_owned`, occupies WIP, and is never resent.
+Its projected `postAttempted: null` means uncertain, not that no POST occurred;
+`ownSourceUnretryable: true` and `effectReconciled: false` make that boundary
+explicit. The proof binds the current detail and policy hashes and the exact
+reviewed intent. New uncertainty, changed evidence or stale proof restores the
+default block. Neither this marker nor a CPU task grants CHECK authority.
