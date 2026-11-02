@@ -1049,6 +1049,7 @@ def pipeline_admission(limit, active, catalog, pending, jobs, diagnostics, confi
     for row in jobs:
         if row["status"] not in ["done", "failed"]:
             own(row["problem"], "source:" + row["sourceSHA256"], "gpu", source=row["sourceSHA256"], job=row["id"])
+    uncertain_diagnostics = set()
     for row in diagnostics["outcomes"]:
         # An adapter's durable ACK can still say check_running after official
         # GET has proved completion. Never turn that stale label into a lock.
@@ -1058,6 +1059,18 @@ def pipeline_admission(limit, active, catalog, pending, jobs, diagnostics, confi
         if row["state"] in ["quota_wait", "uncertain_owned", "check_running"]:
             key = "source:" + source if source else "occurrence:" + row["occurrenceId"]
             own(row["problem"], key, row["state"], row["occurrenceId"], source, row.get("jobId"))
+            # A new, authenticated adapter preflight can prove that quota was
+            # checked before any intent/POST. Keep the candidate's WIP slot,
+            # but do not confuse this resource wait with an uncertain effect.
+            # Legacy/partial status, possible POSTs and unknown actors remain
+            # conservative; this never authorizes an official submission.
+            quota_without_effect = (row["state"] == "quota_wait" and row.get("code") == "CHECK_QUOTA"
+                and row.get("postAttempted") is False and "jobId" in row and row["jobId"] is None
+                and isinstance(source, str) and re.fullmatch(r"[a-f0-9]{64}", source)
+                and any(a["problem"] == row["problem"] and a["occurrenceId"] == row["occurrenceId"]
+                        and a["digest"] == source for a in catalog))
+            if not quota_without_effect:
+                uncertain_diagnostics.add(row["problem"])
     frozen = [{**row, **{k: sorted(row[k]) for k in ["stages", "occurrenceIds", "jobIds"]}}
               for _, row in sorted(owners.items())]
     blocked = sorted({row["problem"] for row in frozen})
@@ -1072,8 +1085,7 @@ def pipeline_admission(limit, active, catalog, pending, jobs, diagnostics, confi
     identities = experiment_identities or {}
     uncertain = {row["problem"] for row in active if row.get("ownershipUncertain")
                  or row["occurrenceId"] not in identities}
-    uncertain.update(row["problem"] for row in frozen
-                     if set(row["stages"]) & {"quota_wait", "uncertain_owned", "check_running"})
+    uncertain.update(uncertain_diagnostics)
     used = {problem: sum(row["problem"] == problem for row in frozen) for problem in PROBLEMS}
     slots = {problem: min(available, max(0, board_limit - used[problem]))
              if problem not in uncertain else 0 for problem in PROBLEMS}
@@ -1842,6 +1854,9 @@ class Watchdog:
                 continue  # Own already-dispatched actions cannot invalidate a remaining approved action set.
             item = {k: row.get(k) for k in ["occurrenceId", "problem", "candidateSHA256", "qaArtifactId", "qaSHA256",
                                           "state", "jobId", "code"]}
+            if (row.get("state") == "quota_wait" and row.get("code") == "CHECK_QUOTA"
+                    and row.get("postAttempted") is False and row.get("jobId") is None):
+                item["postAttempted"] = False
             summary["outcomes"].append(item)
             if not repair_authority:
                 item["classification"] = "diagnostic_only"; continue

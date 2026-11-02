@@ -740,3 +740,22 @@ large-context ownership, immutable original-material handoff and independent QA.
 A private frozen replay additionally compares the old and new readers on real
 size-blocked owners without native/official network calls or operational writes.
 Private inputs, identities and execution evidence are not part of this repository.
+
+CPU admission while official quota is unavailable
+
+Capacity v2 distinguishes a proven preflight resource wait from an uncertain
+execution. Only authenticated CHECK_QUOTA status with postAttempted=false,
+jobId=null and the exact candidate/occurrence in the source catalog qualifies.
+The adapter emits that marker only after ruling out durable uncertain effects
+and before creating any submission intent. Missing or legacy markers, unknown
+actors, uncertain receipts, other rate states and unregistered running checks
+continue to block their board.
+
+The quota candidate keeps its original WIP reservation, source identity and
+hypothesis reservations. Independent CPU work may use remaining real capacity;
+the global/per-board hard limits, ready reservations and repair gates are
+unchanged. A full board still admits no work. The serial legacy capacity
+contract is unchanged. This neither repairs a quota-wait candidate nor permits
+an official request: every CHECK still needs the adapter's fresh quota, rule,
+rate and receipt preflight. The supervisor receives the same bounded evidence;
+no counters, ownership or historical reports are rewritten to open a slot.
