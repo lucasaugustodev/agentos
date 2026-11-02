@@ -681,6 +681,13 @@ def supervisor_definition(config):
         instructions = instructions.replace(
             "You are the periodic OpenKernel portfolio supervisor. Inspect cycle-input.json\nand plan useful independent work across Decode, Prefill and Attention.",
             "You are one dedicated OpenKernel board planner. Inspect cycle-input.json\nand plan useful independent work ONLY for input.planningScope.problem.")
+    if config.get("repairFirstPlanning") is True:
+        instructions = instructions.replace(
+            "boardAvailableCandidateSlots limit. Mix immutable evidence repairs with new\nexperiments in ONE plan. Review EVERY board, not only the first urgent defect.",
+            "boardAvailableCandidateSlots limit. When planningScope.batchPurpose is\nrepair_backlog, publish ONLY a short batch of at most two kind=repair_evidence\nactions from planningScope.repairSourceArtifactIds. Inspect the supplied repair\ncards and the selected candidate/base identities; do not research new optimizations\nor compare unrelated variants before publishing this batch. The original evidence\nand independent QA still gate every repair. Explain unused slots as deliberate\nbounded repair batching. Otherwise mix useful repairs and new experiments and\nreview every supplied board. The controller replenishes the next batch while\nworkers run; do not wait for them or build another scheduler.")
+        instructions = instructions.replace(
+            "repair must not serialize unrelated optimization work.",
+            "repair batch must not wait for unrelated optimization research; that work\nis planned by subsequent refill passes while workers run.")
     value = definition(config, "Supervisão contínua — OpenKernel", [native_step(config, "supervise",
         "Conferir progresso e decidir a próxima experiência", COMMON + instructions,
         ["continuation-plan.json", "supervisor-summary.txt"])])
@@ -696,6 +703,10 @@ def validate_config(config, bound=True):
     require(config.get("model") == "deepseek-v4-pro-0813", "MODEL_SCOPE")
     require(config.get("statePayloadStorage") in [None, STATE_PAYLOAD_STORAGE], "STATE_PAYLOAD_STORAGE")
     require(config.get("plannerMode") in [None, "board-lanes-v1"], "PLANNER_MODE")
+    require(type(config.get("repairFirstPlanning", False)) is bool, "REPAIR_FIRST_CONFIG")
+    require(not config.get("repairFirstPlanning") or
+            config.get("plannerMode") == "board-lanes-v1" and config.get("planVersion") == 2,
+            "REPAIR_FIRST_MODE")
     if config.get("plannerMode") == "board-lanes-v1":
         require(config.get("planVersion") == 2 and config.get("pipelineCapacityVersion") == 2,
                 "PLANNER_LANES_VERSION")
@@ -811,6 +822,15 @@ def validate_plan(plan, observation, config, expected_fingerprint=None, source_i
         require(scope.get("version") == 1 and scope.get("problem") in PROBLEMS
                 and all(exp.get("problem") == scope["problem"] for exp in experiments if isinstance(exp, dict)),
                 "PLAN_LANE_SCOPE")
+        if scope.get("batchPurpose") == "repair_backlog":
+            selected = scope.get("repairSourceArtifactIds")
+            require(version == 2 and type(selected) is list and 1 <= len(selected) <= 2
+                    and all(isinstance(i, str) and UUID.fullmatch(i) for i in selected)
+                    and len(set(selected)) == len(selected),
+                    "PLAN_REPAIR_BATCH_SCOPE")
+            require(len(experiments) <= 2 and all(isinstance(exp, dict)
+                    and exp.get("kind") == "repair_evidence" and exp.get("sourceArtifactId") in selected
+                    for exp in experiments), "PLAN_REPAIR_BATCH_ONLY")
     repairs = observation.get("autoCheckDiagnostics", {}).get("repairableEvidence", [])
     capacity = min(config["maxPendingCandidates"], observation["availableCandidateSlots"],
                    len(repairs) if plan["decision"] == "repair_evidence" else config["maxPendingCandidates"])
@@ -2391,9 +2411,15 @@ class Watchdog:
         if observation.get("planningScope"):
             body["input"]["interpretationRules"].append(
                 "You are the dedicated planner for planningScope.problem only. Other boards have independent planners. Publish a compact useful batch for this board using the supplied sources, remaining slots and reserved hypotheses. The deterministic controller keeps an approved ready buffer and dispatches it without asking you again. Aim to replenish at least readyLowWatermark independent actions when evidence permits; explain a real limitation instead of inventing work. Do not survey other boards, build another scheduler or wait for unrelated planners. All existing QA, lineage and official-action restrictions still apply.")
+        if observation.get("planningScope", {}).get("batchPurpose") == "repair_backlog":
+            self.project_repair_planning_input(body["input"], observation)
         requests = self.state.setdefault("reviewRequests", {})
         if key not in requests:
             packet = self.supply_source_capsules(body["input"], observation)
+            if observation.get("planningScope", {}).get("batchPurpose") == "repair_backlog":
+                supplied = {i for row in packet["sources"] for i in row["artifactIds"]}
+                if not supplied.intersection(observation["planningScope"]["repairSourceArtifactIds"]):
+                    return self.status("supervisor_sources_unavailable", omitted=packet["omitted"], newPostRequests=0)
             if observation["eligibleProblems"] and not packet["sources"] and not observation["diagnosticOnly"]:
                 return self.status("supervisor_sources_unavailable", omitted=packet["omitted"], newPostRequests=0)
             requests[key] = request_numbers_v1(body)
@@ -2863,6 +2889,85 @@ proof of correctness. Any candidate, patch, semantic or numerical defect fails.
         value["fingerprint"] = digest(evidence_material(material))
         return value
 
+    def repair_first_observation(self, observation, problem):
+        """Select a bounded repair opportunity; never synthesize an approved plan.
+
+        The probe only reuses admission checks in memory. The LLM still writes
+        the actual plan, and each approved action is freshly admitted later.
+        Keep full board evidence here: projection happens after its read-set hash.
+        """
+        lane = self.lane_observation(observation, problem)
+        if (not self.config.get("repairFirstPlanning") or problem not in lane["eligibleProblems"]
+                or lane["autoCheckDiagnostics"].get("repairAuthority") is not True
+                or sum(r["experiment"]["problem"] == problem for r in self.ready_actions())
+                   >= self.config.get("readyLowWatermark", 2)):
+            return lane
+        catalog = {a["id"]: a for a in lane["catalog"]}
+        selected, probes = [], []
+        for repair in sorted(lane["autoCheckDiagnostics"]["repairableEvidence"],
+                             key=lambda r: (r["occurrenceId"], r["candidateArtifactId"])):
+            source = catalog.get(repair["candidateArtifactId"])
+            base = repair["originalBaseArtifact"]
+            bound_base = catalog.get(base["id"])
+            if (not source or not bound_base or any(bound_base.get(k) != base.get(k) for k in ["digest", "size"])
+                    or any(r.get("candidateSHA256") == source["digest"] and "ready" in r["stages"]
+                           for r in lane["pipelineOwners"])):
+                continue
+            probe = {"id": "repair-probe-" + str(len(probes)), "kind": "repair_evidence", "problem": problem,
+                "sourceArtifactId": source["id"],
+                "hypothesis": "Replay authenticated evidence for unchanged candidate " + source["digest"],
+                "instructions": "Admission probe only; no task is created. Preserve immutable candidate, base and patch, and require fresh independent QA."}
+            plan = {"version": 2, "evidenceFingerprint": lane["fingerprint"], "decision": "actions",
+                "reason": "Check the existing admission contract before offering a bounded repair batch.",
+                "experiments": probes + [probe], "capacityReview": [{"problem": problem,
+                    "availableSlots": lane["boardAvailableCandidateSlots"][problem],
+                    "plannedActions": len(probes) + 1, "reason": "Bounded repair selection within existing admission capacity."}]}
+            try:
+                validate_plan(plan, {**lane, "planVersion": 2}, self.config)
+            except ValueError:
+                continue
+            probes.append(probe); selected.append(source["id"])
+            if len(selected) == 2:
+                break
+        if selected:
+            lane["planningScope"] = {**lane["planningScope"], "batchPurpose": "repair_backlog",
+                                     "repairSourceArtifactIds": selected}
+            lane["fingerprint"] = digest(evidence_material({k: v for k, v in lane.items()
+                if k not in ["fingerprint", "idleSeconds", "controllerDispatchAgeSeconds"]}))
+        return lane
+
+    def project_repair_planning_input(self, review_input, observation):
+        """Only presentation is reduced; stored selected-source proofs stay full."""
+        selected = set(observation["planningScope"]["repairSourceArtifactIds"])
+        repairs = [r for r in observation["autoCheckDiagnostics"]["repairableEvidence"]
+                   if r["candidateArtifactId"] in selected]
+        ids = selected | {r["originalBaseArtifact"]["id"] for r in repairs}
+        review_input["catalog"] = [a for a in review_input["catalog"] if a["id"] in ids]
+        hashes = {a["digest"] for a in review_input["catalog"]}
+        origins = {a["occurrenceId"] for a in review_input["catalog"]}
+        review_input["confirmedSourceArtifactIds"] = [i for i in review_input["confirmedSourceArtifactIds"] if i in ids]
+        review_input["actionEvidence"] = {**review_input["actionEvidence"], "sources": {
+            i: proof for i, proof in review_input["actionEvidence"]["sources"].items() if i in ids}}
+        review_input["outcomes"] = [o for o in review_input["outcomes"]
+            if o["occurrenceId"] in origins or (o.get("executionEvidence") or {}).get("candidateSHA256") in hashes
+            or any((a.get("qaEvidence") or {}).get("candidateSHA256") in hashes for a in o["artifacts"])]
+        review_input["officialJobs"] = [r for r in review_input["officialJobs"] if r["sourceSHA256"] in hashes]
+        diagnostics = review_input["autoCheckDiagnostics"]
+        review_input["autoCheckDiagnostics"] = {**diagnostics,
+            "repairableEvidence": [r for r in diagnostics["repairableEvidence"] if r["candidateArtifactId"] in selected],
+            "outcomes": [r for r in diagnostics["outcomes"] if r.get("candidateSHA256") in hashes
+                         or r["occurrenceId"] in origins]}
+        review_input["repairCards"] = [{k: row[k] for k in ["problem", "occurrenceId", "candidateArtifactId",
+            "candidateSHA256", "code", "qaArtifactId", "qaSHA256", "repairAttempt", "patchNormalization"] if k in row}
+            | {"originalBaseArtifact": {k: row["originalBaseArtifact"][k] for k in ["id", "digest", "size"]},
+               "qaArtifact": {k: row["qaArtifact"][k] for k in ["id", "digest", "size", "attempt_id"] if k in row["qaArtifact"]}}
+            for row in repairs]
+        if "sourceExternalEvidence" in review_input:
+            review_input["sourceExternalEvidence"] = [r for r in review_input["sourceExternalEvidence"]
+                if r.get("candidateSHA256") in hashes]
+        review_input["interpretationRules"].append(
+            "This is a bounded repair_backlog batch, not optimization research. Select only repairSourceArtifactIds, at most two repair_evidence actions. Inspect repairCards and relevant candidate/base identity and evidence; publish the compact repair plan promptly without comparing unrelated variants or proposing code changes. Existing slots are real unchanged capacity, not a demand to fill every slot in this batch. Original reports, source-specific proofs, fresh admission, independent QA and official-action restrictions remain authoritative. The controller can plan the next batch while these workers run.")
+
     def lane_action_plan(self, review, exp):
         original = review["approvedPlan"]
         return {**original, "decision": "actions", "experiments": [exp], "capacityReview": [
@@ -3049,7 +3154,7 @@ proof of correctness. Any candidate, patch, semantic or numerical defect fails.
                 waits[problem] = "planner_active"; continue
             if ready >= self.config.get("readyLowWatermark", 2):
                 waits[problem] = "ready_buffer_sufficient"; continue
-            lane = self.lane_observation(self.admission_with_ready(observation), problem)
+            lane = self.repair_first_observation(self.admission_with_ready(observation), problem)
             if not lane["eligibleProblems"]:
                 waits[problem] = "no_admissible_capacity_or_source"; continue
             previous = self.state["outcomes"].get(lane["fingerprint"])
