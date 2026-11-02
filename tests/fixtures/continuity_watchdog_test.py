@@ -234,7 +234,9 @@ class WatchTests(unittest.TestCase):
         self.assertEqual(intent['requestDigest'], W.digest(body))
         self.reload()
         self.assertEqual(self.w.review_request(key), body)
-        self.assertEqual(self.w.tick()['state'], 'supervisor_dispatched')
+        result = self.w.tick()
+        self.assertEqual(result['state'], 'supervisor_running')
+        self.assertEqual(result['continuation']['steps'][0]['state'], 'supervisor_reconciled')
         self.assertEqual(len(self.client.posts), 1)
         self.assertEqual(W.read_json(marker)['requestDigest'], intent['requestDigest'])
         self.assertTrue(any(r.startswith('/api/cycle-runs/') for r in self.client.gets))
@@ -3257,6 +3259,33 @@ class WatchTests(unittest.TestCase):
         self.config['controlCycleId'] = new
         self.enable_mixed_plan_contract()
         return old
+
+    def test_mixed_archive_handover_recovers_old_cycle_ack_through_body_ref(self):
+        self.enable_payloads(); self.client.timeout_after_commit_number = 1
+        with self.assertRaises(TimeoutError): self.w.tick()
+        key = next(iter(self.w.state['reviewRequests']))
+        original = self.w.review_request(key)
+        self.assertIn('bodyRef', self.w.state['reviewRequests'][key])
+        old_cycle = self.switch_mixed_control(); self.reload()
+        result = self.w.tick()
+        self.assertEqual(result['state'], 'supervisor_running')
+        self.assertEqual(len(self.client.posts), 1)
+        row = self.w.state['supervisions'][-1]
+        self.assertEqual(row['reconciledOriginalControlCycleId'], old_cycle)
+        self.assertEqual(self.w.supervision_input(row), original['input'])
+        self.assertIn('/api/cycles/' + old_cycle, self.client.gets)
+
+    def test_mixed_archive_handover_unknown_old_cycle_intent_stays_owned(self):
+        self.enable_payloads(); self.client.timeout_before_commit_number = 1
+        with self.assertRaises(TimeoutError): self.w.tick()
+        key = next(iter(self.w.state['reviewRequests']))
+        old_cycle = self.switch_mixed_control(); self.reload()
+        result = self.w.tick()
+        self.assertEqual(result['state'], 'owned_review_uncertain')
+        self.assertEqual(result['originalControlCycleId'], old_cycle)
+        self.assertEqual(len(self.client.posts), 1)
+        self.assertEqual(self.w.state['supervisions'], [])
+        self.assertEqual(set(self.w.state['reviewRequests']), {key})
 
     def test_mixed_handover_same_evidence_uses_new_key_without_rewriting_old_review(self):
         self.parallel_capacity(); self.config.update(maxPendingCandidates=24, maxPipelinesPerProblem=8)

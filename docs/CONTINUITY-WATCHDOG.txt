@@ -586,3 +586,20 @@ the existing bounded adapter reads the same16 experiments. The actual previous
 reader reconciles synthetic lost-ACK, unresolved-intent and partial-dispatch
 exports using GET only. These are isolated storage/recovery results, not evidence
 of live migration, additional model throughput or GPU improvement.
+
+Combined plan2/storage qualification has225 passing server tests. It includes24
+mixed actions with archived inputs, restart after a lost repair acknowledgement,
+and reconciliation of an archived old-control request before a new-control review.
+Uncertain old requests keep their original cycle and block replacement POSTs.
+
+After plan2 has produced work, a storage-only fallback MUST keep the new compatible
+reader, planVersion2 and its control cycle. Expand the CURRENT state and preserve
+every current intent; restoring a pre-rollout snapshot could erase newer ACKs.
+Only remove the storage opt-in. Rebind the adapter's exact watcherConfig pin and
+obtain its real matching observation before resuming; never copy/restamp an old
+status to manufacture freshness. The original plan proofs stay unchanged, so the
+configuration change can close an unstarted remainder while attempted effects are
+reconciled by GET. A synthetic fallback with a distinct new control cycle preserves
+two owners after a lost repair ACK, or one owner plus one uncertain effect when no
+receipt exists, with zero new POSTs. The earlier reader45afb rollback proof applies
+only to the earlier plan contract; it does not authorize that reader over plan2.
