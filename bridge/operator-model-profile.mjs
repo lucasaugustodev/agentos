@@ -5,7 +5,9 @@ import { glmModelProfile } from './glm-model-profile.mjs';
 export function operatorModelProfile(accountId, modelId, policy = readModelPolicy()) {
   if (policy?.version === 2 && modelRouteAllowed(accountId, modelId, policy)) return {
     reasoning: true,
-    maxTokens: 32768,
+    // Native DeepSeek maximum; the selected router accepts this parameter.
+    // This is a per-response ceiling, not a task/token spending budget.
+    maxTokens: 393216,
     compat: {
       thinkingFormat: 'deepseek', supportsReasoningEffort: true,
       maxTokensField: 'max_tokens', supportsStore: false, supportsDeveloperRole: false,
@@ -19,6 +21,6 @@ export function operatorModelProfile(accountId, modelId, policy = readModelPolic
 export function workerModelSettings(accountId, modelId) {
   const profile=operatorModelProfile(accountId, modelId);
   return profile.reasoning
-    ? { reasoning: profile.compat.thinkingFormat === 'deepseek' ? 'high' : 'low', maxOutputTokens: 32768 }
+    ? { reasoning: profile.compat.thinkingFormat === 'deepseek' ? 'high' : 'low', maxOutputTokens: profile.maxTokens }
     : { reasoning: 'high', maxOutputTokens: 8192 };
 }

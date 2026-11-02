@@ -34,7 +34,7 @@ test('v2 selects exactly one operator-owned API pair; model names grant no profi
   assert.throws(()=>assertModelRoute('unverified',policy.model),/MODEL_POLICY_GLM_ONLY/);
   assert.deepEqual(operatorModelProfile('unverified',policy.model),{});
   assert.deepEqual(workerModelSettings('unverified',policy.model),{reasoning:'high',maxOutputTokens:8192});
-  assert.deepEqual(workerModelSettings(policy.bridgeId,policy.model),{reasoning:'high',maxOutputTokens:32768});
+  assert.deepEqual(workerModelSettings(policy.bridgeId,policy.model),{reasoning:'high',maxOutputTokens:393216});
   assert.deepEqual(openCodeRoute({accountId:policy.accountId,model:policy.model}),{accountId:policy.bridgeId,model:policy.model});
   assert.throws(()=>openCodeRoute({accountId:GLM_ACCOUNT,model:'glm-5.3-flash'}),/INVALID_ROUTE/);
 });
@@ -47,10 +47,10 @@ for(const [effort,expected] of [['low','high'],['high','high'],['xhigh','max']])
     .streamSimple({id:policy.model,baseUrl:'https://fixture.invalid/v1',...operatorModelProfile(policy.bridgeId,policy.model)},
       {systemPrompt:'private system',messages:input.messages},
       {apiKey:'fixture-only',maxTokens:input.maxOutputTokens,reasoning:input.reasoning,onTelemetry:(kind,payload)=>events.push({kind,payload})}).result();
-  assert.equal(result.stopReason,'stop');assert.equal(wire.max_tokens,32768);
+  assert.equal(result.stopReason,'stop');assert.equal(wire.max_tokens,393216);
   assert.equal(wire.reasoning_effort,expected);assert.deepEqual(wire.thinking,{type:'enabled'});
   const observed=events.find(e=>e.kind==='MODEL_WIRE_REQUESTED').payload.wire;
-  assert.equal(observed.model,policy.model);assert.equal(observed.maxTokens,32768);
+  assert.equal(observed.model,policy.model);assert.equal(observed.maxTokens,393216);
   assert.equal(observed.reasoningEffort,expected);assert.equal(observed.thinkingType,'enabled');
   assert.equal(observed.clearThinking,null);
   assert.ok(!JSON.stringify(events).includes('private input'));assert.ok(!JSON.stringify(events).includes('fixture-only'));
@@ -78,7 +78,20 @@ test('all assistant reasoning survives both directions and subsequent tool turns
   const payload={model:policy.model,messages:rebuilt,tools:[{type:'function',function:{name:'read'}}],max_completion_tokens:1,thinking:{type:'disabled',clear_thinking:true}};
   const scoped=openCodeCompletionPayload(payload,{accountId:policy.bridgeId,model:policy.model});
   assert.deepEqual(scoped.messages,rebuilt);assert.deepEqual(scoped.thinking,{type:'enabled'});
-  assert.equal(scoped.max_tokens,32768);assert.equal(scoped.max_completion_tokens,undefined);assert.equal(scoped.reasoning_effort,'high');
+  assert.equal(scoped.max_tokens,393216);assert.equal(scoped.max_completion_tokens,undefined);assert.equal(scoped.reasoning_effort,'high');
+});
+
+test('the larger DeepSeek output ceiling leaves legacy GLM and unverified routes unchanged',async t=>{
+  await configured(t,{version:1,mode:'glm-only',accountId:GLM_ACCOUNT.replace('agentos:api:','agentos-api-'),
+    bridgeId:GLM_ACCOUNT,model:'glm-5.3-flash',requestLimit:6,sessionLimit:12});
+  assert.deepEqual(workerModelSettings(GLM_ACCOUNT,'glm-5.3-flash'),{reasoning:'low',maxOutputTokens:32768});
+  assert.deepEqual(workerModelSettings('unverified',policy.model),{reasoning:'high',maxOutputTokens:8192});
+});
+
+test('a length-terminated tool call remains rejected even when its arguments are valid',()=>{
+  assert.throws(()=>fromCompletionsResponse({choices:[{finish_reason:'length',message:{
+    tool_calls:[{id:'not-executable',type:'function',function:{name:'shell',arguments:'{"command":"fixture"}'}}],
+  }}]}),{code:'MODEL_OUTPUT_LIMIT'});
 });
 
 test('explicit empty reasoning is preserved and absence is never fabricated',async()=>{
