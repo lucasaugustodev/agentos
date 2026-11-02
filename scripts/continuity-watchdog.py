@@ -69,6 +69,89 @@ def digest(value):
     return hashlib.sha256(value if isinstance(value, bytes) else canonical(value)).hexdigest()
 
 
+_OFFICIAL_DIAGNOSTIC_TOKEN = object()
+OFFICIAL_DIAGNOSTIC_LIMIT = 2048
+
+
+def official_identity_guard(value, job, origin, *, stdout=None, stderr=None, returncode=None, started=None):
+    """Keep the identity gate; attach only a bounded, allowlisted failure view.
+
+    No response body, arbitrary key, stderr text, URL or command enters status.
+    Diagnostic construction must never replace or weaken the original error.
+    """
+    try:
+        require(value.get("id") == job["id"] and value.get("board") == job["problem"], "OFFICIAL_IDENTITY")
+    except ValueError as error:
+        try:
+            def field(container, key, allowed):
+                present = type(container) is dict and key in container
+                item = container.get(key) if present else None
+                kinds = {str: "string", int: "number", float: "number", bool: "boolean",
+                         list: "array", dict: "object", type(None): "null"}
+                out = {"present": present, "type": kinds.get(type(item), "other")}
+                if type(item) is str:
+                    if allowed(item):
+                        out["value"] = item
+                    else:
+                        out["sha256"] = digest(item.encode("utf-8", errors="surrogatepass"))
+                return out
+
+            id_allowed = lambda item: re.fullmatch(r"[a-f0-9]{16}", item) is not None
+            board_allowed = lambda item: item in PROBLEMS
+            now = time.time()
+            observation = {"version": 1, "origin": origin if origin in ("cli", "cache", "client") else "client",
+                "observedAt": now, "expectedId": field(job, "id", id_allowed),
+                "expectedBoard": field({"board": job.get("problem")}, "board", board_allowed),
+                "returnedId": field(value, "id", id_allowed), "returnedBoard": field(value, "board", board_allowed),
+                "status": field(value, "status", lambda item: item in ("queued", "running", "done", "failed", "cancelled")),
+                "rootType": "object", "knownFieldsPresent": [key for key in ("id", "board", "status", "data", "job", "error", "result") if key in value],
+                "httpStatus": None}
+            if type(stdout) is bytes:
+                observation.update(responseSHA256=digest(stdout), responseBytes=len(stdout), responseEncoding="cli-stdout")
+            else:
+                # Cache data is already parsed. Bound diagnostic work as well as
+                # metadata and do not mistake this encoding for the CLI bytes.
+                encoded = canonical(value)
+                if len(encoded) <= 4 * 1024 * 1024:
+                    observation.update(responseSHA256=digest(encoded), responseBytes=len(encoded), responseEncoding="canonical-json")
+            if type(stderr) is bytes:
+                observation.update(stderrSHA256=digest(stderr), stderrBytes=len(stderr))
+            if type(returncode) is int and -255 <= returncode <= 255:
+                observation["cliExitCode"] = returncode
+            if type(started) in (int, float) and math.isfinite(started) and 0 <= started <= now:
+                observation.update(startedAt=started, durationMs=round((now - started) * 1000))
+            encoded = canonical(observation)
+            if len(encoded) <= OFFICIAL_DIAGNOSTIC_LIMIT:
+                error._official_observation = encoded
+                error._official_diagnostic_token = _OFFICIAL_DIAGNOSTIC_TOKEN
+        except Exception:
+            pass
+        raise
+
+
+def official_error_fields(error, config):
+    """Diagnostic-only addition to the existing blocked status; never authority."""
+    if not (type(error) is ValueError and str(error) == "OFFICIAL_IDENTITY"
+            and getattr(error, "_official_diagnostic_token", None) is _OFFICIAL_DIAGNOSTIC_TOKEN):
+        return {}
+    try:
+        raw = error._official_observation
+        require(type(raw) is bytes and len(raw) <= OFFICIAL_DIAGNOSTIC_LIMIT, "DIAGNOSTIC_SIZE")
+        observation = json.loads(raw)
+        observation["configCanonicalSHA256"] = digest(config)
+        observation["watcherCodeSHA256"] = digest(pathlib.Path(__file__).read_bytes())
+        policy = config.get("autoCheckPolicyPath")
+        if type(policy) is str:
+            try:
+                observation["policySHA256AtFailure"] = digest(protected_bytes(pathlib.Path(policy), 64 * 1024))
+            except Exception:
+                pass
+        require(len(canonical(observation)) <= OFFICIAL_DIAGNOSTIC_LIMIT, "DIAGNOSTIC_SIZE")
+        return {"officialObservationFailure": observation}
+    except Exception:
+        return {}
+
+
 def terminal_diagnostic_current(row, detail, policy, policy_sha, now, maximum_age):
     """Validate a reobserved terminal rejection without changing its evidence.
 
@@ -1199,11 +1282,13 @@ class Client:
         return raw if binary else json.loads(raw)
 
     def official(self, job):
+        started = time.time()
         result = subprocess.run(["/opt/openkernelchallenge/bin/okc", "status", job["id"], "--json"],
             capture_output=True, timeout=60, check=False)
         require(result.returncode == 0 and len(result.stdout) <= 4 * 1024 * 1024, "OFFICIAL_OBSERVATION_UNAVAILABLE")
         value = json.loads(result.stdout)
-        require(value.get("id") == job["id"] and value.get("board") == job["problem"], "OFFICIAL_IDENTITY")
+        official_identity_guard(value, job, "cli", stdout=result.stdout, stderr=result.stderr,
+            returncode=result.returncode, started=started)
         # Full reply remains a protected evidence file. Workers receive bounded measurements, never auth.
         return value
 
@@ -2250,7 +2335,7 @@ class Watchdog:
         for job in registered_jobs:
             cached = self.state["official"].get(job["id"])
             raw = cached or self.client.official(job)
-            require(raw.get("id") == job["id"] and raw.get("board") == job["problem"], "OFFICIAL_IDENTITY")
+            official_identity_guard(raw, job, "cache" if cached else "client")
             if raw.get("status") not in ["done", "failed"]:
                 pending_jobs.append(job["id"])
             else:
@@ -3388,7 +3473,7 @@ def main():
             print(json.dumps(watcher.tick(), ensure_ascii=False))
         except Exception as error:
             code = str(error) if type(error) is ValueError and re.fullmatch(r"[A-Z0-9_]+", str(error)) else type(error).__name__
-            value = {"state": "state_export_blocked", "code": code, "automaticPostRetry": False} if args.command == "export-state" else watcher.status("observation_or_dispatch_blocked", code=code, automaticPostRetry=False)
+            value = {"state": "state_export_blocked", "code": code, "automaticPostRetry": False} if args.command == "export-state" else watcher.status("observation_or_dispatch_blocked", code=code, automaticPostRetry=False, **official_error_fields(error, watcher.config))
             print(json.dumps(value))
             raise SystemExit(1)
 
