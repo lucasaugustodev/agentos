@@ -121,6 +121,10 @@ class PreflightQuotaError(ValueError):
     """Internal provenance: quota refused before any new submission intent."""
 
 
+class AccountPreflightWait(ValueError):
+    """Another account effect is unresolved; this candidate has no new intent."""
+
+
 class EvidenceJSONError(ValueError):
     """Authenticated worker evidence is rejected, with bounded repair references."""
     def __init__(self, stage, artifact):
@@ -916,7 +920,8 @@ class OfficialLane:
         require(len(rows) == 1, "PROBLEM_UNAVAILABLE")
         q = rows[0]["limits"]["checks"]
         previous = self.records()
-        require(all(r.get("state") == "job_recorded" for r in previous), "ACCOUNT_HAS_UNCERTAIN_EFFECT")
+        if not all(r.get("state") == "job_recorded" for r in previous):
+            raise AccountPreflightWait("ACCOUNT_HAS_UNCERTAIN_EFFECT")
         require(all(type(q.get(k)) is int and q[k] >= 0 for k in ("left", "used", "per_day")), "CHECK_QUOTA_SCHEMA")
         if not (q["left"] > self.p["minimumChecksRemaining"] and q["used"] < q["per_day"]):
             raise PreflightQuotaError("CHECK_QUOTA")
@@ -1126,6 +1131,8 @@ def scan(lane, status_path, mode):
             elif "UNCERTAIN" in code or code in {"SOURCE_ALREADY_IN_SHARED_LEDGER", "SOURCE_PREVIOUS_PROVENANCE"}:
                 status, remediation = "uncertain_owned", "reconcile_existing_intent_never_post_again"
             elif code == "CONTROL_PAUSED": status, remediation = "paused", "respect_operator_pause"
+            if isinstance(error, AccountPreflightWait) and code == "ACCOUNT_HAS_UNCERTAIN_EFFECT":
+                status, remediation = "account_wait", "preserve_candidate_wait_for_account_reconciliation_without_post"
             # Any durable effect dominates a later local/registry error. Do not
             # tell a supervisor to start replacement work for an owned POST.
             if binding["candidateSHA256"]:
@@ -1143,8 +1150,10 @@ def scan(lane, status_path, mode):
                         break
             outcomes.append({"occurrenceId": occurrence, "problem": row["problem"],
                              **binding, "state": status, "code": code[:120], "jobId": job_id,
-                             "postAttempted": (False if isinstance(error, PreflightQuotaError)
-                                 and code == "CHECK_QUOTA" and status == "quota_wait" and job_id is None else None),
+                             "postAttempted": (False if job_id is None and (
+                                 isinstance(error, PreflightQuotaError) and code == "CHECK_QUOTA" and status == "quota_wait"
+                                 or isinstance(error, AccountPreflightWait) and code == "ACCOUNT_HAS_UNCERTAIN_EFFECT"
+                                 and status == "account_wait") else None),
                              "proposedRemediation": remediation,
                              **({"evidenceErrors": error.evidence_errors} if isinstance(error, EvidenceJSONError) else {})})
         selection["lastUnregisteredOccurrenceId"] = occurrence

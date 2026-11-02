@@ -1450,10 +1450,37 @@ class ScanSelectionTests(unittest.TestCase):
         IO.atomic_record(path, {"state":"submission_outcome_unknown", "identity":{"sourceSha256":"f"*64}})
         before = path.read_bytes()
         row = A.scan(self.fixture.lane, self.status, "check")["outcomes"][0]
-        self.assertEqual(row["state"], "uncertain_owned")
+        self.assertEqual(row["state"], "account_wait")
         self.assertEqual(row["code"], "ACCOUNT_HAS_UNCERTAIN_EFFECT")
-        self.assertIsNone(row["postAttempted"])
+        self.assertIs(row["postAttempted"], False)
         self.assertEqual(path.read_bytes(), before); self.assertEqual(self.fixture.official.posts, 0)
+
+    def test_untyped_account_wait_is_not_a_no_post_proof(self):
+        self.fixture.lane.run = mock.Mock(side_effect=ValueError("ACCOUNT_HAS_UNCERTAIN_EFFECT"))
+        row = A.scan(self.fixture.lane, self.status, "check")["outcomes"][0]
+        self.assertEqual(row["state"], "uncertain_owned"); self.assertIsNone(row["postAttempted"])
+        self.assertEqual(self.fixture.official.posts, 0)
+
+    def test_own_durable_effect_dominates_typed_account_wait(self):
+        source = A.digest(self.fixture.candidate)
+        path = pathlib.Path(self.p["stateDirectory"]) / (BOARD + "-" + source + "-check.json")
+        IO.atomic_record(path, {"state":"submission_outcome_unknown", "identity":{"sourceSha256":source}})
+        before = path.read_bytes()
+        self.fixture.lane.run = mock.Mock(side_effect=A.AccountPreflightWait("ACCOUNT_HAS_UNCERTAIN_EFFECT"))
+        row = A.scan(self.fixture.lane, self.status, "check")["outcomes"][0]
+        self.assertEqual(row["state"], "uncertain_owned"); self.assertIsNone(row["postAttempted"])
+        self.assertEqual(path.read_bytes(), before); self.assertEqual(self.fixture.official.posts, 0)
+
+    def test_account_wait_preserves_exact_candidate_binding_without_creating_intent(self):
+        foreign = pathlib.Path(self.p["stateDirectory"]) / (BOARD + "-" + "f"*64 + "-check.json")
+        IO.atomic_record(foreign, {"state":"submission_outcome_unknown", "identity":{"sourceSha256":"f"*64}})
+        before = {str(p):p.read_bytes() for p in pathlib.Path(self.p["stateDirectory"]).rglob('*') if p.is_file()}
+        row = A.scan(self.fixture.lane, self.status, "check")["outcomes"][0]
+        self.assertEqual((row["state"], row["postAttempted"], row["jobId"]), ("account_wait", False, None))
+        self.assertEqual(row["candidateSHA256"], A.digest(self.fixture.candidate))
+        self.assertTrue(row["qaArtifactId"] and row["qaSHA256"])
+        self.assertEqual({str(p):p.read_bytes() for p in pathlib.Path(self.p["stateDirectory"]).rglob('*') if p.is_file()}, before)
+        self.assertEqual(self.fixture.official.posts, 0)
 
     def test_local_durable_effect_overrides_even_a_typed_quota_exception(self):
         source = A.digest(self.fixture.candidate)
