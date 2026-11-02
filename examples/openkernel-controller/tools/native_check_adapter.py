@@ -38,6 +38,9 @@ TERMINAL_DIAGNOSTIC_TTL = 3600
 TERMINAL_DIAGNOSTIC_LIMIT = 128
 TERMINAL_DIAGNOSTIC_MAX_BYTES = 1024 * 1024
 JOBS_OBSERVATION_MAX_BYTES = 1024 * 1024
+REQUIRED_ARTIFACT_MAX_BYTES = 1024 * 1024
+OPTIONAL_ARTIFACT_MAX_BYTES = 8 * 1024 * 1024
+ATTEMPT_ARTIFACT_MAX_BYTES = 24 * 1024 * 1024
 JOBS_OBSERVATION_MAX_IDS = 200
 
 
@@ -472,14 +475,29 @@ class NativeAudit:
         self.artifacts = pathlib.Path(policy["artifactDirectory"])
         self.runs = pathlib.Path(policy["workerRunsDirectory"])
 
-    def artifact(self, row, *, allow_empty=False):
+    def artifact_limit(self, row, *, optional=False):
+        # Acceptance evidence and source aliases never inherit the attachment
+        # allowance, even when their name is optional in the other step.
+        canonical_names = PRODUCER_FILES | QA_FILES | {"base-candidate.py"}
+        return (OPTIONAL_ARTIFACT_MAX_BYTES if optional is True and row.get("name") not in canonical_names
+                else REQUIRED_ARTIFACT_MAX_BYTES)
+
+    def artifact_budget(self, rows):
+        # Match the native bridge's per-delivery bounds before allocating any
+        # attachment bytes. Count aliases separately, as the bridge does.
+        require(all(type(r.get("size")) is int and 0 <= r["size"] <= OPTIONAL_ARTIFACT_MAX_BYTES for r in rows),
+                "ARTIFACT_SIZE")
+        require(sum(r["size"] for r in rows) <= ATTEMPT_ARTIFACT_MAX_BYTES, "ARTIFACT_TOTAL_SIZE")
+
+    def artifact(self, row, *, allow_empty=False, optional=False):
         require(UUID.fullmatch(row.get("id", "")) and SHA.fullmatch(row.get("digest", "")), "ARTIFACT_IDENTITY")
         # Only the trusted audit loop can allow empty optional attachments.
         # Required acceptance evidence and source lookups remain nonempty.
         # Empty content still has to match its real size and SHA256 below.
-        require(type(row.get("size")) is int and (0 < row["size"] <= 1024 * 1024
+        maximum = self.artifact_limit(row, optional=optional)
+        require(type(row.get("size")) is int and (0 < row["size"] <= maximum
                 or row["size"] == 0 and allow_empty is True), "ARTIFACT_SIZE")
-        raw = self.io.read_regular(self.artifacts / row["digest"], 1024 * 1024)
+        raw = self.io.read_regular(self.artifacts / row["digest"], maximum)
         require(len(raw) == row["size"] and digest(raw) == row["digest"], "ARTIFACT_BYTES_CHANGED")
         return raw
 
@@ -534,6 +552,8 @@ class NativeAudit:
                 and type(steps["independent-qa"].get("attempt")) is int
                 and steps["independent-qa"]["attempt"] == len(qa_rows), "NATIVE_QA_ATTEMPT_SET")
         actors = [producer, *qa_rows]
+        for actor in actors:
+            self.artifact_budget([r for r in detail["artifacts"] if r["attempt_id"] == actor["id"]])
         require(len({a["id"] for a in actors}) == len(actors)
                 and len({a["fence"] for a in actors}) == len(actors)
                 and all(UUID.fullmatch(a["id"]) and UUID.fullmatch(a["fence"])
@@ -550,7 +570,8 @@ class NativeAudit:
         require(all(type(r.get("name")) is str and re.fullmatch(r"[\w][\w.-]{0,160}", r["name"])
                     for r in source_rows), "ARTIFACT_NAME")
         source_refs = [{k: r[k] for k in ("id", "name", "digest", "size")} for r in source_rows]
-        for row in source_rows: self.artifact(row, allow_empty=row["name"] not in PRODUCER_FILES)
+        for row in source_rows:
+            self.artifact(row, allow_empty=row["name"] not in PRODUCER_FILES, optional=row["name"] not in PRODUCER_FILES)
         contract_sha = digest([1, "produce", [[b["reportArtifact"], b["jsonPointer"], b["dependencyArtifact"]] for b in contract["bindings"]]])
         history = []
         for index, attempt in enumerate(qa_rows):
@@ -568,7 +589,8 @@ class NativeAudit:
                         "consumer": consumer, "source": source, "artifacts": source_refs}
             require(canonical(manifest.get("dependencyEvidence")) == canonical(expected), "NATIVE_QA_DEPENDENCY_SNAPSHOT")
             for row in source_rows:
-                handed = self.io.read_regular(self.runs / attempt["id"] / "home/inputs" / row["id"] / row["name"], 1024 * 1024)
+                handed = self.io.read_regular(self.runs / attempt["id"] / "home/inputs" / row["id"] / row["name"],
+                                              self.artifact_limit(row, optional=row["name"] not in PRODUCER_FILES))
                 require(len(handed) == row["size"] and digest(handed) == row["digest"], "NATIVE_QA_DEPENDENCY_HANDOFF")
             raw = self.io.read_regular(self.runs / attempt["id"] / "home/inputs" / attempt["id"] / "cycle-input.json", 2 * 1024 * 1024)
             binding = manifest["cycleInput"]
@@ -854,10 +876,11 @@ class NativeAudit:
                     and strict_json(raw) == inp, "NATIVE_INPUT_CHANGED")
             rows = [r for r in detail["artifacts"] if r["attempt_id"] == a["id"]]
             require(len({r["name"] for r in rows}) == len(rows) and required.issubset({r["name"] for r in rows}), "NATIVE_ARTIFACT_SET")
+            self.artifact_budget(rows)
             files[key], artifacts[key] = {}, rows
             for row in rows:
                 require(re.fullmatch(r"[\w][\w.-]{0,160}", row["name"]), "ARTIFACT_NAME")
-                data = self.artifact(row, allow_empty=row["name"] not in required)
+                data = self.artifact(row, allow_empty=row["name"] not in required, optional=row["name"] not in required)
                 files[key][row["name"]] = data
                 frozen[key + "--" + row["name"]] = data
             transcript = self.io.read_regular(home / "sessions" / "--workspace--" / a["id"] / "session.v3.jsonl", 24 * 1024 * 1024)
@@ -867,7 +890,8 @@ class NativeAudit:
         require(identities["produce"]["attemptId"] != identities["independent-qa"]["attemptId"], "QA_NOT_INDEPENDENT")
         qa_home = self.runs / identities["independent-qa"]["attemptId"] / "home"
         for row in artifacts["produce"]:
-            raw = self.io.read_regular(qa_home / "inputs" / row["id"] / row["name"], 1024 * 1024)
+            raw = self.io.read_regular(qa_home / "inputs" / row["id"] / row["name"],
+                                      self.artifact_limit(row, optional=row["name"] not in PRODUCER_FILES))
             require(raw == files["produce"][row["name"]], "QA_PREDECESSOR_CHANGED")
         experiment = inp["experiment"]
         require(experiment["problem"] == problem and isinstance(experiment["hypothesis"], str), "EXPERIMENT_SCOPE")
@@ -998,6 +1022,7 @@ class NativeAudit:
                 continue
             require(len(rows) == 1, "SOURCE_ORIGIN_ATTEMPT_SET")
             a = rows[0]
+            self.artifact_budget([r for r in detail["artifacts"] if r["attempt_id"] == a["id"]])
             require(UUID.fullmatch(a["id"]) and UUID.fullmatch(a["fence"]) and a["number"] == (steps[0]["attempt"] if v2 else 1)
                     and a.get("finished_at") and a.get("model") == self.p["model"]
                     and a.get("account_id") == self.p["accountId"], "SOURCE_ORIGIN_ATTEMPT_BINDING")

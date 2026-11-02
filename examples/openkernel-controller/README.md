@@ -471,3 +471,20 @@ and 16 MiB; it never authorizes a submission or resets a consumption floor.
 Even a qualified historical anchor requires new authenticated GETs and strict
 overlap before admission. UTC rollover starts a newly proven daily baseline;
 the unresolved CHECK reservation itself persists across that boundary.
+
+### Optional attachment sizes and immutable evidence
+
+Native audit keeps required producer evidence, canonical QA files and source
+lookups at 1 MiB per file. Only authenticated attempt-inventory loops may read
+optional attachments up to the bridge's 8 MiB per-file and 24 MiB per-attempt
+delivery limits. Inventories are checked before attachment reads, including
+every earlier QA attempt in a version-2 retry chain; duplicate content still
+counts toward the total. Canonical names never receive the optional allowance,
+and source lookups remain strict even when an alias has a different name.
+
+The allowance preserves every byte: SHA256, declared length, predecessor
+handoffs, the second pre-submission audit and immutable evidence snapshots all
+remain checked. No attachment is omitted, truncated, summarized or executed.
+The existing protected reader and POST helper are unchanged. Existing receipts
+are not rewritten, and passing this size check alone is not native acceptance
+or a GPU result.

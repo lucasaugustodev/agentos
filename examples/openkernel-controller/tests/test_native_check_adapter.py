@@ -2543,5 +2543,167 @@ class JobsObservationTests(unittest.TestCase):
             self.qualifier().qualify(A,self.p,'e'*64,self.seed)
 
 
+class OptionalArtifactBoundsTests(unittest.TestCase):
+    def setUp(self):
+        self.f = Fixture(); self.f.setUp(); self.addCleanup(self.f.tearDown)
+        self.raw = b'{"emulation":[]}' + b' ' * (1153946 - len(b'{"emulation":[]}'))
+
+    def attach(self, name="emulation.json", raw=None, attempt=IDS[0]):
+        raw = self.raw if raw is None else raw
+        row = self.f.artifact(name, raw, attempt); self.f.detail["artifacts"].append(row)
+        if attempt == IDS[0]:
+            self.f.put(self.handoff(row), raw)
+        return row
+
+    def handoff(self, row, attempt=IDS[1]):
+        return pathlib.Path(self.f.paths["workerRunsDirectory"]) / attempt / "home/inputs" / row["id"] / row["name"]
+
+    def v2(self, count=3, failed=False):
+        helper = NativeQAV2Tests(); helper.f = self.f; helper.d = self.f.detail; helper.a = self.f.audit
+        helper.optin(count, failed)
+        return helper
+
+    def test_qa1_large_optional_preserves_full_bytes_hashes_and_frozen_snapshot(self):
+        row = self.attach(); self.attach("qa-extra.json", self.raw, IDS[1])
+        audit, files, _ = self.f.audit.audit(OCC)
+        self.assertEqual(files["produce--emulation.json"], self.raw)
+        self.assertEqual(audit["files"]["produce--emulation.json"], row["digest"])
+        result = self.f.lane.run(OCC, "check")  # FakeOfficial only.
+        self.assertEqual(result["state"], "job_recorded")
+        frozen = pathlib.Path(self.f.paths["stateDirectory"]) / (BOARD + "-" + A.digest(self.f.candidate) + "-evidence/produce--emulation.json")
+        self.assertEqual(frozen.read_bytes(), self.raw)
+        self.assertEqual(self.f.official.posts, 1)
+
+    def test_qa2_three_attempts_verify_large_optional_in_every_handoff(self):
+        row = self.attach(); self.v2()
+        audit, files, _ = self.f.audit.audit(OCC)
+        self.assertEqual(len(audit["qaAttemptHistory"]), 3)
+        self.assertEqual(files["produce--emulation.json"], self.raw)
+        prior = self.f.detail["attempts"][1]
+        self.f.put(self.handoff(row, prior["id"]), b'!' + self.raw[1:])
+        with self.assertRaisesRegex(ValueError, "NATIVE_QA_DEPENDENCY_HANDOFF"):
+            self.f.audit.audit(OCC)
+        self.assertEqual(self.f.official.posts, 0)
+
+    def test_required_and_canonical_alias_names_stay_at_one_mib(self):
+        for name in A.PRODUCER_FILES | A.QA_FILES | {"base-candidate.py"}:
+            row = self.f.artifact(name, self.raw)
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, "ARTIFACT_SIZE"):
+                self.f.audit.artifact(row, optional=True, allow_empty=True)
+        row = self.f.artifact("renamed-source.py", self.raw)
+        with self.assertRaisesRegex(ValueError, "ARTIFACT_SIZE"):
+            self.f.audit.artifact(row)  # Source lookups never request optional access.
+
+    def test_required_large_report_fails_actual_qa1_and_qa2_audit(self):
+        row = next(r for r in self.f.detail["artifacts"] if r["name"] == "qa-verification.json")
+        original = copy.deepcopy(row)
+        for version in (1, 2):
+            if version == 2:
+                row.clear(); row.update(original); self.v2(1)
+            row.update(size=len(self.raw), digest=A.digest(self.raw))
+            self.f.put(pathlib.Path(self.f.paths["artifactDirectory"]) / row["digest"], self.raw)
+            with self.subTest(version=version), self.assertRaisesRegex(ValueError, "ARTIFACT_SIZE"):
+                self.f.audit.audit(OCC)
+
+    def test_optional_file_limit_and_metadata_types_are_checked_before_read(self):
+        row = self.f.artifact("large.log", b'x' * A.OPTIONAL_ARTIFACT_MAX_BYTES)
+        self.assertEqual(len(self.f.audit.artifact(row, optional=True)), A.OPTIONAL_ARTIFACT_MAX_BYTES)
+        for size in (A.OPTIONAL_ARTIFACT_MAX_BYTES + 1, -1, True, 1.0):
+            with self.subTest(size=size), mock.patch.object(IO, "read_regular", side_effect=AssertionError("must reject metadata first")):
+                with self.assertRaisesRegex(ValueError, "ARTIFACT_SIZE"):
+                    self.f.audit.artifact(dict(row, size=size), optional=True)
+        with self.assertRaisesRegex(ValueError, "ARTIFACT_SIZE"):
+            self.f.audit.artifact(row, optional=1)
+
+    def test_total_limit_counts_duplicate_content_and_rejects_before_attachment_reads(self):
+        sizes = [{"size": A.OPTIONAL_ARTIFACT_MAX_BYTES}] * 3
+        self.f.audit.artifact_budget(sizes)
+        with self.assertRaisesRegex(ValueError, "ARTIFACT_TOTAL_SIZE"):
+            self.f.audit.artifact_budget(sizes + [{"size": 1}])
+        for i in range(3):
+            row = self.attach("bulk-" + str(i), b'x')
+            row["size"] = A.OPTIONAL_ARTIFACT_MAX_BYTES
+        with mock.patch.object(self.f.audit, "artifact", side_effect=AssertionError("inventory must be checked first")):
+            with self.assertRaisesRegex(ValueError, "ARTIFACT_TOTAL_SIZE"):
+                self.f.audit.audit(OCC)
+
+    def test_v2_all_prior_qa_inventories_are_bounded_before_source_reads(self):
+        self.v2(3)
+        prior = self.f.detail["attempts"][1]
+        for i in range(3):
+            row = self.attach("prior-extra-" + str(i), b'x', prior["id"])
+            row["size"] = A.OPTIONAL_ARTIFACT_MAX_BYTES
+        with mock.patch.object(self.f.audit, "artifact", side_effect=AssertionError("budget first")):
+            with self.assertRaisesRegex(ValueError, "ARTIFACT_TOTAL_SIZE"):
+                self.f.audit.qa_attempt_chain(self.f.detail)
+
+    def test_exact_24_mib_producer_inventory_passes_and_one_more_byte_fails(self):
+        used = sum(r["size"] for r in self.f.detail["artifacts"] if r["attempt_id"] == IDS[0])
+        remaining = A.ATTEMPT_ARTIFACT_MAX_BYTES - used
+        for index in range(3):
+            size = min(remaining, A.OPTIONAL_ARTIFACT_MAX_BYTES)
+            self.attach("bounded-" + str(index) + ".log", bytes([65 + index]) * size)
+            remaining -= size
+        self.assertEqual(remaining, 0)
+        audit, files, _ = self.f.audit.audit(OCC)
+        self.assertEqual(sum(len(raw) for name, raw in files.items() if name.startswith("produce--")), A.ATTEMPT_ARTIFACT_MAX_BYTES)
+        self.assertEqual(len(audit["files"]), len(files))
+        self.attach("one-more-byte.log", b'x')
+        with self.assertRaisesRegex(ValueError, "ARTIFACT_TOTAL_SIZE"):
+            self.f.audit.audit(OCC)
+        self.assertEqual(self.f.official.posts, 0)
+
+    def test_large_optional_corruption_and_handoff_mismatch_are_not_skipped(self):
+        row = self.attach(); path = pathlib.Path(self.f.paths["artifactDirectory"]) / row["digest"]
+        self.f.put(path, b'!' + self.raw[1:])
+        with self.assertRaisesRegex(ValueError, "ARTIFACT_BYTES_CHANGED"):
+            self.f.audit.audit(OCC)
+        self.f.put(path, self.raw); self.f.put(self.handoff(row), b'!' + self.raw[1:])
+        with self.assertRaisesRegex(ValueError, "QA_PREDECESSOR_CHANGED"):
+            self.f.audit.audit(OCC)
+
+    def test_optional_artifact_and_handoff_symlinks_are_rejected(self):
+        row = self.attach(); original = pathlib.Path(self.f.paths["artifactDirectory"]) / row["digest"]
+        other = self.f.root / "same-bytes.json"; self.f.put(other, self.raw)
+        original.unlink(); original.symlink_to(other)
+        with self.assertRaises(ValueError): self.f.audit.audit(OCC)
+        original.unlink(); self.f.put(original, self.raw)
+        handed = self.handoff(row); handed.unlink(); handed.symlink_to(other)
+        with self.assertRaises(ValueError): self.f.audit.audit(OCC)
+        self.assertEqual(self.f.official.posts, 0)
+
+    def test_optional_change_during_preflight_cannot_reach_effect_boundary(self):
+        row = self.attach(); original_preflight = self.f.lane.preflight
+        def change(problem):
+            result = original_preflight(problem)
+            changed = b'!' + self.raw[1:]
+            row.update(digest=A.digest(changed))
+            self.f.put(pathlib.Path(self.f.paths["artifactDirectory"]) / row["digest"], changed)
+            self.f.put(self.handoff(row), changed)
+            return result
+        with mock.patch.object(self.f.lane, "preflight", side_effect=change):
+            with self.assertRaisesRegex(ValueError, "AUDIT_CHANGED_DURING_PREFLIGHT"):
+                self.f.lane.run(OCC, "check")
+        self.assertEqual(self.f.official.posts, 0)
+        self.assertFalse(list(pathlib.Path(self.f.paths["stateDirectory"]).glob("*-check.json")))
+
+    def test_failed_v2_source_keeps_large_optional_inventory_without_acceptance(self):
+        self.attach(); helper = self.v2(2, failed=True)
+        refs = self.f.origin(helper.source)
+        report = A.strict_json(A.pinned(refs[0]))
+        self.assertFalse(report["qualityAccepted"])
+        self.assertEqual(report["qa"]["state"], "failed")
+        self.assertEqual(self.f.official.posts, 0)
+
+    def test_source_alias_with_different_name_does_not_inherit_optional_bound(self):
+        source = self.f.origin_fixture(alias=True)
+        row = next(r for r in self.f.detail["artifacts"] if r["id"] == source["id"])
+        row.update(name="copied-source.py", size=len(self.raw), digest=A.digest(self.raw))
+        source.update({k:row[k] for k in ("name", "size", "digest")})
+        self.f.put(pathlib.Path(self.f.paths["artifactDirectory"]) / row["digest"], self.raw)
+        with self.assertRaisesRegex(ValueError, "SOURCE_ORIGIN_ABSENT"): self.f.origin(source)
+        self.assertEqual(self.f.official.posts, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
