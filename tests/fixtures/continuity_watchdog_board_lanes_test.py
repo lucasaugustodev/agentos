@@ -77,6 +77,14 @@ class BoardLaneTests(unittest.TestCase):
     def close_worker(self, record):
         self.client.complete(record['occurrenceId'], {'review.txt': b'Negative result, actor stopped.'}, state='failed')
 
+    def fill_native_target(self):
+        # Bounded sweeps preserve a fresh observation between dispatches without
+        # replaying the entire historical catalog eight times in one invocation.
+        for _ in range(3):
+            before = len(self.w.state['experiments'])
+            self.w.tick()
+            self.assertLessEqual(len(self.w.state['experiments']) - before, 3)
+
     def native_posts(self, rows):
         return [(route, body) for route, body in rows if route != '/api/cycles/' + self.f.config['controlCycleId'] + '/run']
 
@@ -108,7 +116,7 @@ class BoardLaneTests(unittest.TestCase):
     def test_native_target_eight_keeps_approved_remainder_as_durable_backlog(self):
         reviews = self.boot()
         for r in reviews: self.complete(r, 6)
-        self.w.tick()
+        self.fill_native_target()
         self.assertEqual(len(self.w.state['experiments']), 8)
         self.assertEqual(len(self.w.ready_actions()), 10)
         self.f.reload()
@@ -122,7 +130,7 @@ class BoardLaneTests(unittest.TestCase):
     def test_refill_uses_approved_work_before_any_new_planner_request(self):
         reviews = self.boot()
         for r in reviews: self.complete(r, 6)
-        self.w.tick()
+        self.fill_native_target()
         self.close_worker(self.w.state['experiments'][0])
         before = len(self.client.posts)
         self.w.tick()
@@ -135,7 +143,7 @@ class BoardLaneTests(unittest.TestCase):
     def test_control_pause_blocks_all_lanes_and_all_ready_dispatches(self):
         reviews = self.boot()
         for r in reviews: self.complete(r, 6)
-        self.w.tick()
+        self.fill_native_target()
         self.close_worker(self.w.state['experiments'][0])
         self.client.cycles[self.f.config['controlCycleId']]['state'] = 'paused'
         before = copy.deepcopy(self.w.state)
@@ -164,13 +172,13 @@ class BoardLaneTests(unittest.TestCase):
         first_post = next(i for i, row in enumerate(routes) if row[0] == 'POST')
         self.assertTrue(all(('GET', '/api/cycle-runs/' + r['occurrenceId']) in routes[:first_post]
                             for r in reviews))
-        self.assertEqual(len(self.w.state['experiments']), 8)
+        self.assertEqual(len(self.w.state['experiments']), 3)
 
     def test_archive_preserves_all_lane_inputs_and_approved_actions_after_restart(self):
         self.f.enable_payloads()
         reviews = self.boot()
         for r in reviews: self.complete(r, 6)
-        self.w.tick()
+        self.fill_native_target()
         expected = copy.deepcopy(self.w.export_legacy_state())
         intents = {p.name: p.read_bytes() for p in self.w.directory.glob('intent-*.json')}
         self.f.reload()
@@ -181,7 +189,7 @@ class BoardLaneTests(unittest.TestCase):
     def test_full_approved_backlog_reserves_twenty_four_without_starting_twenty_four_workers(self):
         reviews = self.boot()
         for r in reviews: self.complete(r, 8)
-        self.w.tick()
+        self.fill_native_target()
         ready = self.w.ready_actions()
         self.assertEqual(len(self.w.state['experiments']), 8)
         self.assertEqual(len(ready), 16)
@@ -244,7 +252,7 @@ class BoardLaneTests(unittest.TestCase):
         self.f.reload()
         self.assertEqual(len(self.w.ready_actions()), 9)
         approved = {r['occurrenceId']: copy.deepcopy(r['approvedPlan']) for r in self.planners()}
-        self.w.tick()
+        self.fill_native_target()
         self.assertEqual(len(self.w.state['experiments']), 8)
         self.assertEqual(len(self.w.ready_actions()), 1)
         for r in self.planners():
@@ -348,7 +356,7 @@ class BoardLaneTests(unittest.TestCase):
         for i, exp in enumerate(plan['experiments']):
             exp['sourceArtifactId'] = first['id'] if i in [0, 3] else other['id']
         for r in reviews: self.complete(r, 6, plan if r is decode else None)
-        self.w.tick()
+        self.fill_native_target()
         original = copy.deepcopy(self.w.state['experiments'])
         self.assertEqual(len(original), 8)
         self.assertTrue(any(r['supervisorOccurrenceId'] == decode['occurrenceId'] and
@@ -393,7 +401,7 @@ class BoardLaneTests(unittest.TestCase):
     def test_approved_ready_hypothesis_cannot_be_renamed_by_replenishment_planner(self):
         reviews = self.boot()
         for r in reviews: self.complete(r, 3)
-        self.w.tick()
+        self.fill_native_target()
         ready = self.w.ready_actions()
         self.assertEqual(len(ready), 1)
         reserved = copy.deepcopy(ready[0]['experiment'])
