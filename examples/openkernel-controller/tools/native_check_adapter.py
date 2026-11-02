@@ -429,13 +429,19 @@ def semantic_qa(verification, qa, cpu, source_sha, candidate_sha, checker_sha, r
             require(isinstance(report, list) and bool(report) and all(isinstance(r, dict)
                     and isinstance(r.get("name"), str) and r["name"].strip() and r.get(flag) is True for r in report)
                     and len({r["name"] for r in report}) == len(report), "CPU_MEANINGFUL_" + name)
-            require(all("detail" not in r or isinstance(r["detail"], str) for r in report), "CPU_CASES_NOT_REPLAYED")
         # QA is instructed to report name/flag rows. A textual diagnostic may
-        # be omitted; all other fields, identities, order and flags stay exact.
+        # be omitted. Structured detail is evidence: preserve it in full with
+        # exact JSON types, just like every other field, identity and flag.
         require(canonical([{k: v for k, v in r.items() if k != "detail"} for r in original]) ==
                 canonical([{k: v for k, v in r.items() if k != "detail"} for r in rows]), "CPU_CASES_NOT_REPLAYED")
-        require(all("detail" not in review or review["detail"] == source.get("detail")
-                    for source, review in zip(original, rows)), "CPU_CASES_NOT_REPLAYED")
+        for source, review in zip(original, rows):
+            if isinstance(source.get("detail"), str):
+                require("detail" not in review or canonical(review["detail"]) == canonical(source["detail"]),
+                        "CPU_CASES_NOT_REPLAYED")
+            else:
+                require(("detail" in source) == ("detail" in review) and
+                        ("detail" not in source or canonical(review["detail"]) == canonical(source["detail"])),
+                        "CPU_CASES_NOT_REPLAYED")
 
 
 def apply_single_file_patch(base, patch):

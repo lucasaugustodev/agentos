@@ -511,6 +511,99 @@ class Fixture(unittest.TestCase):
         self.qa['cpuEvidence']['negativeControls'] = copy.deepcopy(self.cpu['negativeControls'])
         self.semantic_check()
 
+    def structured_cpu_evidence(self):
+        self.projected_cpu_evidence()
+        for name in ('cases', 'negativeControls'):
+            for index, row in enumerate(self.cpu[name]):
+                row['detail'] = {'observed': {'count': index + 1, 'exact': True},
+                                 'shape': [2, 4], 'error': 0.0, 'notes': ['bounded', None]}
+            self.qa['cpuEvidence'][name] = copy.deepcopy(self.cpu[name])
+        self.qa['cpuEvidence']['resultSHA256'] = A.digest(A.canonical(self.cpu))
+
+    def test_identical_structured_details_pass_full_native_qa1_and_qa2_without_post(self):
+        self.structured_cpu_evidence()
+        self.detail = self.native_fixture()
+        self.assertEqual(self.lane.run(OCC, 'inspect')['state'], 'eligible')
+        helper = NativeQAV2Tests(); helper.f = self; helper.d = self.detail; helper.a = self.audit
+        helper.optin(1)
+        self.assertEqual(self.lane.run(OCC, 'inspect')['state'], 'eligible')
+        self.assertEqual(self.official.posts, 0)
+
+    def test_structured_detail_cannot_be_omitted_changed_summarized_or_reordered(self):
+        for name in ('cases', 'negativeControls'):
+            for mutation in ('omit', 'nested', 'drop-field', 'summary', 'array-order'):
+                with self.subTest(name=name, mutation=mutation):
+                    self.structured_cpu_evidence()
+                    row = self.qa['cpuEvidence'][name][0]
+                    if mutation == 'omit': del row['detail']
+                    elif mutation == 'nested': row['detail']['observed']['count'] += 1
+                    elif mutation == 'drop-field': del row['detail']['observed']['exact']
+                    elif mutation == 'summary': row['detail'] = 'all checks passed'
+                    else: row['detail']['shape'].reverse()
+                    with self.assertRaisesRegex(ValueError, 'CPU_CASES_NOT_REPLAYED'):
+                        self.semantic_check()
+
+    def test_structured_detail_preserves_exact_nested_json_types(self):
+        for original, claimed in [(1, True), (True, 1), (1, 1.0), (None, False),
+                                  ([1, 2], [1, True]), ({'count': 1}, {'count': True})]:
+            with self.subTest(original=original, claimed=claimed):
+                self.structured_cpu_evidence()
+                self.cpu['cases'][0]['detail'] = {'value': original}
+                self.qa['cpuEvidence']['cases'][0]['detail'] = {'value': claimed}
+                self.qa['cpuEvidence']['resultSHA256'] = A.digest(A.canonical(self.cpu))
+                with self.assertRaisesRegex(ValueError, 'CPU_CASES_NOT_REPLAYED'):
+                    self.semantic_check()
+
+    def test_nontext_details_are_exact_json_data_not_optional_text(self):
+        for detail in ({}, [], None, True, 0, 0.0, ['one', {'two': 2}]):
+            with self.subTest(detail=detail):
+                self.structured_cpu_evidence()
+                self.cpu['cases'][0]['detail'] = copy.deepcopy(detail)
+                self.qa['cpuEvidence']['cases'][0]['detail'] = copy.deepcopy(detail)
+                self.qa['cpuEvidence']['resultSHA256'] = A.digest(A.canonical(self.cpu))
+                self.semantic_check()
+                del self.qa['cpuEvidence']['cases'][0]['detail']
+                with self.assertRaisesRegex(ValueError, 'CPU_CASES_NOT_REPLAYED'):
+                    self.semantic_check()
+
+    def test_detail_cannot_be_added_when_source_had_no_detail(self):
+        for detail in ('new claim', {'count': 1}, [], None, True):
+            with self.subTest(detail=detail):
+                self.structured_cpu_evidence()
+                del self.cpu['cases'][0]['detail']
+                self.qa['cpuEvidence']['cases'][0]['detail'] = detail
+                self.qa['cpuEvidence']['resultSHA256'] = A.digest(A.canonical(self.cpu))
+                with self.assertRaisesRegex(ValueError, 'CPU_CASES_NOT_REPLAYED'):
+                    self.semantic_check()
+
+    def test_structured_details_do_not_relax_true_boolean_case_or_control_flags(self):
+        for name, flag in [('cases', 'passed'), ('negativeControls', 'detected')]:
+            for value in (False, 1, 'true', None):
+                with self.subTest(name=name, value=value):
+                    self.structured_cpu_evidence()
+                    self.cpu[name][0][flag] = value
+                    self.qa['cpuEvidence'][name][0][flag] = value
+                    self.qa['cpuEvidence']['resultSHA256'] = A.digest(A.canonical(self.cpu))
+                    with self.assertRaisesRegex(ValueError, 'CPU_MEANINGFUL_'):
+                        self.semantic_check()
+
+    def test_structured_details_do_not_replace_actual_execution_evidence(self):
+        self.structured_cpu_evidence()
+        self.detail = self.native_fixture()
+        path = pathlib.Path(self.paths['workerRunsDirectory']) / IDS[1] / 'home/sessions/--workspace--' / IDS[1] / 'session.v3.jsonl'
+        self.put(path, A.canonical({'type': 'assistant', 'data': {'text': 'CPU replay passed'}}) + b'\n')
+        with self.assertRaisesRegex(ValueError, 'CPU_REPLAY_EXECUTION_UNPROVEN'):
+            self.lane.run(OCC, 'inspect')
+        self.assertEqual(self.official.posts, 0)
+
+    def test_structured_details_cannot_hide_scope_or_hash_mismatch(self):
+        for field, value in [('scopePreserved', False), ('candidateSHA256', 'f' * 64)]:
+            with self.subTest(field=field):
+                self.structured_cpu_evidence()
+                self.qa[field] = value
+                with self.assertRaisesRegex(ValueError, 'QA_SOURCE_OR_SCOPE_MISMATCH'):
+                    self.semantic_check()
+
     def test_case_and_control_projection_rejects_omission_addition_reorder_and_name_drift(self):
         for name in ['cases', 'negativeControls']:
             for mutation in ['omit', 'add', 'reorder', 'rename']:
