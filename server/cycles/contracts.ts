@@ -2,6 +2,24 @@ import { z } from 'zod';
 import { DomainError, criterionSchema, validateDag } from '../contracts.js';
 import { checkMemoryContent } from '../memory.js';
 
+const artifactName = z.string().regex(/^[\w][\w.-]{0,150}$/);
+export const dependencyEvidenceSchema = z.object({
+  version: z.literal(1),
+  sourceStep: z.string().regex(/^[a-z0-9_-]{1,60}$/),
+  bindings: z.array(z.object({
+    reportArtifact: artifactName,
+    jsonPointer: z.string().min(2).max(500).regex(/^(?:\/(?:[^~\/]|~[01])*)+$/),
+    dependencyArtifact: artifactName,
+  }).strict()).min(1).max(30),
+}).strict().superRefine((value, ctx) => {
+  const seen = new Set<string>();
+  for (const binding of value.bindings) {
+    const key = JSON.stringify([binding.reportArtifact, binding.jsonPointer]);
+    if (seen.has(key)) ctx.addIssue({ code: 'custom', message: 'Duplicate dependency evidence binding.' });
+    seen.add(key);
+  }
+});
+
 export const stepSchema = z
   .object({
     key: z.string().regex(/^[a-z0-9_-]{1,60}$/),
@@ -18,6 +36,7 @@ export const stepSchema = z
     readOnly: z.boolean().default(false),
     sourceStep: z.string().optional(),
     repairStep: z.string().optional(),
+    dependencyEvidence: dependencyEvidenceSchema.optional(),
     action: z
       .string()
       .regex(/^[a-z0-9_.-]{1,100}$/)
@@ -40,6 +59,12 @@ export const stepSchema = z
       });
     if (s.kind === 'action' && !s.action)
       ctx.addIssue({ code: 'custom', message: 'Selecione uma ação registrada.' });
+    if (s.dependencyEvidence && (s.kind !== 'agent' || s.repairStep ||
+        !s.dependsOn.includes(s.dependencyEvidence.sourceStep)))
+      ctx.addIssue({ code: 'custom', message: 'Dependency evidence requires a direct agent dependency and consumer-only retries.' });
+    if (s.parameters.nativeQAContractVersion !== undefined && s.parameters.nativeQAContractVersion !== 1 &&
+        (s.parameters.nativeQAContractVersion !== 2 || !s.dependencyEvidence || s.maxAttempts > 3))
+      ctx.addIssue({ code: 'custom', message: 'NativeQA v2 requires dependency evidence and at most three QA attempts.' });
   });
 export const cycleSchema = z
   .object({
@@ -67,6 +92,12 @@ export const cycleSchema = z
     if (c.trigger.kind === 'bitrix' && (!c.trigger.groupId || c.trigger.stageId === undefined))
       ctx.addIssue({ code: 'custom', message: 'Informe grupo e etapa do Bitrix.' });
     for (const s of c.steps) {
+      if (s.dependencyEvidence) {
+        const source = c.steps.find(p => p.key === s.dependencyEvidence!.sourceStep);
+        if (!source || source.kind !== 'agent' ||
+            (s.parameters.nativeQAContractVersion === 2 && source.maxAttempts !== 1))
+          ctx.addIssue({ code: 'custom', message: 'NativeQA dependency must be an agent with one producer attempt.' });
+      }
       if (
         s.repairStep &&
         (!s.dependsOn.includes(s.repairStep) ||

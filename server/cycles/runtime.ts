@@ -11,6 +11,7 @@ import { importRecall } from '../recall.js';
 import { actionProfiles, bitrixSnapshot, clean } from './integrations.js';
 import { cycleEvent } from './store.js';
 import { isRegisteredValidation, confirmRegisteredValidationStop } from './validation-action.js';
+import { freezeDependencyEvidence, dependencyArtifactBytes, assertDependencySnapshot } from './dependency-evidence.js';
 
 export async function readCycleArtifact(id: string) {
   const a = (await pool.query('SELECT * FROM cycle_artifacts WHERE id=$1', [id])).rows[0];
@@ -49,6 +50,7 @@ export async function runCycleAgent(
   onEvent: (kind: string, payload: any) => Promise<void>,
 ) {
   const definition = s.definition;
+  const dependencySnapshot = definition.dependencyEvidence ? await freezeDependencyEvidence(o, s, a) : undefined;
   const inputJson = JSON.stringify(o.input ?? {});
   const inputBytes = Buffer.from(inputJson, 'utf8');
   // The existing bridge accepts at most 8 MiB per file and 24 MiB in total.
@@ -139,19 +141,32 @@ export async function runCycleAgent(
         attemptId: a.id,
         runFence: a.fence,
       },
+      ...(dependencySnapshot ? { dependencyEvidence: dependencySnapshot } : {}),
     },
     content,
   };
-  await pool.query('UPDATE cycle_attempts SET context=$2 WHERE id=$1', [
+  const contextSaved = await pool.query(dependencySnapshot
+    ? "UPDATE cycle_attempts SET context=$2 WHERE id=$1 AND fence=$3 AND state='running' RETURNING id"
+    : 'UPDATE cycle_attempts SET context=$2 WHERE id=$1', [
     a.id,
     JSON.stringify(context),
+    ...(dependencySnapshot ? [a.fence] : []),
   ]);
-  const parents = (
+  if (dependencySnapshot && contextSaved.rowCount !== 1)
+    throw new DomainError('DEPENDENCY_SOURCE_CHANGED', 'The consumer attempt changed before dependency staging.');
+  let parents = (
     await pool.query(
-      `SELECT s.output,a.id,a.name,a.digest FROM cycle_steps s LEFT JOIN cycle_attempts r ON r.step_id=s.id AND r.number=s.attempt LEFT JOIN cycle_artifacts a ON a.attempt_id=r.id WHERE s.occurrence_id=$1 AND s.key=ANY($2)`,
+      `SELECT s.key,s.output,a.id,a.name,a.digest FROM cycle_steps s LEFT JOIN cycle_attempts r ON r.step_id=s.id AND r.number=s.attempt LEFT JOIN cycle_artifacts a ON a.attempt_id=r.id WHERE s.occurrence_id=$1 AND s.key=ANY($2)`,
       [o.id, definition.dependsOn],
     )
   ).rows;
+  if (dependencySnapshot) {
+    parents = parents.filter(p => p.key !== dependencySnapshot.source.key);
+    for (const ref of dependencySnapshot.artifacts) {
+      await dependencyArtifactBytes(ref);
+      parents.push({ ...ref, key: dependencySnapshot.source.key });
+    }
+  }
   const inputs = [cycleInput];
   let size = inputBytes.length;
   for (const p of parents.filter((p) => p.id)) {
@@ -179,7 +194,7 @@ export async function runCycleAgent(
   }
   const previous = (
     await pool.query(
-      'SELECT summary,error_code FROM cycle_attempts WHERE step_id=$1 AND number<$2 ORDER BY number DESC LIMIT 1',
+      'SELECT summary,error_code,context FROM cycle_attempts WHERE step_id=$1 AND number<$2 ORDER BY number DESC LIMIT 1',
       [s.id, a.number],
     )
   ).rows[0];
@@ -189,7 +204,16 @@ export async function runCycleAgent(
     'Role: executor de etapa do ciclo',
     'Escopo: ' + o.definition.description,
     'Critérios: ' + JSON.stringify(definition.criteria),
-    'Tentativa anterior a corrigir, com arquivos preservados: ' + JSON.stringify(previous ?? null),
+    'Tentativa anterior a corrigir, com arquivos preservados: ' + JSON.stringify(previous ? {
+      summary: previous.summary, error_code: previous.error_code,
+      ...(dependencySnapshot ? { dependencyEvidenceValidation: previous.context?.dependencyEvidenceValidation } : {}),
+    } : null),
+    ...(dependencySnapshot ? [
+      'CURRENT DEPENDENCY EVIDENCE (controller-pinned): ' + JSON.stringify(dependencySnapshot) +
+      '\nUse only these exact current producer artifact IDs and bytes for the dependency report. ' +
+      'Historical input reports are not evidence of this producer. Independently run validation; never copy historical hashes. ' +
+      'A binding mismatch retries only this validation, with the producer frozen. A failed semantic or numerical test must remain failed.',
+    ] : []),
     'Orientação de retomada: ' + JSON.stringify(s.output ?? null),
     'Entrada externa completa: ' + inputPath + '\nSHA256: ' + cycleInput.digest +
       '\nTamanho UTF-8: ' + inputBytes.length + ' bytes. Leia este arquivo diretamente; ' +
@@ -199,6 +223,10 @@ export async function runCycleAgent(
     'Resultados anteriores: ' + JSON.stringify(parents.map((p) => p.output)).slice(0, 18000),
     'A alteração é isolada. Não publicar nem acessar produção. Preserve arquivos e gere evidências reais.',
   ].join('\n\n');
+  if (dependencySnapshot) await tx(async db => {
+    await lock(db);
+    await assertDependencySnapshot(db, o, s, a, dependencySnapshot);
+  });
   let events = Promise.resolve();
   const result = await accountBridge
     .request(

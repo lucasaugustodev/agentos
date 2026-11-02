@@ -8,6 +8,7 @@ import { listBitrix, clean } from './integrations.js';
 import { runCycleAction, runCycleAgent, saveCycleArtifacts, readCycleArtifact } from './runtime.js';
 import { inspectStopped } from '../continuation.js';
 import { collectStoppedArtifacts } from '../artifact-recovery.js';
+import { checkDependencyEvidence, assertDependencySnapshot, DependencyBindingError } from './dependency-evidence.js';
 
 const terminal = ['completed', 'cancelled'];
 export class CycleEngine {
@@ -414,7 +415,7 @@ export class CycleEngine {
           );
           if (!changed.rowCount) return;
           const cancelling = ['cancelling', 'cancelled'].includes(a.occurrence_state),
-            retry = a.number < a.definition.maxAttempts;
+            retry = !a.definition.dependencyEvidence && a.number < a.definition.maxAttempts;
           await db.query(
             "UPDATE cycle_steps SET state=$2,reason=$3,next_at=now()+interval '15 seconds' WHERE id=$1",
             [
@@ -468,8 +469,9 @@ export class CycleEngine {
     const emit = async (kind: string, payload: any) => {
       await cycleEvent(pool, o.cycle_id, o.id, kind, clean(payload), s.id, a.id);
     };
+    let result: any;
     try {
-      const result =
+      result =
         s.definition.kind === 'agent'
           ? await runCycleAgent(o, s, a, account, controller.signal, emit)
           : await runCycleAction(o, s, a, controller.signal, emit);
@@ -494,8 +496,14 @@ export class CycleEngine {
             throw new DomainError('DELIVERY_INVALID', 'Critério não atendido: ' + criterion.label);
         }
       }
+      const dependencySnapshot = s.definition.dependencyEvidence
+        ? await checkDependencyEvidence(o, s, a) : undefined;
       await tx(async (db) => {
         await lock(db);
+        if (dependencySnapshot) {
+          if (controller.signal.aborted) throw new DomainError('DEPENDENCY_EXECUTION_CANCELLED', 'Validation was cancelled.');
+          await assertDependencySnapshot(db, o, s, a, dependencySnapshot);
+        }
         const changed = await db.query(
           "UPDATE cycle_attempts SET state='completed',finished_at=now(),summary=$3,usage=$4,receipt=$5 WHERE id=$1 AND fence=$2 AND state='running' RETURNING id",
           [
@@ -527,17 +535,20 @@ export class CycleEngine {
         !uncertain &&
         !controller.signal.aborted &&
         a.number < s.definition.maxAttempts &&
+        (!s.definition.dependencyEvidence || (e instanceof DependencyBindingError && result?.evidence?.stopped === true)) &&
         !['APPROVAL_REQUIRED', 'ACTION_SCOPE', 'ACTION_UNAVAILABLE', 'BITRIX_AUTH'].includes(code);
       await tx(async (db) => {
         await lock(db);
         const changed = await db.query(
-          "UPDATE cycle_attempts SET state=$3,finished_at=now(),error_code=$4,summary=$5 WHERE id=$1 AND fence=$2 AND state='running' RETURNING id",
+          "UPDATE cycle_attempts SET state=$3,finished_at=now(),error_code=$4,summary=$5,receipt=CASE WHEN $6::boolean THEN $7::jsonb ELSE receipt END WHERE id=$1 AND fence=$2 AND state='running' RETURNING id",
           [
             a.id,
             a.fence,
             uncertain ? 'reconciling' : controller.signal.aborted ? 'cancelled' : 'failed',
             code,
             clean(e.code ? e.message : 'A execução não produziu um resultado válido.'),
+            !!s.definition.dependencyEvidence && result?.evidence?.stopped === true,
+            JSON.stringify(result?.evidence ?? null),
           ],
         );
         if (!changed.rowCount) return;
