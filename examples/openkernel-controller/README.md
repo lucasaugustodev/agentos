@@ -132,6 +132,14 @@ Then exercise restart and deduplication against its journal. This example has
 no serving submission, rules-acceptance or withdrawal endpoint.
 # Native diagnostic CHECK adapter
 
+Projected evidence repairs may carry one additional diagnostic material,
+`prior-qa-original.json`. The adapter binds it to the registered historical
+independent QA artifact, attempt, fence, input, source and candidate. Its raw
+bytes and projection hashes must match. It is not canonical source or current
+acceptance evidence; canonical materials and the new independent QA checks
+remain mandatory. Other extra materials remain rejected, including this file
+on an ordinary experiment. Source-origin audits apply the same distinction.
+
 `tools/native_check_adapter.py` adds a separate, opt-in authority lane for a
 watchdog's completed producer → independent QA experiment. It does not alter the
 existing manual approval path. An operator pins the adapter, qualified transport

@@ -415,6 +415,89 @@ class NativeAudit:
                     and rows[0]["size"] == len(raw), "ARTIFACT_BYTES_CHANGED")
             raise EvidenceJSONError(stage, rows[0]) from error
 
+    def material_set(self, experiment, materials, problem, dispatch, candidate_sha):
+        """Keep canonical inputs closed; authenticate one historical QA attachment.
+
+        A projected repair may carry the original report for worker inspection.
+        It is diagnostic data, never canonical source or current QA acceptance.
+        The new candidate still passes every ordinary audit below this check.
+        """
+        expected = {"base-candidate.py", *self.p["boards"][problem]["materials"]}
+        if set(materials) == expected:
+            return
+        require(set(materials) == expected | {"prior-qa-original.json"}, "MATERIAL_SET_CHANGED")
+        target, diagnostic = experiment.get("repairTarget"), experiment.get("repairQADiagnostic")
+        require(type(target) is dict and type(diagnostic) is dict
+                and UUID.fullmatch(target.get("occurrenceId", ""))
+                and dispatch.get("repairOf") == target["occurrenceId"]
+                and dispatch.get("repairCandidateSHA256") == target.get("candidateSHA256") == candidate_sha,
+                "REPAIR_DIAGNOSTIC_SCOPE")
+        require(type(diagnostic.get("version")) is int and diagnostic["version"] == 1
+                and diagnostic.get("authority") == "prior_qa_diagnostic_only_not_current_acceptance"
+                and diagnostic.get("currentAcceptance") is False and diagnostic.get("bindingState") == "verified"
+                and diagnostic.get("problem") == problem and diagnostic.get("occurrenceId") == target["occurrenceId"]
+                and diagnostic.get("stepKey") == "independent-qa", "REPAIR_DIAGNOSTIC_BINDING")
+        projection, ref = diagnostic.get("reportProjection"), diagnostic.get("artifact")
+        require(type(projection) is dict and type(projection.get("version")) is int and projection["version"] == 1
+                and projection.get("kind") == "bounded_historical_qa" and projection.get("complete") is False
+                and type(ref) is dict and projection.get("originalArtifact") == ref
+                and ref.get("name") == "qa-verification.json" and ref.get("id") == target.get("qaArtifactId")
+                and ref.get("digest") == target.get("qaSHA256"), "REPAIR_DIAGNOSTIC_PROJECTION")
+        attached = [row for row in experiment["materials"] if row["name"] == "prior-qa-original.json"]
+        require(len(attached) == 1 and attached[0].get("artifactId") == ref.get("id")
+                and attached[0].get("attemptId") == diagnostic.get("attemptId")
+                and type(attached[0].get("bytes")) is int and attached[0]["bytes"] == ref.get("size")
+                and attached[0].get("sha256") == ref.get("digest"), "REPAIR_DIAGNOSTIC_MATERIAL_BINDING")
+        raw = self.artifact(ref)
+        require(raw == materials["prior-qa-original.json"], "REPAIR_DIAGNOSTIC_BYTES")
+        original = strict_json(raw)
+        base_sha = digest(materials["base-candidate.py"])
+        require(type(original) is dict and original.get("candidateSHA256") == diagnostic.get("candidateSHA256") == candidate_sha
+                and (original.get("sourceSHA256") or original.get("baseSourceSHA256")) == diagnostic.get("sourceSHA256") == base_sha,
+                "REPAIR_DIAGNOSTIC_SOURCE_BINDING")
+        require(projection.get("reportSHA256") == digest(original)
+                and type(projection.get("reportBytes")) is int and projection["reportBytes"] == len(canonical(original))
+                and projection.get("reportHashDomain") == "original_strict_json_canonical"
+                and projection.get("selectedReportCanonicalization") == REQUEST_CANONICALIZATION
+                and type(diagnostic.get("report")) is dict
+                and set(diagnostic["report"]).issubset(original)
+                and canonical(diagnostic["report"]) == canonical(request_numbers_v1({k: original[k] for k in diagnostic["report"]}))
+                and projection.get("selectedReportSHA256") == digest(diagnostic["report"]), "REPAIR_DIAGNOSTIC_PROJECTION_BINDING")
+        prior = self.runtime.api("GET", "/api/cycle-runs/" + target["occurrenceId"])
+        prior_dispatch, _ = self.dispatch(prior["occurrence"])
+        require(prior_dispatch["problem"] == problem
+                and prior["occurrence"]["input"]["experiment"]["sourceArtifact"]["digest"] == base_sha,
+                "REPAIR_DIAGNOSTIC_OWNER_BINDING")
+        prior_attempt_ids = {a["id"] for a in prior["attempts"]}
+        candidates = [row for row in prior["artifacts"] if row["name"] == "candidate.py" and row["attempt_id"] in prior_attempt_ids]
+        require(bool(candidates) and {row["digest"] for row in candidates} == {candidate_sha}, "REPAIR_DIAGNOSTIC_CANDIDATE_BINDING")
+        for row in candidates:
+            self.artifact(row)
+        rows = [row for row in prior["artifacts"] if row["id"] == ref["id"]]
+        attempts = [a for a in prior["attempts"] if a["id"] == diagnostic.get("attemptId")]
+        require(len(rows) == len(attempts) == 1 and rows[0].get("attempt_id") == diagnostic["attemptId"]
+                and all(rows[0].get(k) == ref.get(k) for k in ("id", "name", "digest", "size")), "REPAIR_DIAGNOSTIC_ARTIFACT_OWNER")
+        attempt = attempts[0]
+        steps = [s for s in prior["steps"] if s["id"] == attempt["step_id"]]
+        require(len(steps) == 1 and steps[0]["id"] == diagnostic.get("stepId")
+                and steps[0]["key"] == "independent-qa" and steps[0].get("attempt") == attempt["number"]
+                and steps[0].get("definition") in prior["occurrence"]["definition"]["steps"]
+                and steps[0]["definition"].get("key") == "independent-qa"
+                and steps[0]["definition"].get("kind") == "agent"
+                and attempt["state"] in {"completed", "failed"} and attempt.get("finished_at")
+                and attempt.get("fence") == diagnostic.get("runFence"), "REPAIR_DIAGNOSTIC_ATTEMPT_BINDING")
+        self.runtime.stopped(attempt["id"])
+        manifest = (attempt.get("context") or {}).get("manifest") or {}
+        binding = manifest.get("cycleInput") or {}
+        require(manifest.get("cycleId") == prior["occurrence"]["cycle_id"]
+                and manifest.get("occurrenceId") == target["occurrenceId"] and manifest.get("step") == "independent-qa"
+                and binding.get("attemptId") == attempt["id"] and binding.get("occurrenceId") == target["occurrenceId"]
+                and binding.get("runFence") == attempt["fence"]
+                and binding.get("digest") == diagnostic.get("cycleInputSHA256"), "REPAIR_DIAGNOSTIC_MANIFEST_BINDING")
+        prior_raw = self.io.read_regular(self.runs / attempt["id"] / "home/inputs" / attempt["id"] / "cycle-input.json", 2 * 1024 * 1024)
+        require(digest(prior_raw) == binding["digest"] and len(prior_raw) == binding.get("size")
+                and strict_json(prior_raw) == prior["occurrence"]["input"], "REPAIR_DIAGNOSTIC_INPUT_BINDING")
+
     def dispatch(self, occurrence):
         directory = pathlib.Path(self.p["watcherStateDirectory"])
         state = watcher_state(self.p)
@@ -505,7 +588,7 @@ class NativeAudit:
             materials[row["name"]] = raw
             frozen["material--" + row["name"]] = raw
         contract = self.p["boards"][problem]
-        require(set(materials) == {"base-candidate.py", *contract["materials"]}, "MATERIAL_SET_CHANGED")
+        self.material_set(experiment, materials, problem, dispatch, digest(files["produce"]["candidate.py"]))
         for name, sha in contract["materials"].items():
             require(digest(materials[name]) == sha, "CANONICAL_MATERIAL_CHANGED")
         base_sha = digest(materials["base-candidate.py"])
@@ -684,8 +767,8 @@ class NativeAudit:
             require(len(raw) == row["bytes"] and digest(raw) == row["sha256"], "SOURCE_ORIGIN_MATERIAL_CHANGED")
             materials[row["name"]] = raw
         contract = self.p["boards"][problem]
-        require(set(materials) == {"base-candidate.py", *contract["materials"]}
-                and all(digest(materials[n]) == sha for n, sha in contract["materials"].items()), "SOURCE_ORIGIN_CANONICAL_CHANGED")
+        self.material_set(experiment, materials, problem, dispatch, source_sha)
+        require(all(digest(materials[n]) == sha for n, sha in contract["materials"].items()), "SOURCE_ORIGIN_CANONICAL_CHANGED")
         base, parent = materials["base-candidate.py"], experiment["sourceArtifact"]
         base_sha = digest(base)
         require(parent["digest"] == base_sha and self.artifact(parent) == base, "SOURCE_ORIGIN_BASE_CHANGED")

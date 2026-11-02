@@ -190,6 +190,138 @@ class Fixture(unittest.TestCase):
         self.assertEqual(len(list(pathlib.Path(self.paths["stateDirectory"]).iterdir())), 0)
         self.assertEqual(self.runtime.stopped.call_count, 2)
 
+    def projected_repair_fixture(self):
+        prior_id = '99999999-9999-4999-8999-999999999999'
+        prior_cycle = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+        prior_attempt = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+        prior_fence = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc'
+        prior_input = copy.deepcopy(self.detail['occurrence']['input'])
+        prior_raw = A.canonical(prior_input)
+        original = {**copy.deepcopy(self.qa), 'historicalMeasurement': 1.0}
+        raw = A.canonical(original)
+        ref = self.artifact('qa-verification.json', raw, prior_attempt)
+        candidate = self.artifact('candidate.py', self.candidate, prior_attempt)
+        projection_ref = {k: ref[k] for k in ['id','name','digest','size']}
+        spec = copy.deepcopy(self.detail['occurrence']['definition']['steps'][1])
+        old_occ = {'id':prior_id,'cycle_id':prior_cycle,'state':'completed',
+            'source_key':'manual:'+WATCH+'-experiment-prior-run','input':prior_input,
+            'definition':copy.deepcopy(self.detail['occurrence']['definition'])}
+        old_attempt = {'id':prior_attempt,'number':1,'step_id':'prior-qa','fence':prior_fence,'state':'completed',
+            'finished_at':'2026-01-01T00:00:00Z','context':{'manifest':{'cycleId':prior_cycle,'occurrenceId':prior_id,
+            'step':'independent-qa','cycleInput':{'attemptId':prior_attempt,'occurrenceId':prior_id,
+            'runFence':prior_fence,'digest':A.digest(prior_raw),'size':len(prior_raw)}}}}
+        self.prior_detail = {'occurrence':old_occ,'steps':[{'id':'prior-qa','key':'independent-qa','attempt':1,
+            'definition':spec}],'attempts':[old_attempt],'artifacts':[ref,candidate]}
+        self.put(pathlib.Path(self.paths['workerRunsDirectory'])/prior_attempt/'home/inputs'/prior_attempt/'cycle-input.json',prior_raw)
+        directory=pathlib.Path(self.paths['watcherStateDirectory'])
+        state=A.strict_json((directory/'state.json').read_bytes())
+        state['experiments'][0].update(repairOf=prior_id,repairCandidateSHA256=A.digest(self.candidate))
+        state['experiments'].append({'occurrenceId':prior_id,'cycleId':prior_cycle,'problem':BOARD,
+                                    'supervisorOccurrenceId':SUPERVISOR})
+        self.put(directory/'state.json',A.canonical(state))
+        key=old_occ['source_key'][len('manual:'):]
+        for kind,rkey,result,body in [('run',key,old_occ,{'requestKey':key,'input':prior_input}),
+                ('create',key[:-4],{'id':prior_cycle,'definition':old_occ['definition']},
+                 {'requestKey':key[:-4],'definition':old_occ['definition']})]:
+            self.put(directory/('intent-'+A.digest(rkey)+'.json'),A.canonical({'state':'recorded','kind':kind,
+                'requestKey':rkey,'requestDigest':A.digest(body),'result':result}))
+        selected=A.request_numbers_v1({k:original[k] for k in ['candidateSHA256','sourceSHA256','passed','historicalMeasurement']})
+        diagnostic={'version':1,'authority':'prior_qa_diagnostic_only_not_current_acceptance','currentAcceptance':False,
+            'bindingState':'verified','problem':BOARD,'occurrenceId':prior_id,'stepKey':'independent-qa',
+            'stepId':'prior-qa','attemptId':prior_attempt,'runFence':prior_fence,'cycleInputSHA256':A.digest(prior_raw),
+            'artifact':projection_ref,'candidateSHA256':A.digest(self.candidate),'sourceSHA256':A.digest(self.source),
+            'report':selected,'reportProjection':{'version':1,'kind':'bounded_historical_qa','complete':False,
+                'originalArtifact':projection_ref,'reportSHA256':A.digest(original),'reportBytes':len(A.canonical(original)),
+                'reportHashDomain':'original_strict_json_canonical','selectedReportCanonicalization':'json-numbers-v1',
+                'selectedReportSHA256':A.digest(selected)}}
+        experiment=self.detail['occurrence']['input']['experiment']
+        experiment.update(repairQADiagnostic=diagnostic,repairTarget={'occurrenceId':prior_id,
+            'candidateSHA256':A.digest(self.candidate),'qaArtifactId':ref['id'],'qaSHA256':ref['digest']})
+        experiment['materials'].append({'name':'prior-qa-original.json','artifactId':ref['id'],'attemptId':prior_attempt,
+            'sha256':ref['digest'],'bytes':ref['size'],'base64':base64.b64encode(raw).decode()})
+        self.runtime.api=lambda method,path:copy.deepcopy(self.prior_detail if path.endswith(prior_id) else self.detail)
+        self.refresh_current_input()
+        return experiment,ref
+
+    def refresh_current_input(self):
+        occurrence=self.detail['occurrence'];key=occurrence['source_key'][len('manual:'):]
+        raw=A.canonical(occurrence['input'])
+        self.put(pathlib.Path(self.paths['watcherStateDirectory'])/('intent-'+A.digest(key)+'.json'),
+            A.canonical({'state':'recorded','kind':'run','requestKey':key,'result':occurrence,
+                         'requestCanonicalization':'json-numbers-v1','requestDigest':A.digest({'requestKey':key,'input':occurrence['input']})}))
+        for attempt in self.detail['attempts']:
+            self.put(pathlib.Path(self.paths['workerRunsDirectory'])/attempt['id']/'home/inputs'/attempt['id']/'cycle-input.json',raw)
+            attempt['context']['manifest']['cycleInput'].update(digest=A.digest(raw),size=len(raw))
+
+    def test_projected_historical_material_full_audit_preserves_canonical_and_numeric_domains(self):
+        experiment,ref=self.projected_repair_fixture()
+        self.assertEqual(experiment['repairQADiagnostic']['report']['historicalMeasurement'],1)
+        self.assertIs(type(experiment['repairQADiagnostic']['report']['historicalMeasurement']),int)
+        self.assertEqual(self.lane.run(OCC,'inspect')['state'],'eligible')
+        self.assertEqual(self.official.posts,0)
+        self.assertEqual(self.runtime.stopped.call_count,3)
+
+    def test_historical_material_never_allows_arbitrary_extras_or_normal_experiment(self):
+        experiment,_=self.projected_repair_fixture()
+        original=copy.deepcopy(experiment)
+        for mutation in ['extra','normal','unprojected']:
+            with self.subTest(mutation=mutation):
+                experiment.clear();experiment.update(copy.deepcopy(original))
+                if mutation=='extra':experiment['materials'].append({'name':'unexpected.bin','sha256':A.digest(b'x'),'bytes':1,'base64':'eA=='})
+                elif mutation=='normal':experiment.pop('repairTarget')
+                else:experiment['repairQADiagnostic'].pop('reportProjection')
+                self.refresh_current_input()
+                with self.assertRaisesRegex(ValueError,'MATERIAL_SET_CHANGED|REPAIR_DIAGNOSTIC_'):
+                    self.audit.audit(OCC)
+
+    def test_historical_material_binds_artifact_attempt_projection_candidate_and_source(self):
+        experiment,_=self.projected_repair_fixture();original=copy.deepcopy(experiment)
+        mutations=[('material-artifact',lambda e:e['materials'][-1].update(artifactId=OCC)),
+            ('material-attempt',lambda e:e['materials'][-1].update(attemptId=IDS[0])),
+            ('material-size-bool',lambda e:e['materials'][-1].update(bytes=True)),
+            ('original-artifact',lambda e:e['repairQADiagnostic']['reportProjection'].update(originalArtifact={})),
+            ('projection-hash',lambda e:e['repairQADiagnostic']['reportProjection'].update(selectedReportSHA256='f'*64)),
+            ('original-hash',lambda e:e['repairQADiagnostic']['reportProjection'].update(reportSHA256='f'*64)),
+            ('selected-value',lambda e:e['repairQADiagnostic']['report'].update(historicalMeasurement=2)),
+            ('source',lambda e:e['repairQADiagnostic'].update(sourceSHA256='f'*64)),
+            ('candidate',lambda e:e['repairTarget'].update(candidateSHA256='f'*64)),
+            ('scope',lambda e:e['repairQADiagnostic'].update(problem='other-board')),
+            ('fence',lambda e:e['repairQADiagnostic'].update(runFence=IDS[0])),
+            ('input-binding',lambda e:e['repairQADiagnostic'].update(cycleInputSHA256='f'*64))]
+        for name,mutate in mutations:
+            with self.subTest(name=name):
+                experiment.clear();experiment.update(copy.deepcopy(original));mutate(experiment);self.refresh_current_input()
+                with self.assertRaisesRegex(ValueError,'MATERIAL_CHANGED|REPAIR_DIAGNOSTIC_'):
+                    self.audit.audit(OCC)
+
+    def test_historical_material_checks_raw_bytes_and_prior_registered_emitter(self):
+        experiment,ref=self.projected_repair_fixture()
+        path=pathlib.Path(self.paths['artifactDirectory'])/ref['digest'];raw=path.read_bytes()
+        self.put(path,raw+b' ')
+        with self.assertRaisesRegex(ValueError,'ARTIFACT_BYTES_CHANGED'):self.audit.audit(OCC)
+        self.put(path,raw)
+        self.prior_detail['artifacts'][0]['attempt_id']=IDS[0]
+        with self.assertRaisesRegex(ValueError,'REPAIR_DIAGNOSTIC_ARTIFACT_OWNER'):self.audit.audit(OCC)
+
+    def test_historical_material_never_relaxes_current_qa_or_canonical_hashes(self):
+        experiment,_=self.projected_repair_fixture()
+        self.replace_evidence('qa-verification.json',A.canonical({**self.qa,'passed':False}),IDS[1])
+        with self.assertRaisesRegex(ValueError,'QA_SOURCE_OR_SCOPE_MISMATCH'):self.audit.audit(OCC)
+        self.replace_evidence('qa-verification.json',A.canonical(self.qa),IDS[1])
+        material=next(x for x in experiment['materials'] if x['name']=='canonical-TASK.md')
+        material.update(base64=base64.b64encode(b'changed').decode(),bytes=7,sha256=A.digest(b'changed'))
+        self.refresh_current_input()
+        with self.assertRaisesRegex(ValueError,'CANONICAL_MATERIAL_CHANGED'):self.audit.audit(OCC)
+
+    def test_source_origin_applies_same_diagnostic_material_guard(self):
+        experiment,_=self.projected_repair_fixture()
+        source=self.origin_fixture(failed_qa=False)
+        self.assertFalse(A.strict_json(A.pinned(self.origin(source)[0]))['qualityAccepted'])
+        experiment['repairQADiagnostic']['reportProjection']['complete']=True
+        self.refresh_current_input()
+        with self.assertRaisesRegex(ValueError,'REPAIR_DIAGNOSTIC_PROJECTION'):
+            self.origin(source)
+
     def dispatch_diagnostic(self, report, *, version=None, projection=None):
         raw = A.canonical(report)
         ref = self.artifact("qa-verification.json", raw, "77777777-7777-7777-7777-777777777777")
