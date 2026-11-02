@@ -414,7 +414,10 @@ def compact_qa_diagnostic(envelope, report):
         "gpuValidated", "performanceGainProven", "officialActionsPerformed", "blockingFindings"]
     projection = {"version": 1, "kind": "bounded_historical_qa", "complete": False,
         "originalArtifact": envelope["artifact"], "reportSHA256": digest(report),
-        "reportBytes": len(canonical(report)), "sections": [], "omittedFieldCount": 0,
+        "reportBytes": len(canonical(report)), "reportHashDomain": "original_strict_json_canonical",
+        "omittedFieldHashDomain": "original_strict_json_canonical",
+        "selectedReportCanonicalization": REQUEST_CANONICALIZATION,
+        "sections": [], "omittedFieldCount": 0,
         "omittedFieldReferences": [], "omittedFieldReferencesComplete": True,
         "arrayCounts": {}}
     selected = {k: report[k] for k in critical if k in report}
@@ -441,13 +444,15 @@ def compact_qa_diagnostic(envelope, report):
                 continue
             if isinstance(cpu[key], list):
                 projection["arrayCounts"]["/cpuEvidence" + pointer(key)] = len(cpu[key])
-            section = {"pointer": "/cpuEvidence" + pointer(key), "value": cpu[key]}
+            section = {"pointer": "/cpuEvidence" + pointer(key), "value": cpu[key],
+                "valueSHA256": digest(request_numbers_v1(cpu[key])),
+                "valueCanonicalization": REQUEST_CANONICALIZATION}
             projection["sections"].append(section)
             if len(canonical(result)) > REPAIR_QA_CONTEXT_LIMIT - reserve:
                 projection["sections"].pop()
     projection.update(omittedFieldCount=len(omissions), allOmissionsSHA256=digest(omissions),
         omittedFieldReferences=[r for r in omissions if len(canonical(r)) <= 320][:8],
-        selectedReportSHA256=digest(selected))
+        selectedReportSHA256=digest(request_numbers_v1(selected)))
     projection["omittedFieldReferencesComplete"] = len(projection["omittedFieldReferences"]) == len(omissions)
     require(len(canonical(result)) <= REPAIR_QA_CONTEXT_LIMIT, "REPAIR_QA_PROJECTION_SIZE")
     return result

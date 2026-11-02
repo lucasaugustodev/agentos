@@ -707,6 +707,14 @@ array order. Omitted fields have JSON-pointer, byte-count and digest references,
 with explicit reference coverage and array counts. No partial cases array is
 presented as a complete report. Decisions continue to read the full strict QA;
 a projection is never current acceptance, official authority or a QA artifact.
+Hash domains are explicit: artifact.digest covers original raw bytes;
+reportSHA256/reportBytes and omitted-field references cover canonical JSON of
+the original strict report (original_strict_json_canonical). In contrast,
+selectedReportSHA256 and each section.valueSHA256 cover the transported value
+after the versioned json-numbers-v1 normalization. Their canonicalization
+markers prevent integral floats or signed zero becoming integers in the API
+from invalidating a context hash. Verify original references from the supplied
+original bytes, not by hashing a projection or normalized partial reconstruction.
 
 Projected repairs also receive prior-qa-original.json as a separate material in
 input.experiment.materials. This contains the complete original bytes/base64,

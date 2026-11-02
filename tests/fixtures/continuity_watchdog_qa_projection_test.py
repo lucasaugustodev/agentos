@@ -67,7 +67,7 @@ class QAProjectionTests(unittest.TestCase):
         self.assertEqual(projection['originalArtifact']['digest'], W.digest(raw))
         self.assertEqual(projection['reportSHA256'], W.digest(self.report))
         self.assertEqual(projection['reportBytes'], len(W.canonical(self.report)))
-        self.assertEqual(projection['selectedReportSHA256'], W.digest(result['report']))
+        self.assertEqual(projection['selectedReportSHA256'], W.digest(W.request_numbers_v1(result['report'])))
         for key in ['passed', 'candidateSHA256', 'sourceSHA256', 'findings', 'limitations']:
             self.assertEqual(result['report'][key], self.report[key])
         self.assertNotIn('cpuEvidence', result['report'])
@@ -116,6 +116,46 @@ class QAProjectionTests(unittest.TestCase):
         context = next(a['qaEvidence'] for o in observation['outcomes']
             for a in o['artifacts'] if a['id'] == self.qa['id'])
         self.assertEqual(context['bindingState'], 'verified')
+
+    def test_projection_hash_domains_survive_api_integral_float_roundtrip(self):
+        self.large()
+        self.report['findings'][0]['metrics'] = {'integral': 1.0, 'signedZero': -0.0, 'fraction': 0.125, 'boolean': True}
+        self.report['cpuEvidence']['negativeControls'][0]['note']['missing'] = 16.0
+        raw = self.store(self.report)
+        before = self.diagnostic()
+        # Independent simulation of JSON API number representation: integer
+        # number spellings are returned as JSON integers, booleans stay booleans.
+        def api_number(text):
+            value = float(text)
+            return int(value) if value.is_integer() else value
+        after = json.loads(json.dumps(before, ensure_ascii=False), parse_float=api_number)
+        self.assertNotEqual(W.digest(before['report']), W.digest(after['report']))
+        projection = after['reportProjection']
+        self.assertEqual(projection['selectedReportCanonicalization'], 'json-numbers-v1')
+        self.assertEqual(projection['selectedReportSHA256'], W.digest(after['report']))
+        self.assertIs(after['report']['findings'][0]['metrics']['boolean'], True)
+        self.assertEqual(projection['originalArtifact']['digest'], W.digest(raw))
+        self.assertEqual(projection['reportHashDomain'], 'original_strict_json_canonical')
+        self.assertEqual(projection['omittedFieldHashDomain'], 'original_strict_json_canonical')
+        self.assertEqual(projection['reportSHA256'], W.digest(json.loads(raw)))
+        self.assertEqual(projection['reportBytes'], len(W.canonical(json.loads(raw))))
+        for section in projection['sections']:
+            original = self.report
+            for part in section['pointer'].split('/')[1:]:
+                original = original[part.replace('~1', '/').replace('~0', '~')]
+            self.assertEqual(section['valueCanonicalization'], 'json-numbers-v1')
+            self.assertEqual(section['valueSHA256'], W.digest(section['value']))
+            self.assertEqual(section['value'], W.request_numbers_v1(original))
+        for ref in projection['omittedFieldReferences']:
+            original = self.report
+            for part in ref['pointer'].split('/')[1:]:
+                original = original[part.replace('~1', '/').replace('~0', '~')]
+            self.assertEqual(ref['sha256'], W.digest(original))
+            self.assertEqual(ref['bytes'], len(W.canonical(original)))
+        normalized = W.request_numbers_v1(before)
+        self.assertEqual(W.canonical(after), W.canonical(normalized))
+        tampered = copy.deepcopy(after); tampered['report']['findings'][0]['metrics']['fraction'] = 0.25
+        self.assertNotEqual(W.digest(tampered['report']), projection['selectedReportSHA256'])
 
     def test_exact_one_mib_artifact_admitted_but_over_bound_rejected_before_fetch(self):
         core = W.canonical(self.report)
