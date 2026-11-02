@@ -175,10 +175,69 @@ class RepairFirstTests(unittest.TestCase):
         for state, code in [('quota_wait', 'CHECK_QUOTA'), ('uncertain_owned', 'POST_UNCERTAIN_RECONCILE_ONLY')]:
             rows = copy.deepcopy(self.statuses); rows[0].update(state=state, code=code)
             self.f.install_diagnostic_fixture(rows)
-            before = len(self.client.posts); result = self.w.tick()
-            self.assertEqual(len(self.client.posts), before)
-            self.assertEqual(result['plannerPending'], 0)
-            self.assertEqual(result['waits'][self.problem], 'no_admissible_capacity_or_source')
+            observation = self.w.observe()
+            lane = self.w.repair_first_observation(self.w.admission_with_ready(observation), self.problem)
+            selected = lane['planningScope'].get('repairSourceArtifactIds', [])
+            held = next(a['id'] for a in observation['catalog']
+                        if a['occurrenceId'] == rows[0]['occurrenceId'] and a['name'] == 'candidate.py')
+            self.assertNotIn(held, selected)
+            if state == 'quota_wait':
+                # Proven no-POST official quota waits reserve WIP, while other
+                # authenticated CPU repairs may proceed under the current contract.
+                self.assertEqual(len(selected), 2)
+                self.assertGreaterEqual(lane['pipelineUsed'], 1)
+            else:
+                self.assertEqual(selected, [])
+                before = len(self.client.posts); result = self.w.tick()
+                self.assertEqual(len(self.client.posts), before)
+                self.assertEqual(result['plannerPending'], 0)
+                self.assertEqual(result['waits'][self.problem], 'no_admissible_capacity_or_source')
+
+    def cached_diagnostics(self):
+        policy = W.read_json(self.f.config['autoCheckPolicyPath'])
+        policy['adapterSHA256'] = 'a' * 64
+        W.atomic(self.f.config['autoCheckPolicyPath'], policy)
+        status = W.read_json(self.f.config['autoCheckStatusPath'])
+        status['policySHA256'] = W.digest(policy)
+        for row in status['outcomes']:
+            detail = self.client.occurrences[row['occurrenceId']]
+            row['diagnosticProof'] = {'version': 1, 'verifyKind': 'native_identity',
+                'observedAt': 9900, 'verifiedAt': 10000,
+                'policySHA256': W.digest(policy), 'adapterSHA256': 'a' * 64,
+                'detailSHA256': W.digest(detail), 'dispatchSHA256': 'b' * 64}
+        W.atomic(self.f.config['autoCheckStatusPath'], status)
+        return status
+
+    def test_cached_repair_batch_keeps_readset_across_three_sweeps_then_dispatches(self):
+        status = self.cached_diagnostics()
+        review = self.open_review(); inp = self.w.supervision_input(review)
+        self.assertEqual(inp['planningScope']['batchPurpose'], 'repair_backlog')
+        for now in [10090, 10180, 10270]:
+            self.w.clock = lambda n=now: n
+            status['observedAt'] = now
+            for row in status['outcomes']: row['diagnosticProof']['verifiedAt'] = now
+            W.atomic(self.f.config['autoCheckStatusPath'], status)
+            lane = self.w.lane_observation(self.w.admission_with_ready(self.w.observe()), self.problem)
+            current = W.action_evidence(lane, self.f.config, version=2)
+            for source in inp['planningScope']['repairSourceArtifactIds']:
+                self.assertEqual(current['sources'][source], inp['actionEvidence']['sources'][source])
+        self.finish(review); self.w.tick()
+        records = [r for r in self.w.state['experiments'] if r['supervisorOccurrenceId'] == review['occurrenceId']]
+        self.assertEqual(len(records), 2)
+        self.assertTrue(all(r.get('repairOf') for r in records))
+        self.assertTrue(all(row['diagnosticProof']['observedAt'] == 9900 for row in status['outcomes']))
+
+    def test_cached_target_with_changed_raw_bytes_is_not_offered_to_fast_planner(self):
+        self.cached_diagnostics()
+        row = self.statuses[0]
+        detail = self.client.occurrences[row['occurrenceId']]
+        candidate = next(a for a in detail['artifacts'] if a['name'] == 'candidate.py')
+        checker = next(a for a in detail['artifacts'] if a['name'] == 'cpu-checks.py')
+        self.client.artifacts[checker['id']] = b'tampered checker; native metadata unchanged'
+        full = self.w.observe()
+        lane = self.w.repair_first_observation(self.w.admission_with_ready(full), self.problem)
+        self.assertNotIn(candidate['id'], lane['planningScope'].get('repairSourceArtifactIds', []))
+        self.assertGreaterEqual(full['pipelineUsed'], 1)
 
     def test_matching_cross_origin_qa_still_invalidates_only_selected_action(self):
         review = self.open_review(); plan = self.plan(review)

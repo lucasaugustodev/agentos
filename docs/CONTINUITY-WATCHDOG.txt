@@ -827,3 +827,32 @@ optimization research before a repair batch. It does not establish a latency or
 performance gain by itself. Measure time to first dispatch and accepted repair,
 context/read volume and whether the ready buffer is replenished while workers
 run. Session count alone is not delivery, and no GPU authority is added.
+
+Compatibility with terminal diagnostic retention
+
+Repair-first selection consumes the current reader's authenticated repair list.
+Retained diagnostics still require their original observation age, recent native
+identity verification, matching policy/code pins and revalidated original bytes.
+The complete selected-source proof is computed before the planner presentation
+is reduced. Reverification timestamps do not replace that semantic read-set.
+Expired, tampered or differently bound evidence cannot become a short-batch
+repair. A proven no-POST official quota wait keeps its pipeline reservation;
+other admissible CPU repairs may proceed. Unknown submission effects retain
+their existing conservative admission rules.
+
+The opt-in does not change the eight-worker target, three planner lanes, twelve
+physical sessions, six concurrent model requests, or hard 24/8 pipeline limits.
+Nor does it extend policy expiry. A future activation requires a separately
+reviewed supervisor definition/control handover, repairFirstPlanning=true in
+the bound configuration, and the exact code/config/policy/unit pins. Preserve
+existing immutable inputs, outbox entries, receipts and pending actors; never
+reinterpret an in-flight plan under a newly edited control definition. Qualify
+that exact handover offline before activation. The default and false settings
+retain the prior supervisor definition byte for byte.
+
+Server-isolated qualification combines the existing reader suite with short
+batch tests, including cached evidence across three sweeps, changed raw checker
+bytes, quota-versus-uncertain ownership and unchanged independent QA. A private
+frozen replay compares normal and short inputs, validates sample plans and
+constructs worker material packets with in-memory receipts only. These examples
+prove compatibility and input size, not model latency or accepted delivery.
