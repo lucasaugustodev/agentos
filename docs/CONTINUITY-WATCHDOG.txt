@@ -889,3 +889,33 @@ absent/1, and the combined source then generates exactly the same fast control
 definition and v1 experiment definitions as the separately qualified fast-only
 source. Do not mutate an existing control definition or reinterpret an old plan
 to avoid the handover.
+Bounded unknown CHECK reservations and independent CPU work
+---------------------------------------------------------
+
+The default behavior still blocks a board with an uncertain official effect.
+An operator-reviewed adapter policy may opt in to uncertainCheckReservations v1
+for exact, immutable, individually pinned CHECK intents. This does not reconcile
+the effect, retry its candidate, accept a result, or enlarge quota or WIP limits.
+
+The watcher only scopes the board veto when a fresh, authenticated adapter status
+contains uncertainCheckReservation with exactly: version=1, slots=1, verifiedAt,
+detailSHA256, policySHA256, ownSourceUnretryable=true, effectReconciled=false, and
+intent. The intent must match the current policy pin byte canonically. The full
+current native detail, latest QA identity and candidate identity must match;
+the adapter has already completed NativeAudit and checked all uncertain ledgers
+under its account lock. The own outcome remains uncertain_owned with explicit
+jobId=null and postAttempted=null. Null never means no POST occurred.
+
+That source SHA and all occurrence aliases keep their single WIP reservation,
+are removed from confirmed source choices, and fail plan validation for both new
+experiments and repairs. Other authenticated sources can use genuinely available
+board/global slots. An additional unknown, missing or stale marker, changed pin,
+changed attempt, inactive authority or inconsistent identity retains the veto.
+Neither the 24/8 pipeline limits nor the 12 sessions/6 request limits change.
+The marker's time is checked but excluded from semantic plan identity; repeated
+verification is not counted as progress or a reason to repeat a task.
+
+Activation requires qualified adapter emission, this watcher reader, and the
+matching policy/code pins in one reviewed handover. No controller definition or
+planner schema changes are required. Isolated fake dispatch and frozen native
+proofs establish admission behavior, not a measured throughput or GPU gain.

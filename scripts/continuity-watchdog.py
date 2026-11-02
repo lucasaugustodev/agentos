@@ -861,6 +861,8 @@ def validate_plan(plan, observation, config, expected_fingerprint=None, source_i
         require(exp["problem"] in PROBLEMS, "EXPERIMENT_SCOPE")
         source = catalog.get(exp["sourceArtifactId"])
         require(source and source["name"] == "candidate.py" and source["problem"] == exp["problem"], "SOURCE_SCOPE")
+        require(not any(r["problem"] == source["problem"] and r["candidateSHA256"] == source["digest"]
+                        for r in observation.get("reservedOfficialSources", [])), "SOURCE_OFFICIAL_EFFECT_RESERVED")
         require(exp["sourceArtifactId"] in observation["confirmedSourceArtifactIds"], "SOURCE_BOUNDARY_UNCONFIRMED")
         require(exp["problem"] in observation["eligibleProblems"], "BOARD_PIPELINE_OWNED")
         boards[exp["problem"]] = boards.get(exp["problem"], 0) + 1
@@ -1100,7 +1102,7 @@ def pipeline_admission(limit, active, catalog, pending, jobs, diagnostics, confi
     for row in jobs:
         if row["status"] not in ["done", "failed"]:
             own(row["problem"], "source:" + row["sourceSHA256"], "gpu", source=row["sourceSHA256"], job=row["id"])
-    uncertain_diagnostics = set()
+    uncertain_diagnostics, reserved_sources = set(), {}
     for row in diagnostics["outcomes"]:
         # An adapter's durable ACK can still say check_running after official
         # GET has proved completion. Never turn that stale label into a lock.
@@ -1122,7 +1124,17 @@ def pipeline_admission(limit, active, catalog, pending, jobs, diagnostics, confi
                 and isinstance(source, str) and re.fullmatch(r"[a-f0-9]{64}", source)
                 and any(a["problem"] == row["problem"] and a["occurrenceId"] == row["occurrenceId"]
                         and a["digest"] == source for a in catalog))
-            if not quota_without_effect:
+            reservation = row.get("verifiedCheckReservation")
+            bounded_effect = (row["state"] == "uncertain_owned"
+                and row.get("code") in ["UNCERTAIN_RECONCILE_NO_RESEND", "SOURCE_PREVIOUS_PROVENANCE"]
+                and type(reservation) is dict and reservation.get("problem") == row["problem"]
+                and reservation.get("sourceSHA256") == source
+                and any(a["problem"] == row["problem"] and a["occurrenceId"] == row["occurrenceId"]
+                        and a["digest"] == source for a in catalog))
+            if bounded_effect:
+                reserved_sources[(row["problem"], source)] = {"problem": row["problem"],
+                    "candidateSHA256": source, "intent": reservation}
+            if not quota_without_effect and not bounded_effect:
                 uncertain_diagnostics.add(row["problem"])
     frozen = [{**row, **{k: sorted(row[k]) for k in ["stages", "occurrenceIds", "jobIds"]}}
               for _, row in sorted(owners.items())]
@@ -1134,6 +1146,11 @@ def pipeline_admission(limit, active, catalog, pending, jobs, diagnostics, confi
             "availableCandidateSlots": available, "confirmedSourceArtifactIds": sorted(confirmed_sources)}
     if (capacity_policy or {}).get("pipelineCapacityVersion") != 2:
         return result
+    if reserved_sources:
+        result["reservedOfficialSources"] = [reserved_sources[k] for k in sorted(reserved_sources)]
+        result["confirmedSourceArtifactIds"] = sorted(r["id"] for r in catalog
+            if r["id"] in confirmed_sources and (r["problem"], r["digest"]) not in reserved_sources)
+        sources = {r["problem"] for r in catalog if r["id"] in result["confirmedSourceArtifactIds"]}
     board_limit = capacity_policy["maxPipelinesPerProblem"]
     identities = experiment_identities or {}
     uncertain = {row["problem"] for row in active if row.get("ownershipUncertain")
@@ -1904,6 +1921,59 @@ class Watchdog:
                 "producerArtifacts": {name: ref(artifacts[name]) for name in
                     ["cpu-checks.py", "cpu-result.json", "verification.json"]}}
 
+    def verified_check_reservation(self, row, detail, catalog, policy, policy_sha):
+        """Scope a proven single unknown CHECK; never accept or resend its bytes."""
+        try:
+            options, proof = policy.get("uncertainCheckReservations"), row.get("uncertainCheckReservation")
+            require(type(options) is dict and set(options) == {"version", "intents"}
+                    and type(options.get("version")) is int and options["version"] == 1
+                    and type(options.get("intents")) is list and 1 <= len(options["intents"]) <= 16,
+                    "CHECK_RESERVATION_POLICY")
+            seen = set()
+            for pin in options["intents"]:
+                require(type(pin) is dict and set(pin) == {"problem", "sourceSHA256", "occurrenceId",
+                    "intentEpoch", "ledgerSHA256", "originPolicy"} and pin.get("problem") in policy["boards"]
+                    and UUID.fullmatch(pin.get("occurrenceId", ""))
+                    and all(type(pin.get(k)) is str and re.fullmatch(r"[a-f0-9]{64}", pin[k])
+                            for k in ["sourceSHA256", "ledgerSHA256"])
+                    and type(pin.get("intentEpoch")) in [int, float] and math.isfinite(pin["intentEpoch"])
+                    and 0 < pin["intentEpoch"] <= self.clock(), "CHECK_RESERVATION_PIN")
+                origin = pin["originPolicy"]
+                require(type(origin) is dict and set(origin) == {"path", "sha256"}
+                        and type(origin["path"]) is str and pathlib.Path(origin["path"]).is_absolute()
+                        and type(origin["sha256"]) is str and re.fullmatch(r"[a-f0-9]{64}", origin["sha256"])
+                        and (pin["problem"], pin["sourceSHA256"]) not in seen, "CHECK_RESERVATION_PIN")
+                seen.add((pin["problem"], pin["sourceSHA256"]))
+            require(type(proof) is dict and set(proof) == {"version", "slots", "verifiedAt", "detailSHA256",
+                        "policySHA256", "ownSourceUnretryable", "effectReconciled", "intent"}
+                    and type(proof["version"]) is int and proof["version"] == 1
+                    and type(proof["slots"]) is int and proof["slots"] == 1
+                    and proof["ownSourceUnretryable"] is True and proof["effectReconciled"] is False
+                    and type(proof["verifiedAt"]) in [int, float] and math.isfinite(proof["verifiedAt"])
+                    and 0 <= self.clock() - proof["verifiedAt"] <= self.config["intervalSeconds"] * 3
+                    and proof["policySHA256"] == policy_sha and proof["detailSHA256"] == digest(detail)
+                    and any(canonical(proof["intent"]) == canonical(pin) for pin in options["intents"]),
+                    "CHECK_RESERVATION_PROOF")
+            pin = proof["intent"]
+            require(row.get("state") == "uncertain_owned"
+                    and row.get("code") in ["UNCERTAIN_RECONCILE_NO_RESEND", "SOURCE_PREVIOUS_PROVENANCE"]
+                    and "jobId" in row and row["jobId"] is None
+                    and "postAttempted" in row and row["postAttempted"] is None
+                    and row.get("problem") == pin["problem"] and row.get("candidateSHA256") == pin["sourceSHA256"]
+                    and detail["occurrence"]["id"] == row["occurrenceId"] and confirmed_boundary(detail)
+                    and any(a["problem"] == pin["problem"] and a["occurrenceId"] == row["occurrenceId"]
+                            and a["digest"] == pin["sourceSHA256"] for a in catalog), "CHECK_RESERVATION_SOURCE")
+            latest = {a["id"] for a in detail["attempts"] if any(s["id"] == a["step_id"]
+                      and s["attempt"] == a["number"] for s in detail["steps"])}
+            require(any(a["id"] == row.get("qaArtifactId") and a["digest"] == row.get("qaSHA256")
+                        and a["name"] == "qa-verification.json" and a["attempt_id"] in latest
+                        for a in detail["artifacts"]), "CHECK_RESERVATION_QA_BINDING")
+            # Keep only immutable semantic identity. Verification time/details
+            # establish freshness above, not a new plan on each timer tick.
+            return pin
+        except (ValueError, KeyError, TypeError, OSError):
+            return None  # The original uncertain owner and board veto remain.
+
     def auto_check_diagnostics(self, catalog, details, tested):
         path = self.config.get("autoCheckStatusPath")
         if not path or not pathlib.Path(path).exists():
@@ -1963,6 +2033,9 @@ class Watchdog:
             summary["outcomes"].append(item)
             if not repair_authority:
                 item["classification"] = "diagnostic_only"; continue
+            reservation = self.verified_check_reservation(row, details[oid], catalog, policy, digest(policy_raw))
+            if reservation is not None:
+                item["verifiedCheckReservation"] = reservation
             if row.get("candidateSHA256") in tested:
                 item["classification"] = "official_job_registered"; continue
             if row["state"] != "rejected_repairable":
