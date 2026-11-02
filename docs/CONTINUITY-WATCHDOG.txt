@@ -856,3 +856,36 @@ bytes, quota-versus-uncertain ownership and unchanged independent QA. A private
 frozen replay compares normal and short inputs, validates sample plans and
 constructs worker material packets with in-memory receipts only. These examples
 prove compatibility and input size, not model latency or accepted delivery.
+
+Optional native QA dependency contract
+
+nativeQAContractVersion is absent/1 by default; only integer 1 or 2 is valid.
+Version 1 preserves existing experiment definitions and request bodies byte for
+byte. Version 2 changes only newly constructed independent-qa steps: parameters
+contain nativeQAContractVersion=2, maxAttempts is three, and dependencyEvidence
+binds /cpuEvidence/checkerSHA256 and /cpuEvidence/resultSHA256 in
+qa-verification.json to the completed produce step's cpu-checks.py and
+cpu-result.json artifacts. The producer remains limited to one attempt. Repair
+candidate immutability criteria, original material bytes, semantic QA criteria
+and official-action prohibitions remain unchanged.
+
+Do not enable version 2 until the matching cycle-runtime dependency gate and
+adapter contract are separately qualified and published. JSON transport of the
+definition alone does not establish runtime enforcement. The core must freeze
+the real predecessor evidence and fence, revalidate them at acceptance, and
+limit retry to the authenticated binding failure with confirmed termination;
+semantic/numerical failures must not gain a retry or acceptance through this
+setting. Existing occurrences and attempted requests keep their original v1
+definitions, receipts and recovery keys. A lost acknowledgment is reconciled
+under its original body rather than recreated under v2.
+
+This QA flag alone does not change supervisor_definition or require a new
+supervisor cycle. It does change bound configuration authority and therefore
+still requires the normal reviewed config/policy handover. repairFirstPlanning
+does change the supervisor instructions and definition hash; enabling it needs
+a separately bound control and preserves old pending actors/receipts. The two
+flags are independent: fast planning can be activated while native QA remains
+absent/1, and the combined source then generates exactly the same fast control
+definition and v1 experiment definitions as the separately qualified fast-only
+source. Do not mutate an existing control definition or reinterpret an old plan
+to avoid the handover.

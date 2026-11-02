@@ -702,6 +702,8 @@ def validate_config(config, bound=True):
     require(re.fullmatch(r"openkernel/[a-z0-9_-]+", config.get("workspace", "")), "WORKSPACE_SCOPE")
     require(config.get("model") == "deepseek-v4-pro-0813", "MODEL_SCOPE")
     require(config.get("statePayloadStorage") in [None, STATE_PAYLOAD_STORAGE], "STATE_PAYLOAD_STORAGE")
+    require(type(config.get("nativeQAContractVersion", 1)) is int
+            and config.get("nativeQAContractVersion", 1) in [1, 2], "NATIVE_QA_CONTRACT_VERSION")
     require(config.get("plannerMode") in [None, "board-lanes-v1"], "PLANNER_MODE")
     require(type(config.get("repairFirstPlanning", False)) is bool, "REPAIR_FIRST_CONFIG")
     require(not config.get("repairFirstPlanning") or
@@ -2648,6 +2650,17 @@ proof of correctness. Any candidate, patch, semantic or numerical defect fails.
                  ["candidate.py", "implementation.patch", "cpu-checks.py", "cpu-result.json", "verification.json"]),
                  native_step(self.config, "independent-qa", "Revisar e reproduzir a experiência", qa,
                  ["qa-verification.json", "review.txt"], ["produce"])]
+        if self.config.get("nativeQAContractVersion", 1) == 2:
+            # Only new opted-in definitions use the cycle runtime's frozen
+            # dependency evidence gate. Existing definitions and their request
+            # receipts retain the v1 single-attempt contract byte for byte.
+            steps[1]["parameters"]["nativeQAContractVersion"] = 2
+            steps[1]["maxAttempts"] = 3
+            steps[1]["dependencyEvidence"] = {"version": 1, "sourceStep": "produce", "bindings": [
+                {"reportArtifact": "qa-verification.json", "jsonPointer": "/cpuEvidence/checkerSHA256",
+                 "dependencyArtifact": "cpu-checks.py"},
+                {"reportArtifact": "qa-verification.json", "jsonPointer": "/cpuEvidence/resultSHA256",
+                 "dependencyArtifact": "cpu-result.json"}]}
         for step, file, fields in [(steps[0], "verification.json", {"passed": True, "scopePreserved": True,
                 "gpuValidated": False, "officialActionsPerformed": False}),
                 (steps[1], "qa-verification.json", {"passed": True, "cpuReplayPassed": True, "scopePreserved": True,
