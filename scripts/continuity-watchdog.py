@@ -1601,7 +1601,7 @@ class Watchdog:
             envelope["code"] = code
             return envelope, identity_bound_report
 
-    def repair_qa_diagnostic(self, detail, artifact, problem, latest_attempts, candidate_sha):
+    def repair_qa_diagnostic(self, detail, artifact, problem, latest_attempts, candidate_sha, binding_conflict=None):
         """Bounded prior QA data, never current acceptance or original raw bytes."""
         require(type(artifact.get("size")) is int and 0 < artifact["size"] <= QA_ARTIFACT_LIMIT,
                 "REPAIR_QA_DIAGNOSTIC_SIZE")
@@ -1626,6 +1626,8 @@ class Watchdog:
                 **{k: context[k] for k in ["occurrenceId", "artifact", "attemptId", "stepId", "stepKey",
                                            "runFence", "sourceSHA256", "candidateSHA256"]},
                 "cycleInputSHA256": binding["digest"]}
+        if binding_conflict is not None:
+            envelope["evidenceBindingConflict"] = binding_conflict
         return compact_qa_diagnostic(envelope, report)
 
     def source_external_evidence(self, catalog, details):
@@ -1808,6 +1810,47 @@ class Watchdog:
         require(len(artifacts) == len({a["name"] for a in artifacts}) == 5, "REPAIR_PRODUCER_EVIDENCE_SET")
         return artifacts
 
+    def historical_qa_binding_conflict(self, review, cpu, source, base, artifacts, qa):
+        """Describe stale QA hashes without accepting or rewriting that report.
+
+        Only the historical QA references may disagree. The independently bound
+        producer artifacts must be exact; the repair still reruns CPU and QA.
+        """
+        evidence = review.get("cpuEvidence")
+        actual = {"checkerSHA256": artifacts["cpu-checks.py"]["digest"],
+                  "resultSHA256": artifacts["cpu-result.json"]["digest"]}
+        require(type(evidence) is dict and all(type(evidence.get(k)) is str
+                and re.fullmatch(r"[a-f0-9]{64}", evidence[k]) for k in actual),
+                "REPAIR_EVIDENCE_HASH_CONFLICT")
+        require(any(evidence[k] != actual[k] for k in actual)
+                and cpu.get("candidateSHA256") == source["digest"]
+                and cpu.get("checkerSHA256") == actual["checkerSHA256"]
+                and cpu.get("sourceSHA256", base["digest"]) == base["digest"],
+                "REPAIR_EVIDENCE_HASH_CONFLICT")
+        require(all(review.get(k) is True for k in ["passed", "scopePreserved", "cpuReplayPassed",
+                    "canonicalPrecisionPreserved", "evaluatorIndependent", "upstreamAttributionPreserved",
+                    "approvedForOfficialReview"])
+                and all(review.get(k) is False for k in ["gpuValidated", "officialActionsPerformed"])
+                and review.get("performanceGainProven", False) is False
+                and review.get("blockingFindings") == [], "REPAIR_CONFLICT_SEMANTICS_UNVERIFIED")
+        self.verified_artifact(artifacts["cpu-checks.py"])
+        verification = self.qa_report(artifacts["verification.json"], "REPAIR_PRODUCER_VERIFICATION_SCHEMA")
+        require(verification.get("sourceSHA256") == base["digest"]
+                and verification.get("candidateSHA256") == source["digest"]
+                and verification.get("passed") is True and verification.get("scopePreserved") is True
+                and verification.get("gpuValidated") is False and verification.get("officialActionsPerformed") is False
+                and verification.get("performanceGainProven", False) is False,
+                "REPAIR_CONFLICT_PRODUCER_VERIFICATION")
+        ref = lambda a: {k: a[k] for k in ["id", "name", "digest", "size", "attempt_id"]}
+        return {"version": 1, "kind": "historical_qa_cpu_binding_conflict",
+                "authority": "diagnostic_only_requires_fresh_cpu_and_independent_qa",
+                "currentAcceptance": False, "originalReportBindingValid": False,
+                "originalQAArtifact": ref(qa),
+                "reportedCpuEvidence": {k: evidence[k] for k in actual}, "actualProducerBindings": actual,
+                "conflictingFields": [k for k in actual if evidence[k] != actual[k]],
+                "producerArtifacts": {name: ref(artifacts[name]) for name in
+                    ["cpu-checks.py", "cpu-result.json", "verification.json"]}}
+
     def auto_check_diagnostics(self, catalog, details, tested):
         path = self.config.get("autoCheckStatusPath")
         if not path or not pathlib.Path(path).exists():
@@ -1900,16 +1943,18 @@ class Watchdog:
                 evidence = review.get("cpuEvidence", {})
                 require(isinstance(evidence, dict), "REPAIR_CPU_EVIDENCE_SCHEMA")
                 for container, key, expected in [(cpu, "candidateSHA256", source["digest"]),
-                        (cpu, "checkerSHA256", by_name["cpu-checks.py"]["digest"]),
-                        (evidence, "checkerSHA256", by_name["cpu-checks.py"]["digest"]),
-                        (evidence, "resultSHA256", by_name["cpu-result.json"]["digest"])]:
+                        (cpu, "checkerSHA256", by_name["cpu-checks.py"]["digest"])]:
                     require(container.get(key) in [None, expected], "REPAIR_EVIDENCE_HASH_CONFLICT")
+                binding_conflict = None
+                if (evidence.get("checkerSHA256") not in [None, by_name["cpu-checks.py"]["digest"]]
+                        or evidence.get("resultSHA256") not in [None, by_name["cpu-result.json"]["digest"]]):
+                    binding_conflict = self.historical_qa_binding_conflict(review, cpu, source, base, by_name, qa)
                 if cpu.get("passed") is not True:
                     item["classification"] = "new_hypothesis_required"; continue
                 if len(repairs) >= 2:
                     item["classification"] = "repair_exhausted"; continue
                 try:
-                    diagnostic = self.repair_qa_diagnostic(detail, qa, row["problem"], latest, source["digest"])
+                    diagnostic = self.repair_qa_diagnostic(detail, qa, row["problem"], latest, source["digest"], binding_conflict)
                 except (ValueError, KeyError, TypeError, OSError, RecursionError) as error:
                     code = str(error) if isinstance(error, ValueError) and re.fullmatch(r"[A-Z][A-Z0-9_]+", str(error)) else "REPAIR_QA_DIAGNOSTIC_UNAVAILABLE"
                     item.update(classification="repair_context_unavailable", repairContextCode=code)
@@ -2516,6 +2561,19 @@ to your complete new QA artifact. Never publish a projection as the QA result.
 Formatting alone may shrink JSON; dropping fields or inventing hashes may not.
 If complete evidence cannot fit, report the limitation and fail the repair.
 """
+            if repair["repairQADiagnostic"].get("evidenceBindingConflict"):
+                conflict_instructions = """\nHISTORICAL QA BINDING CONFLICT: repairQADiagnostic.evidenceBindingConflict
+records the former QA's stale checker/result hashes and authenticated producer
+artifact references. That QA remains invalid for current acceptance or official
+review; do not edit it or copy its attestations. Preserve the immutable candidate
+and canonical patch. Inspect the original report and exact producer bytes, rerun
+the actual CPU checker, and publish NEW evidence. Independent QA must rerun the
+new predecessor checker and bind checkerSHA256/resultSHA256 to those exact current
+bytes, with every actual case and control. A diagnosis of stale hashes is not
+proof of correctness. Any candidate, patch, semantic or numerical defect fails.
+"""
+                producer += conflict_instructions
+                qa += conflict_instructions
         steps = [native_step(self.config, "produce", "Implementar experiência: " + experiment["id"], producer,
                  ["candidate.py", "implementation.patch", "cpu-checks.py", "cpu-result.json", "verification.json"]),
                  native_step(self.config, "independent-qa", "Revisar e reproduzir a experiência", qa,

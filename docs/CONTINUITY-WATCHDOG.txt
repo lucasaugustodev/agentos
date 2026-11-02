@@ -759,3 +759,34 @@ contract is unchanged. This neither repairs a quota-wait candidate nor permits
 an official request: every CHECK still needs the adapter's fresh quota, rule,
 rate and receipt preflight. The supervisor receives the same bounded evidence;
 no counters, ownership or historical reports are rewritten to open a slot.
+
+Historical QA CPU-binding conflicts (2026-11-02)
+
+A historical QA report can quote stale checker/result hashes even when the
+bound producer artifacts are intact. Evidence repair may now describe this
+specific conflict without accepting or rewriting the QA. Both reported hashes
+must be well-formed SHA256 values and at least one must differ. The producer CPU
+candidate/checker bindings must match exactly; its checker, result, verification,
+candidate, base and applicable patch bytes retain their existing identity and
+attempt/fence/manifest guards. Producer verification must bind the exact base
+and candidate and report the required scope/passed/no-GPU/no-official flags.
+QA semantic flags must be strict booleans, positive, without blockers or claims
+of proven GPU performance. Missing producer hashes or contradictory producer
+evidence do not qualify for this path.
+
+The bounded repairQADiagnostic carries evidenceBindingConflict with the original
+QA artifact reference, reported hashes, actual producer artifact references and
+the conflicting field names. currentAcceptance and originalReportBindingValid
+remain false. The report is preserved exactly, including its incorrect claims;
+projection and full-original attachment rules remain unchanged. The marker adds
+instructions only to that new repair execution: keep candidate and canonical
+patch immutable, rerun CPU, and obtain a new independent QA that references the
+actual new checker/result bytes. Existing definitions without this marker remain
+unchanged. No conflicting QA is admitted to official checks by this feature.
+
+This path reuses existing bounded repair attempts, fresh source proofs, capacity,
+quota, policy and uncertain-effect handling. Regression tests cover malformed
+or absent hashes, producer/semantic failures, mutated bytes/patches, incomplete
+attempt proof, projected report transport, independent QA, and exhausted repairs.
+Private frozen replay verifies the five observed conflicts and constructs their
+new requests in memory without executing candidates or making POST requests.
