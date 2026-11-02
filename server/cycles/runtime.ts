@@ -156,7 +156,9 @@ export async function runCycleAgent(
     throw new DomainError('DEPENDENCY_SOURCE_CHANGED', 'The consumer attempt changed before dependency staging.');
   let parents = (
     await pool.query(
-      `SELECT s.key,s.output,a.id,a.name,a.digest FROM cycle_steps s LEFT JOIN cycle_attempts r ON r.step_id=s.id AND r.number=s.attempt LEFT JOIN cycle_artifacts a ON a.attempt_id=r.id WHERE s.occurrence_id=$1 AND s.key=ANY($2)`,
+      dependencySnapshot
+        ? `SELECT s.key,s.output,a.id,a.name,a.digest FROM cycle_steps s LEFT JOIN cycle_attempts r ON r.step_id=s.id AND r.number=s.attempt LEFT JOIN cycle_artifacts a ON a.attempt_id=r.id WHERE s.occurrence_id=$1 AND s.key=ANY($2)`
+        : `SELECT s.output,a.id,a.name,a.digest FROM cycle_steps s LEFT JOIN cycle_attempts r ON r.step_id=s.id AND r.number=s.attempt LEFT JOIN cycle_artifacts a ON a.attempt_id=r.id WHERE s.occurrence_id=$1 AND s.key=ANY($2)`,
       [o.id, definition.dependsOn],
     )
   ).rows;
