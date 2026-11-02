@@ -400,3 +400,6 @@ A stopped final binding failure can establish source provenance for a later
 repair, with `qualityAccepted: false`. It cannot authorize CHECK or enter the
 terminal acceptance path. Failed reports and attempt history are preserved;
 historical hashes never replace current producer evidence.
+Other final failure codes currently cannot provide v2 source provenance; recovery
+from a semantic failure requires a separate contract and is not part of this
+binding-retry change.
