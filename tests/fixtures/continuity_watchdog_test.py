@@ -3252,6 +3252,32 @@ class WatchTests(unittest.TestCase):
         self.assertEqual(len(owned), 2)
         self.assertEqual(owned[-1]['repairCandidateSHA256'], repair['candidateSHA256'])
 
+    def test_mixed_archive_completed_review_fallback_creates_one_new_identity(self):
+        # No adapter-policy rebind may incidentally change the observation
+        # fingerprint here: only the storage configuration authority changes.
+        self.enable_mixed_plan_contract(); self.enable_payloads(); self.w.tick()
+        plan = self.mixed_plan({'muse_decode_layer': 1})
+        self.complete_review(plan)
+        original = self.w.state['supervisions'][-1]
+        old_occurrence = original['occurrenceId']
+        old_key = original['requestKey']
+        expanded = self.w.export_legacy_state()
+        self.config.pop('statePayloadStorage')
+        destination = self.root / 'completed-review-fallback'; destination.mkdir()
+        W.atomic(destination / 'state.json', expanded)
+        for path in self.w.directory.glob('intent-*.json'):
+            (destination / path.name).write_bytes(path.read_bytes())
+        posts = len(self.client.posts)
+        self.w = W.Watchdog(self.config, destination, self.client, clock=lambda: 10060)
+        self.assertEqual(self.w.tick()['state'], 'supervisor_dispatched')
+        fresh = self.w.state['supervisions'][-1]
+        self.assertNotEqual(fresh['occurrenceId'], old_occurrence)
+        self.assertNotEqual(fresh['requestKey'], old_key)
+        self.assertEqual(len(self.client.posts), posts + 1)
+        self.assertEqual(len({r['occurrenceId'] for r in self.w.state['supervisions']}), len(self.w.state['supervisions']))
+        self.assertEqual(self.w.tick()['state'], 'supervisor_running')
+        self.assertEqual(len(self.client.posts), posts + 1)
+
     def switch_mixed_control(self):
         old = self.config['controlCycleId']
         new = uid()
