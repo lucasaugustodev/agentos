@@ -1685,7 +1685,11 @@ class ScanSelectionTests(unittest.TestCase):
         self.assertEqual((row["state"], row["postAttempted"], row["jobId"]), ("account_wait", False, None))
         self.assertEqual(row["candidateSHA256"], A.digest(self.fixture.candidate))
         self.assertTrue(row["qaArtifactId"] and row["qaSHA256"])
-        self.assertEqual({str(p):p.read_bytes() for p in pathlib.Path(self.p["stateDirectory"]).rglob('*') if p.is_file()}, before)
+        after = {str(p):p.read_bytes() for p in pathlib.Path(self.p["stateDirectory"]).rglob('*') if p.is_file()}
+        self.assertEqual({p:after[p] for p in before}, before)
+        added = set(after) - set(before)
+        self.assertEqual({pathlib.Path(p).name for p in added}, {"terminal-diagnostics-v1.json"})
+        self.assertEqual(A.strict_json(after[next(iter(added))])["entries"], {})
         self.assertEqual(self.fixture.official.posts, 0)
 
     def test_local_durable_effect_overrides_even_a_typed_quota_exception(self):
