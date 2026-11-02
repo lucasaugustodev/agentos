@@ -3373,6 +3373,44 @@ class WatchTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'POST_IDENTITY_CHANGED'): self.w.tick()
         self.assertEqual(len(self.client.posts), 1)
 
+    def test_mixed_new_authority_same_evidence_never_reuses_superseded_occurrence(self):
+        self.enable_mixed_plan_contract(); self.w.tick()
+        self.complete_review(self.mixed_plan({'muse_decode_layer': 1}))
+        original = copy.deepcopy(self.w.state['supervisions'][-1])
+        self.config['intervalSeconds'] = 180
+        result = self.w.tick()
+        self.assertEqual(result['state'], 'supervisor_dispatched')
+        self.assertEqual(len(self.client.posts), 2)
+        current = self.w.state['supervisions'][-1]
+        self.assertEqual(current['fingerprint'], original['fingerprint'])
+        self.assertNotEqual(current['requestKey'], original['requestKey'])
+        self.assertNotEqual(current['occurrenceId'], original['occurrenceId'])
+        self.assertEqual(self.w.tick()['state'], 'supervisor_running')
+        self.assertEqual(len(self.w.state['supervisions']), 2)
+
+    def test_mixed_failures_under_old_authority_do_not_exhaust_new_contract(self):
+        self.enable_mixed_plan_contract(); self.w.tick()
+        self.complete_review({}); self.w.tick()
+        self.complete_review({})
+        self.assertEqual(self.w.tick()['state'], 'supervisor_failure_needs_repair')
+        self.config['intervalSeconds'] = 180
+        self.assertEqual(self.w.tick()['state'], 'supervisor_dispatched')
+        self.assertEqual(len(self.client.posts), 3)
+
+    def test_mixed_old_authority_wait_result_does_not_suppress_new_review(self):
+        self.enable_mixed_plan_contract(); self.w.tick()
+        observation = self.w.observe()
+        pending = self.w.state['supervisions'].pop()
+        self.w.state['outcomes'][observation['fingerprint']] = {
+            'decision': 'await_external', 'authoritySHA256': pending['actionEvidence']['authoritySHA256']}
+        # Retain the completed receipt's owner so this tests outcome caching,
+        # not recovery of an unrecorded effect.
+        pending['state'] = 'consumed'; self.w.state['supervisions'].append(pending)
+        self.assertEqual(self.w.tick()['state'], 'awaiting_changed_evidence')
+        self.config['intervalSeconds'] = 180
+        self.assertEqual(self.w.tick()['state'], 'supervisor_dispatched')
+        self.assertEqual(len(self.client.posts), 2)
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

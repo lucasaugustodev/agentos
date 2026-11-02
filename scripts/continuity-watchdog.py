@@ -2063,14 +2063,23 @@ class Watchdog:
         require(len(canonical(review_input)) <= SUPERVISOR_INPUT_LIMIT, "SUPERVISOR_INPUT_SIZE")
         return packet
 
-    def submit_supervisor(self, observation):
-        failures = [r for r in self.state["supervisions"] if r["fingerprint"] == observation["fingerprint"] and r["state"] == "failed"]
-        generation = len(failures) + 1
+    def review_key_prefix(self, observation):
         namespace = "-review-"
         if self.config.get("planVersion") == 2:
-            namespace = "-review-v2-" + digest([self.config["controlCycleId"], self.config["controlDefinitionSHA256"],
-                                               self.config.get("controlVersion")])[:16] + "-"
-        key = self.config["watchId"] + namespace + observation["fingerprint"][:32] + "-" + str(generation)
+            # Includes control pins, configuration and current adapter authority.
+            # A new contract must not reuse the result of a superseded review.
+            namespace = "-review-v2-" + action_evidence(observation, self.config)["authoritySHA256"][:24] + "-"
+        return self.config["watchId"] + namespace + observation["fingerprint"][:32] + "-"
+
+    def review_failures(self, observation):
+        prefix = self.review_key_prefix(observation)
+        return [r for r in self.state["supervisions"] if r["fingerprint"] == observation["fingerprint"] and r["state"] == "failed"
+                and (self.config.get("planVersion") != 2 or r.get("requestKey", "").startswith(prefix))]
+
+    def submit_supervisor(self, observation):
+        failures = self.review_failures(observation)
+        generation = len(failures) + 1
+        key = self.review_key_prefix(observation) + str(generation)
         body = {"requestKey": key, "input": {"version": 1, "watchId": self.config["watchId"],
             "evidenceFingerprint": observation["fingerprint"], "trigger": "stale_progress_diagnostic" if observation["diagnosticOnly"] else "registered_work_reached_boundary",
             "observedIdleSeconds": observation["idleSeconds"], "priorReviewErrors": [r.get("errorCode", "NATIVE_SUPERVISOR_FAILED") for r in failures], **{k: observation[k] for k in
@@ -2480,6 +2489,8 @@ If complete evidence cannot fit, report the limitation and fail the repair.
         self.state["outcomes"][pending["fingerprint"]] = {"supervisorOccurrenceId": pending["occurrenceId"],
             "decision": plan["decision"], "reason": plan["reason"], "dispatched": dispatched,
             "isolatedCandidates": source_input.get("isolatedCandidates", [])}
+        if plan["version"] == 2:
+            self.state["outcomes"][pending["fingerprint"]]["authoritySHA256"] = pending["actionEvidence"]["authoritySHA256"]
         self.save()
         return self.status("experiments_dispatched" if dispatched else "active_owner_preserved" if plan["decision"] == "observe_active" else "awaiting_external", dispatched=dispatched,
                            supervisorOccurrenceId=pending["occurrenceId"], reason=plan["reason"],
@@ -2552,9 +2563,10 @@ If complete evidence cannot fit, report the limitation and fail the repair.
                                                    or observation["pendingOfficialJobs"] and not observation["diagnosticOnly"]):
             return self.status("work_active", active=observation["active"], officialJobs=observation["pendingOfficialJobs"])
         previous = self.state["outcomes"].get(observation["fingerprint"])
-        if previous:
+        if previous and (self.config.get("planVersion") != 2 or
+                         previous.get("authoritySHA256") == action_evidence(observation, self.config)["authoritySHA256"]):
             return self.status("awaiting_changed_evidence", **previous)
-        failed = [s for s in self.state["supervisions"] if s["fingerprint"] == observation["fingerprint"] and s["state"] == "failed"]
+        failed = self.review_failures(observation)
         if len(failed) >= 2:
             return self.status("supervisor_failure_needs_repair", occurrenceId=failed[-1]["occurrenceId"])
         return self.submit_supervisor(observation)
