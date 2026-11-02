@@ -60,8 +60,8 @@ class TerminalDiagnosticsTests(unittest.TestCase):
 
     def test_invalid_proofs_preserve_owner_and_never_authorize_repair(self):
         original = copy.deepcopy(self.row)
-        changes = [{'version': 2}, {'verifyKind': 'full_audit'}, {'observedAt': True}, {'verifiedAt': float('inf')},
-            {'observedAt': -1}, {'observedAt': 10001}, {'verifiedAt': 10006},
+        changes = [{'version': 2}, {'version': True}, {'verifyKind': 'full_audit'}, {'observedAt': True}, {'verifiedAt': float('inf')},
+            {'observedAt': -1}, {'observedAt': 10001}, {'verifiedAt': 10006}, {'verifiedAt': 10004},
             {'verifiedAt': 9899}, {'policySHA256': 'c' * 64}, {'adapterSHA256': 'c' * 64},
             {'detailSHA256': 'c' * 64}, {'dispatchSHA256': 'bad'}]
         # Nonfinite numbers are rejected at the helper before JSON publication.

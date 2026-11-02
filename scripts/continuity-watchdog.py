@@ -80,14 +80,15 @@ def terminal_diagnostic_current(row, detail, policy, policy_sha, now, maximum_ag
     if "diagnosticProof" not in row:
         return True
     proof = row["diagnosticProof"]
-    if not (type(proof) is dict and proof.get("version") == 1 and proof.get("verifyKind") == "native_identity"
+    if not (type(proof) is dict and type(proof.get("version")) is int and proof["version"] == 1
+            and proof.get("verifyKind") == "native_identity"
             and row.get("state") == "rejected_repairable"
             and "jobId" in row and row["jobId"] is None and row.get("postAttempted") is False):
         return False
     observed, verified = proof.get("observedAt"), proof.get("verifiedAt")
     if not all(type(t) in (int, float) and math.isfinite(t) for t in [observed, verified]):
         return False
-    if not (0 <= observed <= verified <= now + 5 and now - verified <= maximum_age
+    if not (0 <= observed <= verified <= now and now - verified <= maximum_age
             and now - observed <= 3600 and verified - observed <= 3600):
         return False
     hashes = [proof.get(k) for k in ["policySHA256", "adapterSHA256", "detailSHA256", "dispatchSHA256"]]
