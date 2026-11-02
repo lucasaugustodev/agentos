@@ -632,3 +632,61 @@ A report can be readable for classification yet unavailable for repair context.
 Oversized, corrupt, unbound or malformed registered QA still fails closed; it is
 never skipped to free ownership or manufacture acceptance. No official action
 or performance improvement is implied by reading a registered CHECK report.
+
+Board-scoped planning and deterministic replenishment (opt-in)
+
+Set plannerMode="board-lanes-v1", targetNativeWorkers=8 and
+readyLowWatermark=2 with planVersion=2 and pipelineCapacityVersion=2. This
+requires a newly registered/pinned supervisor definition with concurrency3.
+Experiment cycles retain concurrency1. Without the opt-in, the single-planner
+contract and existing behavior are unchanged.
+Once lane records/outboxes exist, the reader requires this plannerMode. Removing
+the flag or downgrading to an older reader is not a supported rollback: it would
+hide ready reservations. Hold the new controller if recovery is needed; preserve
+its current state, inputs and intents. A pre-resume rollback must prove that no
+lane request or outbox was created before restoring the original configuration.
+
+One watcher owner under watch.lock manages three independent planner lanes:
+Decode, Prefill and Attention. Each planner receives only its board's source
+capsules, outcomes, diagnostics, official jobs and recent dispatches. Scoped
+request namespaces include board, authority and evidence identity. Validators
+reject cross-board actions; a slow planner cannot hold up the other two lanes.
+No fourth LLM manager is added. The deterministic sweep owns replenishment.
+
+The sweep first reconciles all attempted review/action effects using their
+original identities, then collects all finished plans, admits and validates
+the ready buffer, dispatches ready actions, and finally replenishes planners.
+An uncertain POST prevents new writes globally until GET reconciliation proves
+its result. A lost ACK never authorizes retransmission. A legacy global planner
+may finish naturally in the spare session; its old-authority plan cannot be
+newly dispatched under the changed contract. Its effects and output references
+remain recorded. Additional legacy planners reduce the effective worker target.
+
+approvedPlan is the immutable proposed batch; its persisted outbox records
+unadmitted, ready, dispatching, owned or invalidated states per action. Ready
+actions reserve the global24/per-board8 pipeline budget and exact normalized
+hypotheses before any create/run request. A changed source invalidates the
+affected unstarted action; acknowledged effects remain owned. Ready repairs
+cannot duplicate another repair's fixed candidate output. Archived inputs and
+POST receipts retain their existing byte identity and integrity checks.
+
+The target is8 native worker reservations, counting queued/running/unconfirmed
+production and QA. At most3 new experiments are dispatched per sweep, with
+fresh observation before each action; this bounds expensive observation/API
+work while the ready buffer survives between sweeps. With a private30-second
+timer, an initially empty pool can fill in3 sweeps when work is admissible.
+The native cycle engine already claims queued work every2 seconds. GPU waits
+still count against24/8 but do not count as ready CPU work or native workers.
+Planning replenishes below2 ready actions per board when sources, capacity and
+existing failure rules permit. Eight workers plus3 planners leave1 session for
+handover within the deployed12-session ceiling; the global6-request gate is
+unchanged. External account occupancy can reduce actual concurrent execution.
+
+Status distinguishes nativeReserved, nativeQueued, nativeExecuting,
+plannerPending, legacyPlannerPending, readyActions/readyByProblem and GPU or
+other waiting pipelines. An admitted proposal or queued occurrence is not a
+running session, accepted delivery or performance gain. Explicit per-board
+wait reasons explain insufficient source/capacity, pending planners and held
+failure recovery. Do not shorten intervalSeconds to tune the private timer:
+it also controls diagnostic freshness. Validate actual replenishment latency,
+new evidence and accepted deliveries before claiming productivity improvement.

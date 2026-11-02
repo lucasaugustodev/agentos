@@ -34,6 +34,7 @@ SUPERVISOR_INPUT_LIMIT = 2 * 1024 * 1024
 PRODUCER_DIAGNOSTIC_LIMIT = 16 * 1024
 SUPERVISOR_DIAGNOSTIC_LIMIT = 64 * 1024
 MAX_ADMINISTRATIVE_TRANSITIONS = 3
+MAX_LANE_DISPATCH_PER_SWEEP = 3
 REPAIR_CPU_RAW_LIMIT = 256 * 1024
 REPAIR_CPU_LOGICAL_LIMIT = 128 * 1024
 # Native diagnostic adapter artifact admission is bounded to 1 MiB. Reading
@@ -557,9 +558,17 @@ remaining blockers and capacity decisions. Do not build another plan validator.
 
 
 def supervisor_definition(config):
-    return definition(config, "Supervisão contínua — OpenKernel", [native_step(config, "supervise",
-        "Conferir progresso e decidir a próxima experiência", COMMON + (SUPERVISOR_V2 if config.get("planVersion") == 2 else SUPERVISOR),
+    instructions = SUPERVISOR_V2 if config.get("planVersion") == 2 else SUPERVISOR
+    if config.get("plannerMode") == "board-lanes-v1":
+        instructions = instructions.replace(
+            "You are the periodic OpenKernel portfolio supervisor. Inspect cycle-input.json\nand plan useful independent work across Decode, Prefill and Attention.",
+            "You are one dedicated OpenKernel board planner. Inspect cycle-input.json\nand plan useful independent work ONLY for input.planningScope.problem.")
+    value = definition(config, "Supervisão contínua — OpenKernel", [native_step(config, "supervise",
+        "Conferir progresso e decidir a próxima experiência", COMMON + instructions,
         ["continuation-plan.json", "supervisor-summary.txt"])])
+    if config.get("plannerMode") == "board-lanes-v1":
+        value["concurrency"] = 3
+    return value
 
 
 def validate_config(config, bound=True):
@@ -568,6 +577,13 @@ def validate_config(config, bound=True):
     require(re.fullmatch(r"openkernel/[a-z0-9_-]+", config.get("workspace", "")), "WORKSPACE_SCOPE")
     require(config.get("model") == "deepseek-v4-pro-0813", "MODEL_SCOPE")
     require(config.get("statePayloadStorage") in [None, STATE_PAYLOAD_STORAGE], "STATE_PAYLOAD_STORAGE")
+    require(config.get("plannerMode") in [None, "board-lanes-v1"], "PLANNER_MODE")
+    if config.get("plannerMode") == "board-lanes-v1":
+        require(config.get("planVersion") == 2 and config.get("pipelineCapacityVersion") == 2,
+                "PLANNER_LANES_VERSION")
+        require(type(config.get("targetNativeWorkers", 8)) is int and config.get("targetNativeWorkers", 8) == 8
+                and type(config.get("readyLowWatermark", 2)) is int and config.get("readyLowWatermark", 2) == 2,
+                "PLANNER_LANES_CAPACITY")
     require(re.fullmatch(r"agentos-api-[a-f0-9-]{36}", config.get("accountId", "")), "ACCOUNT_SCOPE")
     capacity_version = config.get("pipelineCapacityVersion", 1)
     require(type(capacity_version) is int and capacity_version in [1, 2], "PIPELINE_CAPACITY_VERSION")
@@ -672,6 +688,11 @@ def validate_plan(plan, observation, config, expected_fingerprint=None, source_i
             and 20 <= len(plan["reason"]) <= 1200, "PLAN_DECISION")
     experiments = plan["experiments"]
     require(type(experiments) is list, "PLAN_EXPERIMENTS")
+    if original.get("planningScope"):
+        scope = original["planningScope"]
+        require(scope.get("version") == 1 and scope.get("problem") in PROBLEMS
+                and all(exp.get("problem") == scope["problem"] for exp in experiments if isinstance(exp, dict)),
+                "PLAN_LANE_SCOPE")
     repairs = observation.get("autoCheckDiagnostics", {}).get("repairableEvidence", [])
     capacity = min(config["maxPendingCandidates"], observation["availableCandidateSlots"],
                    len(repairs) if plan["decision"] == "repair_evidence" else config["maxPendingCandidates"])
@@ -1029,6 +1050,8 @@ class Watchdog:
         self.state = json.loads(raw) if raw is not None else read_json(self.path) if self.path.exists() else {"version": 1, "watchId": config["watchId"],
             "createdAt": clock(), "supervisions": [], "experiments": [], "outcomes": {}, "official": {}}
         require(self.state["watchId"] == config["watchId"], "STATE_SCOPE")
+        if any(r.get("planningProblem") or "outbox" in r for r in self.state["supervisions"]):
+            require(config.get("plannerMode") == "board-lanes-v1", "PLANNER_LANES_STATE_REQUIRES_MODE")
         require(type(self.state.get("version")) is int and self.state["version"] in [1, 2], "STATE_VERSION")
         require(self.state["version"] != 2 or self.external_payloads, "STATE_PAYLOAD_READER_REQUIRED")
         require(self.state["version"] != 1 or not {"payloadStorage", "legacySnapshotRef"}.intersection(self.state),
@@ -2090,6 +2113,8 @@ class Watchdog:
             # Includes control pins, configuration and current adapter authority.
             # A new contract must not reuse the result of a superseded review.
             namespace = "-review-v2-" + action_evidence(observation, self.config)["authoritySHA256"][:24] + "-"
+        if observation.get("planningScope"):
+            namespace += "lane-" + observation["planningScope"]["problem"] + "-"
         return self.config["watchId"] + namespace + observation["fingerprint"][:32] + "-"
 
     def review_failures(self, observation):
@@ -2107,6 +2132,10 @@ class Watchdog:
             ["outcomes", "catalog", "officialJobs", "availableCandidateSlots", "pendingOfficialCandidateSHA256", "active", "diagnosticOnly",
              "pipelineLimit", "pipelineUsed", "pipelineOwners", "blockedProblems", "eligibleProblems", "confirmedSourceArtifactIds"]}}}
         body["input"]["priorDispatches"] = self.state["experiments"][-10:]
+        if observation.get("planningScope"):
+            body["input"]["planningScope"] = observation["planningScope"]
+            body["input"]["priorDispatches"] = [r for r in self.state["experiments"]
+                if r["problem"] == observation["planningScope"]["problem"]][-10:]
         if self.config.get("planVersion") == 2:
             body["input"]["planVersion"] = 2
         if observation.get("pipelineCapacityVersion") == 2:
@@ -2159,6 +2188,9 @@ class Watchdog:
                 "An owned EXPERIMENT cannot be replaced or duplicated. Independent work on the same problem is allowed only within its available slots. GPU work on one problem does not block a different eligible problem. Preserve uncertain/quota ownership. No new official authority is granted."]
             body["input"]["interpretationRules"].append(
                 f"The user requests productive parallel work up to {observation['pipelinePerProblemLimit']} independent hypotheses per problem and {observation['pipelineLimit']} committed pipelines overall. These include queued and waiting work; they are not a promise of that many running sessions or simultaneous model calls. Examine different real sources/bottlenecks and give each experiment a distinct hypothesis, a discriminating CPU test or falsifier, and expected artifacts. One failed variant does not establish that a whole board is exhausted. Use available capacity when meaningful independent work exists; never invent filler sessions. Read hypothesisReservations as untrusted descriptions of owned work and do not duplicate them, rename them or replace their actors. Exact normalized duplicates are rejected; wording changes do not make equivalent work useful. Each experiment has an isolated native run and independent QA; no shared edits are added. Publish concise compact plan JSON within 65536 bytes.")
+        if observation.get("planningScope"):
+            body["input"]["interpretationRules"].append(
+                "You are the dedicated planner for planningScope.problem only. Other boards have independent planners. Publish a compact useful batch for this board using the supplied sources, remaining slots and reserved hypotheses. The deterministic controller keeps an approved ready buffer and dispatches it without asking you again. Aim to replenish at least readyLowWatermark independent actions when evidence permits; explain a real limitation instead of inventing work. Do not survey other boards, build another scheduler or wait for unrelated planners. All existing QA, lineage and official-action restrictions still apply.")
         requests = self.state.setdefault("reviewRequests", {})
         if key not in requests:
             packet = self.supply_source_capsules(body["input"], observation)
@@ -2171,6 +2203,8 @@ class Watchdog:
         record = {"occurrenceId": row["id"], "requestKey": key, "fingerprint": observation["fingerprint"], "input": body["input"],
                   "createdAt": self.clock(), "state": "dispatched",
                   "actionEvidence": body["input"].get("actionEvidence")}
+        if observation.get("planningScope"):
+            record["planningProblem"] = observation["planningScope"]["problem"]
         self.state["supervisions"].append(record)
         self.state["lastDispatchAt"] = self.clock()
         self.save()
@@ -2207,10 +2241,13 @@ class Watchdog:
                 return self.status("owned_review_uncertain", requestKey=key, originalControlCycleId=cycle,
                                    automaticPostRetry=False, newPostRequests=0)
             require(row is not None and row["input"] == body["input"], "RUN_RECEIPT")
-            self.state["supervisions"].append({"occurrenceId": row["id"], "requestKey": key,
+            record = {"occurrenceId": row["id"], "requestKey": key,
                 "fingerprint": body["input"]["evidenceFingerprint"], "input": body["input"],
                 "createdAt": self.clock(), "state": "dispatched", "actionEvidence": body["input"].get("actionEvidence"),
-                "reconciledOriginalControlCycleId": cycle})
+                "reconciledOriginalControlCycleId": cycle}
+            if body["input"].get("planningScope"):
+                record["planningProblem"] = body["input"]["planningScope"]["problem"]
+            self.state["supervisions"].append(record)
             self.save()
             return self.status("supervisor_reconciled", occurrenceId=row["id"], originalControlCycleId=cycle,
                                newPostRequests=0)
@@ -2517,12 +2554,299 @@ If complete evidence cannot fit, report the limitation and fail the repair.
                            supervisorOccurrenceId=pending["occurrenceId"], reason=plan["reason"],
                            isolatedCandidates=source_input.get("isolatedCandidates", []))
 
+    def ready_actions(self):
+        """Durable approved proposals, not another executor or accepted work."""
+        result = []
+        for review in self.state["supervisions"]:
+            if not review.get("planningProblem") or not review.get("approvedPlan"):
+                continue
+            owned = {r["experimentId"] for r in self.state["experiments"]
+                     if r["supervisorOccurrenceId"] == review["occurrenceId"]}
+            for exp in review["approvedPlan"]["experiments"]:
+                action = review.get("outbox", {}).get(exp["id"], {})
+                if exp["id"] not in owned and action.get("state") in ["ready", "dispatching"]:
+                    result.append({"supervisor": review, "experiment": exp, "action": action})
+        return result
+
+    def admission_with_ready(self, observation, exclude=None):
+        """Ready proposals reserve capacity and exact hypotheses before any POST."""
+        value = {**observation, "pipelineOwners": list(observation["pipelineOwners"]),
+                 "hypothesisReservations": list(observation["hypothesisReservations"])}
+        for item in self.ready_actions():
+            review, exp = item["supervisor"], item["experiment"]
+            identity = (review["occurrenceId"], exp["id"])
+            if identity == exclude:
+                continue
+            source = next(a for a in self.supervision_input(review)["catalog"] if a["id"] == exp["sourceArtifactId"])
+            value["pipelineOwners"].append({"problem": exp["problem"],
+                "ownerKey": "ready:" + ":".join(identity), "stages": ["ready"], "occurrenceIds": [],
+                "jobIds": [], "candidateSHA256": source["digest"] if exp["kind"] == "repair_evidence" else None})
+            value["hypothesisReservations"].append({"problem": exp["problem"],
+                "key": hypothesis_identity(exp["problem"], source["digest"], exp["hypothesis"]),
+                "sourceSHA256": source["digest"], "hypothesis": exp["hypothesis"], "stage": "ready"})
+        used = {p: sum(r["problem"] == p for r in value["pipelineOwners"]) for p in PROBLEMS}
+        available = max(0, self.config["maxPendingCandidates"] - len(value["pipelineOwners"]))
+        slots = {p: min(available, max(0, self.config["maxPipelinesPerProblem"] - used[p]))
+                 if p not in observation["uncertainProblems"] else 0 for p in PROBLEMS}
+        sources = {a["problem"] for a in observation["catalog"] if a["id"] in observation["confirmedSourceArtifactIds"]}
+        value.update(pipelineUsed=len(value["pipelineOwners"]), pipelineUsedByProblem=used,
+            availableCandidateSlots=available, boardAvailableCandidateSlots=slots,
+            readyPipelineUsed=len(value["pipelineOwners"]) - observation["pipelineUsed"],
+            blockedProblems=sorted(p for p in PROBLEMS if not slots[p]),
+            eligibleProblems=sorted(p for p in sources if slots[p]))
+        return value
+
+    def lane_observation(self, observation, problem):
+        """Give a planner its real board evidence, not the three-board portfolio."""
+        require(problem in PROBLEMS, "PLANNER_LANE_SCOPE")
+        value = dict(observation)
+        for key in ["catalog", "outcomes", "officialJobs", "active", "pipelineOwners", "hypothesisReservations",
+                    "sourceExternalEvidence"]:
+            if key in value:
+                value[key] = [r for r in value[key] if r.get("problem") == problem]
+        ids, hashes = {a["id"] for a in value["catalog"]}, {a["digest"] for a in value["catalog"]}
+        value["confirmedSourceArtifactIds"] = [i for i in value["confirmedSourceArtifactIds"] if i in ids]
+        value["pendingOfficialCandidateSHA256"] = [s for s in value["pendingOfficialCandidateSHA256"] if s in hashes]
+        value["pendingOfficialJobs"] = [r["id"] for r in value["officialJobs"] if r["status"] not in ["done", "failed"]]
+        diagnostics = value["autoCheckDiagnostics"]
+        value["autoCheckDiagnostics"] = {**diagnostics, **{key: [r for r in diagnostics[key] if r["problem"] == problem]
+            for key in ["outcomes", "repairableEvidence"]}}
+        value.pop("comparisonContext", None)  # Unstructured portfolio reports cannot establish lane scope.
+        for key in ["blockedProblems", "eligibleProblems", "uncertainProblems"]:
+            value[key] = [p for p in value[key] if p == problem]
+        value["pipelineUsedByProblem"] = {problem: observation["pipelineUsedByProblem"][problem]}
+        value["boardAvailableCandidateSlots"] = {problem: observation["boardAvailableCandidateSlots"][problem]}
+        value["availableCandidateSlots"] = min(value["availableCandidateSlots"], value["boardAvailableCandidateSlots"][problem])
+        value["diagnosticOnly"] = bool(value["active"]) and not value["eligibleProblems"]
+        value["planningScope"] = {"version": 1, "problem": problem,
+            "targetNativeWorkers": self.config.get("targetNativeWorkers", 8),
+            "readyLowWatermark": self.config.get("readyLowWatermark", 2)}
+        material = {k: v for k, v in value.items() if k not in
+            ["fingerprint", "idleSeconds", "controllerDispatchAgeSeconds"]}
+        value["fingerprint"] = digest(evidence_material(material))
+        return value
+
+    def lane_action_plan(self, review, exp):
+        original = review["approvedPlan"]
+        return {**original, "decision": "actions", "experiments": [exp], "capacityReview": [
+            {**r, "plannedActions": int(r["problem"] == exp["problem"])}
+            for r in original["capacityReview"]]}
+
+    def lane_action_current(self, review, exp, observation):
+        plan = self.lane_action_plan(review, exp)
+        require(unchanged_action_scope({**review, "approvedPlan": plan}, observation, self.config),
+                "PLAN_OBSERVATION_CHANGED")
+        fresh = self.admission_with_ready(observation, (review["occurrenceId"], exp["id"]))
+        # Another approved repair of the same fixed output is still a duplicate,
+        # even though it has not yet become a native occurrence.
+        if exp["kind"] == "repair_evidence":
+            source = next(a for a in fresh["catalog"] if a["id"] == exp["sourceArtifactId"])
+            require(not any(r["problem"] == exp["problem"] and "ready" in r["stages"]
+                and r.get("candidateSHA256") == source["digest"] for r in fresh["pipelineOwners"]),
+                "PLAN_DUPLICATE_REPAIR")
+        validate_plan(plan, fresh, self.config, expected_fingerprint=review["fingerprint"],
+                      source_input=self.supervision_input(review))
+        return fresh
+
+    def reconcile_lane_actions(self):
+        """Reconcile every attempted effect before any fresh write in any lane."""
+        for review in self.state["supervisions"]:
+            if not review.get("planningProblem") or not review.get("approvedPlan"):
+                continue
+            for exp in review["approvedPlan"]["experiments"]:
+                action = review["outbox"][exp["id"]]
+                existing = [r for r in self.state["experiments"] if r["supervisorOccurrenceId"] == review["occurrenceId"]
+                            and r["experimentId"] == exp["id"]]
+                require(len(existing) <= 1, "DISPATCH_RESERVATION_CONFLICT")
+                if existing:
+                    action.update(state="owned", occurrenceId=existing[0]["occurrenceId"]); continue
+                key = self.config["watchId"] + "-experiment-" + digest([review["occurrenceId"], exp])[:32]
+                try:
+                    created = self.reconcile_existing_post("create", key)
+                    if created is None:
+                        require(not (self.directory / ("intent-" + digest(key + "-run") + ".json")).exists(),
+                                "RUN_WITHOUT_CREATE_INTENT")
+                        continue
+                    row = self.reconcile_existing_post("run", key + "-run", created["id"])
+                    if row is None:
+                        continue  # A known unused cycle is not a running experiment.
+                    repair = None
+                    if exp["kind"] == "repair_evidence":
+                        original = next(r for r in self.supervision_input(review)["autoCheckDiagnostics"]["repairableEvidence"]
+                                        if r["candidateArtifactId"] == exp["sourceArtifactId"])
+                        target = row["input"]["experiment"]["repairTarget"]
+                        require(target["occurrenceId"] == original["occurrenceId"]
+                            and target["candidateSHA256"] == original["candidateSHA256"]
+                            and target["canonicalPatch"]["sha256"] == original["patchNormalization"]["canonicalPatchSHA256"],
+                            "RECONCILE_REPAIR_BINDING")
+                        repair = {**original, "canonicalPatch": target["canonicalPatch"]}
+                    record = self.record_experiment(exp, review, row, repair)
+                    action.update(state="owned", occurrenceId=record["occurrenceId"])
+                except ValueError as error:
+                    if str(error) != "POST_UNCERTAIN_RECONCILE_ONLY":
+                        raise
+                    action.update(state="dispatching", code="POST_UNCERTAIN_RECONCILE_ONLY"); self.save()
+                    return self.status("owned_dispatch_uncertain", supervisorOccurrenceId=review["occurrenceId"],
+                        experimentId=exp["id"], newPostRequests=0, automaticPostRetry=False)
+        self.save()
+        return None
+
+    def collect_lane_plans(self, observation):
+        """Inspect all planner results before dispatch or replenishment."""
+        for review in self.state["supervisions"]:
+            if not review.get("planningProblem") or review["state"] != "dispatched":
+                continue
+            detail = self.client.request("GET", "/api/cycle-runs/" + review["occurrenceId"])
+            if not confirmed_boundary(detail):
+                continue
+            if detail["occurrence"]["state"] != "completed":
+                review.update(state="failed", errorCode="NATIVE_SUPERVISOR_FAILED"); self.save(); continue
+            source_input = self.supervision_input(review)
+            try:
+                rows = [a for a in detail["artifacts"] if a["name"] == "continuation-plan.json"]
+                require(len(rows) == 1, "PLAN_ARTIFACT_MISSING_OR_AMBIGUOUS")
+                plan = json.loads(self.verified_artifact(rows[0], 65536))
+                validate_plan(plan, {"fingerprint": review["fingerprint"], **source_input}, self.config)
+            except (ValueError, KeyError, TypeError) as error:
+                code = str(error) if re.fullmatch(r"[A-Z0-9_]+", str(error)) else "PLAN_FORMAT_INVALID"
+                review.update(state="failed", errorCode=code); self.save(); continue
+            review.update(state="ready", approvedPlan=plan, planArtifactId=rows[0]["id"],
+                          outbox={exp["id"]: {"state": "unadmitted"} for exp in plan["experiments"]})
+            self.save()  # Whole plan and cursor survive a crash before any admission or POST.
+        for review in self.state["supervisions"]:
+            if not review.get("planningProblem") or review["state"] != "ready":
+                continue
+            for exp in review["approvedPlan"]["experiments"]:
+                action = review["outbox"][exp["id"]]
+                if action["state"] != "unadmitted":
+                    continue
+                try:
+                    self.lane_action_current(review, exp, observation)
+                    action["state"] = "ready"
+                except ValueError as error:
+                    action.update(state="invalidated", code=str(error))
+                self.save()
+
+    def finish_lane_outboxes(self):
+        for review in self.state["supervisions"]:
+            if not review.get("planningProblem") or review["state"] != "ready":
+                continue
+            states = [r["state"] for r in review["outbox"].values()]
+            if any(s in ["unadmitted", "ready", "dispatching"] for s in states):
+                continue
+            review["state"] = "consumed"
+            self.state["outcomes"][review["fingerprint"]] = {
+                "supervisorOccurrenceId": review["occurrenceId"], "decision": review["approvedPlan"]["decision"],
+                "reason": review["approvedPlan"]["reason"], "authoritySHA256": review["actionEvidence"]["authoritySHA256"],
+                "planningProblem": review["planningProblem"],
+                "invalidatedActions": sum(s == "invalidated" for s in states)}
+        self.save()
+
+    def lane_sweep(self):
+        """One deterministic owner: reconcile, collect, dispatch, then refill."""
+        if self.control()["cycle"]["state"] != "active":
+            return self.status("paused_by_control_cycle")
+        for _ in range(len(self.state.get("reviewRequests", {})) + 1):
+            recovered = self.reconcile_review_requests()
+            if recovered is None:
+                break
+            if recovered["state"] == "owned_review_uncertain":
+                return recovered
+        # A legacy planner may finish under its original immutable input while
+        # the three scoped lanes start. It owns the spare physical session; it
+        # cannot dispatch an old-authority plan under the new lane contract.
+        legacy = [r for r in self.state["supervisions"] if not r.get("planningProblem")
+                  and r["state"] in ["dispatched", "dispatching"]]
+        legacy_active = 0
+        for review in legacy:
+            if review["state"] == "dispatching":
+                result = self.reconcile_changed_plan(review, {})
+                if result["state"] == "owned_dispatch_uncertain":
+                    return result
+                continue
+            detail = self.client.request("GET", "/api/cycle-runs/" + review["occurrenceId"])
+            if not confirmed_boundary(detail):
+                legacy_active += 1; continue
+            review.update(state="superseded", errorCode="PLANNER_LANE_HANDOVER",
+                terminalArtifacts=[{k: a[k] for k in ["id", "name", "digest", "size"]}
+                                   for a in detail["artifacts"]])
+            self.save()
+        uncertain = self.reconcile_lane_actions()
+        if uncertain:
+            return uncertain
+        observation = self.observe()
+        self.collect_lane_plans(observation)
+        dispatched, invalidated = [], []
+        # A full worker pool must not hide stale work behind a healthy watermark.
+        for item in self.ready_actions():
+            try:
+                self.lane_action_current(item["supervisor"], item["experiment"], observation)
+            except ValueError as error:
+                item["action"].update(state="invalidated", code=str(error))
+                invalidated.append(item["experiment"]["id"]); self.save()
+        native_target = min(self.config.get("targetNativeWorkers", 8), max(0, 12 - 3 - legacy_active))
+        while (self.ready_actions() and len(observation["active"]) < native_target
+               and len(dispatched) < MAX_LANE_DISPATCH_PER_SWEEP):
+            items = self.ready_actions()
+            # Fair selection favors the least occupied board, then oldest plan.
+            counts = {p: sum(r["problem"] == p for r in observation["active"]) for p in PROBLEMS}
+            item = min(items, key=lambda r: (counts[r["experiment"]["problem"]],
+                r["supervisor"]["createdAt"], r["supervisor"]["occurrenceId"], r["experiment"]["id"]))
+            review, exp, action = item["supervisor"], item["experiment"], item["action"]
+            try:
+                self.lane_action_current(review, exp, observation)
+            except ValueError as error:
+                action.update(state="invalidated", code=str(error)); invalidated.append(exp["id"]); self.save()
+                continue
+            action["state"] = "dispatching"; self.save()
+            record = self.dispatch_experiment(exp, {**observation, "fingerprint": review["fingerprint"]}, review)
+            action.update(state="owned", occurrenceId=record["occurrenceId"]); self.save()
+            dispatched.append(record)
+            observation = self.observe()  # Fresh ownership and selected-source proof before the next action.
+        self.finish_lane_outboxes()
+        planners = [r for r in self.state["supervisions"] if r.get("planningProblem") and r["state"] == "dispatched"]
+        opened, waits = [], {}
+        for problem in sorted(PROBLEMS):
+            ready = sum(r["experiment"]["problem"] == problem for r in self.ready_actions())
+            if any(r["planningProblem"] == problem for r in planners):
+                waits[problem] = "planner_active"; continue
+            if ready >= self.config.get("readyLowWatermark", 2):
+                waits[problem] = "ready_buffer_sufficient"; continue
+            lane = self.lane_observation(self.admission_with_ready(observation), problem)
+            if not lane["eligibleProblems"]:
+                waits[problem] = "no_admissible_capacity_or_source"; continue
+            previous = self.state["outcomes"].get(lane["fingerprint"])
+            authority = action_evidence(lane, self.config)["authoritySHA256"]
+            if previous and previous.get("authoritySHA256") == authority:
+                waits[problem] = "awaiting_changed_evidence"; continue
+            if len(self.review_failures(lane)) >= 2:
+                waits[problem] = "supervisor_failure_needs_repair"; continue
+            result = self.submit_supervisor(lane)
+            if result["state"] == "supervisor_dispatched":
+                opened.append(result["occurrenceId"])
+            else:
+                waits[problem] = result["state"]
+        admitted = self.admission_with_ready(observation)
+        planners = [r for r in self.state["supervisions"] if r.get("planningProblem") and r["state"] == "dispatched"]
+        return self.status("board_lanes_swept", dispatched=dispatched, plannersOpened=opened, invalidatedActions=invalidated,
+            nativeReserved=len(observation["active"]), nativeQueued=sum(r["state"] == "queued" for r in observation["active"]),
+            nativeExecuting=sum(r["state"] == "running" and bool(r["attemptIds"]) for r in observation["active"]),
+            targetNativeWorkers=self.config.get("targetNativeWorkers", 8), plannerPending=len(planners),
+            legacyPlannerPending=legacy_active, effectiveNativeTarget=native_target,
+            dispatchBatchLimit=MAX_LANE_DISPATCH_PER_SWEEP,
+            readyActions=len(self.ready_actions()), readyByProblem={p: sum(r["experiment"]["problem"] == p
+                for r in self.ready_actions()) for p in sorted(PROBLEMS)}, pipelineUsed=admitted["pipelineUsed"],
+            pipelineLimit=admitted["pipelineLimit"], waitingPipelineUsed=observation["waitingPipelineUsed"], waits=waits,
+            capacityScope="tracked native reservations; global account/session and request gates remain authoritative")
+
     def tick(self):
         """Drain closed administrative transitions under the caller's existing lock.
 
         Each pass repeats control and observation. Dispatch, real waits and any
         exception stop immediately; uncertain effects never enter a retry loop.
         """
+        if self.config.get("plannerMode") == "board-lanes-v1":
+            return self.lane_sweep()
         transitions = []
         while True:
             result = self._tick_once()
