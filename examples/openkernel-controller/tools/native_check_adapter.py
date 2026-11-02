@@ -393,12 +393,130 @@ class NativeAudit:
         require(len(raw) == row["size"] and digest(raw) == row["digest"], "ARTIFACT_BYTES_CHANGED")
         return raw
 
+    def qa_contract(self, definition):
+        specs = definition.get("steps", [])
+        require(len(specs) == 2 and [s.get("key") for s in specs] == ["produce", "independent-qa"], "NATIVE_DAG_CHANGED")
+        qa = specs[1]
+        parameters = qa.get("parameters", {})
+        require(type(parameters) is dict and type(specs[0].get("parameters", {})) is dict, "NATIVE_QA_CONTRACT")
+        version = parameters.get("nativeQAContractVersion")
+        if version is None and "dependencyEvidence" not in qa:
+            return None
+        bindings = [
+            {"reportArtifact": "qa-verification.json", "jsonPointer": "/cpuEvidence/checkerSHA256", "dependencyArtifact": "cpu-checks.py"},
+            {"reportArtifact": "qa-verification.json", "jsonPointer": "/cpuEvidence/resultSHA256", "dependencyArtifact": "cpu-result.json"}]
+        contract = {"version": 1, "sourceStep": "produce", "bindings": bindings}
+        require(type(version) is int and version == 2
+                and canonical(qa.get("dependencyEvidence")) == canonical(contract)
+                and type(qa.get("maxAttempts")) is int and 1 <= qa["maxAttempts"] <= 3
+                and type(specs[0].get("maxAttempts")) is int and specs[0]["maxAttempts"] == 1
+                and not specs[0].get("dependencyEvidence")
+                and "nativeQAContractVersion" not in specs[0].get("parameters", {})
+                and not qa.get("repairStep"), "NATIVE_QA_CONTRACT")
+        return contract
+
+    def qa_attempt_chain(self, detail, *, allow_failed=False):
+        """V2 opt-in only: validate every stopped QA and its frozen producer.
+
+        A previous mismatch is evidence for a bounded consumer retry, never QA
+        acceptance. Legacy executions retain their single-attempt contract.
+        """
+        occurrence = detail["occurrence"]
+        contract = self.qa_contract(occurrence["definition"])
+        require(contract is not None, "NATIVE_QA_CONTRACT")
+        specs = occurrence["definition"]["steps"]
+        steps = {s["key"]: s for s in detail["steps"]}
+        require(len(detail["steps"]) == len(steps) == 2
+                and all(steps[s["key"]]["definition"] == s for s in specs), "NATIVE_QA_STEPS")
+        producer_rows = [a for a in detail["attempts"] if a["step_id"] == steps["produce"]["id"]]
+        qa_rows = [a for a in detail["attempts"] if a["step_id"] == steps["independent-qa"]["id"]]
+        require(len(producer_rows) == 1 and len(detail["attempts"]) == 1 + len(qa_rows), "NATIVE_QA_ATTEMPT_SET")
+        producer = producer_rows[0]
+        require(type(producer.get("number")) is int and producer["number"] == 1, "NATIVE_QA_PRODUCER")
+        if not qa_rows:
+            require(allow_failed and producer["state"] == "failed" and steps["independent-qa"]["state"] == "queued"
+                    and occurrence["state"] in {"failed", "attention"}, "NATIVE_QA_ATTEMPT_SET")
+            return {"produce": producer}, []
+        require(1 <= len(qa_rows) <= specs[1]["maxAttempts"]
+                and all(type(a.get("number")) is int for a in qa_rows), "NATIVE_QA_ATTEMPT_SET")
+        qa_rows = sorted(qa_rows, key=lambda a: a["number"])
+        require([a["number"] for a in qa_rows] == list(range(1, len(qa_rows) + 1))
+                and type(steps["independent-qa"].get("attempt")) is int
+                and steps["independent-qa"]["attempt"] == len(qa_rows), "NATIVE_QA_ATTEMPT_SET")
+        actors = [producer, *qa_rows]
+        require(len({a["id"] for a in actors}) == len(actors)
+                and len({a["fence"] for a in actors}) == len(actors)
+                and all(UUID.fullmatch(a["id"]) and UUID.fullmatch(a["fence"])
+                        and a.get("finished_at") and a.get("receipt", {}).get("stopped") is True
+                        and a.get("model") == self.p["model"] and a.get("account_id") == self.p["accountId"] for a in actors),
+                "NATIVE_QA_ACTOR_BINDING")
+        require(producer["state"] == steps["produce"]["state"] == "completed"
+                and type(steps["produce"].get("attempt")) is int and steps["produce"]["attempt"] == 1,
+                "NATIVE_QA_PRODUCER")
+        source = {"stepId": steps["produce"]["id"], "key": "produce", "attemptId": producer["id"],
+                  "attemptNumber": 1, "runFence": producer["fence"]}
+        source_rows = sorted([r for r in detail["artifacts"] if r["attempt_id"] == producer["id"]], key=lambda r: (r["name"], r["id"]))
+        require(0 < len(source_rows) <= 256 and len({r["name"] for r in source_rows}) == len(source_rows), "NATIVE_QA_INVENTORY")
+        require(all(type(r.get("name")) is str and re.fullmatch(r"[\w][\w.-]{0,160}", r["name"])
+                    for r in source_rows), "ARTIFACT_NAME")
+        source_refs = [{k: r[k] for k in ("id", "name", "digest", "size")} for r in source_rows]
+        for row in source_rows: self.artifact(row, allow_empty=row["name"] not in PRODUCER_FILES)
+        contract_sha = digest([1, "produce", [[b["reportArtifact"], b["jsonPointer"], b["dependencyArtifact"]] for b in contract["bindings"]]])
+        history = []
+        for index, attempt in enumerate(qa_rows):
+            last = index == len(qa_rows) - 1
+            completed = last and attempt["state"] == "completed"
+            require(completed or (not last or allow_failed) and attempt["state"] == "failed"
+                    and attempt.get("error_code") == "DEPENDENCY_ARTIFACT_BINDING", "NATIVE_QA_RETRY_CAUSE")
+            if last:
+                require(steps["independent-qa"]["state"] == "completed" if completed
+                        else steps["independent-qa"]["state"] in {"failed", "attention"}, "NATIVE_QA_STEP_STATE")
+            manifest = attempt["context"]["manifest"]
+            consumer = {"stepId": steps["independent-qa"]["id"], "key": "independent-qa", "attemptId": attempt["id"],
+                        "attemptNumber": attempt["number"], "runFence": attempt["fence"]}
+            expected = {"version": 1, "contractSHA256": contract_sha, "occurrenceId": occurrence["id"],
+                        "consumer": consumer, "source": source, "artifacts": source_refs}
+            require(canonical(manifest.get("dependencyEvidence")) == canonical(expected), "NATIVE_QA_DEPENDENCY_SNAPSHOT")
+            for row in source_rows:
+                handed = self.io.read_regular(self.runs / attempt["id"] / "home/inputs" / row["id"] / row["name"], 1024 * 1024)
+                require(len(handed) == row["size"] and digest(handed) == row["digest"], "NATIVE_QA_DEPENDENCY_HANDOFF")
+            raw = self.io.read_regular(self.runs / attempt["id"] / "home/inputs" / attempt["id"] / "cycle-input.json", 2 * 1024 * 1024)
+            binding = manifest["cycleInput"]
+            require(manifest.get("cycleId") == occurrence["cycle_id"] and manifest.get("occurrenceId") == occurrence["id"]
+                    and manifest.get("step") == "independent-qa" and binding["attemptId"] == attempt["id"]
+                    and binding["runFence"] == attempt["fence"] and binding["digest"] == digest(raw)
+                    and binding["size"] == len(raw) and strict_json(raw) == occurrence["input"], "NATIVE_QA_INPUT_BINDING")
+            reports = [r for r in detail["artifacts"] if r["attempt_id"] == attempt["id"] and r["name"] == "qa-verification.json"]
+            require(len(reports) == 1, "NATIVE_QA_REPORT_SET")
+            report_ref = {k: reports[0][k] for k in ("id", "name", "digest", "size")}
+            report = strict_json(self.artifact(reports[0])); bindings = []
+            require(type(report) is dict and type(report.get("cpuEvidence")) is dict, "NATIVE_QA_REPORT_BINDING")
+            for b in contract["bindings"]:
+                matches = [r for r in source_refs if r["name"] == b["dependencyArtifact"]]
+                require(len(matches) == 1, "NATIVE_QA_INVENTORY")
+                received = report.get("cpuEvidence", {}).get(b["jsonPointer"].split("/")[-1])
+                require(type(received) is str and SHA.fullmatch(received), "NATIVE_QA_REPORT_BINDING")
+                bindings.append({"reportArtifact": report_ref, "jsonPointer": b["jsonPointer"], "dependencyArtifact": matches[0],
+                                 "expected": matches[0]["digest"], "received": received})
+            status = "matched" if all(b["expected"] == b["received"] for b in bindings) else "mismatch"
+            validation = {"version": 1, "status": status, "source": source, "bindings": bindings}
+            require(canonical(attempt["context"].get("dependencyEvidenceValidation")) == canonical(validation)
+                    and status == ("matched" if completed else "mismatch"), "NATIVE_QA_GATE_PROOF")
+            self.runtime.stopped(attempt["id"])
+            history.append({"attemptId": attempt["id"], "number": attempt["number"], "fence": attempt["fence"],
+                            "state": attempt["state"], "report": report_ref, "snapshotSHA256": digest(expected),
+                            "gateProofSHA256": digest(validation)})
+        return {"produce": producer, "independent-qa": qa_rows[-1]}, history
+
     def diagnostic_binding(self, occurrence_id):
         detail = self.runtime.api("GET", "/api/cycle-runs/" + occurrence_id)
+        v2 = self.qa_contract(detail["occurrence"]["definition"])
         result = {"candidateSHA256": None, "qaArtifactId": None, "qaSHA256": None}
         for step_key, name in (("produce", "candidate.py"), ("independent-qa", "qa-verification.json")):
             steps = [s for s in detail["steps"] if s["key"] == step_key]
-            ids = {a["id"] for a in detail["attempts"] if len(steps) == 1 and a["step_id"] == steps[0]["id"]}
+            ids = {a["id"] for a in detail["attempts"] if len(steps) == 1 and a["step_id"] == steps[0]["id"]
+                   and (not v2 or step_key != "independent-qa" or type(a.get("number")) is int
+                        and type(steps[0].get("attempt")) is int and a["number"] == steps[0]["attempt"])}
             rows = [r for r in detail["artifacts"] if r["attempt_id"] in ids and r["name"] == name]
             if len(rows) == 1:
                 self.artifact(rows[0])
@@ -426,16 +544,18 @@ class NativeAudit:
             detail = self.runtime.api("GET", "/api/cycle-runs/" + occurrence_id)
         occurrence = detail["occurrence"]
         require(occurrence["id"] == occurrence_id and occurrence["state"] == "completed", "CACHE_NATIVE_NOT_TERMINAL")
-        require(len(detail["steps"]) == len(detail["attempts"]) == 2, "CACHE_NATIVE_ATTEMPTS")
+        v2 = self.qa_contract(occurrence["definition"])
+        selected, _ = self.qa_attempt_chain(detail) if v2 else ({}, [])
+        require(len(detail["steps"]) == 2 and (v2 or len(detail["attempts"]) == 2), "CACHE_NATIVE_ATTEMPTS")
         binding = {}
         for key, name in (("produce", "candidate.py"), ("independent-qa", "qa-verification.json")):
             steps = [s for s in detail["steps"] if s["key"] == key]
             require(len(steps) == 1 and steps[0]["state"] == "completed", "CACHE_NATIVE_STEP")
-            attempts = [a for a in detail["attempts"] if a["step_id"] == steps[0]["id"]]
+            attempts = [selected[key]] if v2 else [a for a in detail["attempts"] if a["step_id"] == steps[0]["id"]]
             require(len(attempts) == 1, "CACHE_NATIVE_ATTEMPTS")
             attempt = attempts[0]
             require(UUID.fullmatch(attempt["id"]) and UUID.fullmatch(attempt["fence"])
-                    and attempt["number"] == 1 and attempt["state"] == "completed"
+                    and attempt["number"] == (steps[0]["attempt"] if v2 else 1) and attempt["state"] == "completed"
                     and attempt.get("finished_at") and attempt.get("receipt", {}).get("stopped") is True,
                     "CACHE_NATIVE_ATTEMPT_BOUNDARY")
             manifest = attempt["context"]["manifest"]["cycleInput"]
@@ -612,22 +732,25 @@ class NativeAudit:
         require(definition.get("project") == "openkernel" and definition.get("allowedActions") == []
                 and definition.get("allowedAccounts") == [self.p["accountId"]], "NATIVE_DEFINITION_SCOPE")
         specs = definition["steps"]
+        v2 = self.qa_contract(definition)
         require(len(specs) == 2 and [s["key"] for s in specs] == ["produce", "independent-qa"]
                 and specs[0].get("dependsOn") == [] and specs[1].get("dependsOn") == ["produce"], "NATIVE_DAG_CHANGED")
         for s in specs:
             require(s.get("kind") == "agent" and s.get("readOnly") is True and s.get("workspace") == self.p["workspace"]
                     and s.get("model") == self.p["model"] and s.get("accountId") == self.p["accountId"]
-                    and s.get("maxAttempts") == 1 and not s.get("sourceStep"), "NATIVE_STEP_SCOPE")
-        require(len(detail["attempts"]) == len(detail["steps"]) == 2, "NATIVE_ATTEMPT_SET")
+                    and s.get("maxAttempts") == (specs[1]["maxAttempts"] if v2 and s["key"] == "independent-qa" else 1)
+                    and not s.get("sourceStep"), "NATIVE_STEP_SCOPE")
+        selected, qa_history = self.qa_attempt_chain(detail) if v2 else ({}, [])
+        require(len(detail["steps"]) == 2 and (v2 or len(detail["attempts"]) == 2), "NATIVE_ATTEMPT_SET")
         frozen, identities, files, artifacts = {}, {}, {}, {}
         for key, required in (("produce", PRODUCER_FILES), ("independent-qa", QA_FILES)):
             steps = [s for s in detail["steps"] if s["key"] == key]
             require(len(steps) == 1 and steps[0]["state"] == "completed", "STEP_NOT_COMPLETED")
             require(steps[0].get("definition") == next(s for s in specs if s["key"] == key), "STEP_DEFINITION_CHANGED")
-            attempts = [a for a in detail["attempts"] if a["step_id"] == steps[0]["id"]]
+            attempts = [selected[key]] if v2 else [a for a in detail["attempts"] if a["step_id"] == steps[0]["id"]]
             require(len(attempts) == 1, "ATTEMPT_SET")
             a = attempts[0]
-            require(UUID.fullmatch(a["id"]) and UUID.fullmatch(a["fence"]) and a["number"] == 1
+            require(UUID.fullmatch(a["id"]) and UUID.fullmatch(a["fence"]) and a["number"] == (steps[0]["attempt"] if v2 else 1)
                     and a["state"] == "completed" and a.get("finished_at") and a.get("receipt", {}).get("stopped") is True,
                     "ATTEMPT_NOT_STOPPED")
             require(a.get("model") == self.p["model"] and a.get("account_id") == self.p["accountId"], "ATTEMPT_MODEL_SCOPE")
@@ -695,7 +818,8 @@ class NativeAudit:
                   "qaArtifactId": qa_row["id"], "qaSHA256": qa_row["digest"], "dispatchReceiptSHA256": digest(receipts["run"]),
                   "cpuExecutionEvidence": commands, "hypothesis": experiment["hypothesis"], "provenance": provenance,
                   "gpuValidated": False, "performanceGainProven": False, "candidateExecutedByController": False,
-                  "files": {name: digest(raw) for name, raw in sorted(frozen.items())}}
+                  "files": {name: digest(raw) for name, raw in sorted(frozen.items())},
+                  **({"nativeQAContractVersion": 2, "qaAttemptHistory": qa_history} if v2 else {})}
         return report, frozen, producer["candidate.py"]
 
     def source_provenance(self, problem, source_sha, source_artifact=None, ancestry=()):
@@ -754,20 +878,23 @@ class NativeAudit:
         require(definition.get("project") == "openkernel" and definition.get("allowedActions") == []
                 and definition.get("allowedAccounts") == [self.p["accountId"]], "SOURCE_ORIGIN_DEFINITION_SCOPE")
         specs = definition["steps"]
+        v2 = self.qa_contract(definition)
         require(len(specs) == 2 and [s["key"] for s in specs] == ["produce", "independent-qa"]
                 and specs[0].get("dependsOn") == [] and specs[1].get("dependsOn") == ["produce"], "SOURCE_ORIGIN_DAG")
         for spec in specs:
             require(spec.get("kind") == "agent" and spec.get("readOnly") is True
                     and spec.get("workspace") == self.p["workspace"] and spec.get("model") == self.p["model"]
-                    and spec.get("accountId") == self.p["accountId"] and spec.get("maxAttempts") == 1
+                    and spec.get("accountId") == self.p["accountId"]
+                    and spec.get("maxAttempts") == (specs[1]["maxAttempts"] if v2 and spec["key"] == "independent-qa" else 1)
                     and not spec.get("sourceStep"), "SOURCE_ORIGIN_EXECUTOR_SCOPE")
-        require(len(detail["steps"]) == 2 and len(detail["attempts"]) in {1, 2}, "SOURCE_ORIGIN_ATTEMPT_SET")
+        selected, qa_history = self.qa_attempt_chain(detail, allow_failed=True) if v2 else ({}, [])
+        require(len(detail["steps"]) == 2 and (v2 or len(detail["attempts"]) in {1, 2}), "SOURCE_ORIGIN_ATTEMPT_SET")
         identities, attempts, frozen = {}, {}, {}
         for spec in specs:
             key = spec["key"]
             steps = [s for s in detail["steps"] if s["key"] == key]
             require(len(steps) == 1 and steps[0].get("definition") == spec, "SOURCE_ORIGIN_STEP_BINDING")
-            rows = [a for a in detail["attempts"] if a["step_id"] == steps[0]["id"]]
+            rows = ([selected[key]] if key in selected else []) if v2 else [a for a in detail["attempts"] if a["step_id"] == steps[0]["id"]]
             if key == "independent-qa" and not rows:
                 # The native engine leaves the downstream step queued when its
                 # only producer fails. No attempted/unknown QA may be treated as
@@ -779,7 +906,7 @@ class NativeAudit:
                 continue
             require(len(rows) == 1, "SOURCE_ORIGIN_ATTEMPT_SET")
             a = rows[0]
-            require(UUID.fullmatch(a["id"]) and UUID.fullmatch(a["fence"]) and a["number"] == 1
+            require(UUID.fullmatch(a["id"]) and UUID.fullmatch(a["fence"]) and a["number"] == (steps[0]["attempt"] if v2 else 1)
                     and a.get("finished_at") and a.get("model") == self.p["model"]
                     and a.get("account_id") == self.p["accountId"], "SOURCE_ORIGIN_ATTEMPT_BINDING")
             require((key == "produce" and (a["state"] == steps[0]["state"] == "completed"
@@ -889,7 +1016,8 @@ class NativeAudit:
                   "producerArtifactId": producer_row["id"], "selectedArtifactAttemptId": selected[0]["attempt_id"],
                   "identities": identities, "patchSHA256": patch_row["digest"], "dispatchReceiptSHA256": digest(receipts["run"]),
                   "qa": qa_evidence, "producerReports": producer_reports,
-                  "provenance": provenance, "files": {k: digest(v) for k, v in sorted(frozen.items())}}
+                  "provenance": provenance, "files": {k: digest(v) for k, v in sorted(frozen.items())},
+                  **({"nativeQAContractVersion": 2, "qaAttemptHistory": qa_history} if v2 else {})}
         directory = pathlib.Path(options["registryDirectory"])
         require(directory == pathlib.Path(self.p["stateDirectory"]) / "source-origins" and directory.resolve() == directory,
                 "SOURCE_ORIGIN_REGISTRY_SCOPE")

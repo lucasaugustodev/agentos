@@ -380,3 +380,23 @@ then be absolute paths without parent traversal. The checker invocation, content
 hashes, successful tool call/result pair and all shell-control exclusions remain
 required. Other directory changes, substitutions, redirects, extra statements
 and report-only claims remain unproven; this does not execute or approve code.
+
+### NativeQA v2: bounded retries of the review
+
+New definitions can opt into `parameters.nativeQAContractVersion: 2` on the QA
+step and the exact dependency-evidence contract binding `cpuEvidence.checkerSHA256`
+and `cpuEvidence.resultSHA256` to the current producer's `cpu-checks.py` and
+`cpu-result.json`. The producer still has one attempt. QA has at most three.
+This requires the compatible core gate; a version flag alone grants nothing.
+
+The adapter verifies every QA attempt's frozen producer identity, complete
+artifact inventory, consumer fence, input bytes, report bytes and controller
+binding proof. Attempts must be contiguous. Earlier attempts must be stopped
+failures specifically caused by `DEPENDENCY_ARTIFACT_BINDING`; unrelated failures
+and legacy retries remain ineligible. Only the last completed QA with a matching
+gate can enter normal semantic QA and execution-witness validation.
+
+A stopped final binding failure can establish source provenance for a later
+repair, with `qualityAccepted: false`. It cannot authorize CHECK or enter the
+terminal acceptance path. Failed reports and attempt history are preserved;
+historical hashes never replace current producer evidence.

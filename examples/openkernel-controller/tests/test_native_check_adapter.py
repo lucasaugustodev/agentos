@@ -1757,6 +1757,156 @@ class ScanSelectionTests(unittest.TestCase):
         self.assertEqual(self.fixture.official.posts, 0)
 
 
+class NativeQAV2Tests(unittest.TestCase):
+    def setUp(self):
+        self.f=Fixture();self.f.setUp();self.addCleanup(self.f.tearDown)
+        self.d=self.f.detail;self.a=self.f.audit
+
+    def optin(self, count=2, failed=False):
+        self.source=self.f.origin_fixture(failed_qa=False)
+        specs=self.d['occurrence']['definition']['steps'];qa_spec=specs[1]
+        qa_spec.update(maxAttempts=3,parameters={'nativeQAContractVersion':2},dependencyEvidence={
+            'version':1,'sourceStep':'produce','bindings':[
+                {'reportArtifact':'qa-verification.json','jsonPointer':'/cpuEvidence/checkerSHA256','dependencyArtifact':'cpu-checks.py'},
+                {'reportArtifact':'qa-verification.json','jsonPointer':'/cpuEvidence/resultSHA256','dependencyArtifact':'cpu-result.json'}]})
+        self.d['steps'][0]['attempt']=1;self.d['steps'][1]['attempt']=count
+        producer,last=self.d['attempts'];last['number']=count
+        priors=[]
+        for number in range(1,count):
+            prior=copy.deepcopy(last);prior.update(id=f'99999999-9999-4999-8999-{number:012d}',fence=f'aaaaaaaa-aaaa-4aaa-8aaa-{number:012d}',
+                number=number,state='failed',error_code='DEPENDENCY_ARTIFACT_BINDING')
+            prior['context']['manifest']['cycleInput'].update(attemptId=prior['id'],runFence=prior['fence'])
+            bad=copy.deepcopy(self.f.qa);bad['cpuEvidence']['checkerSHA256']='f'*64
+            self.d['artifacts'].append(self.f.artifact('qa-verification.json',A.canonical(bad),prior['id']))
+            priors.append(prior)
+        self.d['attempts']=[producer,*priors,last]
+        if failed:
+            last.update(state='failed',error_code='DEPENDENCY_ARTIFACT_BINDING')
+            self.d['steps'][1]['state']='attention';self.d['occurrence']['state']='attention'
+            row=next(r for r in self.d['artifacts'] if r['attempt_id']==last['id'] and r['name']=='qa-verification.json')
+            bad=copy.deepcopy(self.f.qa);bad['cpuEvidence']['resultSHA256']='f'*64;raw=A.canonical(bad)
+            row.update(digest=A.digest(raw),size=len(raw));self.f.put(pathlib.Path(self.f.paths['artifactDirectory'])/row['digest'],raw)
+        self.f.refresh_current_input()
+        key=self.d['occurrence']['source_key'][len('manual:'):-4]
+        self.f.put(pathlib.Path(self.f.paths['watcherStateDirectory'])/('intent-'+A.digest(key)+'.json'),A.canonical({
+            'state':'recorded','kind':'create','requestKey':key,'result':{'id':CYCLE,'definition':self.d['occurrence']['definition']},
+            'requestDigest':A.digest({'requestKey':key,'definition':self.d['occurrence']['definition']})}))
+        source={'stepId':self.d['steps'][0]['id'],'key':'produce','attemptId':producer['id'],'attemptNumber':1,'runFence':producer['fence']}
+        refs=sorted([{k:r[k] for k in ['id','name','digest','size']} for r in self.d['artifacts'] if r['attempt_id']==producer['id']],key=lambda r:(r['name'],r['id']))
+        bindings=qa_spec['dependencyEvidence']['bindings'];contract_sha=A.digest([1,'produce',[[b['reportArtifact'],b['jsonPointer'],b['dependencyArtifact']] for b in bindings]])
+        for attempt in self.d['attempts'][1:]:
+            for ref in refs:
+                self.f.put(pathlib.Path(self.f.paths['workerRunsDirectory'])/attempt['id']/'home/inputs'/ref['id']/ref['name'],
+                    (pathlib.Path(self.f.paths['artifactDirectory'])/ref['digest']).read_bytes())
+            consumer={'stepId':self.d['steps'][1]['id'],'key':'independent-qa','attemptId':attempt['id'],'attemptNumber':attempt['number'],'runFence':attempt['fence']}
+            attempt['context']['manifest']['dependencyEvidence']={'version':1,'contractSHA256':contract_sha,'occurrenceId':OCC,
+                'consumer':consumer,'source':copy.deepcopy(source),'artifacts':copy.deepcopy(refs)}
+            report_row=next(r for r in self.d['artifacts'] if r['attempt_id']==attempt['id'] and r['name']=='qa-verification.json')
+            report=A.strict_json((pathlib.Path(self.f.paths['artifactDirectory'])/report_row['digest']).read_bytes())
+            result=[]
+            for b in bindings:
+                dep=next(r for r in refs if r['name']==b['dependencyArtifact'])
+                result.append({'reportArtifact':{k:report_row[k] for k in ['id','name','digest','size']},'jsonPointer':b['jsonPointer'],
+                    'dependencyArtifact':copy.deepcopy(dep),'expected':dep['digest'],'received':report['cpuEvidence'][b['jsonPointer'].split('/')[-1]]})
+            attempt['context']['dependencyEvidenceValidation']={'version':1,'status':'matched' if attempt['state']=='completed' else 'mismatch',
+                'source':copy.deepcopy(source),'bindings':result}
+        return last
+
+    def test_v2_first_attempt_and_bounded_three_attempts_pass_full_audit(self):
+        self.optin(3)
+        result,_,_=self.a.audit(OCC)
+        self.assertEqual(result['nativeQAContractVersion'],2)
+        self.assertEqual([r['state'] for r in result['qaAttemptHistory']],['failed','failed','completed'])
+        self.assertEqual(result['identities']['independent-qa']['attemptId'],IDS[1])
+        self.assertEqual(self.f.official.posts,0)
+
+    def test_v2_single_qa_still_requires_positive_controller_gate(self):
+        self.optin(1);self.a.audit(OCC)
+        self.d['attempts'][-1]['context'].pop('dependencyEvidenceValidation')
+        with self.assertRaisesRegex(ValueError,'NATIVE_QA_GATE_PROOF'):self.a.audit(OCC)
+
+    def test_legacy_retry_never_adopted_as_v2(self):
+        self.optin(2);self.d['occurrence']['definition']['steps'][1].pop('parameters');self.d['occurrence']['definition']['steps'][1].pop('dependencyEvidence')
+        with self.assertRaises(ValueError):self.a.audit(OCC)
+
+    def test_v2_contract_rejects_other_bindings_versions_and_producer_retry(self):
+        self.optin();definition=self.d['occurrence']['definition'];original=copy.deepcopy(definition)
+        changes=[lambda d:d['steps'][1]['parameters'].update(nativeQAContractVersion=True),
+            lambda d:d['steps'][1]['dependencyEvidence']['bindings'][0].update(jsonPointer='/historical/checkerSHA256'),
+            lambda d:d['steps'][1].update(maxAttempts=4),lambda d:d['steps'][0].update(maxAttempts=2),
+            lambda d:d['steps'][1].update(repairStep='produce')]
+        for change in changes:
+            value=copy.deepcopy(original);change(value)
+            with self.assertRaisesRegex(ValueError,'NATIVE_QA_CONTRACT'):self.a.qa_contract(value)
+
+    def test_v2_rejects_attempt_gaps_mixed_fences_old_selection_and_bad_retry(self):
+        self.optin(3);original=copy.deepcopy(self.d)
+        changes=[lambda d:d['attempts'][1].update(number=2),lambda d:d['attempts'][1].update(number=True),
+            lambda d:d['steps'][1].update(attempt=2),lambda d:d['attempts'][1].update(error_code='HARNESS_SANDBOX_OOM'),
+            lambda d:d['attempts'][1]['receipt'].update(stopped=False),lambda d:d['attempts'][2].update(fence=d['attempts'][1]['fence']),
+            lambda d:d['attempts'][-1]['context']['manifest']['dependencyEvidence']['consumer'].update(attemptId=d['attempts'][1]['id']),
+            lambda d:d['attempts'][-1]['context']['manifest']['dependencyEvidence']['source'].update(runFence=IDS[1]),
+            lambda d:d['attempts'][-1]['context']['manifest']['dependencyEvidence']['artifacts'][0].update(digest='f'*64),
+            lambda d:d['attempts'][1]['context']['dependencyEvidenceValidation'].update(status='matched')]
+        for change in changes:
+            self.d.clear();self.d.update(copy.deepcopy(original));change(self.d)
+            with self.assertRaises(ValueError):self.a.qa_attempt_chain(self.d)
+
+    def test_v2_requires_physical_stop_for_failed_qa(self):
+        self.optin();prior=self.d['attempts'][1]['id']
+        self.f.runtime.stopped.side_effect=lambda aid: (_ for _ in ()).throw(ValueError('STILL_RUNNING')) if aid==prior else None
+        with self.assertRaisesRegex(ValueError,'STILL_RUNNING'):self.a.audit(OCC)
+
+    def test_v2_raw_failed_report_cannot_be_replaced_by_forged_gate_proof(self):
+        self.optin();prior=self.d['attempts'][1]
+        row=next(r for r in self.d['artifacts'] if r['attempt_id']==prior['id'])
+        self.f.put(pathlib.Path(self.f.paths['artifactDirectory'])/row['digest'],b'{}')
+        with self.assertRaisesRegex(ValueError,'ARTIFACT_BYTES_CHANGED'):self.a.audit(OCC)
+
+    def test_v2_prior_qa_handoff_must_match_frozen_producer_bytes(self):
+        self.optin();prior=self.d['attempts'][1];ref=prior['context']['manifest']['dependencyEvidence']['artifacts'][0]
+        self.f.put(pathlib.Path(self.f.paths['workerRunsDirectory'])/prior['id']/'home/inputs'/ref['id']/ref['name'],b'changed')
+        with self.assertRaisesRegex(ValueError,'NATIVE_QA_DEPENDENCY_HANDOFF'):self.a.audit(OCC)
+
+    def test_v2_inventory_rejects_path_escape_before_reading_handoff(self):
+        self.optin();row=next(r for r in self.d['artifacts'] if r['attempt_id']==IDS[0])
+        row['name']='../../outside'
+        with self.assertRaisesRegex(ValueError,'ARTIFACT_NAME'):self.a.qa_attempt_chain(self.d)
+
+    def test_v2_invalid_report_shape_is_not_retry_authority(self):
+        self.optin();prior=self.d['attempts'][1];row=next(r for r in self.d['artifacts'] if r['attempt_id']==prior['id'])
+        raw=A.canonical({'cpuEvidence':1});row.update(digest=A.digest(raw),size=len(raw))
+        self.f.put(pathlib.Path(self.f.paths['artifactDirectory'])/row['digest'],raw)
+        with self.assertRaisesRegex(ValueError,'NATIVE_QA_REPORT_BINDING'):self.a.audit(OCC)
+
+    def test_v2_diagnostic_and_cache_use_only_last_qa_and_invalidate_history_change(self):
+        self.optin(3);binding=self.a.diagnostic_binding(OCC);identity=self.a.terminal_identity(OCC)
+        last=next(r for r in self.d['artifacts'] if r['attempt_id']==IDS[1] and r['name']=='qa-verification.json')
+        self.assertEqual(binding['qaArtifactId'],last['id']);self.assertEqual(identity['binding'],binding)
+        self.d['attempts'][1]['context']['manifest']['dependencyEvidence']['consumer']['runFence']=IDS[1]
+        with self.assertRaisesRegex(ValueError,'NATIVE_QA_DEPENDENCY_SNAPSHOT'):self.a.terminal_identity(OCC)
+
+    def test_failed_final_v2_is_origin_only_not_acceptance_or_terminal_cache(self):
+        self.optin(3,failed=True)
+        refs=self.f.origin(self.source);report=A.strict_json(A.pinned(refs[0]))
+        self.assertFalse(report['qualityAccepted']);self.assertEqual(report['qa']['state'],'failed')
+        self.assertEqual(len(report['qaAttemptHistory']),3)
+        with self.assertRaisesRegex(ValueError,'NATIVE_NOT_COMPLETED'):self.a.audit(OCC)
+        with self.assertRaisesRegex(ValueError,'CACHE_NATIVE_NOT_TERMINAL'):self.a.terminal_identity(OCC)
+
+    def test_other_final_failure_has_no_v2_origin_authority(self):
+        self.optin(2,failed=True);self.d['attempts'][-1]['error_code']='DELIVERY_INVALID'
+        with self.assertRaisesRegex(ValueError,'NATIVE_QA_RETRY_CAUSE'):self.f.origin(self.source)
+
+    def test_v2_successful_gate_does_not_replace_semantic_qa_or_replay(self):
+        self.optin();row=next(r for r in self.d['artifacts'] if r['attempt_id']==IDS[1] and r['name']=='qa-verification.json')
+        raw=self.a.artifact(row);report=A.strict_json(raw);report['canonicalPrecisionPreserved']=False;raw=A.canonical(report)
+        row.update(digest=A.digest(raw),size=len(raw));self.f.put(pathlib.Path(self.f.paths['artifactDirectory'])/row['digest'],raw)
+        for b in self.d['attempts'][-1]['context']['dependencyEvidenceValidation']['bindings']:
+            b['reportArtifact']={k:row[k] for k in ['id','name','digest','size']}
+        with self.assertRaisesRegex(ValueError,'QA_ATTESTATION_MISSING'):self.a.audit(OCC)
+
+
 class QuotaSynchronizationTests(unittest.TestCase):
     def setUp(self):
         self.f = Fixture(); self.f.setUp(); self.addCleanup(self.f.tearDown)
