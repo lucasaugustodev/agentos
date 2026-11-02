@@ -1504,5 +1504,144 @@ class ScanSelectionTests(unittest.TestCase):
         self.assertEqual(self.fixture.official.posts, 0)
 
 
+class QuotaSynchronizationTests(unittest.TestCase):
+    def setUp(self):
+        self.f = Fixture(); self.f.setUp(); self.addCleanup(self.f.tearDown)
+        self.lane, self.p, self.official = self.f.lane, self.f.p, self.f.official
+        self.p["minimumChecksRemaining"] = 0
+        self.day = int(NOW // 86400) * 86400
+        self.job = "abcdef0123456789"
+
+    def record(self, used=9, known=None, mirror=True):
+        row = {"state":"job_recorded", "mode":"check", "intentEpoch":NOW-120,
+               "identity":{"problem":BOARD,"sourceSha256":"f"*64}, "receipt":{"job_id":self.job},
+               "quotaObservation":{"version":1,"problem":BOARD,"utcDayStart":self.day,
+                   "checkedAt":NOW-121,"used":used,"knownJobIds":known or []}}
+        for key in ["stateDirectory", "legacyLedger"] if mirror else ["stateDirectory"]:
+            IO.atomic_record(pathlib.Path(self.p[key]) / (BOARD+"-"+"f"*64+"-check.json"),row)
+        return row
+
+    def visible(self, job=None):
+        return {"job_id":job or self.job,"problem":BOARD,"mode":"check","submitted_at":NOW-120}
+
+    def test_last_acknowledged_check_blocks_stale_left_even_when_job_is_visible(self):
+        self.record(); self.official.left=1; self.official.jobs=[self.visible()]
+        before={str(p):p.read_bytes() for key in ['stateDirectory','legacyLedger'] for p in pathlib.Path(self.p[key]).glob('*')}
+        with self.assertRaisesRegex(A.PreflightQuotaError,"CHECK_QUOTA_SYNC_PENDING"):
+            self.lane.preflight(BOARD)
+        self.assertEqual(before,{p:pathlib.Path(p).read_bytes() for p in before})
+        self.assertEqual(self.official.posts,0)
+
+    def test_missing_acknowledged_job_waits_for_get_visibility_before_new_post(self):
+        self.record(used=2);self.official.left=8;self.official.jobs=[]
+        with self.assertRaisesRegex(A.PreflightQuotaError,"CHECK_QUOTA_SYNC_PENDING"):
+            self.lane.preflight(BOARD)
+        self.assertEqual(self.official.posts,0)
+
+    def test_remote_consumed_count_overrides_stale_quota_without_local_history(self):
+        self.official.left=1
+        self.official.jobs=[self.visible(format(i,'016x')) for i in range(10)]
+        with self.assertRaisesRegex(A.PreflightQuotaError,"CHECK_QUOTA_SYNC_PENDING"):
+            self.lane.preflight(BOARD)
+        self.assertEqual(self.official.posts,0)
+
+    def test_acknowledged_job_and_mirror_count_once_when_consumption_is_reflected(self):
+        self.record(used=2);self.official.left=7;self.official.jobs=[self.visible()]
+        result=self.lane.preflight(BOARD)
+        self.assertEqual(result['quotaObservation']['used'],3)
+        self.assertEqual(result['quotaObservation']['knownJobIds'],[self.job])
+
+    def test_new_intent_contains_observation_before_sole_post(self):
+        original=self.official.check
+        def inspect_intent(problem,snapshot):
+            path=pathlib.Path(self.p['stateDirectory'])/(BOARD+'-'+A.digest(self.f.candidate)+'-check.json')
+            value=A.strict_json(path.read_bytes())
+            self.assertEqual(value['state'],'submission_intent')
+            self.assertEqual(value['quotaObservation'],{'version':1,'problem':BOARD,'utcDayStart':self.day,'checkedAt':NOW,'used':0,'knownJobIds':[]})
+            return original(problem,snapshot)
+        self.official.check=inspect_intent
+        self.assertEqual(self.lane.run(OCC,'check')['state'],'job_recorded')
+        self.assertEqual(self.official.posts,1)
+
+    def test_midnight_during_second_audit_waits_before_any_snapshot(self):
+        clock=[self.day+86400-1]
+        self.lane.clock=lambda:clock[0];self.p['expiresAt']=clock[0]+3600
+        original=self.lane.audit.audit;calls=[]
+        def crosses(occurrence_id):
+            result=original(occurrence_id);calls.append(occurrence_id)
+            if len(calls)==2:clock[0]+=2
+            return result
+        self.lane.audit.audit=crosses
+        with self.assertRaisesRegex(A.PreflightQuotaError,'CHECK_QUOTA_SYNC_PENDING'):
+            self.lane.run(OCC,'check')
+        self.assertEqual(list(pathlib.Path(self.p['stateDirectory']).iterdir()),[])
+        self.assertEqual(self.official.posts,0)
+
+    def test_midnight_during_freeze_never_creates_intent_and_next_tick_repreflights(self):
+        clock=[self.day+86400-1]
+        self.lane.clock=lambda:clock[0];self.p['expiresAt']=clock[0]+3600
+        original=IO.immutable_snapshot
+        def crosses(path,raw):
+            result=original(path,raw)
+            if pathlib.Path(path).name.startswith('preflight-'):clock[0]+=2
+            return result
+        with mock.patch.object(IO,'immutable_snapshot',side_effect=crosses):
+            with self.assertRaisesRegex(A.PreflightQuotaError,'CHECK_QUOTA_SYNC_PENDING'):
+                self.lane.run(OCC,'check')
+        for key in ['stateDirectory','legacyLedger']:
+            self.assertEqual(list(pathlib.Path(self.p[key]).glob('*-check.json')),[])
+        self.assertEqual(self.official.posts,0)
+        self.assertEqual(self.lane.run(OCC,'check')['state'],'job_recorded')
+        path=pathlib.Path(self.p['stateDirectory'])/(BOARD+'-'+A.digest(self.f.candidate)+'-check.json')
+        intent=A.strict_json(path.read_bytes())
+        self.assertEqual(intent['quotaObservation']['utcDayStart'],int(intent['intentEpoch']//86400)*86400)
+        self.assertEqual(self.official.posts,1)
+
+    def test_account_wait_audits_candidate_but_performs_no_official_get_or_post(self):
+        path=pathlib.Path(self.p['stateDirectory'])/(BOARD+'-'+'f'*64+'-check.json')
+        IO.atomic_record(path,{'state':'submission_outcome_unknown','identity':{'sourceSha256':'f'*64}})
+        original=self.lane.audit.audit;calls=[]
+        def observed(occurrence_id):
+            calls.append(occurrence_id);return original(occurrence_id)
+        self.lane.audit.audit=observed
+        self.official.fetch=mock.Mock(side_effect=AssertionError('no official network before reconciliation'))
+        with self.assertRaisesRegex(A.AccountPreflightWait,'ACCOUNT_HAS_UNCERTAIN_EFFECT'):
+            self.lane.run(OCC,'check')
+        self.assertEqual(calls,[OCC]);self.official.fetch.assert_not_called()
+        self.assertEqual(self.official.posts,0)
+
+    def test_yesterday_and_other_board_do_not_consume_today_scope(self):
+        record=self.record(used=9);record['intentEpoch']=self.day-1
+        self.official.jobs=[{**self.visible(),'submitted_at':self.day-1},
+                            {**self.visible('1234567890abcdef'),'problem':'muse_prefill_layer'}]
+        result=self.lane.quota_observation([record],self.official.jobs,BOARD,{'used':0,'left':10,'per_day':10},NOW)
+        self.assertEqual(result['used'],0);self.assertEqual(result['knownJobIds'],[])
+
+    def test_malformed_observation_is_not_quota_wait_no_post_proof(self):
+        row=self.record(used=True);self.official.left=7;self.official.jobs=[self.visible()]
+        with self.assertRaisesRegex(ValueError,'CHECK_QUOTA_OBSERVATION_SCHEMA'):
+            self.lane.preflight(BOARD)
+        self.assertEqual(self.official.posts,0)
+
+    def test_sync_wait_scan_has_explicit_false_and_binding_but_no_new_intent(self):
+        self.record();self.official.left=1;self.official.jobs=[self.visible()]
+        result=A.scan(self.lane,self.f.root/'sync-status.json','check')['outcomes'][0]
+        self.assertEqual((result['state'],result['code'],result['postAttempted'],result['jobId']),('quota_wait','CHECK_QUOTA_SYNC_PENDING',False,None))
+        self.assertEqual(result['candidateSHA256'],A.digest(self.f.candidate))
+        path=pathlib.Path(self.p['stateDirectory'])/(BOARD+'-'+A.digest(self.f.candidate)+'-check.json')
+        self.assertFalse(path.exists());self.assertEqual(self.official.posts,0)
+
+    def test_untyped_sync_and_own_uncertainty_never_get_false_marker(self):
+        self.lane.run=mock.Mock(side_effect=ValueError('CHECK_QUOTA_SYNC_PENDING'))
+        row=A.scan(self.lane,self.f.root/'sync-status.json','check')['outcomes'][0]
+        self.assertIsNone(row['postAttempted'])
+        path=pathlib.Path(self.p['stateDirectory'])/(BOARD+'-'+A.digest(self.f.candidate)+'-check.json')
+        IO.atomic_record(path,{'state':'submission_outcome_unknown','identity':{'sourceSha256':A.digest(self.f.candidate)}})
+        self.lane.run=mock.Mock(side_effect=A.PreflightQuotaError('CHECK_QUOTA_SYNC_PENDING'))
+        row=A.scan(self.lane,self.f.root/'sync-status.json','check')['outcomes'][0]
+        self.assertEqual(row['state'],'uncertain_owned');self.assertIsNone(row['postAttempted'])
+        self.assertEqual(self.official.posts,0)
+
+
 if __name__ == "__main__":
     unittest.main()

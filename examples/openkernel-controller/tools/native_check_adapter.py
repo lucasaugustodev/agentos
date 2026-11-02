@@ -902,7 +902,59 @@ class OfficialLane:
                     rows.append(strict_json(raw))
         return rows
 
+    def quota_observation(self, previous, jobs, problem, quota, now):
+        """A lagging quota GET cannot erase CHECKs acknowledged by this lane.
+
+        New intents retain this observation before POST. Existing records are
+        never rewritten; a known local job missing from the GET waits for sync.
+        """
+        day = int(now // 86400) * 86400
+        remote = set()
+        for row in jobs:
+            if row.get("problem") == problem and row.get("mode") == "check" and row["submitted_at"] >= day:
+                require(JOB.fullmatch(row.get("job_id", "")) and row["submitted_at"] <= now + 5, "CHECK_JOBS_SCHEMA")
+                remote.add(row["job_id"])
+        local = {}
+        for row in previous:
+            if row.get("mode") != "check" or row.get("identity", {}).get("problem") != problem:
+                continue
+            epoch = row.get("intentEpoch")
+            require(type(epoch) in (int, float) and math.isfinite(epoch) and epoch <= now + 5, "CHECK_QUOTA_LOCAL_SCHEMA")
+            if epoch < day: continue
+            job = row.get("receipt", {}).get("job_id")
+            require(row.get("state") == "job_recorded" and JOB.fullmatch(job or ""), "CHECK_QUOTA_LOCAL_SCHEMA")
+            # Native and legacy mirrors count once; contradictory mirrors wait.
+            require(job not in local or canonical(local[job]) == canonical(row), "CHECK_QUOTA_LOCAL_CONFLICT")
+            local[job] = row
+        if set(local) - remote:
+            raise PreflightQuotaError("CHECK_QUOTA_SYNC_PENDING")
+        known = remote | set(local)
+        consumed = max(quota["used"], len(known))
+        for row in local.values():
+            observation = row.get("quotaObservation")
+            if observation is None: continue  # Legacy record; no invented baseline.
+            require(type(observation) is dict and observation.get("version") == 1
+                    and observation.get("problem") == problem and observation.get("utcDayStart") == day
+                    and type(observation.get("checkedAt")) in (int, float)
+                    and math.isfinite(observation["checkedAt"]) and day <= observation["checkedAt"] <= row["intentEpoch"]
+                    and type(observation.get("used")) is int and observation["used"] >= 0
+                    and type(observation.get("knownJobIds")) is list
+                    and all(type(j) is str and JOB.fullmatch(j) for j in observation["knownJobIds"])
+                    and len(set(observation["knownJobIds"])) == len(observation["knownJobIds"]), "CHECK_QUOTA_OBSERVATION_SCHEMA")
+            # The observation predates this POST, so this job cannot already be
+            # in it. Later jobs outside its membership add to the proven floor.
+            require(row["receipt"]["job_id"] not in observation["knownJobIds"], "CHECK_QUOTA_OBSERVATION_SCHEMA")
+            consumed = max(consumed, observation["used"] + len(known - set(observation["knownJobIds"])))
+        if min(quota["left"], quota["per_day"] - consumed) <= self.p["minimumChecksRemaining"]:
+            raise PreflightQuotaError("CHECK_QUOTA_SYNC_PENDING")
+        return {"version": 1, "problem": problem, "utcDayStart": day, "checkedAt": now,
+                "used": consumed, "knownJobIds": sorted(known)}
+
     def preflight(self, problem):
+        # NativeAudit has already run. An account wait must not suppress CPU
+        # evidence auditing, but needs no official GETs until reconciled.
+        if not all(r.get("state") == "job_recorded" for r in self.records()):
+            raise AccountPreflightWait("ACCOUNT_HAS_UNCERTAIN_EFFECT")
         live = self.official.fetch("problems/" + problem)
         require(live.get("name") == problem, "PROBLEM_CHANGED")
         current = {**live["files"], "AGENTS.md": live["agents_md"], "TASK.md": live["task_md"]}
@@ -936,7 +988,9 @@ class OfficialLane:
         require(isinstance(jobs, list) and all(type(j.get("submitted_at")) in (int, float)
                 and math.isfinite(j["submitted_at"]) for j in jobs), "JOBS_TIME_SCHEMA")
         require(sum(j["submitted_at"] > now - 60 for j in jobs) < maximum, "EXTERNAL_RATE_WAIT")
-        return {"checkedAt": now, "quota": q, "rules": self.p["rulesEvidence"], "effectiveRate": maximum}
+        observation = self.quota_observation(previous, jobs, problem, q, now)
+        return {"checkedAt": now, "quota": q, "quotaObservation": observation,
+                "rules": self.p["rulesEvidence"], "effectiveRate": maximum}
 
     def register(self, receipt_path, value, audit):
         job = value.get("receipt", {}).get("job_id")
@@ -986,6 +1040,8 @@ class OfficialLane:
             require(fresh == audit and fresh_files == files and fresh_source == source, "AUDIT_CHANGED_DURING_PREFLIGHT")
             require(self.clock() < self.p["expiresAt"], "POLICY_EXPIRED")
             require(self.control_active(), "CONTROL_PAUSED")
+            if int(self.clock() // 86400) * 86400 != checks["quotaObservation"]["utcDayStart"]:
+                raise PreflightQuotaError("CHECK_QUOTA_SYNC_PENDING")
             snapshot = self.state / (key + ".py")
             self.io.immutable_snapshot(snapshot, source)
             self.io.immutable_snapshot(self.state / (key + "-audit.json"), canonical(audit))
@@ -997,8 +1053,12 @@ class OfficialLane:
             identity = {"origin": "native-diagnostic-check-policy-v1", "problem": problem, "sourceSha256": sha,
                         "occurrenceId": occurrence_id, "policySHA256": self.policy_sha, "auditSHA256": digest(audit),
                         "operatorReviewedCandidate": False}
-            value = {"createdAt": dt.datetime.now(dt.timezone.utc).isoformat(), "intentEpoch": self.clock(),
-                     "mode": "check", "identity": identity, "state": "submission_intent", "automaticPostRetry": False}
+            intent_epoch = self.clock()
+            if int(intent_epoch // 86400) * 86400 != checks["quotaObservation"]["utcDayStart"]:
+                raise PreflightQuotaError("CHECK_QUOTA_SYNC_PENDING")
+            value = {"createdAt": dt.datetime.now(dt.timezone.utc).isoformat(), "intentEpoch": intent_epoch,
+                     "mode": "check", "identity": identity, "state": "submission_intent", "automaticPostRetry": False,
+                     "quotaObservation": checks["quotaObservation"]}
             self.io.immutable_snapshot(intent, canonical(value))
             self.io.immutable_snapshot(mirror, canonical(value))
             # The single effect boundary. All failures after this point are
@@ -1126,7 +1186,7 @@ def scan(lane, status_path, mode):
                 if code in {"NO_CANDIDATE_CHANGE", "NO_EXECUTABLE_CHANGE"}:
                     remediation = "supervisor_new_hypothesis"
             if code == "NATIVE_NOT_COMPLETED": status, remediation = "await_native", "preserve_active_native_owner"
-            elif code in {"CHECK_QUOTA", "POLICY_DAILY_BUDGET", "LOCAL_RATE_WAIT", "EXTERNAL_RATE_WAIT", "TRACK_CLOSED"}:
+            elif code in {"CHECK_QUOTA", "CHECK_QUOTA_SYNC_PENDING", "POLICY_DAILY_BUDGET", "LOCAL_RATE_WAIT", "EXTERNAL_RATE_WAIT", "TRACK_CLOSED"}:
                 status, remediation = "quota_wait", "await_official_quota_or_rate_window"
             elif "UNCERTAIN" in code or code in {"SOURCE_ALREADY_IN_SHARED_LEDGER", "SOURCE_PREVIOUS_PROVENANCE"}:
                 status, remediation = "uncertain_owned", "reconcile_existing_intent_never_post_again"
@@ -1151,7 +1211,7 @@ def scan(lane, status_path, mode):
             outcomes.append({"occurrenceId": occurrence, "problem": row["problem"],
                              **binding, "state": status, "code": code[:120], "jobId": job_id,
                              "postAttempted": (False if job_id is None and (
-                                 isinstance(error, PreflightQuotaError) and code == "CHECK_QUOTA" and status == "quota_wait"
+                                 isinstance(error, PreflightQuotaError) and code in {"CHECK_QUOTA", "CHECK_QUOTA_SYNC_PENDING"} and status == "quota_wait"
                                  or isinstance(error, AccountPreflightWait) and code == "ACCOUNT_HAS_UNCERTAIN_EFFECT"
                                  and status == "account_wait") else None),
                              "proposedRemediation": remediation,

@@ -327,3 +327,20 @@ diagnostic includes the exact artifact reference and a specific evidence error,
 so a separately validated planner repair contract can request new producer and
 independent QA work. This classification is not acceptance or permission to
 submit. Nonfinite policy, state or unbound payloads remain controller errors.
+
+### CHECK account waits and quota synchronization
+
+An unresolved account submission blocks further official CHECKs. After auditing
+the candidate, preflight reports a typed `account_wait` with
+`ACCOUNT_HAS_UNCERTAIN_EFFECT`, `postAttempted: false`, no job ID and the exact
+candidate binding. The candidate's own uncertain durable intent always takes
+precedence. This permits CPU repair planning without claiming an official effect.
+
+New CHECK intents record their quota observation and known official job IDs.
+The next preflight conservatively combines that observation with local receipts
+and the current GET jobs response before consuming another slot. Missing local
+jobs, exhausted observed capacity or a UTC day transition during preflight/freezing
+yield `CHECK_QUOTA_SYNC_PENDING` before any new intent or POST. Because GET jobs
+is bounded, missing older jobs can conservatively delay CHECK until the UTC reset.
+Historical intents are not rewritten; a POST with an uncertain 429 outcome is
+never automatically resent or reclassified as a preflight refusal.
