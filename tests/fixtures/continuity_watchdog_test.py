@@ -110,9 +110,10 @@ class WatchTests(unittest.TestCase):
 
     def plan(self, n=1):
         review = self.w.state['supervisions'][-1]
+        review_input = self.w.supervision_input(review)
         sources = {}
-        for source in review['input']['catalog']:
-            if source['problem'] in review['input']['eligibleProblems']:
+        for source in review_input['catalog']:
+            if source['problem'] in review_input['eligibleProblems']:
                 sources.setdefault(source['problem'], source)
         chosen = sorted(sources.values(), key=lambda r: ['muse_decode_layer', 'muse_prefill_layer', 'muse_attention_decode'].index(r['problem']))
         if not chosen: chosen = self.w.observe()['catalog'][:1]  # Deliberately invalid plans for diagnostic tests.
@@ -140,6 +141,283 @@ class WatchTests(unittest.TestCase):
 
     def reload(self):
         self.w = W.Watchdog(self.config, self.root / 'state', self.client, clock=lambda: 10060)
+
+    def enable_payloads(self):
+        self.config['statePayloadStorage'] = W.STATE_PAYLOAD_STORAGE
+        self.reload()
+
+    def test_payload_upgrade_preserves_every_value_and_raw_snapshot_and_intent(self):
+        self.w.tick(); self.complete_review()
+        before = copy.deepcopy(self.w.state)
+        # Preserve the byte serialization too, including whitespace.
+        original = json.dumps(before, indent=2).encode()
+        self.w.path.write_bytes(original)
+        intents = {p.name: p.read_bytes() for p in self.w.directory.glob('intent-*.json')}
+        self.enable_payloads(); self.w.save()
+        self.assertEqual(self.w.state['version'], 2)
+        self.assertEqual(self.w.payloads.read(self.w.state['legacySnapshotRef'], W.STATE_SNAPSHOT_LIMIT), original)
+        self.assertEqual(self.w.export_legacy_state(), before)
+        review = self.w.state['supervisions'][-1]
+        request_key = next(iter(self.w.state['reviewRequests']))
+        ref = self.w.state['reviewRequests'][request_key]
+        self.assertNotIn('input', review)
+        self.assertEqual(ref['bodyRef'], review['inputRef']['blob'])
+        self.assertEqual(self.w.review_request(request_key), self.client.posts[0][1])
+        self.assertEqual(self.w.state['experiments'], before['experiments'])
+        self.assertEqual(intents, {p.name: p.read_bytes() for p in self.w.directory.glob('intent-*.json')})
+        for p in self.w.directory.glob('payloads/*/*.json'):
+            self.assertEqual(p.stat().st_mode & 0o777, 0o400)
+        self.reload()
+        self.assertEqual(self.w.export_legacy_state(), before)
+
+    def test_payload_archive_before_state_crash_keeps_legacy_and_retry_reuses_blobs(self):
+        self.w.tick(); before = self.w.path.read_bytes()
+        self.enable_payloads()
+        real_atomic = W.atomic
+        def crash_index(path, value, **kw):
+            if pathlib.Path(path) == self.w.path: raise OSError('simulated index crash')
+            return real_atomic(path, value, **kw)
+        with mock.patch.object(W, 'atomic', side_effect=crash_index):
+            with self.assertRaisesRegex(OSError, 'index crash'): self.w.save()
+        self.assertEqual(self.w.path.read_bytes(), before)
+        self.assertEqual(self.w.state['version'], 1)
+        archived = {p.name: p.read_bytes() for p in self.w.directory.glob('payloads/*/*.json')}
+        self.assertGreaterEqual(len(archived), 2)
+        self.reload(); self.w.save()
+        self.assertEqual(archived, {p.name: p.read_bytes() for p in self.w.directory.glob('payloads/*/*.json')})
+        self.assertEqual(self.w.export_legacy_state(), json.loads(before))
+
+    def test_payload_crash_before_blob_link_never_publishes_partial_final_name(self):
+        self.w.tick(); before = self.w.path.read_bytes(); self.enable_payloads()
+        with mock.patch.object(W.os, 'link', side_effect=OSError('simulated link crash')):
+            with self.assertRaisesRegex(OSError, 'link crash'): self.w.save()
+        self.assertEqual(self.w.path.read_bytes(), before)
+        self.assertEqual(list(self.w.directory.glob('payloads/*/*.json')), [])
+        self.reload(); self.w.save()
+        self.assertEqual(self.w.export_legacy_state(), json.loads(before))
+
+    def test_payload_crash_after_index_commit_reloads_complete_refs(self):
+        self.w.tick(); before = copy.deepcopy(self.w.state); self.enable_payloads()
+        real_atomic = W.atomic
+        def crash_after(path, value, **kw):
+            real_atomic(path, value, **kw)
+            if pathlib.Path(path) == self.w.path: raise OSError('simulated process death')
+        with mock.patch.object(W, 'atomic', side_effect=crash_after):
+            with self.assertRaisesRegex(OSError, 'process death'): self.w.save()
+        self.assertEqual(self.w.state['version'], 1)
+        self.reload()
+        self.assertEqual(self.w.state['version'], 2)
+        self.assertEqual(self.w.export_legacy_state(), before)
+
+    def test_payload_pending_missing_or_corrupt_is_not_model_failure_or_new_review(self):
+        self.enable_payloads(); self.w.tick(); self.complete_review()
+        pending = self.w.state['supervisions'][-1]
+        path = self.w.payloads.path(pending['inputRef']['blob'])
+        original = path.read_bytes(); posts = len(self.client.posts)
+        path.write_bytes(original.replace(b'watchId', b'watchXX', 1))
+        with self.assertRaisesRegex(ValueError, 'STATE_PAYLOAD_INTEGRITY'): self.w.tick()
+        self.assertEqual(pending['state'], 'dispatched')
+        self.assertEqual(len(self.client.posts), posts)
+        path.unlink()
+        with self.assertRaises(FileNotFoundError): self.w.tick()
+        self.assertEqual(pending['state'], 'dispatched')
+        self.assertEqual(len(self.client.posts), posts)
+        self.assertEqual(len(self.w.state['supervisions']), 1)
+
+    def test_payload_unknown_review_preserves_body_digest_and_only_reconciles_get(self):
+        self.enable_payloads(); self.client.timeout_after_commit_number = 1
+        with self.assertRaises(TimeoutError): self.w.tick()
+        key = next(iter(self.w.state['reviewRequests']))
+        body = copy.deepcopy(self.client.posts[0][1])
+        marker = next(self.w.directory.glob('intent-*.json'))
+        intent = W.read_json(marker)
+        self.assertEqual(intent['requestDigest'], W.digest(body))
+        self.reload()
+        self.assertEqual(self.w.review_request(key), body)
+        self.assertEqual(self.w.tick()['state'], 'supervisor_dispatched')
+        self.assertEqual(len(self.client.posts), 1)
+        self.assertEqual(W.read_json(marker)['requestDigest'], intent['requestDigest'])
+        self.assertTrue(any(r.startswith('/api/cycle-runs/') for r in self.client.gets))
+
+    def test_payload_unknown_missing_blob_never_recreates_request(self):
+        self.enable_payloads(); self.client.timeout_before_commit_number = 1
+        with self.assertRaises(TimeoutError): self.w.tick()
+        key = next(iter(self.w.state['reviewRequests']))
+        self.w.payloads.path(self.w.state['reviewRequests'][key]['bodyRef']).unlink()
+        self.reload()
+        with self.assertRaises(FileNotFoundError): self.w.tick()
+        self.assertEqual(len(self.client.posts), 1)
+        self.assertEqual(self.w.state['supervisions'], [])
+        self.assertEqual(W.read_json(next(self.w.directory.glob('intent-*.json')))['state'], 'intent')
+
+    def test_payload_partial_plan_lost_ack_reloads_without_detaching_pending_alias(self):
+        self.add_seed(); self.enable_payloads(); self.w.tick(); self.complete_review(self.plan(2))
+        self.client.timeout_after_commit_number = 5
+        with self.assertRaises(TimeoutError): self.w.tick()
+        self.assertEqual(self.w.state['supervisions'][-1]['state'], 'dispatching')
+        self.reload()
+        self.assertEqual(self.w.tick()['state'], 'experiments_dispatched')
+        self.assertEqual(len(self.client.posts), 5)
+        self.assertEqual(len(self.w.state['experiments']), 2)
+        self.assertEqual(self.w.state['supervisions'][-1]['state'], 'consumed')
+        self.assertEqual(W.read_json(self.w.path)['supervisions'][-1]['state'], 'consumed')
+        self.reload()
+        self.assertEqual(self.w.tick()['state'], 'work_active')
+        self.assertEqual(len(self.client.posts), 5)
+
+    def test_payload_history_load_and_observe_do_not_hydrate_but_export_verifies(self):
+        self.enable_payloads(); self.w.tick()
+        self.w.state['supervisions'][-1]['state'] = 'consumed'; self.w.save()
+        with mock.patch.object(W.StatePayloads, 'value', side_effect=AssertionError('history hydrated')):
+            self.reload(); self.w.observe(); self.w.save()
+            with self.assertRaisesRegex(AssertionError, 'history hydrated'): self.w.export_legacy_state()
+        self.assertEqual(len(self.client.posts), 1)
+
+    def test_payload_reference_shape_scope_and_hash_are_checked(self):
+        self.enable_payloads(); self.w.tick(); pending = self.w.state['supervisions'][-1]
+        original = copy.deepcopy(pending['inputRef'])
+        for mutate, code in [
+            (lambda r: r.update(selector='../../state.json'), 'STATE_INPUT_REF'),
+            (lambda r: r.update(path='/etc/passwd'), 'STATE_INPUT_REF'),
+            (lambda r: r.update(sha256='f' * 64), 'STATE_INPUT_INTEGRITY'),
+            (lambda r: r.update(requestKey='foreign-watch-review-any'), 'STATE_REQUEST_BINDING'),
+            (lambda r: r['blob'].update(bytes=True), 'STATE_PAYLOAD_REF')]:
+            pending['inputRef'] = copy.deepcopy(original); mutate(pending['inputRef'])
+            with self.assertRaisesRegex(ValueError, code): self.w.supervision_input(pending)
+        pending['inputRef'] = original
+        pending['fingerprint'] = 'f' * 64
+        with self.assertRaisesRegex(ValueError, 'STATE_INPUT_BINDING'): self.w.supervision_input(pending)
+        self.assertEqual(len(self.client.posts), 1)
+
+    def test_payload_existing_corrupt_digest_path_is_never_overwritten(self):
+        raw = b'{"immutable":true}'
+        ref = self.w.payloads.put(raw); path = self.w.payloads.path(ref)
+        path.write_bytes(b'corrupt')
+        with self.assertRaisesRegex(ValueError, 'STATE_PAYLOAD_INTEGRITY'): self.w.payloads.put(raw)
+        self.assertEqual(path.read_bytes(), b'corrupt')
+
+    def test_payload_shared_ref_metadata_cannot_destroy_different_inline_input(self):
+        self.enable_payloads(); self.w.tick()
+        before = self.w.path.read_bytes()
+        pending = self.w.state['supervisions'][0]
+        altered = self.w.supervision_input(pending); altered['different'] = True
+        request = next(iter(self.w.state['reviewRequests'].values()))
+        request.update(inputSHA256=W.digest(altered), inputBytes=len(W.canonical(altered)))
+        added = {**pending, 'input': altered}
+        del added['inputRef']
+        self.w.state['supervisions'].append(added)
+        with self.assertRaisesRegex(ValueError, 'STATE_INPUT_INTEGRITY'): self.w.save()
+        self.assertEqual(self.w.path.read_bytes(), before)
+        self.assertEqual(added['input'], altered)
+
+    def test_payload_shared_ref_wrong_input_size_preserves_inline_copy(self):
+        self.enable_payloads(); self.w.tick()
+        before = self.w.path.read_bytes()
+        pending = self.w.state['supervisions'][0]
+        original = self.w.supervision_input(pending)
+        request = next(iter(self.w.state['reviewRequests'].values()))
+        request['inputBytes'] += 1
+        added = {**pending, 'input': original}
+        del added['inputRef']
+        self.w.state['supervisions'].append(added)
+        with self.assertRaisesRegex(ValueError, 'STATE_INPUT_INTEGRITY'): self.w.save()
+        self.assertEqual(self.w.path.read_bytes(), before)
+        self.assertEqual(added['input'], original)
+
+    def test_payload_symlink_directory_is_rejected_without_external_write(self):
+        outside = self.root / 'outside'; outside.mkdir()
+        (self.w.directory / 'payloads').symlink_to(outside, target_is_directory=True)
+        with self.assertRaisesRegex(ValueError, 'PROTECTED_OWNER_MODE'): self.w.payloads.put(b'{}')
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_payload_v2_requires_opt_in_and_legacy_export_reopens_with_old_config(self):
+        self.enable_payloads(); self.w.tick(); expected = self.w.export_legacy_state()
+        old_config = {k: v for k, v in self.config.items() if k != 'statePayloadStorage'}
+        with self.assertRaisesRegex(ValueError, 'STATE_PAYLOAD_READER_REQUIRED'):
+            W.Watchdog(old_config, self.w.directory, self.client)
+        destination = self.root / 'rollback'; destination.mkdir()
+        W.atomic(destination / 'state.json', expected)
+        legacy = W.Watchdog(old_config, destination, self.client)
+        self.assertEqual(legacy.state, expected)
+        self.assertEqual(legacy.state['reviewRequests'], expected['reviewRequests'])
+
+    def test_payload_empty_legacy_state_roundtrip_preserves_absent_fields(self):
+        self.w.save(); before = copy.deepcopy(self.w.state)
+        self.enable_payloads(); self.w.save()
+        self.assertEqual(self.w.export_legacy_state(), before)
+        self.assertNotIn('reviewRequests', self.w.state)
+
+    def test_payload_export_is_private_at_creation_with_permissive_umask(self):
+        self.enable_payloads(); self.w.tick()
+        output = self.root / 'private-export.json'
+        old_mask = W.os.umask(0o022)
+        try:
+            receipt = self.w.export_legacy_file(output)
+        finally:
+            W.os.umask(old_mask)
+        self.assertEqual(output.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(W.digest(output.read_bytes()), receipt['sha256'])
+        self.assertEqual(W.read_json(output), self.w.export_legacy_state())
+        with self.assertRaises(FileExistsError): self.w.export_legacy_file(output)
+
+    def test_payload_export_preflights_reader_limit_before_hydrating_history(self):
+        self.enable_payloads(); self.w.tick()
+        before = self.w.path.read_bytes()
+        with mock.patch.object(W, 'STATE_SNAPSHOT_LIMIT', 1024):
+            with mock.patch.object(W.StatePayloads, 'value', side_effect=AssertionError('hydrated')):
+                with self.assertRaisesRegex(ValueError, 'STATE_EXPORT_SIZE'): self.w.export_legacy_state()
+        self.assertEqual(self.w.path.read_bytes(), before)
+        self.assertEqual(len(self.client.posts), 1)
+
+    def test_payload_export_cli_needs_no_api_credentials_or_status_mutation(self):
+        self.enable_payloads(); self.w.tick()
+        before = self.w.path.read_bytes()
+        status_before = (self.w.directory / 'latest.json').read_bytes()
+        config_path = self.root / 'config.json'; W.atomic(config_path, self.config)
+        output = self.root / 'offline-export.json'
+        result = W.subprocess.run([W.sys.executable, '-B', str(SOURCE), 'export-state', str(config_path),
+            '--state-dir', str(self.w.directory), '--output', str(output)], capture_output=True, timeout=20,
+            env={'PATH': '/usr/bin:/bin', 'LANG': 'C.UTF-8', 'TMPDIR': str(self.root)})
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        self.assertEqual(json.loads(result.stdout)['newPostRequests'], 0)
+        self.assertEqual(W.read_json(output), self.w.export_legacy_state())
+        self.assertEqual(output.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(self.w.path.read_bytes(), before)
+        self.assertEqual((self.w.directory / 'latest.json').read_bytes(), status_before)
+
+    def test_payload_historical_input_without_request_is_preserved_separately(self):
+        self.w.tick(); before = copy.deepcopy(self.w.state)
+        self.w.state['reviewRequests'] = {}; before['reviewRequests'] = {}
+        self.w.save(); self.enable_payloads(); self.w.save()
+        self.assertEqual(self.w.state['supervisions'][0]['inputRef']['selector'], 'self')
+        self.assertEqual(self.w.export_legacy_state(), before)
+
+    def test_payload_capsule_growth_moves_to_blobs_not_repeated_index_copies(self):
+        self.enable_payloads(); self.w.tick()
+        review = self.w.state['supervisions'][0]
+        body = self.w.review_request(next(iter(self.w.state['reviewRequests'])))
+        initial_size = self.w.path.stat().st_size
+        for i in range(8):
+            copied = copy.deepcopy(body)
+            copied['requestKey'] += '-history-' + str(i)
+            copied['input']['sourceCapsules']['syntheticFixturePadding'] = 'x' * 500000
+            self.w.state['reviewRequests'][copied['requestKey']] = copied
+            self.w.state['supervisions'].append({**review, 'occurrenceId': uid(), 'state': 'consumed',
+                'input': copied['input']})
+            del self.w.state['supervisions'][-1]['inputRef']
+            self.w.save()
+        self.assertLess(self.w.path.stat().st_size - initial_size, 40000)
+        self.assertGreater(sum(p.stat().st_size for p in self.w.directory.glob('payloads/*/*.json')), 4000000)
+        expanded = self.w.export_legacy_state()
+        self.assertEqual(len(expanded['supervisions']), 9)
+        self.assertGreater(len(W.canonical(expanded)), 8000000)
+
+    def test_payload_bounded_archive_rejects_oversize_without_index_mutation(self):
+        self.w.tick(); before = self.w.path.read_bytes(); self.enable_payloads()
+        self.w.state['reviewRequests']['oversize'] = {'requestKey': 'oversize',
+            'input': {'watchId': self.config['watchId'], 'padding': 'x' * W.STATE_PAYLOAD_LIMIT}}
+        with self.assertRaisesRegex(ValueError, 'STATE_PAYLOAD_SIZE'): self.w.save()
+        self.assertEqual(self.w.path.read_bytes(), before)
 
     def register_completed_job(self):
         self.w.tick(); self.complete_review(); self.w.tick()

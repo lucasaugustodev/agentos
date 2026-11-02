@@ -19,6 +19,7 @@ import re
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -35,6 +36,9 @@ SUPERVISOR_DIAGNOSTIC_LIMIT = 64 * 1024
 MAX_ADMINISTRATIVE_TRANSITIONS = 3
 REPAIR_CPU_RAW_LIMIT = 256 * 1024
 REPAIR_CPU_LOGICAL_LIMIT = 128 * 1024
+STATE_PAYLOAD_STORAGE = "content-addressed-v1"
+STATE_SNAPSHOT_LIMIT = 64 * 1024 * 1024
+STATE_PAYLOAD_LIMIT = 3 * 1024 * 1024
 EVIDENCE_REPAIR_CODES = {"PATCH_HEADER_SCOPE", "CPU_REPLAY_EXECUTION_UNPROVEN", "QA_LIMITATIONS_MISSING", "QA_TEST_BINDING",
     "CPU_RESULT_BINDING", "CPU_MEANINGFUL_cases", "CPU_MEANINGFUL_negativeControls", "CPU_CASES_NOT_REPLAYED",
     "QA_ATTESTATION_MISSING_canonicalPrecisionPreserved", "QA_ATTESTATION_MISSING_evaluatorIndependent",
@@ -146,6 +150,79 @@ def protected_bytes(path, limit):
                 "PROTECTED_OWNER_MODE")
     require(path.is_file() and path.stat().st_size <= limit, "PROTECTED_FILE_SIZE")
     return path.read_bytes()
+
+
+class StatePayloads:
+    """Private immutable bytes. Paths are derived, never accepted from state."""
+    def __init__(self, directory):
+        self.directory = pathlib.Path(directory) / "payloads"
+
+    @staticmethod
+    def validate_ref(ref, limit=STATE_PAYLOAD_LIMIT):
+        require(type(ref) is dict and set(ref) == {"version", "sha256", "bytes"}
+                and type(ref["version"]) is int and ref["version"] == 1
+                and type(ref["sha256"]) is str and re.fullmatch(r"[a-f0-9]{64}", ref["sha256"])
+                and type(ref["bytes"]) is int and 0 < ref["bytes"] <= limit, "STATE_PAYLOAD_REF")
+        return ref
+
+    def path(self, ref, limit=STATE_PAYLOAD_LIMIT):
+        self.validate_ref(ref, limit)
+        return self.directory / ref["sha256"][:2] / (ref["sha256"] + ".json")
+
+    def read(self, ref, limit=STATE_PAYLOAD_LIMIT):
+        raw = protected_bytes(self.path(ref, limit), limit)
+        require(len(raw) == ref["bytes"] and digest(raw) == ref["sha256"], "STATE_PAYLOAD_INTEGRITY")
+        return raw
+
+    def put(self, raw, limit=STATE_PAYLOAD_LIMIT):
+        require(type(raw) is bytes and 0 < len(raw) <= limit, "STATE_PAYLOAD_SIZE")
+        ref = {"version": 1, "sha256": digest(raw), "bytes": len(raw)}
+        path = self.path(ref, limit)
+        # Check all ancestors before creating any payload file. No symlink or
+        # writable ancestor can redirect the content-addressed publication.
+        for parent in [self.directory.parent, *self.directory.parent.parents]:
+            metadata = parent.lstat()
+            require(parent.resolve() == parent and metadata.st_uid == 0 and not metadata.st_mode & 0o022
+                    and not stat.S_ISLNK(metadata.st_mode), "PROTECTED_OWNER_MODE")
+        for directory in [self.directory, path.parent]:
+            directory.mkdir(exist_ok=True, mode=0o700)
+            metadata = directory.lstat()
+            require(directory.resolve() == directory and metadata.st_uid == 0 and not metadata.st_mode & 0o022
+                    and not stat.S_ISLNK(metadata.st_mode), "PROTECTED_OWNER_MODE")
+            parent_fd = os.open(directory.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(parent_fd)
+            finally:
+                os.close(parent_fd)
+        if path.exists():
+            require(self.read(ref, limit) == raw, "STATE_PAYLOAD_INTEGRITY")
+            return ref
+        fd, temporary = tempfile.mkstemp(prefix=".publish-", dir=path.parent)
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(raw)
+                stream.flush()
+                os.fchmod(stream.fileno(), 0o400)
+                os.fsync(stream.fileno())
+            try:
+                os.link(temporary, path)  # Never replace an existing digest path.
+            except FileExistsError:
+                require(self.read(ref, limit) == raw, "STATE_PAYLOAD_INTEGRITY")
+            directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        finally:
+            os.unlink(temporary)
+        # A crash can leave an unreferenced complete blob; never a partial final
+        # blob. The index is committed only after this durable publication.
+        return ref
+
+    def value(self, ref):
+        value = json.loads(self.read(ref))
+        require(type(value) is dict, "STATE_PAYLOAD_OBJECT")
+        return value
 
 
 def case_counts(raw):
@@ -487,6 +564,7 @@ def validate_config(config, bound=True):
     require(re.fullmatch(r"[a-z0-9-]{8,80}", config.get("watchId", "")), "WATCH_ID")
     require(re.fullmatch(r"openkernel/[a-z0-9_-]+", config.get("workspace", "")), "WORKSPACE_SCOPE")
     require(config.get("model") == "deepseek-v4-pro-0813", "MODEL_SCOPE")
+    require(config.get("statePayloadStorage") in [None, STATE_PAYLOAD_STORAGE], "STATE_PAYLOAD_STORAGE")
     require(re.fullmatch(r"agentos-api-[a-f0-9-]{36}", config.get("accountId", "")), "ACCOUNT_SCOPE")
     capacity_version = config.get("pipelineCapacityVersion", 1)
     require(type(capacity_version) is int and capacity_version in [1, 2], "PIPELINE_CAPACITY_VERSION")
@@ -942,12 +1020,175 @@ class Watchdog:
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.client, self.clock = client, clock
         self.path = self.directory / "state.json"
-        self.state = read_json(self.path) if self.path.exists() else {"version": 1, "watchId": config["watchId"],
+        self.payloads = StatePayloads(self.directory)
+        self.external_payloads = config.get("statePayloadStorage") == STATE_PAYLOAD_STORAGE
+        raw = protected_bytes(self.path, STATE_SNAPSHOT_LIMIT) if self.path.exists() and self.external_payloads else None
+        self.state = json.loads(raw) if raw is not None else read_json(self.path) if self.path.exists() else {"version": 1, "watchId": config["watchId"],
             "createdAt": clock(), "supervisions": [], "experiments": [], "outcomes": {}, "official": {}}
         require(self.state["watchId"] == config["watchId"], "STATE_SCOPE")
+        require(type(self.state.get("version")) is int and self.state["version"] in [1, 2], "STATE_VERSION")
+        require(self.state["version"] != 2 or self.external_payloads, "STATE_PAYLOAD_READER_REQUIRED")
+        require(self.state["version"] != 1 or not {"payloadStorage", "legacySnapshotRef"}.intersection(self.state),
+                "STATE_RESERVED_FIELDS")
+        if self.state["version"] == 2:
+            require(self.state.get("payloadStorage") == STATE_PAYLOAD_STORAGE, "STATE_PAYLOAD_STORAGE")
+            self.payloads.validate_ref(self.state.get("legacySnapshotRef"), STATE_SNAPSHOT_LIMIT)
+        # Preserve the original serialization too, not just an equivalent JSON
+        # value. Migration never discards input history or touches POST intents.
+        self.legacy_snapshot = (raw if raw is not None else canonical(self.state)) if self.state["version"] == 1 else None
 
     def save(self):
-        atomic(self.path, self.state)
+        if not self.external_payloads:
+            atomic(self.path, self.state)
+            return
+        state = dict(self.state)
+        state.update(version=2, payloadStorage=STATE_PAYLOAD_STORAGE)
+        if "legacySnapshotRef" not in state:
+            state["legacySnapshotRef"] = self.payloads.put(self.legacy_snapshot, STATE_SNAPSHOT_LIMIT)
+        requests, inputs = {}, {}
+        for key, stored in state.get("reviewRequests", {}).items():
+            if type(stored) is dict and set(stored) == {"bodyRef", "inputSHA256", "inputBytes"}:
+                self.validate_request_ref(stored)
+                requests[key] = stored
+            else:
+                self.validate_request_body(key, stored)
+                raw_input = canonical(stored["input"])
+                requests[key] = {"bodyRef": self.payloads.put(canonical(stored)),
+                    "inputSHA256": digest(raw_input), "inputBytes": len(raw_input)}
+            ref = requests[key]
+            # Identical inputs can safely share their enclosing immutable body.
+            inputs.setdefault(ref["inputSHA256"], {"version": 1, "blob": ref["bodyRef"], "selector": "input",
+                "sha256": ref["inputSHA256"], "bytes": ref["inputBytes"], "requestKey": key})
+        records = []
+        for original in state["supervisions"]:
+            record = dict(original)
+            require(not ("input" in record and "inputRef" in record), "STATE_INPUT_AMBIGUOUS")
+            if "input" in record:
+                value = record.pop("input")
+                self.validate_supervision_input(original, value)
+                raw_input = canonical(value)
+                ref = inputs.get(digest(raw_input))
+                if ref is None:
+                    ref = {"version": 1, "blob": self.payloads.put(raw_input), "selector": "self",
+                           "sha256": digest(raw_input), "bytes": len(raw_input)}
+                else:
+                    # Metadata alone cannot authorize replacing the only inline
+                    # copy with an existing ref. Verify the shared bytes first.
+                    body = self.payloads.value(ref["blob"])
+                    self.validate_request_body(ref["requestKey"], body)
+                    require(canonical(body["input"]) == raw_input and len(raw_input) == ref["bytes"]
+                            and digest(raw_input) == ref["sha256"], "STATE_INPUT_INTEGRITY")
+                record["inputRef"] = ref
+            else:
+                self.validate_input_ref(record.get("inputRef"))
+            records.append(record)
+        state["supervisions"] = records
+        if "reviewRequests" in state:
+            state["reviewRequests"] = requests
+        atomic(self.path, state)
+        # Preserve aliases held by dispatch/consume across saves. Replacing the
+        # state tree would detach pending mutations after the first write.
+        if "reviewRequests" in self.state:
+            self.state["reviewRequests"].clear()
+            self.state["reviewRequests"].update(requests)
+        for original, record in zip(self.state["supervisions"], records):
+            original.clear(); original.update(record)
+        for key in ["version", "payloadStorage", "legacySnapshotRef"]:
+            self.state[key] = state[key]
+        self.legacy_snapshot = None
+
+    def validate_request_ref(self, ref):
+        require(type(ref) is dict and set(ref) == {"bodyRef", "inputSHA256", "inputBytes"}, "STATE_REQUEST_REF")
+        self.payloads.validate_ref(ref["bodyRef"])
+        self.payloads.validate_ref({"version": 1, "sha256": ref["inputSHA256"], "bytes": ref["inputBytes"]})
+
+    def validate_input_ref(self, ref):
+        require(type(ref) is dict and ref.get("selector") in ["input", "self"], "STATE_INPUT_REF")
+        fields = {"version", "blob", "selector", "sha256", "bytes"}
+        require(set(ref) == (fields | {"requestKey"} if ref["selector"] == "input" else fields), "STATE_INPUT_REF")
+        self.payloads.validate_ref(ref["blob"])
+        self.payloads.validate_ref({k: ref[k] for k in ["version", "sha256", "bytes"]})
+        if ref["selector"] == "input":
+            require(type(ref["requestKey"]) is str and ref["requestKey"].startswith(self.config["watchId"] + "-review-"),
+                    "STATE_REQUEST_BINDING")
+
+    def validate_request_body(self, key, body):
+        require(type(body) is dict and body.get("requestKey") == key and type(body.get("input")) is dict
+                and body["input"].get("watchId") == self.config["watchId"], "STATE_REQUEST_BINDING")
+
+    def validate_supervision_input(self, record, value):
+        require(type(value) is dict and value.get("watchId") == self.config["watchId"]
+                and value.get("evidenceFingerprint") == record.get("fingerprint"), "STATE_INPUT_BINDING")
+
+    def review_request(self, key):
+        stored = self.state["reviewRequests"][key]
+        if "bodyRef" not in stored:
+            self.validate_request_body(key, stored)
+            return stored
+        self.validate_request_ref(stored)
+        body = self.payloads.value(stored["bodyRef"])
+        self.validate_request_body(key, body)
+        raw = canonical(body["input"])
+        require(digest(raw) == stored["inputSHA256"] and len(raw) == stored["inputBytes"], "STATE_INPUT_INTEGRITY")
+        return body
+
+    def supervision_input(self, record):
+        require(not ("input" in record and "inputRef" in record), "STATE_INPUT_AMBIGUOUS")
+        if "input" in record:
+            return record["input"]  # Unmodified legacy contract.
+        ref = record.get("inputRef")
+        self.validate_input_ref(ref)
+        value = self.payloads.value(ref["blob"])
+        if ref["selector"] == "input":
+            self.validate_request_body(ref["requestKey"], value)
+            value = value["input"]
+        raw = canonical(value)
+        require(digest(raw) == ref["sha256"] and len(raw) == ref["bytes"], "STATE_INPUT_INTEGRITY")
+        self.validate_supervision_input(record, value)
+        return value
+
+    def export_legacy_state(self):
+        """Verified expansion for rollback/inspection; never overwrite live state."""
+        state = dict(self.state)
+        # Conservative preflight before resolving any historical blob. A v1
+        # rollback is available only while its full expansion fits the reader's
+        # bounded index. Never truncate history to force it to fit.
+        estimated = len(canonical(state))
+        for stored in state.get("reviewRequests", {}).values():
+            if "bodyRef" in stored:
+                self.validate_request_ref(stored)
+                estimated += stored["bodyRef"]["bytes"]
+        for row in state["supervisions"]:
+            if "inputRef" in row:
+                self.validate_input_ref(row["inputRef"])
+                estimated += row["inputRef"]["bytes"]
+        require(estimated <= STATE_SNAPSHOT_LIMIT, "STATE_EXPORT_SIZE")
+        if state["version"] == 1:
+            return json.loads(canonical(state))
+        self.payloads.read(state["legacySnapshotRef"], STATE_SNAPSHOT_LIMIT)
+        if "reviewRequests" in state:
+            state["reviewRequests"] = {key: self.review_request(key) for key in state["reviewRequests"]}
+        state["supervisions"] = [{**{k: v for k, v in row.items() if k != "inputRef"},
+                                  "input": self.supervision_input(row)} for row in state["supervisions"]]
+        state["version"] = 1
+        for key in ["payloadStorage", "legacySnapshotRef"]:
+            state.pop(key, None)
+        return json.loads(canonical(state))
+
+    def export_legacy_file(self, path):
+        value = self.export_legacy_state()
+        raw = canonical(value)
+        # The export contains private context. Be private from creation even
+        # when called by an embedding tool with a permissive umask.
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(raw); stream.flush(); os.fsync(stream.fileno())
+        directory_fd = os.open(pathlib.Path(path).parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+        return {"state": "legacy_exported", "sha256": digest(raw), "bytes": len(raw), "newPostRequests": 0}
 
     def status(self, state, **facts):
         value = {"observedAt": now_iso(), "state": state, "watchId": self.config["watchId"],
@@ -1891,7 +2132,7 @@ class Watchdog:
                 return self.status("supervisor_sources_unavailable", omitted=packet["omitted"], newPostRequests=0)
             requests[key] = body
             self.save()
-        body = requests[key]
+        body = self.review_request(key)
         row = self.post_once("run", key, body, self.config["controlCycleId"])
         record = {"occurrenceId": row["id"], "fingerprint": observation["fingerprint"], "input": body["input"],
                   "createdAt": self.clock(), "state": "dispatched",
@@ -2113,7 +2354,7 @@ If complete evidence cannot fit, report the limitation and fail the repair.
                     unstarted.append({"experimentId": exp["id"], "reason": "RUN_NOT_ATTEMPTED", "cycleId": created["id"]}); continue
                 repair = None
                 if action_kind(pending["approvedPlan"], exp) == "repair_evidence":
-                    original = next(r for r in pending["input"]["autoCheckDiagnostics"]["repairableEvidence"]
+                    original = next(r for r in self.supervision_input(pending)["autoCheckDiagnostics"]["repairableEvidence"]
                                     if r["candidateArtifactId"] == exp["sourceArtifactId"])
                     target = row["input"]["experiment"]["repairTarget"]
                     require(target["occurrenceId"] == original["occurrenceId"]
@@ -2162,9 +2403,12 @@ If complete evidence cannot fit, report the limitation and fail the repair.
         # A scoped proof permits only the original selected boards. Capacity,
         # ownership, eligibility, source boundaries and repair authority are all
         # checked against the fresh observation below, including partial plans.
+        # Storage failures are controller failures, never model rejection or
+        # authority to abandon a pending run and dispatch another supervisor.
+        source_input = self.supervision_input(pending)
         try:
             validate_plan(plan, observation, self.config, expected_fingerprint=pending["fingerprint"],
-                          source_input=pending["input"])
+                          source_input=source_input)
         except ValueError as error:
             pending["freshAdmissionError"] = str(error)
             if has_intent or owned:
@@ -2192,11 +2436,11 @@ If complete evidence cannot fit, report the limitation and fail the repair.
                 "problems": sorted({exp["problem"] for exp in plan["experiments"]}), "freshAdmission": pending["pipelineReservation"]}
         self.state["outcomes"][pending["fingerprint"]] = {"supervisorOccurrenceId": pending["occurrenceId"],
             "decision": plan["decision"], "reason": plan["reason"], "dispatched": dispatched,
-            "isolatedCandidates": pending["input"].get("isolatedCandidates", [])}
+            "isolatedCandidates": source_input.get("isolatedCandidates", [])}
         self.save()
         return self.status("experiments_dispatched" if dispatched else "active_owner_preserved" if plan["decision"] == "observe_active" else "awaiting_external", dispatched=dispatched,
                            supervisorOccurrenceId=pending["occurrenceId"], reason=plan["reason"],
-                           isolatedCandidates=pending["input"].get("isolatedCandidates", []))
+                           isolatedCandidates=source_input.get("isolatedCandidates", []))
 
     def tick(self):
         """Drain closed administrative transitions under the caller's existing lock.
@@ -2243,11 +2487,12 @@ If complete evidence cannot fit, report the limitation and fail the repair.
             if detail["occurrence"]["state"] != "completed":
                 pending.update({"state": "failed", "errorCode": "NATIVE_SUPERVISOR_FAILED"}); self.save()
                 return self.status("supervisor_failed", occurrenceId=pending["occurrenceId"], reason="Native supervisor did not complete; preserved for diagnosis.")
+            source_input = self.supervision_input(pending)
             try:
                 rows = [a for a in detail["artifacts"] if a["name"] == "continuation-plan.json"]
                 require(len(rows) == 1, "PLAN_ARTIFACT_MISSING_OR_AMBIGUOUS")
                 plan = json.loads(self.verified_artifact(rows[0], 65536))
-                original = {"fingerprint": pending["fingerprint"], **pending["input"]}
+                original = {"fingerprint": pending["fingerprint"], **source_input}
                 validate_plan(plan, original, self.config)
             except (ValueError, KeyError, TypeError) as error:
                 code = str(error) if re.fullmatch(r"[A-Z0-9_]+", str(error)) else "PLAN_FORMAT_INVALID"
@@ -2271,9 +2516,10 @@ If complete evidence cannot fit, report the limitation and fail the repair.
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["template", "tick"])
+    parser.add_argument("command", choices=["template", "tick", "export-state"])
     parser.add_argument("config", type=pathlib.Path)
     parser.add_argument("--state-dir", type=pathlib.Path)
+    parser.add_argument("--output", type=pathlib.Path)
     args = parser.parse_args()
     for item in [args.config, pathlib.Path(__file__).absolute()]:
         require(item.is_absolute() and item.resolve() == item, "PROTECTED_PATH")
@@ -2286,6 +2532,8 @@ def main():
         print(json.dumps({"requestKey": config["watchId"] + "-control", "definition": supervisor_definition(config)}, ensure_ascii=False))
         return
     require(args.state_dir is not None, "STATE_DIRECTORY_REQUIRED")
+    if args.command == "export-state":
+        require((args.state_dir / "state.json").is_file(), "STATE_EXPORT_SOURCE_REQUIRED")
     os.umask(0o077)
     args.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     with (args.state_dir / "watch.lock").open("a+") as lock:
@@ -2293,12 +2541,24 @@ def main():
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             print(json.dumps({"state": "observer_already_running"})); return
-        watcher = Watchdog(config, args.state_dir, Client())
+        watcher = Watchdog(config, args.state_dir, Client() if args.command == "tick" else None)
         try:
+            if args.command == "export-state":
+                output = args.output
+                require(output is not None and output.is_absolute() and output.resolve() == output
+                        and not output.exists() and args.state_dir.resolve() not in output.parents,
+                        "STATE_EXPORT_PATH")
+                for parent in output.parents:
+                    metadata = parent.lstat()
+                    require(metadata.st_uid == 0 and not metadata.st_mode & 0o022
+                            and not stat.S_ISLNK(metadata.st_mode), "PROTECTED_OWNER_MODE")
+                print(json.dumps(watcher.export_legacy_file(output)))
+                return
             print(json.dumps(watcher.tick(), ensure_ascii=False))
         except Exception as error:
             code = str(error) if type(error) is ValueError and re.fullmatch(r"[A-Z0-9_]+", str(error)) else type(error).__name__
-            print(json.dumps(watcher.status("observation_or_dispatch_blocked", code=code, automaticPostRetry=False)))
+            value = {"state": "state_export_blocked", "code": code, "automaticPostRetry": False} if args.command == "export-state" else watcher.status("observation_or_dispatch_blocked", code=code, automaticPostRetry=False)
+            print(json.dumps(value))
             raise SystemExit(1)
 
 

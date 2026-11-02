@@ -516,3 +516,66 @@ change. Nine new cases cover 24 mixed actions, exact repair routing, invalid kin
 and capacity reports, unchanged legacy definitions, current capacity admission,
 lost acknowledgements and per-action repair read sets. These are isolated controller
 tests, not evidence that 24 agents have actually started or produced GPU gains.
+
+Immutable private state payloads (separate explicit opt-in)
+
+statePayloadStorage: content-addressed-v1 enables state format2. watchId,
+experiments, outcomes, planning decisions and action proofs remain inline. The
+large reviewRequests bodies and supervisions inputs move to root-owned immutable
+payloads/<sha256-prefix>/<sha256>.json files inside the private state directory.
+An input can reference its enclosing request body, so the large source capsules
+are stored once per request. Input hashes, lengths, watch identity and review
+fingerprint remain checked; refs never accept an arbitrary path or selector.
+The state index contains no request/context truncation. Worker inputs and native
+API contracts are unchanged, and official POST authority remains absent.
+
+The first migration preserves the exact original state bytes in an immutable
+legacySnapshotRef. Each payload is fsynced and atomically linked without replacing
+an existing digest path before the state index is replaced. A crash may leave a
+complete unreferenced blob, but cannot publish a ref to a partially written blob.
+Existing corrupt blobs are never overwritten. No blob or historical record is
+garbage-collected by this change. Intent files remain complete and untouched:
+requestDigest, unknown effects and GET-only reconciliation keep their contracts.
+An absent or damaged pending blob blocks the controller; it is not a model failure
+or permission to create a replacement supervisor. Only pending/request consumers
+resolve payloads. Loading the index, observing experiments or saving metadata does
+not hydrate historical inputs. The adapter's watchId/experiments reader remains
+compatible; diagnostic tools reading inline input must use the accessor or export.
+
+The new reader accepts legacy state1. Reading state2 requires the explicit opt-in;
+an old reader must never be pointed at refs. The storage flag changes the existing
+global configuration authority hash, so activation must account for any pending
+review and its original proof. Migration does not upgrade old proofs or make an
+uncertain action repeatable. Coordinate the writer and installer before activation.
+
+For a reviewed rollback or offline inspection, export a fully expanded state1 to
+a NEW private path outside the state directory:
+
+  python3 continuity-watchdog.py export-state /private/config.json \
+    --state-dir /private/watch --output /private/rollback-state.json
+
+The export runs under the existing watch lock, verifies every historical payload,
+creates its output0600 even with a permissive umask, and never sends a request or
+replaces the live index. Verify successful completion and its SHA receipt before
+using the file; an interrupted export may leave an incomplete destination, which
+is never silently overwritten. Rollback also needs the unchanged complete intents
+and a coordinated stopped writer. The preflight conservatively requires the full
+expansion to fit64MiB, matching the bounded adapter reader. If it does not fit,
+export is blocked before hydrating the history; do not truncate history or deploy
+an old reader anyway. Back up index, blobs and intents together. Copying state.json
+alone is no longer a complete backup.
+
+This removes duplicate bulk payloads from the frequently read index; it does not
+promise constant metadata size or lower total disk usage immediately. The initial
+raw snapshot is retained, and payload/intent history still consumes disk. Capacity
+monitoring and a separately reviewed retention policy remain necessary. Tests cover
+legacy migration, byte identity, crash publication order, damaged refs, lost ACKs,
+partial-plan resumption, lazy history, private export and bounded rollback.
+
+Qualification has206 passing server tests. A frozen33-review/33-request snapshot
+shrinks its index from24,331,198 to644,932 bytes (97.35%) while expanding back to
+the exact original canonical SHA. All65 intent files remain byte-identical, and
+the existing bounded adapter reads the same16 experiments. The actual previous
+reader reconciles synthetic lost-ACK, unresolved-intent and partial-dispatch
+exports using GET only. These are isolated storage/recovery results, not evidence
+of live migration, additional model throughput or GPU improvement.
