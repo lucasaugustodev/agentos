@@ -590,7 +590,7 @@ reader reconciles synthetic lost-ACK, unresolved-intent and partial-dispatch
 exports using GET only. These are isolated storage/recovery results, not evidence
 of live migration, additional model throughput or GPU improvement.
 
-Combined plan2/storage qualification has225 passing server tests. It includes24
+Combined plan2/storage qualification has229 passing server tests. It includes24
 mixed actions with archived inputs, restart after a lost repair acknowledgement,
 and reconciliation of an archived old-control request before a new-control review.
 Uncertain old requests keep their original cycle and block replacement POSTs.
@@ -606,3 +606,13 @@ reconciled by GET. A synthetic fallback with a distinct new control cycle preser
 two owners after a lost repair ACK, or one owner plus one uncertain effect when no
 receipt exists, with zero new POSTs. The earlier reader45afb rollback proof applies
 only to the earlier plan contract; it does not authorize that reader over plan2.
+
+A completed review under an old configuration must also receive a fresh identity
+after storage fallback, even when the observed work fingerprint and control cycle
+are unchanged. Version2 review keys, failure budgets and cached outcomes bind the
+current authority digest. The regression test fails when the same old receipt is
+reused and now proves exactly one new review followed by its running state.
+A frozen full-input replay validates23 mixed actions (including one authorized
+repair) alongside one existing owner,16 source capsules and two verified external
+reports. The constructed input is below1MiB and roundtrips through archived state.
+Control/policy bindings in that replay are explicitly synthetic; no plan is sent.
