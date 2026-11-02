@@ -222,15 +222,24 @@ def validate_policy(policy, now, adapter_sha, allow_disabled=False):
 def source_screen(raw):
     """Conservative diagnostic-lane gate, not a proof of semantic legality."""
     tree = ast.parse(raw.decode("utf-8"))
-    denied = {"os", "sys", "subprocess", "socket", "requests", "urllib", "http", "pathlib", "inspect", "importlib", "pickle", "marshal", "ctypes"}
+    denied = {"os", "sys", "subprocess", "socket", "requests", "urllib", "http", "pathlib", "inspect", "importlib", "pickle", "marshal", "ctypes",
+              "base64", "binascii", "codecs", "zlib", "gzip", "bz2", "lzma", "builtins"}
+    dynamic = {"exec", "eval", "compile", "__import__", "open", "getattr", "setattr", "globals", "locals", "__builtins__"}
+    loaders = {"load_library", "load_binary", "load_cubin", "cuModuleLoad", "cuModuleLoadData", "cuModuleLoadDataEx",
+               "cuLibraryLoadData", "cuLibraryLoadFromFile", "module_from_buffer", "fromhex", "b64decode", "b85decode", "a85decode", "decompress"}
     for node in ast.walk(tree):
         modules = ([n.name for n in node.names] if isinstance(node, ast.Import)
                    else [node.module or ""] if isinstance(node, ast.ImportFrom) else [])
         require(not any(m.split(".")[0] in denied or re.search(r"(^|\.)(reference|checks|evaluator|runner|static_checks)(\.|$)", m) for m in modules), "SOURCE_REQUIRES_MANUAL_REVIEW")
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
-            require(node.func.id not in {"exec", "eval", "compile", "__import__", "open", "getattr", "setattr", "globals", "locals"}, "SOURCE_REQUIRES_MANUAL_REVIEW")
+        if isinstance(node, ast.ImportFrom):
+            require(not any(n.name in dynamic | loaders for n in node.names), "SOURCE_REQUIRES_MANUAL_REVIEW")
+        if isinstance(node, ast.Name):
+            # Also catch aliases such as f = exec; the later call's name alone
+            # cannot establish that submitted code remains inspectable source.
+            require(node.id not in dynamic | loaders, "SOURCE_REQUIRES_MANUAL_REVIEW")
         if isinstance(node, ast.Attribute):
-            require(node.attr not in {"environ", "getenv", "system", "popen", "__dict__", "__globals__", "__subclasses__"}, "SOURCE_REQUIRES_MANUAL_REVIEW")
+            require(node.attr not in {"environ", "getenv", "system", "popen", "__dict__", "__globals__", "__subclasses__"} | dynamic | loaders,
+                    "SOURCE_REQUIRES_MANUAL_REVIEW")
 
 
 def replay_commands(raw, checker_sha, candidate_sha):

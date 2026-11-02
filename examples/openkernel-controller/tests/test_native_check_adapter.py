@@ -322,6 +322,42 @@ class Fixture(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'REPAIR_DIAGNOSTIC_PROJECTION'):
             self.origin(source)
 
+    def test_source_screen_requires_review_for_encoded_payloads_and_binary_loaders(self):
+        snippets=[
+            'import base64 as b\npayload = b.b64decode("AA==")',
+            'import zlib as z\npayload = z.decompress(b"bytes")',
+            'import codecs as c\npayload = c.decode("00", "hex")',
+            'from torch.ops import load_library as f\nf("kernel.so")',
+            'torch.ops.load_library("kernel.so")',
+            'cuda.cuModuleLoadData(b"prebuilt cubin")',
+            'from cuda import cuModuleLoadData as f\nf(b"prebuilt cubin")',
+            'cuda.cuLibraryLoadFromFile("kernel.so")',
+            'module_from_buffer(b"prebuilt cubin")',
+            'loader(bytes.fromhex("00ab"))',
+        ]
+        for snippet in snippets:
+            with self.subTest(snippet=snippet):
+                with self.assertRaisesRegex(ValueError,'SOURCE_REQUIRES_MANUAL_REVIEW'):
+                    A.source_screen(snippet.encode())
+
+    def test_source_screen_checks_aliased_dynamic_execution_without_running_code(self):
+        for snippet in ['f = exec\nf(payload)','f = eval\nf(payload)',
+                        'from builtins import exec as f\nf(payload)',
+                        'f = __builtins__["exec"]\nf(payload)',
+                        'other.compile(payload, "kernel", "exec")']:
+            with self.subTest(snippet=snippet):
+                with self.assertRaisesRegex(ValueError,'SOURCE_REQUIRES_MANUAL_REVIEW'):
+                    A.source_screen(snippet.encode())
+
+    def test_source_screen_preserves_readable_jit_and_installed_official_helpers(self):
+        for snippet in [
+            'import triton\nimport triton.language as tl\n@triton.jit\ndef kernel(x):\n    value = tl.load(x)\n',
+            'from torch.utils.cpp_extension import load_inline\nmodule = load_inline(name="readable", cpp_sources="", cuda_sources="__global__ void kernel() {}")',
+            'import nvrtc\nprogram = nvrtc.nvrtcCreateProgram("__global__ void kernel() {}", "kernel.cu")\ncompiled = nvrtc.nvrtcCompileProgram(program, [])',
+            'from sglang.srt.layers.quantization.marlin_utils import marlin_make_workspace\ndef prepare(device):\n    return marlin_make_workspace(device)\n',
+        ]:
+            with self.subTest(snippet=snippet):A.source_screen(snippet.encode())
+
     def dispatch_diagnostic(self, report, *, version=None, projection=None):
         raw = A.canonical(report)
         ref = self.artifact("qa-verification.json", raw, "77777777-7777-7777-7777-777777777777")

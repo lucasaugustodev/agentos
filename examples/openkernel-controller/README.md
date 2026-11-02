@@ -140,6 +140,12 @@ acceptance evidence; canonical materials and the new independent QA checks
 remain mandatory. Other extra materials remain rejected, including this file
 on an ordinary experiment. Source-origin audits apply the same distinction.
 
+The source screen sends encoded payload decoders, precompiled binary loaders and
+dynamic execution aliases to manual review. It does not execute the submitted
+code or prove arbitrary source legality. Readable Triton/CUDA JIT compilation and
+installed official helpers remain allowed; data compression outside this narrow
+diagnostic lane may need a separate review.
+
 `tools/native_check_adapter.py` adds a separate, opt-in authority lane for a
 watchdog's completed producer → independent QA experiment. It does not alter the
 existing manual approval path. An operator pins the adapter, qualified transport
