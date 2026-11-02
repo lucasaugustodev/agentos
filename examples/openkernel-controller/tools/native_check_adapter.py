@@ -37,6 +37,8 @@ MAX_SAFE_INTEGER = 2 ** 53 - 1
 TERMINAL_DIAGNOSTIC_TTL = 3600
 TERMINAL_DIAGNOSTIC_LIMIT = 128
 TERMINAL_DIAGNOSTIC_MAX_BYTES = 1024 * 1024
+JOBS_OBSERVATION_MAX_BYTES = 1024 * 1024
+JOBS_OBSERVATION_MAX_IDS = 200
 
 
 def require(ok, code):
@@ -212,6 +214,7 @@ def validate_policy(policy, now, adapter_sha, allow_disabled=False):
     require(policy.get("quotaPolicy") == "official-account-limits", "POLICY_QUOTA_SCOPE")
     require(type(policy.get("minimumChecksRemaining")) is int and policy["minimumChecksRemaining"] >= 0, "QUOTA_RESERVE")
     reservation_policy(policy)
+    jobs_observation_policy(policy)
     for key in ("accountId", "model", "stateDirectory", "legacyLedger", "accountLock", "watcherStateDirectory", "registryPath", "artifactDirectory", "workerRunsDirectory"):
         require(isinstance(policy.get(key), str) and policy[key], "POLICY_FIELD_" + key)
     origins = policy.get("nativeSourceOrigins")
@@ -259,6 +262,65 @@ def reservation_policy(policy):
         require(key not in seen, "UNCERTAIN_RESERVATION_POLICY")
         seen.add(key)
     return value
+
+
+def jobs_observation_policy(policy):
+    value = policy.get("jobsObservation")
+    if value is None: return None
+    require(type(value) is dict and set(value) == {"version", "indexPath", "bootstrap"}
+            and type(value["version"]) is int and value["version"] == 1,
+            "JOBS_OBSERVATION_POLICY")
+    path = pathlib.Path(value["indexPath"])
+    require(path.is_absolute() and path.parent == pathlib.Path(policy["stateDirectory"])
+            and re.fullmatch(r"jobs-observation-v1-[a-z0-9]{8,64}\.json", path.name),
+            "JOBS_OBSERVATION_POLICY")
+    ref = value["bootstrap"]
+    require(type(ref) is dict and set(ref) == {"path", "sha256"}
+            and type(ref["path"]) is str and pathlib.Path(ref["path"]).is_absolute()
+            and SHA.fullmatch(ref.get("sha256", "")), "JOBS_OBSERVATION_POLICY")
+    return value
+
+
+def jobs_window_identity(response, now, maximum=50):
+    """Identity only: result/status changes must not rewrite historical jobs."""
+    require(type(response) is list or type(response) is dict and set(response) == {"jobs"}, "JOBS_WINDOW_SCHEMA")
+    rows = response if type(response) is list else response["jobs"]
+    require(type(rows) is list and len(rows) <= maximum, "JOBS_WINDOW_SIZE")
+    result = []
+    for row in rows:
+        require(type(row) is dict and JOB.fullmatch(row.get("job_id", ""))
+                and type(row.get("problem")) is str and 1 <= len(row["problem"]) <= 100
+                and row.get("mode") in {"check", "run"}
+                and type(row.get("submitted_at")) in (int, float)
+                and math.isfinite(row["submitted_at"]) and 0 < row["submitted_at"] <= now + 5,
+                "JOBS_WINDOW_IDENTITY")
+        result.append({key: row[key] for key in ("job_id", "problem", "mode", "submitted_at")})
+    require(len({row["job_id"] for row in result}) == len(result)
+            and [row["submitted_at"] for row in result] == sorted((row["submitted_at"] for row in result), reverse=True),
+            "JOBS_WINDOW_ORDER")
+    return result
+
+
+def jobs_window_complete(window, day):
+    return len(window) < 50 or window[-1]["submitted_at"] < day
+
+
+def jobs_head_overlap(previous_window, previous_jobs, current_window):
+    """A repeated head and exact remaining prefix establish continuity."""
+    if not previous_window:
+        require(len(current_window) < 50, "JOBS_WINDOW_HEAD_MISSING")
+        return copy.deepcopy(current_window)
+    matches = [i for i, row in enumerate(current_window) if row["job_id"] == previous_window[0]["job_id"]]
+    require(len(matches) == 1, "JOBS_WINDOW_HEAD_MISSING")
+    offset = matches[0]
+    overlap = current_window[offset:]
+    require(canonical(overlap) == canonical(previous_window[:len(overlap)])
+            and len(overlap) == min(len(previous_window), 50 - offset), "JOBS_WINDOW_OVERLAP_CHANGED")
+    known = {row["job_id"] for row in previous_jobs}
+    require(all(row["job_id"] not in known for row in current_window[:offset]), "JOBS_WINDOW_REUSED_ID")
+    combined = copy.deepcopy(current_window[:offset]) + copy.deepcopy(previous_jobs)
+    require(len(combined) <= JOBS_OBSERVATION_MAX_IDS, "JOBS_OBSERVATION_ID_LIMIT")
+    return jobs_window_identity(combined, max(row["submitted_at"] for row in combined), JOBS_OBSERVATION_MAX_IDS)
 
 
 def source_screen(raw):
@@ -1247,6 +1309,166 @@ class OfficialLane:
             pass  # Missing proof preserves the original, fully blocked outcome.
         return error
 
+    def jobs_authority(self, team, day):
+        options = jobs_observation_policy(self.p)
+        scope = {key: self.p[key] for key in ("project", "accountId", "model", "stateDirectory",
+                 "legacyLedger", "accountLock", "transportHelper")}
+        return {"policySHA256": self.policy_sha, "adapterSHA256": self.p["adapterSHA256"],
+                "transportScopeSHA256": digest(scope), "teamSHA256": digest(team), "utcDayStart": day,
+                "indexPath": options["indexPath"], "bootstrap": options["bootstrap"]}
+
+    def jobs_report(self, ref, authority, reanchor=False):
+        raw = pinned(ref)
+        require(len(raw) <= JOBS_OBSERVATION_MAX_BYTES, "JOBS_OBSERVATION_BYTES")
+        report = strict_json(raw)
+        require(type(report) is dict and report.get("kind") == "okc-jobs-observation-v1"
+                and type(report.get("version")) is int and report["version"] == 1,
+                "JOBS_OBSERVATION_REPORT")
+        old = report["authority"]
+        if reanchor:
+            # Only an explicitly pinned bootstrap may cross a policy/code
+            # boundary. Never adopt an incompatible existing mutable index.
+            require(all(old[key] == authority[key] for key in ("transportScopeSHA256", "teamSHA256", "utcDayStart")),
+                    "JOBS_OBSERVATION_REANCHOR_SCOPE")
+        else:
+            require(canonical(old) == canonical(authority), "JOBS_OBSERVATION_AUTHORITY")
+        start, end = report["readStartedAt"], report["observedAt"]
+        require(type(start) in (int, float) and type(end) in (int, float)
+                and math.isfinite(start) and math.isfinite(end) and 0 <= end - start <= 60
+                and int(start // 86400) * 86400 == int(end // 86400) * 86400 == authority["utcDayStart"],
+                "JOBS_OBSERVATION_TIME")
+        window = jobs_window_identity(report["response"], end)
+        jobs = jobs_window_identity(report["jobs"], end, JOBS_OBSERVATION_MAX_IDS)
+        require(canonical(window) == canonical(report["window"])
+                and canonical(window) == canonical(jobs[:len(window)])
+                and digest(report["meBefore"]["team"]) == digest(report["meAfter"]["team"]) == authority["teamSHA256"],
+                "JOBS_OBSERVATION_BINDING")
+        if report["coverage"] == "utc_baseline":
+            require(report["previousReport"] is None and jobs_window_complete(window, authority["utcDayStart"])
+                    and canonical(jobs) == canonical(window), "JOBS_OBSERVATION_BASELINE")
+        else:
+            require(report["coverage"] == "head_overlap" and type(report["previousReport"]) is dict
+                    and SHA.fullmatch(report["previousReport"].get("sha256", "")), "JOBS_OBSERVATION_CHAIN")
+        return report
+
+    def jobs_bootstrap(self, authority):
+        ref = jobs_observation_policy(self.p)["bootstrap"]
+        raw = pinned(ref)
+        require(len(raw) <= JOBS_OBSERVATION_MAX_BYTES, "JOBS_OBSERVATION_BYTES")
+        seed = strict_json(raw)
+        if seed.get("kind") == "okc-jobs-observation-v1":
+            report = self.jobs_report(ref, authority, reanchor=True)
+            require(report["observedAt"] <= self.clock(), "JOBS_OBSERVATION_FUTURE")
+            return report["window"], report["jobs"], ref
+        require(type(seed.get("version")) is int and seed["version"] == 1 and type(seed["startEpoch"]) in (int, float)
+                and type(seed["endEpoch"]) in (int, float) and math.isfinite(seed["startEpoch"])
+                and math.isfinite(seed["endEpoch"]) and 0 <= seed["endEpoch"] - seed["startEpoch"] <= 60
+                and int(seed["startEpoch"] // 86400) * 86400 == authority["utcDayStart"]
+                and int(seed["endEpoch"] // 86400) * 86400 == authority["utcDayStart"]
+                and seed["endEpoch"] <= self.clock()
+                and seed["postTransport"] == self.p["transportHelper"] and type(seed.get("POSTs")) is int and seed["POSTs"] == 0,
+                "JOBS_OBSERVATION_BOOTSTRAP")
+        captured_policy_raw = pinned(seed["refs"]["policy"])
+        require(digest(captured_policy_raw) == seed["policySHA256"], "JOBS_OBSERVATION_BOOTSTRAP_POLICY")
+        captured_policy = strict_json(captured_policy_raw)
+        scope = {key: captured_policy[key] for key in ("project", "accountId", "model", "stateDirectory",
+                 "legacyLedger", "accountLock", "transportHelper")}
+        require(digest(scope) == authority["transportScopeSHA256"], "JOBS_OBSERVATION_BOOTSTRAP_SCOPE")
+        before = strict_json(pinned(seed["refs"]["meBefore"]))
+        after = strict_json(pinned(seed["refs"]["meAfter"]))
+        require(digest(before["team"]) == digest(after["team"]) == seed["teamSHA256"] == authority["teamSHA256"],
+                "JOBS_OBSERVATION_BOOTSTRAP_ACCOUNT")
+        window = jobs_window_identity(strict_json(pinned(seed["refs"]["jobs"])), seed["endEpoch"])
+        require(jobs_window_complete(window, authority["utcDayStart"]), "JOBS_OBSERVATION_BOOTSTRAP_COVERAGE")
+        return window, window, ref
+
+    def observe_jobs(self, response, me_before, read_started):
+        """GET-only evidence, separate from the unchanged single-POST helper."""
+        options = jobs_observation_policy(self.p)
+        try:
+            pinned(options["bootstrap"])
+            me_after = self.official.fetch("me")
+            now = self.clock(); day = int(now // 86400) * 86400
+            require(type(me_before.get("team")) is str and 1 <= len(me_before["team"]) <= 200
+                    and me_after.get("team") == me_before["team"], "JOBS_OBSERVATION_ACCOUNT")
+            require(0 <= now - read_started <= 60 and int(read_started // 86400) * 86400 == day,
+                    "JOBS_OBSERVATION_TIME")
+            authority = self.jobs_authority(me_before["team"], day)
+            window = jobs_window_identity(response, now)
+            path = pathlib.Path(options["indexPath"])
+            before_raw = protected(path, maximum=JOBS_OBSERVATION_MAX_BYTES) if path.exists() else None
+            previous_ref, coverage = None, "utc_baseline"
+            if before_raw is not None:
+                pointer = strict_json(before_raw)
+                require(type(pointer) is dict and set(pointer) == {"version", "report"}
+                        and type(pointer["version"]) is int and pointer["version"] == 1, "JOBS_OBSERVATION_INDEX")
+                old_raw = pinned(pointer["report"]); old = strict_json(old_raw)
+                old_authority = old["authority"]
+                # UTC rollover may begin a new proven baseline, but cannot
+                # carry the previous day's index across account/code changes.
+                same_scope = {k:v for k,v in old_authority.items() if k != "utcDayStart"}
+                require(canonical(same_scope) == canonical({k:v for k,v in authority.items() if k != "utcDayStart"}),
+                        "JOBS_OBSERVATION_AUTHORITY")
+                if old_authority["utcDayStart"] == day:
+                    old = self.jobs_report(pointer["report"], authority)
+                    require(old["observedAt"] <= now, "JOBS_OBSERVATION_FUTURE")
+                    jobs = jobs_head_overlap(old["window"], old["jobs"], window)
+                    previous_ref, coverage = pointer["report"], "head_overlap"
+                else:
+                    require(old_authority["utcDayStart"] < day and jobs_window_complete(window, day), "JOBS_OBSERVATION_ROLLOVER")
+                    jobs = window
+            elif jobs_window_complete(window, day):
+                jobs = window
+            else:
+                old_window, old_jobs, previous_ref = self.jobs_bootstrap(authority)
+                jobs = jobs_head_overlap(old_window, old_jobs, window); coverage = "head_overlap"
+            report = {"version": 1, "kind": "okc-jobs-observation-v1", "authority": authority,
+                      "readStartedAt": read_started, "observedAt": now, "coverage": coverage,
+                      "previousReport": previous_ref, "window": window, "jobs": jobs,
+                      "meBefore": me_before, "meAfter": me_after, "response": response}
+            raw = canonical(report)
+            require(len(raw) <= JOBS_OBSERVATION_MAX_BYTES, "JOBS_OBSERVATION_BYTES")
+            directory = self.state / "jobs-observation-reports"
+            directory.mkdir(mode=0o700, exist_ok=True)
+            require(directory.resolve() == directory and all(part.lstat().st_uid == 0
+                    and not part.lstat().st_mode & 0o022 and not stat.S_ISLNK(part.lstat().st_mode)
+                    for part in (directory, *directory.parents)), "JOBS_OBSERVATION_DIRECTORY")
+            ref = {"path": str(directory / (digest(raw) + ".json")), "sha256": digest(raw)}
+            current_raw = protected(path, maximum=JOBS_OBSERVATION_MAX_BYTES) if path.exists() else None
+            require(current_raw == before_raw, "JOBS_OBSERVATION_CAS")
+            self.io.immutable_snapshot(pathlib.Path(ref["path"]), raw)
+            require((protected(path, maximum=JOBS_OBSERVATION_MAX_BYTES) if path.exists() else None) == before_raw,
+                    "JOBS_OBSERVATION_CAS")
+            self.io.atomic_record(path, {"version": 1, "report": ref})
+            committed = protected(path)
+            require(canonical(strict_json(committed)) == canonical({"version": 1, "report": ref}), "JOBS_OBSERVATION_CAS")
+            return jobs, {"version": 1, "indexPath": str(path), "indexSHA256": digest(committed),
+                          "report": ref, "teamSHA256": authority["teamSHA256"], "observedAt": now,
+                          "readStartedAt": read_started, "utcDayStart": day}
+        except (ValueError, KeyError, TypeError, OSError) as error:
+            waiting = PreflightQuotaError("CHECK_QUOTA_SYNC_PENDING")
+            waiting.observation_reason = str(error)[:120]
+            raise waiting from error
+
+    def jobs_observation_read_set(self, checks):
+        proof = checks.get("jobsObservation")
+        if proof is None: return
+        try:
+            now = self.clock(); options = jobs_observation_policy(self.p)
+            require(proof["indexPath"] == options["indexPath"]
+                    and digest(protected(proof["indexPath"])) == proof["indexSHA256"]
+                    and canonical(strict_json(protected(proof["indexPath"]))["report"]) == canonical(proof["report"])
+                    and 0 <= now - proof["readStartedAt"] <= 60
+                    and proof["observedAt"] <= now
+                    and int(now // 86400) * 86400 == proof["utcDayStart"], "JOBS_OBSERVATION_STALE_OR_CHANGED")
+            raw = pinned(proof["report"]); report = strict_json(raw)
+            pinned(options["bootstrap"])
+            self.jobs_report(proof["report"], self.jobs_authority(report["meBefore"]["team"], proof["utcDayStart"]))
+        except (ValueError, KeyError, TypeError, OSError) as error:
+            waiting = PreflightQuotaError("CHECK_QUOTA_SYNC_PENDING")
+            waiting.observation_reason = str(error)[:120]
+            raise waiting from error
+
     def quota_observation(self, previous, jobs, problem, quota, now):
         """A lagging quota GET cannot erase CHECKs acknowledged by this lane.
 
@@ -1306,7 +1528,8 @@ class OfficialLane:
         require({n: digest(v.encode()) for n, v in current.items()} == self.p["boards"][problem]["officialFiles"], "OFFICIAL_CONTRACT_CHANGED")
         rules = self.official.fetch("llms.txt", public=True)
         metadata = self.official.fetch("rules")
-        accepted = self.official.fetch("me").get("rules", {})
+        account_before = self.official.fetch("me")
+        accepted = account_before.get("rules", {})
         require(digest(rules.encode()) == self.p["rulesEvidence"]["llmsSha256"]
                 and metadata.get("version") == self.p["rulesEvidence"]["version"], "RULES_CHANGED")
         require(accepted.get("version") == metadata["version"] and type(accepted.get("accepted_at")) in (float, int)
@@ -1328,8 +1551,13 @@ class OfficialLane:
         now = self.clock()
         require(sum(r.get("intentEpoch", 0) > now - 60 for r in previous) < maximum, "LOCAL_RATE_WAIT")
         jobs = self.official.fetch("jobs")
-        jobs = (self.reservation_jobs_window(jobs, now) if reservation_policy(self.p) is not None
-                else jobs if isinstance(jobs, list) else jobs.get("jobs"))
+        jobs_proof = None
+        if jobs_observation_policy(self.p) is not None:
+            jobs, jobs_proof = self.observe_jobs(jobs, account_before, reservation_started)
+            now = self.clock()
+        else:
+            jobs = (self.reservation_jobs_window(jobs, now) if reservation_policy(self.p) is not None
+                    else jobs if isinstance(jobs, list) else jobs.get("jobs"))
         require(isinstance(jobs, list) and all(type(j.get("submitted_at")) in (int, float)
                 and math.isfinite(j["submitted_at"]) for j in jobs), "JOBS_TIME_SCHEMA")
         require(sum(j["submitted_at"] > now - 60 for j in jobs) < maximum, "EXTERNAL_RATE_WAIT")
@@ -1341,6 +1569,9 @@ class OfficialLane:
             raise PreflightQuotaError("CHECK_QUOTA_SYNC_PENDING")
         result = {"checkedAt": now, "quota": q, "quotaObservation": observation,
                   "rules": self.p["rulesEvidence"], "effectiveRate": maximum}
+        if jobs_proof is not None:
+            result["jobsObservation"] = jobs_proof
+            self.jobs_observation_read_set(result)
         if reservation_policy(self.p) is not None:
             if int(reservation_started // 86400) * 86400 != observation["utcDayStart"]:
                 raise PreflightQuotaError("CHECK_QUOTA_SYNC_PENDING")
@@ -1403,6 +1634,7 @@ class OfficialLane:
             require(self.clock() < self.p["expiresAt"], "POLICY_EXPIRED")
             require(self.control_active(), "CONTROL_PAUSED")
             self.reservation_read_set(checks)
+            self.jobs_observation_read_set(checks)
             if int(self.clock() // 86400) * 86400 != checks["quotaObservation"]["utcDayStart"]:
                 raise PreflightQuotaError("CHECK_QUOTA_SYNC_PENDING")
             snapshot = self.state / (key + ".py")
@@ -1418,6 +1650,7 @@ class OfficialLane:
                         "operatorReviewedCandidate": False}
             intent_epoch = self.clock()
             self.reservation_read_set(checks)
+            self.jobs_observation_read_set(checks)
             if int(intent_epoch // 86400) * 86400 != checks["quotaObservation"]["utcDayStart"]:
                 raise PreflightQuotaError("CHECK_QUOTA_SYNC_PENDING")
             value = {"createdAt": dt.datetime.now(dt.timezone.utc).isoformat(), "intentEpoch": intent_epoch,
@@ -1425,6 +1658,8 @@ class OfficialLane:
                      "quotaObservation": checks["quotaObservation"]}
             if "uncertainCheckReservations" in checks:
                 value["uncertainCheckReservations"] = checks["uncertainCheckReservations"]
+            if "jobsObservation" in checks:
+                value["jobsObservation"] = checks["jobsObservation"]
             self.io.immutable_snapshot(intent, canonical(value))
             self.io.immutable_snapshot(mirror, canonical(value))
             # The single effect boundary. All failures after this point are
@@ -1697,6 +1932,7 @@ def scan(lane, status_path, mode):
                                  and status == "account_wait") else None),
                              "proposedRemediation": remediation,
                              **({"accountWaitReason": error.reservation_reason} if getattr(error, "reservation_reason", None) else {}),
+                             **({"jobsObservationReason": error.observation_reason} if getattr(error, "observation_reason", None) else {}),
                              **({"evidenceErrors": error.evidence_errors} if getattr(error, "evidence_errors", None) else {})}
             reservation = getattr(error, "uncertain_check_reservation", None)
             if (isinstance(error, ReservedUncertainEffect) and status == "uncertain_owned"

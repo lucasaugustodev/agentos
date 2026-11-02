@@ -2306,5 +2306,242 @@ class UncertainCheckReservationTests(unittest.TestCase):
         self.assertIsNone(outcome['postAttempted']);self.assertEqual(self.official.posts,0)
 
 
+class JobsObservationTests(unittest.TestCase):
+    def setUp(self):
+        self.f=Fixture();self.f.setUp();self.addCleanup(self.f.tearDown)
+        self.p,self.lane,self.official=self.f.p,self.f.lane,self.f.official
+        self.p['transportHelper']={'path':str(self.f.root/'transport.py'),'sha256':'d'*64}
+        self.p['minimumChecksRemaining']=0
+        self.now=NOW;self.day=int(NOW//86400)*86400;self.team='isolated-team'
+        self.lane.clock=lambda:self.now
+        self.original_fetch=self.official.fetch
+        self.official.fetch=self.fetch
+        self.baseline=[self.row(i+1,NOW-1000-i if i<43 else self.day-100-i) for i in range(50)]
+        self.seed=self.capture(self.baseline)
+        self.p['jobsObservation']={'version':1,'indexPath':str(pathlib.Path(self.p['stateDirectory'])/'jobs-observation-v1-testcase.json'),'bootstrap':self.seed}
+        self.index=pathlib.Path(self.p['jobsObservation']['indexPath'])
+
+    def row(self,i,stamp=None,mode='check'):
+        return {'job_id':f'{i:016x}','problem':BOARD,'mode':mode,'submitted_at':NOW-100+i if stamp is None else stamp}
+
+    def fetch(self,route,public=False):
+        if route=='me':return {'team':self.team,'rules':{'version':'test-rules-v1','accepted_at':1}}
+        if route=='problems':return {'tracks':{'kernels':{'open':True}},'problems':[{'name':BOARD,'limits':{'checks':{'per_day':200,'used':0,'left':200}}}]}
+        return self.original_fetch(route,public)
+
+    def put(self,name,value):
+        path=self.f.root/name;raw=A.canonical(value);IO.immutable_snapshot(path,raw)
+        return {'path':str(path),'sha256':A.digest(raw)}
+
+    def capture(self,jobs):
+        before=self.fetch('me');policy_raw=A.canonical(self.p)
+        refs={'meBefore':self.put('bootstrap-me-before.json',before),'meAfter':self.put('bootstrap-me-after.json',before),
+              'jobs':self.put('bootstrap-jobs.json',{'jobs':jobs}),'policy':self.put('bootstrap-policy.json',self.p)}
+        return self.put('bootstrap-capture.json',{'version':1,'startEpoch':self.now-2,'endEpoch':self.now-1,
+            'refs':refs,'postTransport':self.p['transportHelper'],'policySHA256':A.digest(policy_raw),
+            'teamSHA256':A.digest(self.team),'POSTs':0})
+
+    def observe(self,rows=None):
+        return self.lane.observe_jobs({'jobs':self.baseline if rows is None else rows},self.fetch('me'),self.now-1)
+
+    def append(self,count):
+        return [self.row(100+i,NOW-100-i) for i in range(count)]+self.baseline
+
+    def test_real_window50_to51_to60_preserves_all_ids(self):
+        jobs,proof=self.observe();self.assertEqual(len(jobs),50)
+        extended=self.append(1);jobs,proof=self.observe(extended[:50]);self.assertEqual(len(jobs),51)
+        later=[self.row(200+i,NOW-50-i) for i in range(9)]+extended
+        jobs,proof=self.observe(later[:50]);self.assertEqual(len(jobs),60)
+        self.assertEqual(jobs,later);self.lane.jobs_observation_read_set({'jobsObservation':proof})
+        self.assertEqual(self.official.posts,0)
+
+    def test_bootstrap_can_anchor_current_full_day_window(self):
+        rows=self.append(10);self.assertTrue(all(r['submitted_at']>=self.day for r in rows[:50]))
+        jobs,proof=self.observe(rows[:50]);self.assertEqual(len(jobs),60)
+        self.assertEqual(A.strict_json(A.pinned(proof['report']))['previousReport'],self.seed)
+
+    def test_more_than50_new_jobs_or_missing_head_is_a_gap(self):
+        self.observe();before=self.index.read_bytes()
+        for rows in [[self.row(500+i,NOW-100-i) for i in range(50)],self.baseline[1:]]:
+            with self.assertRaises(A.PreflightQuotaError):self.observe(rows)
+            self.assertEqual(self.index.read_bytes(),before)
+        self.assertEqual(self.official.posts,0)
+
+    def test_overlap_reorder_deletion_identity_change_and_reused_id_fail_closed(self):
+        jobs,proof=self.observe();original=self.index.read_bytes()
+        reused=self.append(12);self.observe(reused[:50]);original=self.index.read_bytes()
+        cases=[reused[1:51],copy.deepcopy(reused[:50]),copy.deepcopy(reused[:50]),
+            [copy.deepcopy(self.baseline[-1])]+reused[:49]]
+        cases[1][2]['mode']='run';cases[2][2],cases[2][3]=cases[2][3],cases[2][2]
+        cases[3][0]['submitted_at']=self.now-1
+        for rows in cases:
+            with self.assertRaises(A.PreflightQuotaError):self.observe(rows)
+            self.assertEqual(self.index.read_bytes(),original)
+
+    def test_mutable_status_changes_do_not_change_job_identity(self):
+        self.observe();changed=[{**r,'status':'done','speedup':1.5} for r in self.baseline]
+        jobs,_=self.observe(changed);self.assertEqual(jobs,self.baseline)
+
+    def test_token_rotation_same_team_is_ok_other_team_is_not(self):
+        self.observe();self.official.token='different-secret-not-observed'
+        self.observe();before=self.index.read_bytes();self.team='different-team'
+        with self.assertRaises(A.PreflightQuotaError):self.observe()
+        self.assertEqual(self.index.read_bytes(),before)
+
+    def test_team_changes_between_authenticated_gets_do_not_publish(self):
+        before=self.fetch('me');self.team='other-team'
+        with self.assertRaises(A.PreflightQuotaError):self.lane.observe_jobs({'jobs':self.baseline},before,self.now-1)
+        self.assertFalse(self.index.exists())
+
+    def test_utc_rollover_requires_current_complete_window_not_old_day_floor(self):
+        self.observe();self.now=self.day+86400+30
+        jobs,proof=self.observe(self.baseline)
+        self.assertEqual(proof['utcDayStart'],self.day+86400)
+        self.assertEqual(A.strict_json(A.pinned(proof['report']))['coverage'],'utc_baseline')
+        self.assertEqual(self.lane.quota_observation([],jobs,BOARD,{'used':0,'left':10,'per_day':10},self.now)['used'],0)
+
+    def test_utc_crossing_or_slow_reads_cannot_publish_or_create_intent(self):
+        for start in [self.now-61,self.day-1]:
+            with self.assertRaises(A.PreflightQuotaError):self.lane.observe_jobs({'jobs':self.baseline},self.fetch('me'),start)
+        self.assertFalse(self.index.exists());self.assertEqual(self.official.posts,0)
+
+    def test_read_set_rejects_stale_changed_index_namespace_and_policy(self):
+        jobs,proof=self.observe();checks={'jobsObservation':proof};raw=self.index.read_bytes()
+        self.now+=61
+        with self.assertRaises(A.PreflightQuotaError):self.lane.jobs_observation_read_set(checks)
+        self.now=NOW
+        IO.atomic_record(self.index,{'version':1,'report':self.seed})
+        with self.assertRaises(A.PreflightQuotaError):self.lane.jobs_observation_read_set(checks)
+        self.index.write_bytes(raw);self.lane.policy_sha='c'*64
+        with self.assertRaises(A.PreflightQuotaError):self.lane.jobs_observation_read_set(checks)
+
+    def test_existing_index_cannot_silently_cross_code_or_policy(self):
+        self.observe();before=self.index.read_bytes();self.p['adapterSHA256']='c'*64
+        with self.assertRaises(A.PreflightQuotaError):self.observe()
+        self.assertEqual(self.index.read_bytes(),before)
+
+    def test_explicit_pinned_reanchor_new_namespace_preserves_complete_chain(self):
+        self.observe();rows=self.append(12);jobs,proof=self.observe(rows[:50]);before=self.index.read_bytes()
+        old_index=self.index;self.lane.policy_sha='e'*64;self.p['adapterSHA256']='f'*64
+        self.p['jobsObservation']={'version':1,'indexPath':str(old_index.with_name('jobs-observation-v1-reanchor.json')),'bootstrap':proof['report']}
+        self.index=pathlib.Path(self.p['jobsObservation']['indexPath'])
+        new,ref=self.observe(rows[:50]);self.assertEqual(new,jobs)
+        self.assertEqual(old_index.read_bytes(),before);self.lane.jobs_observation_read_set({'jobsObservation':ref})
+
+    def test_default_full50_guard_remains_unchanged(self):
+        self.p.pop('jobsObservation')
+        with self.assertRaises(A.PreflightQuotaError):self.lane.reservation_jobs_window(self.append(12)[:50],NOW)
+
+    def test_retained_acknowledged_job_outside_window_still_counts_once(self):
+        self.observe();rows=self.append(12);jobs,_=self.observe(rows[:50]);old=self.baseline[42]
+        record={'state':'job_recorded','mode':'check','intentEpoch':old['submitted_at'],
+                'identity':{'problem':BOARD,'sourceSha256':'f'*64},'receipt':{'job_id':old['job_id']}}
+        self.assertNotIn(old['job_id'],[r['job_id'] for r in rows[:50]])
+        q=self.lane.quota_observation([record,record],jobs,BOARD,{'used':0,'left':200,'per_day':200},NOW)
+        self.assertEqual(len(q['knownJobIds']),55);self.assertEqual(q['used'],55)
+
+    def test_run_jobs_participate_in_rate_but_not_check_quota(self):
+        rows=[self.row(1000+i,NOW-1-i,'run') for i in range(6)]
+        self.official.jobs=rows
+        with self.assertRaisesRegex(ValueError,'EXTERNAL_RATE_WAIT'):self.lane.preflight(BOARD)
+        self.assertEqual(self.lane.quota_observation([],rows,BOARD,{'used':0,'left':10,'per_day':10},NOW)['used'],0)
+        self.assertEqual(self.official.posts,0)
+
+    def test_preintent_guard_is_after_audit_and_preserves_single_post_boundary(self):
+        self.official.jobs=self.baseline;original=self.lane.audit.audit;calls=[]
+        def late(oid):
+            result=original(oid);calls.append(oid)
+            if len(calls)==2:self.now+=61
+            return result
+        self.lane.audit.audit=late
+        with self.assertRaises(A.PreflightQuotaError):self.lane.run(OCC,'check')
+        self.assertEqual(calls,[OCC,OCC]);self.assertEqual(self.official.posts,0)
+        self.assertEqual(list(pathlib.Path(self.p['stateDirectory']).glob('*-check.json')),[])
+
+    def test_new_intent_pins_get_observation_but_transport_authority_is_unchanged(self):
+        self.official.jobs=self.baseline;transport=copy.deepcopy(self.p['transportHelper'])
+        self.assertEqual(self.lane.run(OCC,'check')['state'],'job_recorded')
+        intent=A.strict_json((pathlib.Path(self.p['stateDirectory'])/(BOARD+'-'+A.digest(self.f.candidate)+'-check.json')).read_bytes())
+        self.assertIn('jobsObservation',intent);self.assertEqual(self.p['transportHelper'],transport)
+        self.assertEqual(self.official.posts,1)
+
+    def test_duplicate_ids_envelope_and_unsafe_time_are_not_coverage(self):
+        for rows in [[self.baseline[0],self.baseline[0]],{**self.baseline[0],'submitted_at':float('inf')}]:
+            with self.assertRaises(A.PreflightQuotaError):self.observe(rows if isinstance(rows,list) else [rows])
+        with self.assertRaises(ValueError):A.jobs_window_identity({'jobs':self.baseline,'next':'cursor'},NOW)
+
+    def test_identity_limit_and_report_bytes_are_bounded(self):
+        self.observe();previous=self.baseline
+        for batch in range(3):
+            current=[self.row(2000+batch*49+i,NOW-500+batch*60-i) for i in range(49)]+previous
+            self.observe(current[:50]);previous=current
+        before=self.index.read_bytes();current=[self.row(3000+i,NOW-100-i) for i in range(4)]+previous
+        with self.assertRaises(A.PreflightQuotaError):self.observe(current[:50])
+        self.assertEqual(self.index.read_bytes(),before)
+        huge=[{**r,'ignoredMutable': 'x'*22000} for r in previous[:50]]
+        with self.assertRaises(A.PreflightQuotaError):self.observe(huge)
+
+    def test_index_cas_failure_cannot_publish_an_observation(self):
+        self.observe();original=IO.immutable_snapshot
+        def changed(path,raw):
+            original(path,raw)
+            if pathlib.Path(path).parent.name=='jobs-observation-reports':IO.atomic_record(self.index,{'version':1,'report':self.seed})
+        with mock.patch.object(IO,'immutable_snapshot',side_effect=changed),self.assertRaises(A.PreflightQuotaError):self.observe()
+        self.assertEqual(self.official.posts,0)
+
+    def test_clock_rollback_cannot_rejuvenate_an_existing_observation(self):
+        self.observe();before=self.index.read_bytes();self.now-=1
+        with self.assertRaises(A.PreflightQuotaError):self.observe()
+        self.assertEqual(self.index.read_bytes(),before)
+
+    def test_bootstrap_pin_is_rechecked_before_intent(self):
+        _,proof=self.observe();path=pathlib.Path(self.seed['path']);path.chmod(0o600);path.write_bytes(b'{}');path.chmod(0o400)
+        with self.assertRaises(A.PreflightQuotaError):self.lane.jobs_observation_read_set({'jobsObservation':proof})
+        self.assertEqual(self.official.posts,0)
+
+    def qualifier(self):
+        spec=importlib.util.spec_from_file_location('get_chain_qualifier',pathlib.Path(__file__).parents[1]/'tools/qualify_jobs_observation.py')
+        module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+        return module
+
+    def qualify(self,ref):
+        policy=copy.deepcopy(self.p);policy['jobsObservation']['bootstrap']=ref
+        policy['adapterSHA256']=A.digest(pathlib.Path(A.__file__).read_bytes())
+        return self.qualifier().qualify(A,policy,'e'*64,ref)
+
+    def test_qualifier_reconstructs_complete_chain_and_explicit_reanchor(self):
+        self.observe();_,head=self.observe(self.append(12)[:50])
+        proof=self.qualify(head['report']);self.assertEqual(proof['jobCount'],62)
+        self.assertEqual(len(proof['references']),2);self.assertTrue(proof['admissionRequiresNewFreshGETs'])
+        old=head['report'];self.p['jobsObservation']={'version':1,'indexPath':str(self.index.with_name('jobs-observation-v1-newscope.json')),'bootstrap':old}
+        self.lane.policy_sha='e'*64;self.p['adapterSHA256']='f'*64
+        _,new=self.observe(self.append(12)[:50]);self.assertEqual(self.qualify(new['report'])['jobCount'],62)
+
+    def test_qualifier_rejects_omitted_historical_id_outside_current_window(self):
+        self.observe();_,head=self.observe(self.append(12)[:50]);value=A.strict_json(A.pinned(head['report']))
+        value['jobs'].pop();bad=self.put('bad-omitted-history.json',value)
+        with self.assertRaisesRegex(ValueError,'QUALIFICATION_UNION_CHANGED'):self.qualify(bad)
+
+    def test_qualifier_rejects_dangling_cycle_and_implicit_authority_handover(self):
+        self.observe();_,head=self.observe(self.append(12)[:50]);original=A.strict_json(A.pinned(head['report']))
+        value=copy.deepcopy(original);value['previousReport']={'path':head['report']['path'],'sha256':'0'*64}
+        bad=self.put('bad-chain-cycle.json',value)
+        with self.assertRaises(ValueError):self.qualify(bad)
+        value=copy.deepcopy(original);value['authority']['policySHA256']='0'*64
+        bad=self.put('bad-implicit-authority.json',value)
+        with self.assertRaisesRegex(ValueError,'QUALIFICATION_REANCHOR_NOT_EXPLICIT'):self.qualify(bad)
+
+    def test_qualifier_bootstrap_capture_preserves_authenticated_raw_pins(self):
+        proof=self.qualify(self.seed);self.assertEqual(proof['jobCount'],50)
+        self.assertEqual(proof['GETs'],0);self.assertEqual(proof['POSTs'],0)
+        capture=A.strict_json(A.pinned(self.seed));path=pathlib.Path(capture['refs']['jobs']['path'])
+        path.chmod(0o600);path.write_bytes(b'{"jobs":[]}');path.chmod(0o400)
+        with self.assertRaisesRegex(ValueError,'PIN_CHANGED'):self.qualify(self.seed)
+
+    def test_qualifier_requires_policy_pin_for_the_exact_adapter(self):
+        with self.assertRaisesRegex(ValueError,'QUALIFICATION_ADAPTER_POLICY_PIN'):
+            self.qualifier().qualify(A,self.p,'e'*64,self.seed)
+
+
 if __name__ == "__main__":
     unittest.main()

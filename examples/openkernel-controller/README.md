@@ -437,3 +437,37 @@ Its projected `postAttempted: null` means uncertain, not that no POST occurred;
 explicit. The proof binds the current detail and policy hashes and the exact
 reviewed intent. New uncertainty, changed evidence or stale proof restores the
 default block. Neither this marker nor a CPU task grants CHECK authority.
+
+### A bounded GET observation index for the recent-jobs window
+
+The optional `jobsObservation` policy has `version: 1`, a new namespaced
+`indexPath` inside the controller state directory, and a pinned `bootstrap`
+reference. Without it, the existing full-50-job guard remains unchanged. The
+API's `limit` and `offset` parameters are not assumed to implement pagination.
+
+Each admission reads the authenticated account, recent jobs and account again.
+It requires one stable team, one UTC day and at most 60 seconds across the
+observation and final pre-intent checks. A baseline must reach before the UTC
+boundary or be the actual short recent-jobs window. Later windows must contain
+the previous head and exactly the same remaining prefix in the same order.
+Only IDs preceding that head are added; an ID already in the historical union
+cannot reappear there. A gap, deletion, reorder, changed identity or ambiguous
+window waits for reconciliation rather than declaring the list complete.
+
+The immutable report keeps the raw authenticated responses, the four immutable
+job identity fields, its predecessor and the complete verified union, bounded
+to 200 IDs and 1 MiB. Mutable result/status fields do not change job identity.
+All modes participate in the rate window; only CHECKs on the matching board
+participate in its quota floor. The index uses a compare-and-swap check under
+the existing account lock and is pinned again before creating an intent.
+The official POST helper and uncertain-intent reservations remain unchanged.
+
+A policy, code or account change cannot silently adopt an existing index.
+For a reviewed handover, `tools/qualify_jobs_observation.py` must verify the
+complete pinned predecessor chain, reconstruct every union, and check the
+baseline before its report is explicitly pinned as the bootstrap of a new
+namespace. The qualifier is offline and prepare-only, bounded to 256 references
+and 16 MiB; it never authorizes a submission or resets a consumption floor.
+Even a qualified historical anchor requires new authenticated GETs and strict
+overlap before admission. UTC rollover starts a newly proven daily baseline;
+the unresolved CHECK reservation itself persists across that boundary.
