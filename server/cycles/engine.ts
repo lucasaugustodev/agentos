@@ -9,6 +9,7 @@ import { runCycleAction, runCycleAgent, saveCycleArtifacts, readCycleArtifact } 
 import { inspectStopped } from '../continuation.js';
 import { collectStoppedArtifacts } from '../artifact-recovery.js';
 import { checkDependencyEvidence, assertDependencySnapshot, DependencyBindingError } from './dependency-evidence.js';
+import { claimCycleTerminationInspections, inspectAndRecordCycleTermination } from './termination-evidence.js';
 
 const terminal = ['completed', 'cancelled'];
 export class CycleEngine {
@@ -18,6 +19,16 @@ export class CycleEngine {
   active = new Map<string, AbortController>();
   busy = false;
   stopped = false;
+  terminationEvidenceWork?: Promise<void>;
+  scheduleTerminalEvidence() {
+    if (this.stopped || this.terminationEvidenceWork) return;
+    // Evidence I/O cannot hold up ready worker dispatch. At most two read-only
+    // inspections run, and their transaction rechecks the exact failed attempt.
+    this.terminationEvidenceWork = (async () => {
+      const claims = await claimCycleTerminationInspections();
+      await Promise.all(claims.map(claim => inspectAndRecordCycleTermination(claim)));
+    })().catch(() => {}).finally(() => { this.terminationEvidenceWork = undefined; });
+  }
   async start() {
     this.timer = setInterval(() => void this.tick(), 2000);
     await this.tick();
@@ -57,6 +68,7 @@ export class CycleEngine {
         if (!job) break;
         void this.execute(job);
       }
+      this.scheduleTerminalEvidence();
     } catch (e: any) {
       await pool
         .query(
@@ -613,6 +625,7 @@ export class CycleEngine {
     clearInterval(this.timer);
     for (const c of this.active.values()) c.abort();
     while (this.active.size || this.busy) await new Promise((r) => setTimeout(r, 100));
+    await this.terminationEvidenceWork;
     if (this.owner) {
       await this.owner.query('SELECT pg_advisory_unlock(4280088)');
       this.owner.release();
