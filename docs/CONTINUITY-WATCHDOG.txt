@@ -482,3 +482,37 @@ available slots (7/8/8) with an input below1MiB; its synthetic plan is never sen
 Retrospective incident reconstruction is labelled as such and does not replace an
 old persisted review's proof or establish the cause of a later authority failure.
 These checks do not establish live dispatch, accepted work or GPU improvement.
+
+Mixed action plans (explicit planVersion=2)
+
+A version-1 plan chooses one global mode. Selecting evidence repair therefore
+prevents the same review from requesting independent code experiments. Version 2
+uses decision=actions and an explicit kind on every entry: experiment or
+repair_evidence. Both can coexist in one bounded plan. Each repair still requires
+the exact authorized target, immutable candidate/patch and independent replay/QA;
+ordinary code work retains its own source, scope and acceptance checks. Per-action
+source proofs select the appropriate experiment or repair hash. Unknown POSTs
+continue through GET-only reconciliation, including a lost repair acknowledgement
+after an ordinary experiment was already dispatched.
+
+Every boardAvailableCandidateSlots key requires one capacityReview entry with the
+observed availableSlots, exact plannedActions count and a short factual reason.
+The counts describe the immutable planning input; fresh admission independently
+checks current capacity. Reasons are model judgments, not deterministic proof of
+novelty or exhaustion. The supervisor must consider every board, mix urgent repairs
+with independent hypotheses, and avoid waiting for a different candidate's GPU
+result when its proposed CPU work does not depend on that result. Capacity alone
+does not justify filler work or waive any correctness gate.
+
+This opt-in changes the control definition, unlike capacity-only configuration.
+Pin a matching versioned control definition before activation. Existing version-1
+reviews and request bodies are not rewritten or silently promoted. A new manual
+control cycle permits a reversible pin handover without changing in-flight
+occurrences. Do not roll back to an old reader while version-2 plans still require
+reconciliation: preserve a compatible reader and the current complete state.
+
+Server qualification has 193 passing tests before the independent payload-storage
+change. Nine new cases cover 24 mixed actions, exact repair routing, invalid kinds
+and capacity reports, unchanged legacy definitions, current capacity admission,
+lost acknowledgements and per-action repair read sets. These are isolated controller
+tests, not evidence that 24 agents have actually started or produced GPU gains.

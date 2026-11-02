@@ -2774,5 +2774,145 @@ class WatchTests(unittest.TestCase):
         self.assertFalse(W.confirmed_boundary(d))
 
 
+    def enable_mixed_plan_contract(self):
+        self.parallel_capacity()
+        self.config.update(planVersion=2, maxPendingCandidates=24, maxPipelinesPerProblem=8)
+        self.config['controlDefinitionSHA256'] = W.digest(W.supervisor_definition(self.config))
+        self.client.cycles[self.config['controlCycleId']]['definition'] = W.supervisor_definition(self.config)
+        W.validate_config(self.config)
+
+    def mixed_plan(self, counts, repair=None):
+        plan = self.parallel_plan(counts)
+        plan.update(version=2, decision='actions')
+        for exp in plan['experiments']:
+            exp['kind'] = 'experiment'
+        if repair:
+            exp = next(e for e in plan['experiments'] if e['problem'] == repair['problem'])
+            exp.update(kind='repair_evidence', sourceArtifactId=repair['candidateArtifactId'])
+        inp = self.w.state['supervisions'][-1]['input']
+        plan['capacityReview'] = [{'problem': p, 'availableSlots': n, 'plannedActions': counts.get(p, 0),
+            'reason': 'Selected distinct source-bound CPU strategies; remaining capacity awaits additional discriminating evidence.'}
+            for p, n in inp['boardAvailableCandidateSlots'].items()]
+        return plan
+
+    def prepare_mixed_actions(self, counts=None):
+        status = self.repairable_operation()
+        self.enable_mixed_plan_contract()
+        self.add_seed(); self.add_seed('muse_attention_decode', b'# attention\n')
+        self.install_diagnostic_fixture([status])
+        self.w.tick()
+        inp = self.w.state['supervisions'][-1]['input']
+        repair = inp['autoCheckDiagnostics']['repairableEvidence'][0]
+        return self.mixed_plan(counts or {'muse_prefill_layer': 1, 'muse_decode_layer': 1}, repair), repair
+
+    def test_mixed_contract_is_explicit_optin_and_legacy_definition_is_unchanged(self):
+        original = W.supervisor_definition(self.config)
+        self.enable_mixed_plan_contract()
+        self.assertNotEqual(original, W.supervisor_definition(self.config))
+        self.assertEqual(original, W.supervisor_definition({**self.config, 'planVersion': 1}))
+        text = W.supervisor_definition(self.config)['steps'][0]['instructions']
+        self.assertIn('Mix immutable evidence repairs with new', text)
+        self.assertIn('including the SAME board', text)
+        self.assertNotIn('otherwise []', text)
+        for value in [True, 0, 3]:
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, 'PLAN_VERSION_CONFIG'):
+                W.validate_config({**self.config, 'planVersion': value})
+
+    def test_mixed_twenty_four_actions_dispatch_repair_and_independent_work_together(self):
+        plan, repair = self.prepare_mixed_actions({p: 8 for p in W.PROBLEMS})
+        self.complete_review(plan)
+        result = self.w.tick()
+        self.assertEqual(result['state'], 'experiments_dispatched')
+        self.assertEqual(len(result['dispatched']), 24)
+        repairs = [r for r in result['dispatched'] if r.get('repairCandidateSHA256')]
+        self.assertEqual(len(repairs), 1)
+        self.assertEqual(repairs[0]['repairCandidateSHA256'], repair['candidateSHA256'])
+        for r in result['dispatched']:
+            definition = self.client.occurrences[r['occurrenceId']]['occurrence']['definition']
+            self.assertEqual([s['key'] for s in definition['steps']], ['produce', 'independent-qa'])
+            self.assertEqual(definition['allowedActions'], [])
+        self.assertEqual(self.w.observe()['pipelineUsed'], 24)
+
+    def test_mixed_action_cannot_label_an_unauthorized_source_as_repair(self):
+        plan, _ = self.prepare_mixed_actions()
+        plan['experiments'][0]['kind'] = 'repair_evidence'
+        self.complete_review(plan)
+        posts = len(self.client.posts)
+        result = self.w._tick_once()
+        self.assertEqual(result['code'], 'REPAIR_SCOPE_NOT_AUTHORIZED')
+        self.assertEqual(len(self.client.posts), posts)
+
+    def test_mixed_kind_and_capacity_report_are_strict(self):
+        plan, _ = self.prepare_mixed_actions()
+        inp = self.w.state['supervisions'][-1]['input']
+        observation = {'fingerprint': plan['evidenceFingerprint'], **inp}
+        changes = ['kind', 'missing_kind', 'missing_board', 'duplicate_board', 'invented_slots', 'invented_actions', 'bool_count', 'short_reason']
+        for change in changes:
+            bad = copy.deepcopy(plan)
+            if change == 'kind': bad['experiments'][0]['kind'] = 'shell'
+            elif change == 'missing_kind': del bad['experiments'][0]['kind']
+            elif change == 'missing_board': bad['capacityReview'].pop()
+            elif change == 'duplicate_board': bad['capacityReview'][-1] = bad['capacityReview'][0]
+            elif change == 'invented_slots': bad['capacityReview'][0]['availableSlots'] += 1
+            elif change == 'invented_actions': bad['capacityReview'][0]['plannedActions'] += 1
+            elif change == 'bool_count': bad['capacityReview'][0]['plannedActions'] = True
+            else: bad['capacityReview'][0]['reason'] = 'idle'
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                W.validate_plan(bad, observation, self.config)
+
+    def test_mixed_contract_does_not_accept_legacy_plan_under_new_prompt(self):
+        self.enable_mixed_plan_contract(); self.w.tick()
+        self.complete_review(self.plan())
+        posts = len(self.client.posts)
+        self.assertEqual(self.w._tick_once()['code'], 'PLAN_FIELDS')
+        self.assertEqual(len(self.client.posts), posts)
+
+    def test_mixed_coverage_uses_immutable_review_but_admission_uses_fresh_capacity(self):
+        plan, _ = self.prepare_mixed_actions()
+        original = self.w.state['supervisions'][-1]['input']
+        observation = self.w.observe()
+        observation['boardAvailableCandidateSlots']['muse_prefill_layer'] -= 1
+        self.assertEqual(W.validate_plan(plan, observation, self.config,
+                         expected_fingerprint=plan['evidenceFingerprint'], source_input=original), plan)
+        observation['boardAvailableCandidateSlots']['muse_prefill_layer'] = 0
+        with self.assertRaisesRegex(ValueError, 'PLAN_BOARD_CAPACITY'):
+            W.validate_plan(plan, observation, self.config, expected_fingerprint=plan['evidenceFingerprint'], source_input=original)
+
+    def test_mixed_repair_lost_ack_reconciles_without_duplicate_dispatch(self):
+        plan, repair = self.prepare_mixed_actions()
+        self.complete_review(plan)
+        self.client.timeout_after_commit_number = len(self.client.posts) + 4
+        with self.assertRaises(TimeoutError): self.w.tick()
+        posts = len(self.client.posts)
+        self.reload()
+        self.assertEqual(self.w.tick()['state'], 'experiments_dispatched')
+        self.assertEqual(len(self.client.posts), posts)
+        owned = self.w.state['experiments'][-2:]
+        self.assertEqual(len({r['occurrenceId'] for r in owned}), 2)
+        self.assertEqual(owned[-1]['repairCandidateSHA256'], repair['candidateSHA256'])
+
+    def test_mixed_changed_authority_with_lost_repair_ack_is_get_only(self):
+        plan, repair = self.prepare_mixed_actions()
+        self.complete_review(plan)
+        self.client.timeout_after_commit_number = len(self.client.posts) + 4
+        with self.assertRaises(TimeoutError): self.w.tick()
+        posts = len(self.client.posts)
+        self.config['maxPendingCandidates'] = 23
+        self.install_diagnostic_fixture([repair])
+        self.reload()
+        self.assertEqual(self.w.tick()['state'], 'changed_plan_reconciled')
+        self.assertEqual(len(self.client.posts), posts)
+        self.assertEqual(self.w.state['experiments'][-1]['repairCandidateSHA256'], repair['candidateSHA256'])
+
+    def test_mixed_source_scope_checks_repair_target_for_its_own_action(self):
+        plan, _ = self.prepare_mixed_actions()
+        pending = self.w.state['supervisions'][-1]
+        pending['approvedPlan'] = plan
+        fresh = self.w.observe()
+        self.assertTrue(W.unchanged_action_scope(pending, fresh, self.config))
+        fresh['autoCheckDiagnostics']['repairableEvidence'][0]['qaSHA256'] = 'f' * 64
+        self.assertFalse(W.unchanged_action_scope(pending, fresh, self.config))
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

@@ -422,9 +422,63 @@ def definition(config, name, steps):
             "concurrency": 1, "allowedActions": [], "allowedAccounts": [config["accountId"]], "steps": steps}
 
 
+SUPERVISOR_V2 = """You are the periodic OpenKernel portfolio supervisor. Inspect cycle-input.json
+and plan useful independent work across Decode, Prefill and Attention. MoE/BF16
+standalone boards belong to another operator. Read the supplied source capsules and
+candidate-bound evidence before selecting each hypothesis. Preserve canonical
+contracts, active actors, uncertain ownership and the exact source identities.
+
+Publish ONLY evidence/continuation-plan.json and evidence/supervisor-summary.txt,
+plus the mandatory native handoff. The plan has exactly these fields:
+{ "version":2, "evidenceFingerprint":"<input evidenceFingerprint>",
+  "decision":"actions" or "await_external" or "observe_active",
+  "reason":"20..1200 characters",
+  "experiments":[{"id":"short-lowercase-id", "kind":"experiment" or "repair_evidence",
+    "problem":"muse_decode_layer" or "muse_prefill_layer" or "muse_attention_decode",
+    "sourceArtifactId":"UUID from catalog", "hypothesis":"20..1200 characters",
+    "instructions":"50..12000 characters"}],
+  "capacityReview":[{"problem":"one entry for EVERY boardAvailableCandidateSlots key",
+    "availableSlots":0, "plannedActions":0, "reason":"20..600 characters"}] }
+
+For decision=actions, include 1..availableCandidateSlots actions, respecting each
+boardAvailableCandidateSlots limit. Mix immutable evidence repairs with new
+experiments in ONE plan. Review EVERY board, not only the first urgent defect.
+Aim for the requested parallel portfolio in input, with distinct useful hypotheses
+and discriminating CPU checks. Do not create filler or repeat owned hypotheses under
+different names. capacityReview must explain the selected count and any unused
+capacity from actual source/bottleneck/dependency evidence. A negative result from
+one variant does not exhaust a whole board. GPU work on a DIFFERENT candidate,
+including the SAME board, is not a dependency of independent CPU work. An evidence
+repair must not serialize unrelated optimization work.
+
+kind=experiment changes code against the named confirmed candidate.py, with an
+explicit falsifier, negative control and expected artifacts. Do not delegate an
+optimization already present in that source or call CPU success a GPU improvement.
+kind=repair_evidence may name ONLY a candidateArtifactId in repairableEvidence.
+It preserves candidate, base and original patch bytes; only the preauthorized
+transport-header normalization in canonicalPatch is allowed. It repairs/replays
+evidence followed by fresh independent QA. It cannot fix code or numerical defects.
+Use kind=experiment for an actual semantic defect. Quota, paused policy and uncertain
+POST ownership never confer repair authority. Each action retains its own gates.
+
+For decision=await_external, experiments=[] and name a full pending official
+candidate SHA256 in reason. Explain in capacityReview why no independent eligible
+work can proceed; waiting on one candidate alone is insufficient. When
+diagnosticOnly=true, decision=observe_active, experiments=[], and quote an exact
+active occurrence UUID in reason. Diagnose without stopping/replacing its actor.
+A heartbeat proves presence, not progress; a long call can be legitimate.
+
+Use ONLY supplied eligibleProblems, confirmedSourceArtifactIds and source capsules.
+No network, arbitrary actions, new permissions or official GPU submissions. The
+controller validates and dispatches producer plus independent QA for each action.
+Keep compact plan JSON below 65536 bytes. The summary states the concrete next work,
+remaining blockers and capacity decisions. Do not build another plan validator.
+"""
+
+
 def supervisor_definition(config):
     return definition(config, "Supervisão contínua — OpenKernel", [native_step(config, "supervise",
-        "Conferir progresso e decidir a próxima experiência", COMMON + SUPERVISOR,
+        "Conferir progresso e decidir a próxima experiência", COMMON + (SUPERVISOR_V2 if config.get("planVersion") == 2 else SUPERVISOR),
         ["continuation-plan.json", "supervisor-summary.txt"])])
 
 
@@ -436,6 +490,8 @@ def validate_config(config, bound=True):
     require(re.fullmatch(r"agentos-api-[a-f0-9-]{36}", config.get("accountId", "")), "ACCOUNT_SCOPE")
     capacity_version = config.get("pipelineCapacityVersion", 1)
     require(type(capacity_version) is int and capacity_version in [1, 2], "PIPELINE_CAPACITY_VERSION")
+    require(type(config.get("planVersion", 1)) is int and config.get("planVersion", 1) in [1, 2]
+            and (config.get("planVersion", 1) == 1 or capacity_version == 2), "PLAN_VERSION_CONFIG")
     if capacity_version == 2:
         require(type(config.get("maxPendingCandidates")) is int and 1 <= config["maxPendingCandidates"] <= 24,
                 "CANDIDATE_CAPACITY")
@@ -515,11 +571,23 @@ def native_experiment_identity(detail, problem):
         return None
 
 
+def action_kind(plan, experiment):
+    """Versioned action semantics; legacy request bodies/identities stay unchanged."""
+    return experiment["kind"] if plan["version"] == 2 else (
+        "repair_evidence" if plan["decision"] == "repair_evidence" else "experiment")
+
+
 def validate_plan(plan, observation, config, expected_fingerprint=None, source_input=None):
-    require(type(plan) is dict and set(plan) == {"version", "evidenceFingerprint", "decision", "reason", "experiments"}, "PLAN_FIELDS")
-    require(plan["version"] == 1 and plan["evidenceFingerprint"] ==
+    original = observation if source_input is None else source_input
+    version = original.get("planVersion", 1)
+    fields = {"version", "evidenceFingerprint", "decision", "reason", "experiments"}
+    if version == 2:
+        fields.add("capacityReview")
+    require(type(plan) is dict and set(plan) == fields, "PLAN_FIELDS")
+    require(type(plan["version"]) is int and plan["version"] == version and plan["evidenceFingerprint"] ==
             (observation["fingerprint"] if expected_fingerprint is None else expected_fingerprint), "PLAN_EVIDENCE")
-    require(plan["decision"] in ["experiments", "repair_evidence", "await_external", "observe_active"] and type(plan["reason"]) is str
+    decisions = ["actions", "await_external", "observe_active"] if version == 2 else ["experiments", "repair_evidence", "await_external", "observe_active"]
+    require(plan["decision"] in decisions and type(plan["reason"]) is str
             and 20 <= len(plan["reason"]) <= 1200, "PLAN_DECISION")
     experiments = plan["experiments"]
     require(type(experiments) is list, "PLAN_EXPERIMENTS")
@@ -527,7 +595,7 @@ def validate_plan(plan, observation, config, expected_fingerprint=None, source_i
     capacity = min(config["maxPendingCandidates"], observation["availableCandidateSlots"],
                    len(repairs) if plan["decision"] == "repair_evidence" else config["maxPendingCandidates"])
     require((plan["decision"] in ["await_external", "observe_active"] and not experiments) or
-            (plan["decision"] in ["experiments", "repair_evidence"] and 1 <= len(experiments) <= capacity), "PLAN_CAPACITY")
+            (plan["decision"] in ["actions", "experiments", "repair_evidence"] and 1 <= len(experiments) <= capacity), "PLAN_CAPACITY")
     if observation.get("diagnosticOnly"):
         require(plan["decision"] == "observe_active" and any(r["occurrenceId"] in plan["reason"]
                 for r in observation.get("active", [])), "LIVE_OWNER_DIAGNOSIS_ONLY")
@@ -541,7 +609,11 @@ def validate_plan(plan, observation, config, expected_fingerprint=None, source_i
     reserved = {r["key"] for r in observation.get("hypothesisReservations", [])} if parallel else set()
     catalog = {r["id"]: r for r in observation["catalog"]}
     for exp in experiments:
-        require(type(exp) is dict and set(exp) == {"id", "problem", "sourceArtifactId", "hypothesis", "instructions"}, "EXPERIMENT_FIELDS")
+        exp_fields = {"id", "problem", "sourceArtifactId", "hypothesis", "instructions"}
+        if version == 2:
+            exp_fields.add("kind")
+        require(type(exp) is dict and set(exp) == exp_fields, "EXPERIMENT_FIELDS")
+        require(action_kind(plan, exp) in ["experiment", "repair_evidence"], "ACTION_KIND")
         require(re.fullmatch(r"[a-z][a-z0-9-]{2,40}", exp.get("id", "")) and exp["id"] not in seen, "EXPERIMENT_ID")
         seen.add(exp["id"])
         require(exp["problem"] in PROBLEMS, "EXPERIMENT_SCOPE")
@@ -556,7 +628,7 @@ def validate_plan(plan, observation, config, expected_fingerprint=None, source_i
         else:
             require(boards[exp["problem"]] == 1, "PLAN_DUPLICATE_BOARD")
         validate_source_access(source, observation if source_input is None else source_input)
-        if plan["decision"] == "repair_evidence":
+        if action_kind(plan, exp) == "repair_evidence":
             require(any(r["candidateArtifactId"] == exp["sourceArtifactId"] and r["problem"] == exp["problem"]
                         for r in repairs), "REPAIR_SCOPE_NOT_AUTHORIZED")
         require(type(exp["hypothesis"]) is str and 20 <= len(exp["hypothesis"]) <= 1200, "HYPOTHESIS")
@@ -565,7 +637,7 @@ def validate_plan(plan, observation, config, expected_fingerprint=None, source_i
             identity = hypothesis_identity(exp["problem"], source["digest"], exp["hypothesis"])
             require(identity not in hypotheses and identity not in reserved, "PLAN_DUPLICATE_HYPOTHESIS")
             hypotheses.add(identity)
-            if plan["decision"] == "repair_evidence":
+            if action_kind(plan, exp) == "repair_evidence":
                 candidate = (exp["problem"], source["digest"])
                 native_occurrences = {oid for row in observation["pipelineOwners"]
                                       if "native" in row["stages"] for oid in row["occurrenceIds"]}
@@ -576,6 +648,19 @@ def validate_plan(plan, observation, config, expected_fingerprint=None, source_i
                                 and row["occurrenceId"] in native_occurrences for row in observation["catalog"]),
                     "PLAN_DUPLICATE_REPAIR")
                 repair_candidates.add(candidate)
+    if version == 2:
+        rows = plan["capacityReview"]
+        slots = original["boardAvailableCandidateSlots"]
+        require(type(rows) is list and len(rows) == len(slots), "CAPACITY_REVIEW")
+        covered = set()
+        for row in rows:
+            require(type(row) is dict and set(row) == {"problem", "availableSlots", "plannedActions", "reason"}, "CAPACITY_REVIEW")
+            problem = row["problem"]
+            require(type(problem) is str and problem in slots and problem not in covered, "CAPACITY_REVIEW")
+            covered.add(problem)
+            require(type(row["availableSlots"]) is int and row["availableSlots"] == slots[problem]
+                    and type(row["plannedActions"]) is int and row["plannedActions"] == boards.get(problem, 0)
+                    and type(row["reason"]) is str and 20 <= len(row["reason"]) <= 600, "CAPACITY_REVIEW")
     return plan
 
 
@@ -715,14 +800,14 @@ def unchanged_action_scope(pending, observation, config):
     proof, plan = pending.get("actionEvidence"), pending["approvedPlan"]
     if not isinstance(proof, dict) or proof.get("version") not in [1, 2] or not plan["experiments"]:
         return False
-    if plan["decision"] not in ["experiments", "repair_evidence"]:
+    if plan["decision"] not in ["actions", "experiments", "repair_evidence"]:
         return False
     current = action_evidence(observation, config, version=proof["version"])
     if proof["version"] == 2:
         if proof.get("authoritySHA256") != current["authoritySHA256"] or not isinstance(proof.get("sources"), dict):
             return False
-        field = "repairSHA256" if plan["decision"] == "repair_evidence" else "experimentSHA256"
         for experiment in plan["experiments"]:
+            field = "repairSHA256" if action_kind(plan, experiment) == "repair_evidence" else "experimentSHA256"
             old, new = (value.get("sources", {}).get(experiment["sourceArtifactId"]) for value in [proof, current])
             if not isinstance(old, dict) or not isinstance(new, dict) or old.get("unavailable") or new.get("unavailable"):
                 return False
@@ -1747,6 +1832,8 @@ class Watchdog:
             ["outcomes", "catalog", "officialJobs", "availableCandidateSlots", "pendingOfficialCandidateSHA256", "active", "diagnosticOnly",
              "pipelineLimit", "pipelineUsed", "pipelineOwners", "blockedProblems", "eligibleProblems", "confirmedSourceArtifactIds"]}}}
         body["input"]["priorDispatches"] = self.state["experiments"][-10:]
+        if self.config.get("planVersion") == 2:
+            body["input"]["planVersion"] = 2
         if observation.get("pipelineCapacityVersion") == 2:
             body["input"].update({k: observation[k] for k in ["pipelineCapacityVersion", "pipelinePerProblemLimit",
                 "pipelineUsedByProblem", "boardAvailableCandidateSlots", "nativePipelineUsed", "waitingPipelineUsed",
@@ -1838,7 +1925,7 @@ class Watchdog:
 
     def dispatch_experiment(self, experiment, observation, supervisor):
         repair = None
-        if supervisor["approvedPlan"]["decision"] == "repair_evidence":
+        if action_kind(supervisor["approvedPlan"], experiment) == "repair_evidence":
             repair = next(r for r in observation["autoCheckDiagnostics"]["repairableEvidence"]
                           if r["candidateArtifactId"] == experiment["sourceArtifactId"])
         producer = COMMON + """Read input.experiment. Implement exactly its bounded hypothesis against
@@ -2025,7 +2112,7 @@ If complete evidence cannot fit, report the limitation and fail the repair.
                 if row is None:
                     unstarted.append({"experimentId": exp["id"], "reason": "RUN_NOT_ATTEMPTED", "cycleId": created["id"]}); continue
                 repair = None
-                if pending["approvedPlan"]["decision"] == "repair_evidence":
+                if action_kind(pending["approvedPlan"], exp) == "repair_evidence":
                     original = next(r for r in pending["input"]["autoCheckDiagnostics"]["repairableEvidence"]
                                     if r["candidateArtifactId"] == exp["sourceArtifactId"])
                     target = row["input"]["experiment"]["repairTarget"]
