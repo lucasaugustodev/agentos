@@ -1158,5 +1158,156 @@ class Fixture(unittest.TestCase):
         self.assertEqual(self.official.posts, 1)
 
 
+class ScanSelectionTests(unittest.TestCase):
+    def setUp(self):
+        self.fixture = Fixture(); self.fixture.setUp(); self.addCleanup(self.fixture.tearDown)
+        self.root, self.p = self.fixture.root, self.fixture.p
+        self.status = self.root / "fair-status.json"
+        self.rows = [{"occurrenceId": "aaaaaaaa-aaaa-aaaa-aaaa-" + str(i).zfill(12), "problem": BOARD}
+                     for i in range(1, 206)]
+        self.calls, self.registered = [], {}
+        def run(oid, mode):
+            self.calls.append(oid)
+            return {"state": "eligible", "postAttempted": False}
+        self.lane = types.SimpleNamespace(p=self.p, policy_sha="b"*64, io=IO,
+            registered_occurrences=lambda: self.registered,
+            audit=types.SimpleNamespace(diagnostic_binding=lambda oid: {
+                "candidateSHA256": None, "qaArtifactId": None, "qaSHA256": None}),
+            run=run, clock=lambda: NOW, state=pathlib.Path(self.p["stateDirectory"]),
+            legacy=pathlib.Path(self.p["legacyLedger"]))
+
+    def state(self, rows):
+        path = pathlib.Path(self.p["watcherStateDirectory"]) / "state.json"
+        IO.atomic_record(path, {"watchId": WATCH, "experiments": rows})
+        return path
+
+    def job(self, row):
+        return {"id": "0123456789abcdef", "problem": BOARD, "sourceSHA256": "c"*64,
+                "qaArtifactId": IDS[0], "qaSHA256": "d"*64}
+
+    def test_old_unregistered_owners_are_not_dropped_by_last_hundred(self):
+        rows = self.rows[:119]
+        self.registered.update({r["occurrenceId"]:self.job(r) for r in rows[19:49]})
+        path = self.state(rows); before = path.read_bytes()
+        result = A.scan(self.lane, self.status, "inspect")
+        self.assertEqual(result["scanSelection"]["unregisteredCandidates"], 89)
+        self.assertEqual(len(self.calls), 89); self.assertEqual(len(result["outcomes"]), 100)
+        self.assertTrue({rows[i]["occurrenceId"] for i in [1,5,16]}.issubset(self.calls))
+        self.assertEqual(path.read_bytes(), before)
+        self.assertFalse(any(r["postAttempted"] for r in result["outcomes"]))
+
+    def test_round_robin_reaches_every_pending_owner_without_raising_limit(self):
+        self.state(self.rows)
+        for _ in range(3):
+            result = A.scan(self.lane, self.status, "inspect")
+            self.assertEqual(len(result["outcomes"]), 100)
+            self.assertEqual(result["scanSelection"]["candidateLimit"], 100)
+        self.assertEqual(set(self.calls), {r["occurrenceId"] for r in self.rows})
+        self.assertEqual(self.calls[:100], [r["occurrenceId"] for r in self.rows[:100]])
+        self.assertEqual(self.calls[100:200], [r["occurrenceId"] for r in self.rows[100:200]])
+
+    def test_cursor_survives_last_owner_becoming_registered_and_new_append(self):
+        self.state(self.rows[:101]); A.scan(self.lane, self.status, "inspect")
+        self.registered[self.rows[99]["occurrenceId"]] = self.job(self.rows[99])
+        self.state(self.rows[:103]); self.calls.clear()
+        A.scan(self.lane, self.status, "inspect")
+        self.assertEqual(self.calls[:3], [r["occurrenceId"] for r in self.rows[100:103]])
+        self.assertNotIn(self.rows[99]["occurrenceId"], self.calls)
+
+    def test_deadline_cursor_advances_only_through_finished_inspections(self):
+        self.state(self.rows[:3])
+        with mock.patch.object(A.time, "monotonic", side_effect=[0, 1, 46]):
+            result = A.scan(self.lane, self.status, "inspect")
+        self.assertTrue(result["scanBudgetExhausted"])
+        self.assertEqual(result["scanSelection"]["lastUnregisteredOccurrenceId"], self.rows[0]["occurrenceId"])
+        self.calls.clear(); A.scan(self.lane, self.status, "inspect")
+        self.assertEqual(self.calls[0], self.rows[1]["occurrenceId"])
+
+    def test_cursor_is_policy_scoped_and_malformed_hint_fails_before_audit(self):
+        self.state(self.rows)
+        A.scan(self.lane, self.status, "inspect")
+        previous = A.strict_json(self.status.read_bytes()); previous["policySHA256"] = "e"*64
+        IO.atomic_record(self.status, previous); self.calls.clear()
+        A.scan(self.lane, self.status, "inspect")
+        self.assertEqual(self.calls[0], self.rows[0]["occurrenceId"])
+        previous = A.strict_json(self.status.read_bytes())
+        previous["scanSelection"]["lastUnregisteredOccurrenceId"] = {"not": "an identity"}
+        IO.atomic_record(self.status, previous); self.calls.clear()
+        with self.assertRaisesRegex(ValueError, "SCAN_CURSOR_SCOPE"):
+            A.scan(self.lane, self.status, "inspect")
+        self.assertEqual(self.calls, [])
+
+    def test_status_write_crash_keeps_prior_cursor_and_repeats_only_read_inspection(self):
+        self.state(self.rows)
+        A.scan(self.lane, self.status, "inspect")
+        before = self.status.read_bytes(); self.calls.clear()
+        with mock.patch.object(IO, "atomic_record", side_effect=OSError("isolated failure")):
+            with self.assertRaises(OSError): A.scan(self.lane, self.status, "inspect")
+        failed = list(self.calls); self.assertEqual(self.status.read_bytes(), before)
+        self.calls.clear(); A.scan(self.lane, self.status, "inspect")
+        self.assertEqual(self.calls, failed)
+
+    def test_registered_rows_are_filler_and_never_reaudited(self):
+        self.state(self.rows[:3]); self.registered.update({r["occurrenceId"]:self.job(r) for r in self.rows[1:3]})
+        result = A.scan(self.lane, self.status, "inspect")
+        self.assertEqual(self.calls, [self.rows[0]["occurrenceId"]])
+        self.assertEqual(sum(r["state"] == "check_running" for r in result["outcomes"]), 2)
+        self.assertTrue(all(r.get("jobId") == "0123456789abcdef" for r in result["outcomes"] if r["state"] == "check_running"))
+
+    def test_unknown_result_keeps_ownership_and_rotates_without_resubmission(self):
+        self.state(self.rows[:2])
+        def unknown(oid, mode):
+            self.calls.append(oid)
+            raise ValueError("UNCERTAIN_RECONCILE_NO_RESEND")
+        self.lane.run = unknown
+        first = A.scan(self.lane, self.status, "inspect")
+        second = A.scan(self.lane, self.status, "inspect")
+        self.assertTrue(all(r["state"] == "uncertain_owned" and r["postAttempted"] is None
+                            for d in [first, second] for r in d["outcomes"]))
+        self.assertEqual(len(self.calls), 4)
+
+    def test_real_preflight_quota_has_no_post_marker_but_untyped_error_does_not(self):
+        self.fixture.official.left = 0
+        first = A.scan(self.fixture.lane, self.status, "check")["outcomes"][0]
+        self.assertEqual((first["state"], first["code"], first["postAttempted"]),
+                         ("quota_wait", "CHECK_QUOTA", False))
+        self.assertEqual(self.fixture.official.posts, 0)
+        self.fixture.lane.run = mock.Mock(side_effect=ValueError("CHECK_QUOTA"))
+        second = A.scan(self.fixture.lane, self.status, "check")["outcomes"][0]
+        self.assertIsNone(second["postAttempted"])
+
+    def test_global_unknown_effect_dominates_other_candidate_quota_failure(self):
+        self.fixture.official.left = 0
+        path = pathlib.Path(self.p["stateDirectory"]) / (BOARD + "-" + "f"*64 + "-check.json")
+        IO.atomic_record(path, {"state":"submission_outcome_unknown", "identity":{"sourceSha256":"f"*64}})
+        before = path.read_bytes()
+        row = A.scan(self.fixture.lane, self.status, "check")["outcomes"][0]
+        self.assertEqual(row["state"], "uncertain_owned")
+        self.assertEqual(row["code"], "ACCOUNT_HAS_UNCERTAIN_EFFECT")
+        self.assertIsNone(row["postAttempted"])
+        self.assertEqual(path.read_bytes(), before); self.assertEqual(self.fixture.official.posts, 0)
+
+    def test_local_durable_effect_overrides_even_a_typed_quota_exception(self):
+        source = A.digest(self.fixture.candidate)
+        path = pathlib.Path(self.p["stateDirectory"]) / (BOARD + "-" + source + "-check.json")
+        IO.atomic_record(path, {"state":"submission_outcome_unknown", "identity":{"sourceSha256":source}})
+        self.fixture.lane.run = mock.Mock(side_effect=A.PreflightQuotaError("CHECK_QUOTA"))
+        row = A.scan(self.fixture.lane, self.status, "check")["outcomes"][0]
+        self.assertEqual(row["state"], "uncertain_owned"); self.assertIsNone(row["postAttempted"])
+        self.assertEqual(self.fixture.official.posts, 0)
+
+    def test_malformed_quota_is_not_authenticated_quota_exhaustion(self):
+        original = self.fixture.official.fetch
+        def invalid(path, public=False):
+            result = original(path, public)
+            if path == "problems": result["problems"][0]["limits"]["checks"]["left"] = True
+            return result
+        self.fixture.official.fetch = invalid
+        row = A.scan(self.fixture.lane, self.status, "check")["outcomes"][0]
+        self.assertEqual(row["code"], "CHECK_QUOTA_SCHEMA")
+        self.assertEqual(row["state"], "controller_blocked"); self.assertIsNone(row["postAttempted"])
+        self.assertEqual(self.fixture.official.posts, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

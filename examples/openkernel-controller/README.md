@@ -190,6 +190,25 @@ budget. The native controller remains the pause switch, checked again before the
 intent is created. An expired policy produces an explicit `policy_expired`
 diagnostic and does not pause CPU workers.
 
+Selection covers the whole recorded experiment history. Unregistered occurrences
+are inspected first, with at most 100 selected occurrences per scan. A policy-bound
+cursor in the atomic status rotates after the last actually inspected occurrence,
+so old unresolved owners and new arrivals both receive inspection over successive
+scans. Registered jobs fill any remaining positions using their verified registry
+receipts, without native re-audit or another POST. Neither history nor receipts are
+truncated. A crash before the status write repeats inspection under the existing
+no-resend guards; the cursor conveys ordering only, never permission or acceptance.
+The status describes that bounded scan, not a refreshed copy of omitted historical
+diagnostics. The existing registry and durable effect records remain authoritative.
+
+Only a typed `CHECK_QUOTA` refusal from the official preflight, after checking the
+account's durable records and before creating a submission intent, emits
+`postAttempted=false`. A same-named error from another stage remains unconfirmed.
+Any existing local/shared effect overrides that hint; unknown effects stay
+`uncertain_owned` and are never resent. Malformed quota data is a controller
+failure, not authenticated quota exhaustion. This does not waive quota checks or
+grant a CHECK; it lets consumers distinguish resource waiting from uncertainty.
+
 The root-owned registry records the confirmed job plus immutable native/QA,
 policy, audit, dispatch and transport receipt hashes. The watchdog reads it and
 owns terminal GET observation. A separate status snapshot distinguishes

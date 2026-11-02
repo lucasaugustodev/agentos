@@ -117,6 +117,10 @@ def same_json_numeric_representation(left, right):
     return left == right
 
 
+class PreflightQuotaError(ValueError):
+    """Internal provenance: quota refused before any new submission intent."""
+
+
 class EvidenceJSONError(ValueError):
     """Authenticated worker evidence is rejected, with bounded repair references."""
     def __init__(self, stage, artifact):
@@ -819,14 +823,15 @@ class OfficialLane:
         rows = [r for r in quota.get("problems", []) if r.get("name") == problem]
         require(len(rows) == 1, "PROBLEM_UNAVAILABLE")
         q = rows[0]["limits"]["checks"]
-        require(all(type(q.get(k)) is int and q[k] >= 0 for k in ("left", "used", "per_day"))
-                and q["left"] > self.p["minimumChecksRemaining"] and q["used"] < q["per_day"], "CHECK_QUOTA")
+        previous = self.records()
+        require(all(r.get("state") == "job_recorded" for r in previous), "ACCOUNT_HAS_UNCERTAIN_EFFECT")
+        require(all(type(q.get(k)) is int and q[k] >= 0 for k in ("left", "used", "per_day")), "CHECK_QUOTA_SCHEMA")
+        if not (q["left"] > self.p["minimumChecksRemaining"] and q["used"] < q["per_day"]):
+            raise PreflightQuotaError("CHECK_QUOTA")
         rate = re.search(r"Submissions are rate-limited \((\d+) a minute per token,\s*(\d+) a minute per account\)", rules)
         require(rate is not None, "RATE_POLICY_UNKNOWN")
         maximum = min(map(int, rate.groups()))
         require(0 < maximum <= 1000, "RATE_POLICY_INVALID")
-        previous = self.records()
-        require(all(r.get("state") == "job_recorded" for r in previous), "ACCOUNT_HAS_UNCERTAIN_EFFECT")
         now = self.clock()
         require(sum(r.get("intentEpoch", 0) > now - 60 for r in previous) < maximum, "LOCAL_RATE_WAIT")
         jobs = self.official.fetch("jobs")
@@ -937,15 +942,50 @@ def official_client(helper, boards):
     return Official()
 
 
+def scan_selection(state, registered, boards, cursor=None):
+    """Bound work, not history: fairly inspect unresolved owners before known jobs."""
+    rows, seen = [], set()
+    for row in state.get("experiments", []):
+        occurrence = row.get("occurrenceId", "")
+        if not UUID.fullmatch(occurrence) or row.get("problem") not in boards or occurrence in seen:
+            continue
+        seen.add(occurrence); rows.append(row)
+    positions = {r["occurrenceId"]: i for i, r in enumerate(rows)}
+    pending = [r for r in rows if r["occurrenceId"] not in registered]
+    # The cursor is an ordering hint, never a receipt or authority. Keeping it
+    # in the atomic status makes a crash retry the same bounded read work.
+    after = positions.get(cursor, -1)
+    pending = [r for r in pending if positions[r["occurrenceId"]] > after] + [
+        r for r in pending if positions[r["occurrenceId"]] <= after]
+    selected = pending[:100]
+    selected += [r for r in reversed(rows) if r["occurrenceId"] in registered][:100 - len(selected)]
+    return selected, {"version": 1, "candidateLimit": 100,
+        "unregisteredCandidates": len(pending), "registeredCandidates": len(rows) - len(pending),
+        "selectedCandidates": len(selected), "lastUnregisteredOccurrenceId": cursor,
+        "order": "unregistered_round_robin_then_registered"}
+
+
 def scan(lane, status_path, mode):
     """One bounded scan; terminal GET and supervisor continuation remain watcher-owned."""
     require(mode in ("inspect", "check"), "CHECK_ONLY")
     state = watcher_state(lane.p)
     outcomes = []
     registered = lane.registered_occurrences()
+    cursor = None
+    if pathlib.Path(status_path).exists():
+        prior = strict_json(protected(status_path, maximum=1024 * 1024))
+        if (prior.get("version") == 1 and prior.get("watchId") == lane.p["watchId"]
+                and prior.get("policySHA256") == lane.policy_sha and prior.get("scanSelection") is not None):
+            selection = prior["scanSelection"]
+            require(isinstance(selection, dict) and selection.get("version") == 1
+                    and (selection.get("lastUnregisteredOccurrenceId") is None
+                         or isinstance(selection.get("lastUnregisteredOccurrenceId"), str)
+                         and UUID.fullmatch(selection["lastUnregisteredOccurrenceId"])), "SCAN_CURSOR_SCOPE")
+            cursor = selection.get("lastUnregisteredOccurrenceId")
+    selected, selection = scan_selection(state, registered, lane.p["boards"], cursor)
     started = time.monotonic()
     budget_exhausted = False
-    for row in reversed(state.get("experiments", [])[-100:]):
+    for row in selected:
         occurrence = row.get("occurrenceId", "")
         if not UUID.fullmatch(occurrence) or row.get("problem") not in lane.p["boards"]:
             continue
@@ -1011,12 +1051,15 @@ def scan(lane, status_path, mode):
                         break
             outcomes.append({"occurrenceId": occurrence, "problem": row["problem"],
                              **binding, "state": status, "code": code[:120], "jobId": job_id,
-                             "postAttempted": None, "proposedRemediation": remediation,
+                             "postAttempted": (False if isinstance(error, PreflightQuotaError)
+                                 and code == "CHECK_QUOTA" and status == "quota_wait" and job_id is None else None),
+                             "proposedRemediation": remediation,
                              **({"evidenceErrors": error.evidence_errors} if isinstance(error, EvidenceJSONError) else {})})
+        selection["lastUnregisteredOccurrenceId"] = occurrence
     doc = {"version": 1, "watchId": lane.p["watchId"], "observedAt": lane.clock(), "mode": mode,
            "policySHA256": lane.policy_sha, "policyExpiresAt": lane.p["expiresAt"],
            "controllerState": "active" if lane.p["enabled"] else "inspection_only_policy_disabled",
-           "scanBudgetExhausted": budget_exhausted, "outcomes": outcomes}
+           "scanBudgetExhausted": budget_exhausted, "scanSelection": selection, "outcomes": outcomes}
     lane.io.atomic_record(pathlib.Path(status_path), doc)
     return doc
 
