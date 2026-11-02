@@ -344,3 +344,32 @@ yield `CHECK_QUOTA_SYNC_PENDING` before any new intent or POST. Because GET jobs
 is bounded, missing older jobs can conservatively delay CHECK until the UTC reset.
 Historical intents are not rewritten; a POST with an uncertain 429 outcome is
 never automatically resent or reclassified as a preflight refusal.
+
+### Terminal diagnoses across partial scans
+
+The 45-second scan budget may split the unresolved backlog into several batches.
+The protected `terminal-diagnostics-v1.json` index retains at most 128 terminal
+native rejections for one hour from their original observation. It does not
+retain quota, eligibility, uncertain effects, acceptance or CHECK authority.
+Only rejections emitted by a native audit before any POST intent qualify. The
+index is bounded to 1 MiB and status publication to 256 KiB; overflow fails closed.
+Policy or adapter changes invalidate cached authority. Historical watcher inputs,
+dispatch intents and official receipts remain untouched.
+
+A cached row carries `diagnosticProof` with its original `observedAt`, separate
+`verifiedAt`, policy/code hashes, full native-detail hash and dispatch-receipt
+hash. `verifyKind: native_identity` explicitly means that the adapter rechecked
+the authenticated GET, completed attempts, fences, manifests, artifact inventory
+and both dispatch receipts. It does **not** mean that the old diagnosis or raw
+transcript bytes were audited again. Registry entries, including source aliases,
+and both current ledgers dominate a cached rejection. Changed or unavailable
+identity removes cached authority and preserves the owner for fresh observation.
+
+The continuity consumer must validate this proof and its per-row ages before
+using it; the status file's global timestamp cannot refresh an older diagnosis.
+It must still rehash the original QA, producer evidence, candidate, base and
+patch before requesting native repair. The repaired candidate needs new CPU
+execution and independent QA. Cache timestamps are excluded from semantic
+source proofs after validation, so verification alone does not cancel a pending
+repair plan. This index reduces repeat deep audits; it is not an acceptance
+cache or a substitute for official quota and effect reconciliation.

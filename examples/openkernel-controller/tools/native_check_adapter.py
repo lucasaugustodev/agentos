@@ -34,6 +34,9 @@ QA_FILES = {"qa-verification.json", "review.txt"}
 WATCHER_STATE_MAX_BYTES = 64 * 1024 * 1024
 REQUEST_CANONICALIZATION = "json-numbers-v1"
 MAX_SAFE_INTEGER = 2 ** 53 - 1
+TERMINAL_DIAGNOSTIC_TTL = 3600
+TERMINAL_DIAGNOSTIC_LIMIT = 128
+TERMINAL_DIAGNOSTIC_MAX_BYTES = 1024 * 1024
 
 
 def require(ok, code):
@@ -123,6 +126,13 @@ class PreflightQuotaError(ValueError):
 
 class AccountPreflightWait(ValueError):
     """Another account effect is unresolved; this candidate has no new intent."""
+
+
+class NativeDiagnosticError(ValueError):
+    """A native audit rejected before this call could create a POST intent."""
+    def __init__(self, error):
+        super().__init__(str(error))
+        self.evidence_errors = getattr(error, "evidence_errors", [])
 
 
 class EvidenceJSONError(ValueError):
@@ -384,7 +394,51 @@ class NativeAudit:
                 self.artifact(rows[0])
                 if name == "candidate.py": result["candidateSHA256"] = rows[0]["digest"]
                 else: result.update(qaArtifactId=rows[0]["id"], qaSHA256=rows[0]["digest"])
+        # This is only a cache read-set, never an audit/QA acceptance. Snapshot
+        # again after a rejection so a moving attempt cannot enter the cache.
+        self._diagnostic_identity = None
+        try:
+            self._diagnostic_identity = self.terminal_identity(occurrence_id, detail)
+        except (ValueError, KeyError, TypeError, OSError):
+            pass
         return result
+
+    def terminal_identity(self, occurrence_id, detail=None):
+        """Authenticated complete native detail and both dispatch receipts.
+
+        Only completed, fenced attempts qualify. Hash the full response, not a
+        hand-picked subset: changed steps, definitions, manifests, artifact
+        inventories or attempt identity invalidate the historical diagnosis.
+        Raw evidence is still verified by the consumer before native repair;
+        this method does not grant CHECK or acceptance authority.
+        """
+        if detail is None:
+            detail = self.runtime.api("GET", "/api/cycle-runs/" + occurrence_id)
+        occurrence = detail["occurrence"]
+        require(occurrence["id"] == occurrence_id and occurrence["state"] == "completed", "CACHE_NATIVE_NOT_TERMINAL")
+        require(len(detail["steps"]) == len(detail["attempts"]) == 2, "CACHE_NATIVE_ATTEMPTS")
+        binding = {}
+        for key, name in (("produce", "candidate.py"), ("independent-qa", "qa-verification.json")):
+            steps = [s for s in detail["steps"] if s["key"] == key]
+            require(len(steps) == 1 and steps[0]["state"] == "completed", "CACHE_NATIVE_STEP")
+            attempts = [a for a in detail["attempts"] if a["step_id"] == steps[0]["id"]]
+            require(len(attempts) == 1, "CACHE_NATIVE_ATTEMPTS")
+            attempt = attempts[0]
+            require(UUID.fullmatch(attempt["id"]) and UUID.fullmatch(attempt["fence"])
+                    and attempt["number"] == 1 and attempt["state"] == "completed"
+                    and attempt.get("finished_at") and attempt.get("receipt", {}).get("stopped") is True,
+                    "CACHE_NATIVE_ATTEMPT_BOUNDARY")
+            manifest = attempt["context"]["manifest"]["cycleInput"]
+            require(manifest["attemptId"] == attempt["id"] and manifest["runFence"] == attempt["fence"]
+                    and SHA.fullmatch(manifest["digest"]), "CACHE_NATIVE_MANIFEST")
+            rows = [r for r in detail["artifacts"] if r["attempt_id"] == attempt["id"] and r["name"] == name]
+            require(len(rows) == 1 and UUID.fullmatch(rows[0]["id"]) and SHA.fullmatch(rows[0]["digest"]),
+                    "CACHE_NATIVE_ARTIFACT")
+            if key == "produce": binding["candidateSHA256"] = rows[0]["digest"]
+            else: binding.update(qaArtifactId=rows[0]["id"], qaSHA256=rows[0]["digest"])
+        _, receipts = self.dispatch(occurrence)
+        return {"detailSHA256": digest(detail), "dispatchSHA256": digest({k: digest(v) for k, v in receipts.items()}),
+                "binding": binding}
 
     def request_digest(self, receipt, body, *, allow_legacy_diagnostic=False):
         version = receipt.get("requestCanonicalization")
@@ -1019,7 +1073,10 @@ class OfficialLane:
         with os.fdopen(fd, "r+") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             require(self.control_active(), "CONTROL_PAUSED")
-            audit, files, source = self.audit.audit(occurrence_id)
+            try:
+                audit, files, source = self.audit.audit(occurrence_id)
+            except ValueError as error:
+                raise NativeDiagnosticError(error) from error
             problem, sha = audit["problem"], audit["sourceSHA256"]
             key = problem + "-" + sha
             intent, mirror = self.state / (key + "-check.json"), self.legacy / (key + "-check.json")
@@ -1122,6 +1179,67 @@ def scan_selection(state, registered, boards, cursor=None):
         "order": "unregistered_round_robin_then_registered"}
 
 
+def terminal_diagnostic_code(code):
+    return isinstance(code, str) and (code.startswith(("CPU_", "QA_", "PATCH_"))
+        or code in {"NO_CANDIDATE_CHANGE", "NO_EXECUTABLE_CHANGE"})
+
+
+def diagnostic_effect(lane, row, registered):
+    """Current authenticated effects always dominate historical rejection."""
+    occurrence, problem, source = row["occurrenceId"], row["problem"], row["candidateSHA256"]
+    matching = [job for oid, job in registered.items() if oid == occurrence
+                or job["problem"] == problem and job["sourceSHA256"] == source]
+    require(len({job["id"] for job in matching}) <= 1, "DIAGNOSTIC_REGISTERED_SOURCE_CONFLICT")
+    job = matching[0] if matching else None
+    if job:
+        return {"occurrenceId": occurrence, "problem": problem, "candidateSHA256": job["sourceSHA256"],
+                "qaArtifactId": job["qaArtifactId"], "qaSHA256": job["qaSHA256"], "state": "check_running",
+                "jobId": job["id"], "postAttempted": False, "proposedRemediation": "observe_same_official_job"}
+    effects = []
+    for directory in (lane.state, lane.legacy):
+        path = directory / (problem + "-" + source + "-check.json")
+        if not path.exists():
+            continue
+        raw = lane.io.read_regular(path, 1024 * 1024) if directory == lane.legacy else protected(path)
+        value = strict_json(raw)
+        effects.append(value)
+    if not effects:
+        return None
+    jobs = {(value.get("receipt") or {}).get("job_id") for value in effects}
+    known = (all(value.get("state") == "job_recorded" for value in effects)
+             and len(jobs) == 1 and JOB.fullmatch(next(iter(jobs)) or ""))
+    return {k: row[k] for k in ["occurrenceId", "problem", "candidateSHA256", "qaArtifactId", "qaSHA256"]} | {
+        "state": "check_running" if known else "uncertain_owned", "jobId": next(iter(jobs)) if known else None,
+        "postAttempted": None, "proposedRemediation": "observe_same_official_job" if known else
+        "reconcile_existing_intent_never_post_again"}
+
+
+def diagnostic_cache_entry(row, lane, now):
+    """Validate a cache record, without assigning fresh observation authority."""
+    require(type(row) is dict, "DIAGNOSTIC_CACHE_SCHEMA")
+    proof = row.get("diagnosticProof", {})
+    require(row.get("state") == "rejected_repairable" and terminal_diagnostic_code(row.get("code"))
+            and "jobId" in row and row["jobId"] is None and row.get("postAttempted") is False,
+            "DIAGNOSTIC_CACHE_SCOPE")
+    require(type(proof) is dict and type(proof.get("version")) is int and proof["version"] == 1
+            and proof.get("verifyKind") == "native_identity"
+            and proof.get("policySHA256") == lane.policy_sha
+            and proof.get("adapterSHA256") == lane.p["adapterSHA256"], "DIAGNOSTIC_CACHE_AUTHORITY")
+    require(all(type(proof.get(key)) in (int, float) and math.isfinite(proof[key])
+                for key in ("observedAt", "verifiedAt"))
+            and proof["observedAt"] <= proof["verifiedAt"] <= now + 5
+            and 0 <= now - proof["observedAt"] <= TERMINAL_DIAGNOSTIC_TTL,
+            "DIAGNOSTIC_CACHE_EXPIRED")
+    require(all(isinstance(proof.get(key), str) and SHA.fullmatch(proof[key])
+                for key in ("detailSHA256", "dispatchSHA256"))
+            and all(isinstance(row.get(key), str) and SHA.fullmatch(row[key])
+                    for key in ("candidateSHA256", "qaSHA256"))
+            and UUID.fullmatch(row.get("occurrenceId", "")) and UUID.fullmatch(row.get("qaArtifactId", ""))
+            and row.get("problem") in lane.p["boards"], "DIAGNOSTIC_CACHE_BINDING")
+    require(len(canonical(row)) <= 2048, "DIAGNOSTIC_CACHE_ENTRY_SIZE")
+    return proof
+
+
 def scan(lane, status_path, mode):
     """One bounded scan; terminal GET and supervisor continuation remain watcher-owned."""
     require(mode in ("inspect", "check"), "CHECK_ONLY")
@@ -1142,9 +1260,63 @@ def scan(lane, status_path, mode):
     selected, selection = scan_selection(state, registered, lane.p["boards"], cursor)
     started = time.monotonic()
     budget_exhausted = False
+    cache_path = lane.state / "terminal-diagnostics-v1.json"
+    cache, verified, unavailable = {}, set(), []
+    if cache_path.exists():
+        document = strict_json(protected(cache_path, maximum=TERMINAL_DIAGNOSTIC_MAX_BYTES))
+        require(type(document) is dict and type(document.get("version")) is int
+                and document["version"] == 1 and document.get("watchId") == lane.p["watchId"]
+                and isinstance(document.get("entries"), dict)
+                and len(document["entries"]) <= TERMINAL_DIAGNOSTIC_LIMIT, "DIAGNOSTIC_CACHE_FILE")
+        if (document.get("policySHA256") == lane.policy_sha
+                and document.get("adapterSHA256") == lane.p["adapterSHA256"]):
+            cache = document["entries"]
+    owned = {r["occurrenceId"]: r for r in state.get("experiments", []) if r.get("problem") in lane.p["boards"]}
+    # Revalidate historical diagnoses first. Cheap native GET/receipt identity
+    # checks avoid repeating deep audits and official calls for rejected work.
+    # Unverified records stay in the private index, never in fresh outcomes.
+    for occurrence, cached in list(cache.items()):
+        if time.monotonic() - started >= 45:
+            budget_exhausted = True
+            break
+        try:
+            proof = diagnostic_cache_entry(cached, lane, lane.clock())
+            require(occurrence in owned and cached["occurrenceId"] == occurrence
+                    and owned[occurrence]["problem"] == cached["problem"], "DIAGNOSTIC_CACHE_OWNER")
+            effect = diagnostic_effect(lane, cached, registered)
+            if effect:
+                outcomes.append(effect); verified.add(occurrence); del cache[occurrence]
+                continue
+            current = lane.audit.terminal_identity(occurrence)
+            require(all(current[key] == proof[key] for key in ["detailSHA256", "dispatchSHA256"])
+                    and all(cached[key] == value for key, value in current["binding"].items()),
+                    "DIAGNOSTIC_CACHE_IDENTITY_CHANGED")
+            effect = diagnostic_effect(lane, cached, registered)
+            if effect:
+                outcomes.append(effect); verified.add(occurrence); del cache[occurrence]
+                continue
+            current_row = copy.deepcopy(cached)
+            current_row["diagnosticProof"]["verifiedAt"] = lane.clock()
+            cache[occurrence] = current_row; outcomes.append(current_row); verified.add(occurrence)
+        except (ValueError, KeyError, TypeError, OSError, subprocess.TimeoutExpired) as error:
+            del cache[occurrence]
+            unavailable.append({"occurrenceId": occurrence, "code": str(error)[:120]})
+            # Do not re-label the old diagnosis as current. The owner remains
+            # conservative until a new ordinary audit supplies a fresh result.
+            if occurrence in owned:
+                cached = cached if type(cached) is dict else {}
+                outcomes.append({"occurrenceId": occurrence, "problem": owned[occurrence]["problem"],
+                    "candidateSHA256": cached.get("candidateSHA256"), "qaArtifactId": cached.get("qaArtifactId"),
+                    "qaSHA256": cached.get("qaSHA256"), "state": "observation_wait", "jobId": None,
+                    "postAttempted": None, "code": "CACHED_DIAGNOSTIC_UNAVAILABLE",
+                    "proposedRemediation": "reaudit_native_identity_preserve_owner"})
     for row in selected:
         occurrence = row.get("occurrenceId", "")
         if not UUID.fullmatch(occurrence) or row.get("problem") not in lane.p["boards"]:
+            continue
+        if occurrence in verified:
+            if occurrence not in registered:
+                selection["lastUnregisteredOccurrenceId"] = occurrence
             continue
         if occurrence in registered:
             job = registered[occurrence]
@@ -1208,19 +1380,57 @@ def scan(lane, status_path, mode):
                         else:
                             status, remediation = "uncertain_owned", "reconcile_existing_intent_never_post_again"
                         break
-            outcomes.append({"occurrenceId": occurrence, "problem": row["problem"],
+            outcome = {"occurrenceId": occurrence, "problem": row["problem"],
                              **binding, "state": status, "code": code[:120], "jobId": job_id,
                              "postAttempted": (False if job_id is None and (
                                  isinstance(error, PreflightQuotaError) and code in {"CHECK_QUOTA", "CHECK_QUOTA_SYNC_PENDING"} and status == "quota_wait"
                                  or isinstance(error, AccountPreflightWait) and code == "ACCOUNT_HAS_UNCERTAIN_EFFECT"
                                  and status == "account_wait") else None),
                              "proposedRemediation": remediation,
-                             **({"evidenceErrors": error.evidence_errors} if isinstance(error, EvidenceJSONError) else {})})
+                             **({"evidenceErrors": error.evidence_errors} if getattr(error, "evidence_errors", None) else {})}
+            if (isinstance(error, NativeDiagnosticError) and status == "rejected_repairable"
+                    and job_id is None and terminal_diagnostic_code(code)
+                    and getattr(lane.audit, "_diagnostic_identity", None)):
+                try:
+                    effect = diagnostic_effect(lane, outcome, registered)
+                    if effect:
+                        outcome = effect
+                    else:
+                        old = lane.audit._diagnostic_identity
+                        current = lane.audit.terminal_identity(occurrence)
+                        require(current == old and all(outcome[k] == v for k, v in current["binding"].items()),
+                                "DIAGNOSTIC_CHANGED_DURING_AUDIT")
+                        effect = diagnostic_effect(lane, outcome, registered)
+                        if effect:
+                            outcome = effect
+                        else:
+                            now = lane.clock()
+                            outcome.update(postAttempted=False, diagnosticProof={"version": 1, "verifyKind": "native_identity",
+                                "observedAt": now, "verifiedAt": now, "policySHA256": lane.policy_sha,
+                                "adapterSHA256": lane.p["adapterSHA256"],
+                                **{key: current[key] for key in ("detailSHA256", "dispatchSHA256")}})
+                            diagnostic_cache_entry(outcome, lane, now)
+                            if occurrence in cache or len(cache) < TERMINAL_DIAGNOSTIC_LIMIT:
+                                cache[occurrence] = copy.deepcopy(outcome)
+                except (ValueError, KeyError, TypeError, OSError, subprocess.TimeoutExpired):
+                    outcome.pop("diagnosticProof", None)
+                    outcome["postAttempted"] = None
+            outcomes.append(outcome)
         selection["lastUnregisteredOccurrenceId"] = occurrence
+    outcomes = list({row["occurrenceId"]: row for row in outcomes}.values())
+    cache_document = {"version": 1, "watchId": lane.p["watchId"], "policySHA256": lane.policy_sha,
+                      "adapterSHA256": lane.p["adapterSHA256"], "entries": cache}
+    require(len(canonical(cache_document)) <= TERMINAL_DIAGNOSTIC_MAX_BYTES, "DIAGNOSTIC_CACHE_SIZE")
+    # Cache-before-status crash is safe: it only stores historical rejections,
+    # and every later use repeats identity/effect verification before exposure.
+    lane.io.atomic_record(cache_path, cache_document)
     doc = {"version": 1, "watchId": lane.p["watchId"], "observedAt": lane.clock(), "mode": mode,
            "policySHA256": lane.policy_sha, "policyExpiresAt": lane.p["expiresAt"],
            "controllerState": "active" if lane.p["enabled"] else "inspection_only_policy_disabled",
-           "scanBudgetExhausted": budget_exhausted, "scanSelection": selection, "outcomes": outcomes}
+           "scanBudgetExhausted": budget_exhausted, "scanSelection": selection, "outcomes": outcomes,
+           "terminalDiagnostics": {"entries": len(cache), "verified": len(verified), "unavailable": unavailable,
+                                   "originalObservationTTLSeconds": TERMINAL_DIAGNOSTIC_TTL}}
+    require(len(canonical(doc)) <= 262144, "DIAGNOSTIC_STATUS_SIZE")
     lane.io.atomic_record(pathlib.Path(status_path), doc)
     return doc
 

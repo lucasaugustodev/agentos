@@ -629,7 +629,8 @@ class Fixture(unittest.TestCase):
         self.assertEqual(row["proposedRemediation"], "supervisor_new_hypothesis")
         self.assertEqual(row["candidateSHA256"], A.digest(self.candidate))
         self.assertEqual(self.official.posts, 0)
-        self.assertEqual(list(pathlib.Path(self.paths["stateDirectory"]).iterdir()), [])
+        self.assertEqual([p.name for p in pathlib.Path(self.paths["stateDirectory"]).iterdir()],
+                         ["terminal-diagnostics-v1.json"])
 
     def test_kernel_structure_ignores_only_comments_formatting_and_declared_docs(self):
         before = b'"""module old"""\nclass C:\n    """class old"""\n    async def run(self, x):\n        """method old"""\n        return x + 1\n'
@@ -1324,6 +1325,211 @@ class Fixture(unittest.TestCase):
         self.assertEqual(row["state"], "check_running")
         self.assertEqual(row["jobId"], "1234567890abcdef")
         self.assertEqual(self.official.posts, 1)
+
+
+class TerminalDiagnosticCacheTests(unittest.TestCase):
+    def setUp(self):
+        self.f = Fixture(); self.f.setUp(); self.addCleanup(self.f.tearDown)
+        self.status = self.f.root / "cached-status.json"
+        self.cache = pathlib.Path(self.f.p["stateDirectory"]) / "terminal-diagnostics-v1.json"
+        self.now = NOW
+        self.f.lane.clock = lambda: self.now
+        qa = copy.deepcopy(self.f.qa); qa["cpuEvidence"]["resultSHA256"] = "f" * 64
+        self.f.replace_evidence("qa-verification.json", A.canonical(qa), IDS[1])
+
+    def scan(self):
+        return A.scan(self.f.lane, self.status, "inspect")
+
+    def cache_only(self):
+        with mock.patch.object(A, "scan_selection", return_value=([], {"version":1, "lastUnregisteredOccurrenceId":None})):
+            return self.scan()
+
+    def test_terminal_rejection_is_reverified_without_repeating_audit_or_original_age(self):
+        first = self.scan()["outcomes"][0]
+        self.assertEqual(first["code"], "QA_TEST_BINDING")
+        self.assertFalse(first["postAttempted"])
+        self.now += 120
+        with mock.patch.object(self.f.audit, "audit", side_effect=AssertionError("no repeat full audit")):
+            second = self.scan()["outcomes"][0]
+        self.assertEqual(second["diagnosticProof"]["observedAt"], NOW)
+        self.assertEqual(second["diagnosticProof"]["verifiedAt"], NOW + 120)
+        self.assertEqual(second["diagnosticProof"]["verifyKind"], "native_identity")
+        self.assertEqual(self.f.official.posts, 0)
+
+    def test_any_complete_detail_change_invalidates_cached_authority(self):
+        changes = [lambda d: d["attempts"][0].update(fence=IDS[1]),
+                   lambda d: d["steps"][0].update(state="running"),
+                   lambda d: d["attempts"][1]["context"]["manifest"]["cycleInput"].update(digest="e" * 64),
+                   lambda d: d["artifacts"][0].update(digest="d" * 64),
+                   lambda d: d["attempts"][0].update(receipt={"stopped": False})]
+        original = copy.deepcopy(self.f.detail)
+        for change in changes:
+            with self.subTest(change=change):
+                self.f.detail = copy.deepcopy(original)
+                self.scan(); change(self.f.detail)
+                row = self.cache_only()["outcomes"][0]
+                self.assertEqual(row["state"], "observation_wait")
+                self.assertNotIn("diagnosticProof", row)
+                self.assertEqual(A.strict_json(self.cache.read_bytes())["entries"], {})
+
+    def test_dispatch_receipt_change_invalidates_even_when_api_detail_unchanged(self):
+        self.scan()
+        directory = pathlib.Path(self.f.p["watcherStateDirectory"])
+        path = next(p for p in directory.glob("intent-*.json") if A.strict_json(p.read_bytes())["kind"] == "create")
+        value = A.strict_json(path.read_bytes()); value["requestDigest"] = "0" * 64
+        IO.atomic_record(path, value)
+        self.assertEqual(self.cache_only()["outcomes"][0]["state"], "observation_wait")
+
+    def test_ttl_is_from_original_observation_not_latest_verification(self):
+        self.scan(); self.now += 3500; self.scan()
+        self.now += 101
+        row = self.cache_only()["outcomes"][0]
+        self.assertNotIn("diagnosticProof", row)
+        self.assertEqual(row["state"], "observation_wait")
+
+    def test_policy_or_code_change_cannot_reuse_historical_record(self):
+        for field in ("policy", "code", "materials"):
+            with self.subTest(field=field):
+                self.scan(); self.now += 1
+                if field == "policy": self.f.lane.policy_sha = "e" * 64
+                elif field == "code": self.f.p["adapterSHA256"] = "f" * 64
+                else:
+                    self.f.p["boards"][BOARD]["materials"]["canonical-TASK.md"] = "0" * 64
+                    self.f.lane.policy_sha = A.digest(self.f.p)
+                self.assertEqual(self.cache_only()["outcomes"], [])
+
+    def test_unknown_and_acknowledged_effects_dominate_cache(self):
+        self.scan()
+        key = BOARD + "-" + A.digest(self.f.candidate) + "-check.json"
+        path = pathlib.Path(self.f.p["legacyLedger"]) / key
+        IO.atomic_record(path, {"state": "submission_outcome_unknown"})
+        row = self.cache_only()["outcomes"][0]
+        self.assertEqual((row["state"], row["postAttempted"]), ("uncertain_owned", None))
+        self.assertNotIn("diagnosticProof", row)
+        path.unlink(); self.scan()
+        IO.atomic_record(path, {"state": "job_recorded", "receipt": {"job_id": "0123456789abcdef"}})
+        row = self.cache_only()["outcomes"][0]
+        self.assertEqual((row["state"], row["jobId"]), ("check_running", "0123456789abcdef"))
+
+    def test_registry_dominates_and_both_ledgers_are_checked_before_cache(self):
+        self.scan()
+        self.f.lane.registered_occurrences = lambda: {OCC: {"problem": BOARD, "id": "0123456789abcdef",
+            "sourceSHA256": A.digest(self.f.candidate), "qaArtifactId": IDS[1], "qaSHA256": "b" * 64}}
+        self.assertEqual(self.cache_only()["outcomes"][0]["state"], "check_running")
+        self.f.lane.registered_occurrences = lambda: {}
+        self.scan()
+        key = BOARD + "-" + A.digest(self.f.candidate) + "-check.json"
+        IO.atomic_record(pathlib.Path(self.f.p["stateDirectory"]) / key,
+                         {"state": "job_recorded", "receipt": {"job_id": "0123456789abcdef"}})
+        IO.atomic_record(pathlib.Path(self.f.p["legacyLedger"]) / key, {"state": "submission_outcome_unknown"})
+        self.assertEqual(self.cache_only()["outcomes"][0]["state"], "uncertain_owned")
+
+    def test_nonterminal_and_provenance_failures_are_never_cached(self):
+        for code in ["CHECK_QUOTA", "SOURCE_ORIGIN_QA_BINDING", "DISPATCH_DIGEST", "NATIVE_NOT_COMPLETED"]:
+            with self.subTest(code=code), mock.patch.object(self.f.audit, "audit", side_effect=ValueError(code)):
+                row = self.scan()["outcomes"][0]
+                self.assertNotIn("diagnosticProof", row)
+                self.assertEqual(A.strict_json(self.cache.read_bytes())["entries"], {})
+
+    def test_same_source_effect_of_another_occurrence_dominates_cached_rejection(self):
+        self.scan()
+        self.f.lane.registered_occurrences = lambda: {SUPERVISOR: {"problem":BOARD,"id":"0123456789abcdef",
+            "sourceSHA256":A.digest(self.f.candidate),"qaArtifactId":IDS[1],"qaSHA256":"b"*64}}
+        key=BOARD+"-"+A.digest(self.f.candidate)+"-check.json"
+        IO.atomic_record(pathlib.Path(self.f.p["legacyLedger"])/key,
+            {"state":"job_recorded","receipt":{"job_id":"0123456789abcdef"},"identity":{"occurrenceId":SUPERVISOR}})
+        row=self.cache_only()["outcomes"][0]
+        self.assertEqual((row["state"],row["jobId"]),("check_running","0123456789abcdef"))
+        self.assertNotIn("diagnosticProof",row)
+
+    def test_registered_source_alias_without_ledger_dominates_before_native_get(self):
+        self.scan()
+        self.f.lane.registered_occurrences = lambda: {SUPERVISOR: {"problem":BOARD,"id":"0123456789abcdef",
+            "sourceSHA256":A.digest(self.f.candidate),"qaArtifactId":IDS[1],"qaSHA256":"b"*64}}
+        with mock.patch.object(self.f.runtime,"api",side_effect=AssertionError("registered alias needs no native read")):
+            row=self.cache_only()["outcomes"][0]
+        self.assertEqual((row["state"],row["jobId"]),("check_running","0123456789abcdef"))
+        self.assertNotIn("diagnosticProof",row)
+
+    def test_effect_created_during_identity_get_dominates_before_verified_time(self):
+        self.scan(); self.now+=120
+        original=self.f.audit.terminal_identity
+        def racing(oid,detail=None):
+            value=original(oid,detail)
+            key=BOARD+"-"+A.digest(self.f.candidate)+"-check.json"
+            IO.atomic_record(pathlib.Path(self.f.p["legacyLedger"])/key,{"state":"submission_outcome_unknown"})
+            return value
+        with mock.patch.object(self.f.audit,"terminal_identity",side_effect=racing):
+            row=self.cache_only()["outcomes"][0]
+        self.assertEqual(row["state"],"uncertain_owned")
+        self.assertNotIn("diagnosticProof",row)
+        self.assertEqual(A.strict_json(self.cache.read_bytes())["entries"],{})
+
+    def test_invalid_proof_times_and_injected_effect_authority_are_rejected(self):
+        row = self.scan()["outcomes"][0]
+        for field, value in [("observedAt", True), ("verifiedAt", float("nan")),
+                             ("verifiedAt", float("inf")), ("verifiedAt", NOW + 6),
+                             ("observedAt", NOW + 1)]:
+            changed = copy.deepcopy(row); changed["diagnosticProof"][field] = value
+            with self.subTest(field=field, value=value), self.assertRaises(ValueError):
+                A.diagnostic_cache_entry(changed, self.f.lane, NOW)
+        for state in ["eligible", "quota_wait", "uncertain_owned", "check_running"]:
+            changed = {**row, "state": state}
+            with self.subTest(state=state), self.assertRaisesRegex(ValueError, "DIAGNOSTIC_CACHE_SCOPE"):
+                A.diagnostic_cache_entry(changed, self.f.lane, NOW)
+
+    def test_cache_before_status_crash_reloads_without_new_effect(self):
+        original = IO.atomic_record
+        def crash(path, value):
+            if pathlib.Path(path) == self.status: raise OSError("isolated status crash")
+            return original(path, value)
+        with mock.patch.object(IO, "atomic_record", side_effect=crash), self.assertRaises(OSError):
+            self.scan()
+        self.assertTrue(self.cache.is_file()); self.assertFalse(self.status.exists())
+        with mock.patch.object(self.f.audit, "audit", side_effect=AssertionError("cache reload")):
+            self.assertEqual(self.scan()["outcomes"][0]["code"], "QA_TEST_BINDING")
+        self.assertEqual(self.f.official.posts, 0)
+
+    def test_cache_count_and_file_bytes_are_bounded(self):
+        self.scan(); before = self.status.read_bytes()
+        value = A.strict_json(self.cache.read_bytes()); original = next(iter(value["entries"].values()))
+        value["entries"] = {str(i):original for i in range(129)}; IO.atomic_record(self.cache, value)
+        with self.assertRaisesRegex(ValueError, "DIAGNOSTIC_CACHE_FILE"): self.scan()
+        self.assertEqual(self.status.read_bytes(), before)
+        self.cache.write_bytes(b" " * (A.TERMINAL_DIAGNOSTIC_MAX_BYTES + 1))
+        with self.assertRaisesRegex(ValueError, "PROTECTED_FILE"): self.scan()
+        self.assertEqual(self.status.read_bytes(), before)
+
+    def test_three_partial_sweeps_accumulate_verified_rejections_without_fake_freshness(self):
+        rows = [{"occurrenceId": "aaaaaaaa-aaaa-aaaa-aaaa-" + str(i).zfill(12), "problem": BOARD} for i in range(3)]
+        IO.atomic_record(pathlib.Path(self.f.p["watcherStateDirectory"]) / "state.json", {"watchId":WATCH, "experiments":rows})
+        elapsed = [0]; calls = []
+        def identity(oid):
+            return {"detailSHA256":A.digest(oid), "dispatchSHA256":"e"*64,
+                    "binding":{"candidateSHA256":A.digest(oid), "qaArtifactId":IDS[1], "qaSHA256":"f"*64}}
+        audit = types.SimpleNamespace(terminal_identity=identity)
+        def binding(oid):
+            audit._diagnostic_identity = identity(oid)
+            return identity(oid)["binding"]
+        audit.diagnostic_binding = binding
+        def reject(oid, mode):
+            calls.append(oid); elapsed[0] += 46
+            raise A.NativeDiagnosticError(ValueError("QA_TEST_BINDING"))
+        lane = types.SimpleNamespace(p=self.f.p, policy_sha="b"*64, io=IO, audit=audit, run=reject,
+            clock=lambda:self.now, registered_occurrences=lambda:{}, state=pathlib.Path(self.f.p["stateDirectory"]),
+            legacy=pathlib.Path(self.f.p["legacyLedger"]))
+        first_observed = {}
+        for n in range(1,4):
+            elapsed[0] = 0; self.now += 120
+            with mock.patch.object(A.time, "monotonic", side_effect=lambda:elapsed[0]):
+                result = A.scan(lane, self.status, "inspect")
+            self.assertEqual(len(result["outcomes"]), n)
+            for row in result["outcomes"]:
+                first_observed.setdefault(row["occurrenceId"], row["diagnosticProof"]["observedAt"])
+                self.assertEqual(row["diagnosticProof"]["observedAt"], first_observed[row["occurrenceId"]])
+                self.assertEqual(row["diagnosticProof"]["verifiedAt"], self.now)
+            self.assertLess(len(A.canonical(result)), 262144)
+        self.assertEqual(len(calls), 3)
 
 
 class ScanSelectionTests(unittest.TestCase):
