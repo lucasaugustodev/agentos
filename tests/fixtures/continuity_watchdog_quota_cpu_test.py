@@ -114,6 +114,12 @@ class QuotaCPUAdmissionTests(unittest.TestCase):
 
     def test_marker_does_not_survive_other_status_or_wrong_policy(self):
         status = self.f.repairable_operation()
+        incomplete = {**status, 'state': 'quota_wait', 'code': 'CHECK_QUOTA'}
+        incomplete.pop('jobId')
+        self.f.install_diagnostic_fixture([incomplete])
+        observed = self.f.w.observe()
+        self.assertNotIn('postAttempted', observed['autoCheckDiagnostics']['outcomes'][0])
+        self.assertIn('muse_decode_layer', observed['uncertainProblems'])
         for changed in [{'state': 'uncertain_owned'}, {'code': 'OTHER'}, {'jobId': '0123456789abcdef'}]:
             row = {**status, 'state': 'quota_wait', 'code': 'CHECK_QUOTA', **changed}
             self.f.install_diagnostic_fixture([row])

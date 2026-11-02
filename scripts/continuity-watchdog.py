@@ -1898,7 +1898,7 @@ class Watchdog:
             item = {k: row.get(k) for k in ["occurrenceId", "problem", "candidateSHA256", "qaArtifactId", "qaSHA256",
                                           "state", "jobId", "code"]}
             if (row.get("state") == "quota_wait" and row.get("code") == "CHECK_QUOTA"
-                    and row.get("postAttempted") is False and row.get("jobId") is None):
+                    and row.get("postAttempted") is False and "jobId" in row and row["jobId"] is None):
                 item["postAttempted"] = False
             summary["outcomes"].append(item)
             if not repair_authority:
