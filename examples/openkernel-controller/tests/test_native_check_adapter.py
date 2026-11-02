@@ -1084,6 +1084,49 @@ class Fixture(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "CPU_REPLAY_EXECUTION_UNPROVEN"):
                 A.replay_commands(raw, A.digest(self.checker), A.digest(self.candidate))
 
+    def replay_with_command(self, command):
+        rows = [A.strict_json(line) for line in self.transcript().splitlines()]
+        rows[0]['data']['arguments'] = json.dumps({'command': command})
+        return b'\n'.join(A.canonical(row) for row in rows)
+
+    def test_static_workspace_cd_prefix_keeps_real_pinned_replay(self):
+        command = 'sha256sum /workspace/evidence/cpu-checks.py /workspace/evidence/candidate.py && python3 /workspace/evidence/cpu-checks.py --candidate /workspace/evidence/candidate.py'
+        for prefix in ('', 'cd /workspace && ', 'cd "/workspace" && '):
+            raw = self.replay_with_command(prefix + command)
+            proof = A.replay_commands(raw, A.digest(self.checker), A.digest(self.candidate))
+            self.assertEqual(proof[0]['commandSHA256'], A.digest((prefix + command).encode()))
+
+    def test_workspace_prefix_rejects_other_cwds_and_shell_control(self):
+        command = 'sha256sum /workspace/evidence/cpu-checks.py /workspace/evidence/candidate.py && python3 /workspace/evidence/cpu-checks.py'
+        for prefix in ('cd /tmp && ', 'cd /workspace; ', 'cd /workspace || ', 'cd /workspace && cd /tmp && ',
+                       'cd "$PWD" && ', 'cd /workspace && echo ', 'cd /workspace && false && ',
+                       'cd /workspace &&\n', 'cd /workspace && $(true) ', 'cd /workspace && `true` '):
+            with self.subTest(prefix=prefix), self.assertRaisesRegex(ValueError, 'CPU_REPLAY_EXECUTION_UNPROVEN'):
+                A.replay_commands(self.replay_with_command(prefix + command), A.digest(self.checker), A.digest(self.candidate))
+
+    def test_workspace_prefix_requires_absolute_unambiguous_artifacts(self):
+        for checker, candidate in [('cpu-checks.py','/workspace/candidate.py'),('/workspace/cpu-checks.py','candidate.py'),
+                                   ('/workspace/../tmp/cpu-checks.py','/workspace/candidate.py'),
+                                   ('//workspace/cpu-checks.py','/workspace/candidate.py')]:
+            command = f'cd /workspace && sha256sum {checker} {candidate} && python3 {checker}'
+            with self.subTest(checker=checker,candidate=candidate), self.assertRaisesRegex(ValueError, 'CPU_REPLAY_EXECUTION_UNPROVEN'):
+                A.replay_commands(self.replay_with_command(command), A.digest(self.checker), A.digest(self.candidate))
+
+    def test_workspace_prefix_cannot_replace_execution_or_tool_witness(self):
+        command = 'cd /workspace && sha256sum /workspace/cpu-checks.py /workspace/candidate.py && python3 /workspace/cpu-checks.py'
+        raw = self.replay_with_command(command)
+        for bad in (raw.replace(b'python3', b'echo python3'), raw.replace(b'python3', b'bash -c python3'),
+                    raw.replace(A.digest(self.checker).encode(),b'f'*64), raw.replace(b'exit code 0',b'exit code 1'),
+                    raw.splitlines()[0], raw.splitlines()[1]):
+            with self.assertRaisesRegex(ValueError, 'CPU_REPLAY_EXECUTION_UNPROVEN'):
+                A.replay_commands(bad, A.digest(self.checker), A.digest(self.candidate))
+
+    def test_workspace_prefix_rejects_trailing_commands_redirection_and_substitution(self):
+        command = 'cd /workspace && sha256sum /workspace/cpu-checks.py /workspace/candidate.py && python3 /workspace/cpu-checks.py'
+        for suffix in ('; true', ' && true', ' || true', ' | cat', ' > /tmp/out', ' $(true)', ' `true`', '\ntrue'):
+            with self.subTest(suffix=suffix), self.assertRaisesRegex(ValueError, 'CPU_REPLAY_EXECUTION_UNPROVEN'):
+                A.replay_commands(self.replay_with_command(command+suffix), A.digest(self.checker), A.digest(self.candidate))
+
     def test_patch_exact_and_adverse(self):
         self.assertEqual(A.apply_single_file_patch(self.source, self.patch), self.candidate)
         for patch in (self.patch.replace(b"base-candidate.py", b"../../etc/passwd"), self.patch.replace(b"    return x\n", b"    return y\n"), self.patch + self.patch):

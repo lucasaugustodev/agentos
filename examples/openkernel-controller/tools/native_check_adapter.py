@@ -286,6 +286,16 @@ def replay_commands(raw, checker_sha, candidate_sha):
             tokens = list(lexer)
         except ValueError:
             continue
+        # One static workspace prefix is equivalent for the two absolute
+        # artifact operands and the identical checker invocation. Do not infer
+        # other cwd changes, relative operands or compound shell semantics.
+        if tokens[:3] == ["cd", "/workspace", "&&"]:
+            tokens = tokens[3:]
+            if len(tokens) < 6 or not all(
+                    pathlib.PurePosixPath(value).is_absolute()
+                    and not value.startswith("//") and ".." not in pathlib.PurePosixPath(value).parts
+                    for value in tokens[1:3]):
+                continue
         # A narrow direct-command protocol, not arbitrary shell interpretation:
         # sha256sum CHECKER CANDIDATE && python3 CHECKER [arguments].
         # Reject echo/python-looking strings, false &&, nested shells, redirects,

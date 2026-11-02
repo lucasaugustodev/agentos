@@ -373,3 +373,10 @@ execution and independent QA. Cache timestamps are excluded from semantic
 source proofs after validation, so verification alone does not cancel a pending
 repair plan. This index reduces repeat deep audits; it is not an acceptance
 cache or a substitute for official quota and effect reconciliation.
+
+The CPU replay witness also permits one literal `cd /workspace &&` prefix before
+`sha256sum CHECKER CANDIDATE && python3 CHECKER ...`. Both artifact operands must
+then be absolute paths without parent traversal. The checker invocation, content
+hashes, successful tool call/result pair and all shell-control exclusions remain
+required. Other directory changes, substitutions, redirects, extra statements
+and report-only claims remain unproven; this does not execute or approve code.
