@@ -1,0 +1,921 @@
+CONTINUOUS OPERATION WATCHDOG
+
+The manual native cycle "Supervisão contínua — OpenKernel" is the visible owner.
+Its active/paused state controls future dispatch. A separate systemd timer checks
+registered native executions and official GET-only job results every two minutes.
+It does not reactivate an old completed objective or replan its full backlog.
+
+When registered work reaches a confirmed boundary, a native model supervisor
+receives bounded measured outcomes, actual independently verified QA JSON and an
+immutable artifact catalog. It produces continuation-plan.json. A deterministic
+consumer binds the plan to its original evidence, problem scope and source artifact,
+then checks current capacity and fixed runtime constraints before creating producer
+-> independent QA cycles. Terminal outputs become the next supervisor input. Empty JSON, arbitrary
+accounts/workspaces/actions and unverified waiting reasons are rejected.
+
+New reviews persist controller-owned actionEvidence before dispatch. If only another
+board changes, an actionable plan can remain valid when its selected boards' source,
+QA, results, provenance and ownership are unchanged. Global authority and current
+slots, ownership, eligible problems, source boundaries and repair permission are
+checked again. Evidence supplied in model output cannot grant this exception; legacy
+reviews without the controller proof still require the original global fingerprint.
+Same-board or authority changes reconcile existing effects by GET and close only the
+unattempted remainder. An uncertain attempted POST retains ownership without resend.
+
+Evidence hashes normalize only known inventories: artifact and occurrence records,
+jobs, owners and diagnostic collections are ordered by identity. API list order alone
+cannot invalidate a plan. Duplicate records remain visible; CPU cases, instructions,
+patch hunks and other semantic sequences are not recursively sorted or deduplicated.
+
+The watchdog also diagnoses ten minutes without published material evidence even
+when heartbeats or tool/model responses continue. This is a read-only suspicion:
+the supervisor cannot stop, retry or replace a live/uncertain executor. Long calls
+can be legitimate. A terminal label requires the native stopped receipt or a
+matching fenced HARNESS_STOPPED proof; manual review steps remain owned by their
+original controller.
+
+Only authorized Decode, Prefill and Attention experiments are dispatched. CPU
+source work is isolated and read-only against the source workspace. Independent
+QA remains mandatory. Global model/request capacity stays owned by AgentOS.
+Candidate limits prevent accumulating unmeasured variants. GPU CHECK/SCORE is
+not automatically authorized by this watchdog; awaiting official measurement is
+an explicit state, not a claim of autonomous GPU execution or verified gain.
+
+Durability: persist the approved plan before any dispatch, then persist each
+POST intent before I/O. Restart reconciles lost responses using canonical GETs;
+it never resends an ambiguous POST. Partial multi-experiment dispatch resumes its
+approved action set without treating its own progress as stale external evidence.
+Two invalid/failed supervisor revisions for the same evidence reach the explicit
+supervisor_failure_needs_repair diagnostic after one corrective review. This is a
+bounded failure state, not a promise of unrestricted automatic recovery. A supervisor
+response, active timer or executor heartbeat is not a completed material deliverable.
+
+Implementation: scripts/continuity-watchdog.py (Python standard library only).
+Tests: python3 -B tests/fixtures/continuity_watchdog_test.py, on server only.
+Registration and state contain private operational metadata and stay outside Git.
+Deploy a root-owned immutable script, root-only registration and state directory.
+Service uses User=root explicitly because the official CLI resolves its signed-in
+profile through that identity. Credentials are read by the trusted controller,
+never placed in worker prompts, outputs, command arguments or event artifacts.
+
+Qualification must distinguish: timer active, observation succeeded, supervisor
+dispatched, native attempt running, plan consumed, producer/QA dispatched, and an
+actual accepted/benchmarked outcome. Unit tests are not proof of live autonomy.
+
+Planning input separates named official incumbent benchmarks from available
+candidate source artifacts. An unknown incumbent source stays unknown and cannot
+be selected as an experiment base. Test/benchmark counts come from official
+record events per board. Full receipts remain protected and hash-addressed;
+successful log tails are omitted from the next model input. Root-pinned comparison
+context supplies compact measured profiles, uncertainty and next hypotheses.
+
+An optional root-owned official-check registry can register diagnostic jobs from
+a separately authorized adapter. The reader verifies native occurrence ownership,
+confirmed stop, current source/QA artifacts, successful source-bound QA, wrapper
+receipt identity and the exact CHECK transport receipt. Native dispatch provenance
+(dispatchReceiptSHA256) and GPU transport digest (transportReceiptSHA256) are
+separate. Registered results wake the next supervisor after their actual terminal
+status; this reader never authorizes or sends an official POST itself.
+
+Future experiment templates request reproducible one-file patches and explicit
+CPU checker/result hashes, cases, negative controls and limitations from both
+producer and independent replay. Older running cycle definitions remain intact.
+Missing evidence is a blocked qualification, never permission to assume it passed.
+
+Registry tests need a root-owned temporary directory with protected parents.
+Set TMPDIR to a dedicated root-only test directory on the server; do not change
+ownership or permissions of a shared build directory to make these tests pass.
+
+The optional adapter status reader checks its root-owned policy, current watcher
+code/config pins, freshness, native occurrence, source and QA artifact identities.
+Controller/storage/transport failures, quota and uncertain effects never authorize
+kernel evidence repair. Missing evidence can produce a fixed repair_evidence cycle:
+the candidate and original base stay byte-identical, previous checker/results come
+from the same original producer attempt, and a new independent QA replays the work.
+Semantic/numerical failures require a new code hypothesis instead. Two unsuccessful
+repairs isolate that candidate with an explicit repair_exhausted diagnostic; no
+third repair is enqueued, while other eligible sources remain available. Disabled
+or inactive adapter policy provides diagnostic information only, never repair authority.
+
+Transport-only patch normalization accepts only one file with either canonical
+headers or that board's exact kernel submission headers. It changes just those two
+headers, applies every hunk in memory, and requires exact candidate bytes. Original
+patch, canonical patch and application proof retain separate hashes. Arbitrary,
+truncated, multi-file or divergent patches cannot use this repair action.
+
+Material age derives from published artifacts or completed native stages and is
+reported separately from controller dispatch age. A diagnostic call cannot reset
+material age. Files still being built inside an active workspace are not published
+progress, and this limitation is explicit in the supervisor input.
+
+A changed supervisor prompt requires updating the existing native control cycle
+through PUT /api/cycles/:id with its expected version before installing matching
+controlDefinitionSHA256/controlVersion configuration. Never create a replacement
+control cycle or mutate active occurrence snapshots. Wait until no supervisor plan
+is pending, preserve prior config/code receipts, and validate the next actual native
+dispatch uses the new definition. Tests cover stale version rejection and preserved
+old snapshots; deployment still requires a separate live verification.
+
+Published producer verification and CPU results now carry bounded semantic evidence
+into the next supervisor input. The reader binds both reports to the latest produce
+attempt, its immutable input source, candidate and checker bytes. Invalid JSON,
+conflicting hashes or attempt identity produce a local diagnostic without copying
+unvalidated report text or stopping observations of unrelated work. A reported
+falsification remains negative_result_reported, never QA acceptance or GPU proof;
+CPU success alone does not imply a useful code change or measured improvement.
+
+Authenticated adapter NO_EXECUTABLE_CHANGE or NO_CANDIDATE_CHANGE rejections require
+a new hypothesis. Only that candidate is isolated from selection, while the original
+source and other eligible work remain available. Such rejections never authorize an
+evidence-only repair, override active QA, or change existing occurrence snapshots.
+
+New supervisor inputs include sourceCapsules in the existing local cycle-input.json.
+The model prompt contains the input path and hash, not the source bytes. The controller
+fetches and verifies selectable terminal sources; the supervisor decodes only needed
+files into data/sources and navigates a bounded static AST index. The old workspace
+baseline/submission is not a substitute for the selected artifact. No network,
+credentials, new agent stage, backend change or native control version is needed.
+
+Capsules preserve artifact aliases while sharing bytes by problem and digest. They
+prioritize the best measured available source, its known parent, and the most recent
+available candidate and its known parent, followed by other confirmed sources.
+Recency uses verified material progress as well as completion time, since failed
+deliveries can have no occurrence completion timestamp. Recency does not imply
+usefulness, acceptance or correctness. A benchmark with unknown
+source remains a benchmark, never an available incumbent. Limits are 256 KiB per
+source, 1 MiB total raw source and 2 MiB for the complete input, including existing
+context and metadata. Omitted sources have explicit identities, counts and reasons;
+they are removed from that review's selectable catalog. Missing/corrupt sources do
+not grant inspection or dispatch authority. If no eligible source can be supplied,
+the controller reports supervisor_sources_unavailable without spending a model call.
+
+Plan validation checks the selected artifact against the exact capsule bytes and
+hash stored in the review input, then checks the current catalog, ownership and
+capacity before dispatch. A retry reuses the original persisted POST body. Existing
+pending reviews retain their original input contract; their effects are reconciled
+using the existing ownership rules. Sources and AST indexes are untrusted data and
+navigation aids: providing bytes does not prove the model read them or establish
+semantic novelty, correctness or performance. Independent QA and the no-op GPU
+admission guard still apply. Measure the effect on redundant proposals and accepted
+executable candidates before claiming improved productivity.
+
+QA defects travel with their source
+
+qaEvidence preserves complete structured blockingFindings from an artifact whose
+bytes, hash, latest attempt and candidate identity have been checked. The parent
+source is checked when the native input supplies it. This is a bound QA report,
+not acceptance or a guarantee that its claims are correct. Missing blockers are
+marked not_reported; malformed, cross-candidate, corrupt or oversized reports
+produce an explicit local diagnostic with no unverified report text. Limits are
+64 KiB per QA report, 32 blockers and 32 KiB for the complete blocker array. No
+blocker is silently clipped. Legacy findings/limitations summaries explicitly
+mark truncation, while the complete blockers remain separately available.
+
+The planner receives that evidence with the outcome. When it selects a source,
+the same occurrence/candidate-bound structure is also delivered as
+input.experiment.sourceQAEvidence to its worker. Canonical source and policy
+materials remain unchanged. Workers report conflicts between the scoped task and
+known blockers instead of silently losing the report. Registered experiments require
+the exact independent-qa step definition, latest attempt and confirmed stop boundary;
+the envelope includes stepId, stepKey and runFence. A producer cannot publish a file
+with the QA name and acquire QA provenance. Legacy reports explicitly say that
+independence is not established. Legacy string blockers retain their full text and
+receive identities derived from array index and text hash, never invented semantic IDs.
+
+Separately pinned engineering reports
+
+Optional sourceEvidenceRefs configuration entries bind kind
+operator-reviewed-source-report, root-protected path/sha256, problem, occurrenceId,
+candidateArtifactId, candidateSHA256 and sourceSHA256. Reports must match the native
+catalog, original source and stopped occurrence. Every cited evidence file is byte
+verified. Rules identify kind official_contract, controller_admission or primary_source.
+An active_material rule must match the current canonical material name/hash and actual
+bytes; historical_provenance rules reference verified report evidence by refId/hash.
+Historical provenance is explicitly not proof of the active numerical or admission rule.
+
+sourceExternalEvidence is supplied to both the planner and the selected worker.
+It carries only source-bound findings, references and classification, never nextWork,
+permissions or acceptance. The worker receives exact_source when the selected bytes
+match the reported candidate; a different source on the same board receives board_history.
+That does not assert ancestry or a current defect: the model must revalidate relevant
+code. Other boards do not receive the report. Native QA and external engineering reports
+remain distinct, and every future candidate still needs its own QA and admission gates.
+
+Limits: eight report references, 24 KiB per report, 16 evidence files (512 KiB each,
+2 MiB total verified bytes), 32 findings (16 KiB total) and 64 KiB accepted context.
+Invalid bindings, changed references and omissions produce local diagnostics, without
+injecting unverified text or blocking observations of other boards. Material changes
+participate in that board's read-set proof. Existing persisted review inputs remain
+immutable; changing configuration requires a quiescent review boundary and normal rollout.
+
+Qualification for this context protocol includes 112 server-only tests. They cover
+emitter forgery, fence and attempt mismatches, complete long blockers, legacy strings,
+external report corruption, source/board mismatches, active rule bytes, historical
+references and context limits. A separate read-only replay used actual native QA
+and pinned engineering evidence to verify propagation without a POST or acceptance
+change. Live supervision received the new evidence; better candidate quality or GPU
+performance requires downstream measurement and is not established by these tests.
+
+Future producer and QA instructions distinguish three hash identities explicitly:
+sourceSHA256 hashes the base-candidate.py bytes supplied in experiment.materials
+and must match experiment.sourceArtifact.digest; candidateSHA256 hashes the final
+candidate.py bytes. The task-input file has a separate cycleInputSHA256 identity.
+QA must independently rehash these files, and a producer that substitutes the task
+input hash for the base remains rejected even when CPU tests pass. Evidence repair
+still preserves the original base and immutable candidate separately.
+QA is instructed to copy the complete replayed cases and negativeControls arrays,
+including extensions, instead of rebuilding name/flag-only rows. Producers must
+keep original-case diagnostics separate from mutant-control state. Inconsistent
+claims remain a failed review; this does not widen the adapter's accepted schema.
+
+This clarification changes only future worker instructions, not the supervisor
+definition, source-binding gates, native criteria, permissions or already persisted
+definitions/inputs. Qualification now includes 115 server-only tests: generated
+material bindings, the input-hash/source-hash counterexample, immutable repair
+criteria and GET reconciliation of existing create/run receipts. Instructions make
+the contract explicit; they do not prove model compliance or successful GPU work.
+
+Pipeline capacity tracks pending candidates by their originating occurrence, not
+only by source digest. A canonical evidence repair supersedes its predecessor's
+pending claim and retains one native reservation while queued, running or uncertain.
+Its own successful QA retains a reservation until official measurement; confirmed
+failure releases capacity for a new supervised plan without reviving the rejected
+predecessor. The alias requires matching persisted repair identity, original base,
+candidate, patch proof, input scope and predecessor artifacts. Missing or conflicting
+links retain conservative accounting. Equal bytes alone never merge actors, and
+two actual repair actors continue to occupy two native slots.
+
+The combined capacity and prior-QA-context revision has 125 server-only tests.
+A frozen operational replay reproduced three apparent owners before the fix and
+two after it, making the independent board eligible while preserving the active
+repair and unmeasured candidate. Queued, running, uncertain and terminal repairs,
+conflicting lineage, real multiple actors and legacy request reconciliation are
+covered. A counterfactual replay does not by itself prove a new live dispatch.
+
+Evidence repair carries the complete previous qa-verification.json in
+input.experiment.repairQADiagnostic, separate from repairTarget and the canonical
+materials list. The report is limited to32KiB and byte-checked against its artifact
+size/SHA. Its current native QA step, attempt, fence, confirmed stop, candidate and
+base must match; the runtime manifest must bind that occurrence/step/attempt/fence.
+cycleInputSHA256 is the digest recorded in that authenticated manifest, not an
+independent rehash of the task-input file in this context helper.
+
+The envelope explicitly says prior_qa_diagnostic_only_not_current_acceptance and
+currentAcceptance:false. All report fields and ordered arrays are preserved as
+historical data. They grant no permission, scope change or acceptance, and cannot
+replace the repair's own replay and independent QA. The planner already receives
+the prior review; this additional complete worker diagnostic is omitted from its
+compact repair summary. It remains included in the board's evidence binding.
+
+If this additional diagnostic cannot be bound, only that repair is withheld with
+classification repair_context_unavailable and an explicit cause. No raw diagnostic
+is injected; unrelated boards and supervision remain available. This does not
+relax the preexisting source, artifact, ownership or repair-admission gates.
+
+Only newly dispatched repairs receive this context. Existing native inputs,
+definitions and uncertain create/run receipts remain unchanged. Qualification
+includes120 server-only tests, with a causal handoff failure on the previous code,
+artifact/hash/size and candidate/attempt/fence counterexamples, unchanged replay
+instructions/materials/criteria, and the existing ownership/reconciliation tests.
+An invalid QA manifest also has a causal red/green test proving that another
+board still reaches its supervisor and producer dispatch without that report.
+
+Immediate continuation after closed administrative transitions
+
+One tick can process up to three stale_plan_superseded, supervisor_failed or
+supervisor_plan_rejected transitions. After each, it checks the native control
+and observes current evidence/ownership again, under the same existing process
+lock. It can then dispatch one new supervisor review without waiting for another
+timer interval. A dispatch, active owner, real wait, pause or exception ends that
+invocation. Transport errors are not retried inside the drain. Existing review
+failure limits, request identities, uncertain-effect GET reconciliation, WIP,
+source/authority gates and official policy remain unchanged.
+
+POST reconciliation is deliberately not an administrative drain state: even a
+reconciled create with no run remains a separate boundary. The compact continuation
+status records the transition count, up to three state/occurrence/code references,
+the final wait reason and next action. Reaching the bound persists an explicit
+administrative_transition_limit status; already closed transitions remain saved
+and the next normal tick can resume. This is a scheduler-latency improvement,
+not evidence of useful kernel performance or complete autonomous recovery.
+
+Known separate limitation: when evidence returns to a historical fingerprint,
+the existing request key can acknowledge a formerly superseded review. The
+A-to-B-to-A regression test proves this patch stops after one acknowledgement,
+does not resend a POST or dispatch an experiment in that invocation, and does
+not loop. It does not claim to repair the broader historical-review identity
+problem. Changing those keys or recovery semantics requires a separate change.
+Native repair evidence is selected only from the authenticated current producer
+step/attempt, with its definition, manifest, fence and confirmed stop. An
+independent QA attachment named cpu-result.json cannot replace or duplicate the
+producer's report. Missing, ambiguous, oversized or malformed native envelopes
+withhold only that repair action and keep its reservation; other boards and
+their pending plans can continue. Global policy, configuration and external
+owner checks remain strict. The qualified snapshot includes a QA report with
+an independently produced CPU result and a producer report above the existing
+size limit: selection is corrected, the limit remains enforced locally.
+
+Qualification now contains 131 server-only tests, four causal failures on the
+previous controller and an offline replay of frozen native/official GET data.
+No kernel, provider call, official POST, acceptance or production state change
+is performed by that replay. Instruction changes do not prove model compliance.
+
+Failed producer diagnostics
+
+executionEvidence.producerDiagnostics preserves useful contents of verified
+cpu-result.json and verification.json when a producer reports failed cases or
+undetected negative controls. It reaches the supervisor even during diagnosticOnly
+reviews with no eligible source or free pipeline slot. It uses the existing
+artifact reads, not another API, credential or retrieval tool, and never sends the
+whole REPORT. The complete failed-case/control objects, explicitly supplied
+assumptions/model/details and limitations/reasons retain their values and JSON
+pointers. Detail keys remain opaque: no association between a section and a case
+is invented. Smaller complete detail-map entries take budget priority; arrays
+inside them retain their order. Missing values, rules and measurements are not inferred.
+
+The latest producer attempt, step definition, closed attempt boundary and native
+manifest occurrence/attempt/fence must match. Artifact bytes, source, candidate
+and checker identities use the existing execution-evidence checks. The input
+digest is the value recorded by the native manifest, not a claim of a new rehash
+of a worker's input file. The envelope remains producer_report_only, with
+currentAcceptance:false and officialAuthorization:false. Its reported estimates,
+contract opinions and arbitrary text are untrusted data, not instructions, QA,
+canonical rules, GPU measurements or permissions. Eligibility and acceptance
+gates remain unchanged.
+
+Limits: 16 KiB per diagnostic envelope, including a 3 KiB reserve for omission
+metadata; complete sections that do not fit are omitted with counts, reasons and
+up to eight bounded references. No numeric expression or caveat is silently
+truncated. Compact planning input allows 64 KiB total for diagnostic envelopes,
+omission markers and metadata, favoring the most recent closed producer. Markers
+that cannot fit are aggregated into producerDiagnosticOmissions, with counts,
+up to eight occurrence/attempt/hash references and a digest of all omissions.
+The 4 KiB summary reserve is included in the total. Original report artifact
+IDs/hashes remain in every outcome's executionEvidence, and the original
+observation and persisted request are not mutated. The existing 2 MiB complete
+input limit still applies. Invalid
+bindings and unavailable artifact reads yield an occurrence-local diagnostic;
+unrelated boards remain observable and eligible. Existing persisted review
+requests and uncertain POST receipts are reconciled without rewriting their
+original input or adding new diagnostics retroactively.
+Evidence-repair ingestion has a separate raw/semantic size contract. Only the
+already authenticated producer cpu-result.json selected for a permitted repair
+may be read up to 256 KiB. Its original size and SHA must match. UTF-8 JSON is parsed
+without duplicate keys or nonfinite numbers, and the COMPLETE compact JSON must
+still fit 128 KiB. No fields, diagnostics, controls or ordered arrays are removed.
+Invalid envelopes remain local to that repair. The raw artifact stays unchanged
+in repairTarget.materials; this read path cannot accept a delivery or GPU check.
+
+Future repair instructions require a compact newly generated CPU report, fresh
+checker/result hashes and actual independent replay, preserving the exact kernel
+candidate and canonical patch. QA must retain its full findings and the complete
+case/control rows in a compact report within its unchanged 32 KiB limit. Existing
+inputs, definitions, intent identities, generic artifact limits, executionEvidence
+limits and official adapter rules are unchanged.
+
+Payload sizing for this revision is qualification evidence, not a new runtime
+guard or dependency. The isolated qualification measures the constructed request
+bodies with the Python serializer used by Client.request, and separately measures
+body.input using Node's JSON.stringify as runCycleAgent does for cycle-input.json.
+The full repair packet must remain below the adapter's 2 MiB input bound and the
+API's 3 MiB body bound. A generic preflight needs durable prepared create/run bodies
+and recovery of those exact bytes before new validation; it is separate work and
+must not prevent GET-only reconciliation or discard an unstarted valid remainder.
+
+The combined controller revision has 152 passing server-only tests. Frozen native
+evidence replays confirm that the formatting-heavy repair becomes eligible with
+all raw materials intact, while the old QA remains rejected; the failed producer's
+complete cost estimate and caveats reach a diagnostic-only review. A separate
+causal trace confirms that terminal administrative handoff starts one new review
+within the same tick. These are controller qualification results, not evidence
+of successful model work, GPU performance or uninterrupted live autonomy.
+
+Parallel committed pipelines (explicit opt-in)
+
+pipelineCapacityVersion: 2 enables maxPendingCandidates up to24 and
+maxPipelinesPerProblem up to8. Existing12/4 configurations remain valid. Without
+that opt-in, the existing total limit of
+1..3 and one owned pipeline per problem remain unchanged. These are HARD limits
+on committed pipelines: native production, its sequential QA, unmeasured output,
+quota reservations and official GPU waits share them. Waiting work does not vanish
+from accounting. Three waiting pipelines can leave nine native slots in a12-slot
+configuration; twelve waiting pipelines leave none. There is no hidden overshoot
+or claim that all24 are running CPU sessions. nativePipelineUsed and
+waitingPipelineUsed are disjoint counts; their sum equals pipelineUsed. Native
+claims include queued work, not just executing sessions. The deployed12-session
+and six-call admission limits remain unchanged;24 queued/owned pipelines do not
+authorize24 executing sessions or more than six simultaneous model requests.
+
+boardAvailableCandidateSlots exposes the per-problem remaining capacity in the
+supervisor input. Several independently useful hypotheses may share a confirmed
+source and problem, each in its own native occurrence/workspace with sequential
+independent QA. The current control definition and all delivery/official gates
+remain unchanged. New input rules replace only the obsolete one-per-problem
+instruction, preserve all other evidence and quality rules, and request useful
+parallel work instead of empty sessions. Provider request concurrency is separate
+and is not raised by this controller change; the deployed six-call semaphore and
+session limits still apply, including supervision calls.
+
+The controller rejects duplicate normalized hypothesis text for the same problem
+and exact base digest, including renamed actions and existing native/waiting work.
+This is a deterministic exact-duplicate check, NOT a proof of semantic novelty;
+the supervisor must distinguish genuine bottlenecks, tests and expected outputs.
+Two evidence repairs cannot target the same candidate in one plan, and a candidate
+already owned by native production/QA or another repair cannot acquire a second
+repair. Unknown native scope/boundary and uncertain/quota ownership keep the board
+reserved. Canonical repair-parent aliasing still counts one logical pipeline while
+two real native actors remain two owners.
+
+Partial plans reserve their full approved set, preserve immutable inputs and
+reconcile uncertain POSTs by GET only. New external ownership can invalidate an
+unstarted remainder; no attempt is silently replaced or repeated. Qualification
+has168 passing server-only tests, including12 distinct native runs,4 per problem,
+over-capacity/duplicate rejection, GPU waiting reservations, uncertain ownership,
+repair aliases and partial dispatch across one or three problems. A frozen native
+snapshot preserves its one running owner while exposing11 available slots (3/4/4)
+and a complete supervisor input below1MiB. That offline proof does not mean11 real
+agents were dispatched or that performance improved; live dispatch and accepted
+results remain separate observations.
+
+Selected-source planning read sets
+
+New capacity-v2 reviews use actionEvidence version2. Each selectable artifact has
+an exact descriptor/boundary proof and separate experiment/repair read-set hashes.
+The experiment proof includes producer reports and verified QA describing the
+EXACT candidateSHA256, including independent QA from another origin for identical
+bytes. A child's sourceSHA256 matching the selected base is not equivalent to its
+candidateSHA256 matching that base. Unknown QA/report bindings at the selected
+origin remain relevant and conservative. Matching official results, local adapter
+diagnostics, supplied exact-source or board-history engineering findings and
+canonical material references remain part of the decision context.
+
+An unrelated producer on the same problem may publish a different candidate and
+advance to QA without invalidating an experiment against an unchanged older base.
+Global policy/configuration/repair authority still must match. Source eligibility,
+remaining total/per-problem capacity, owned hypotheses and uncertain ownership are
+rechecked at consumption. Repair proofs additionally bind the complete selected
+repair target, including QA, artifacts and canonical patch. A stale adapter status
+or withdrawn repair authority still invalidates a repair. Unknown POST intents use
+the unchanged GET reconciliation path; a model cannot supply its own scope proof.
+
+Only contract-defined inventories are normalized before projection. Failures,
+artifact inventories and producer-artifact inventories can change order without
+creating a false source change. Duplicate records and ordered findings, CPU cases,
+diagnostic sections and patch content remain significant. Existing version1 proofs
+retain their original board-wide semantics and are never upgraded in place.
+
+Canonical PIN changes invalidate scope immediately. Actual file bytes still pass
+the existing material_packet hash check before a new dispatch. The source proof
+does not add filesystem/network reads or claim a new recovery guarantee: if bytes
+drift while their pin stays unchanged, the preexisting body-reconstruction path
+can fail closed before reconciling an uncertain intent. That recovery limitation
+requires a separate prepared-body contract; it is not bypassed here.
+
+Qualification now has184 passing server-only tests. The new scenarios prove a
+same-problem producer-to-QA transition can preserve an independent selected-source
+plan, while relevant QA/results, boundary changes, repair-target changes, authority
+changes and fresh capacity/duplicate conflicts still reject it. Twenty-four
+distinct queued native occurrences retain eight reservations per problem, and the
+25th total or ninth per problem is rejected. The existing12/4 and legacy behavior
+remain covered. A frozen full-input replay keeps its existing owner and exposes23
+available slots (7/8/8) with an input below1MiB; its synthetic plan is never sent.
+Retrospective incident reconstruction is labelled as such and does not replace an
+old persisted review's proof or establish the cause of a later authority failure.
+These checks do not establish live dispatch, accepted work or GPU improvement.
+
+Mixed action plans (explicit planVersion=2)
+
+A version-1 plan chooses one global mode. Selecting evidence repair therefore
+prevents the same review from requesting independent code experiments. Version 2
+uses decision=actions and an explicit kind on every entry: experiment or
+repair_evidence. Both can coexist in one bounded plan. Each repair still requires
+the exact authorized target, immutable candidate/patch and independent replay/QA;
+ordinary code work retains its own source, scope and acceptance checks. Per-action
+source proofs select the appropriate experiment or repair hash. Unknown POSTs
+continue through GET-only reconciliation, including a lost repair acknowledgement
+after an ordinary experiment was already dispatched.
+
+Every boardAvailableCandidateSlots key requires one capacityReview entry with the
+observed availableSlots, exact plannedActions count and a short factual reason.
+The counts describe the immutable planning input; fresh admission independently
+checks current capacity. Reasons are model judgments, not deterministic proof of
+novelty or exhaustion. The supervisor must consider every board, mix urgent repairs
+with independent hypotheses, and avoid waiting for a different candidate's GPU
+result when its proposed CPU work does not depend on that result. Capacity alone
+does not justify filler work or waive any correctness gate.
+
+This opt-in changes the control definition, unlike capacity-only configuration.
+Pin a matching versioned control definition before activation. Existing version-1
+reviews and request bodies are not rewritten or silently promoted. A new manual
+control cycle permits a reversible pin handover without changing in-flight
+occurrences. Do not roll back to an old reader while version-2 plans still require
+reconciliation: preserve a compatible reader and the current complete state.
+
+New version-2 review keys include the full controller/configuration authority hash,
+including control identity and definition pins. Failure budgets and cached wait
+decisions are scoped to that authority too, so a superseded contract cannot be
+replayed or suppress a fresh review after an authorized configuration change. Before
+creating a new review, unrecorded review intents are reconciled by GET against
+their ORIGINAL cycle, with the saved body digest and receipt checked. A lost ACK
+recovers the exact input; an unknown effect yields owned_review_uncertain and
+blocks new submissions. Unattempted prepared bodies remain immutable historical
+data. Handover never renames an intent or resends it under the new control cycle.
+
+Server qualification has 201 passing tests before the independent payload-storage
+change. Seventeen new cases cover 24 mixed actions, exact repair routing, invalid kinds
+and capacity reports, unchanged legacy definitions, current capacity admission,
+lost acknowledgements, real control-cycle handover and per-action repair read sets. These are isolated controller
+tests, not evidence that 24 agents have actually started or produced GPU gains.
+
+Immutable private state payloads (separate explicit opt-in)
+
+statePayloadStorage: content-addressed-v1 enables state format2. watchId,
+experiments, outcomes, planning decisions and action proofs remain inline. The
+large reviewRequests bodies and supervisions inputs move to root-owned immutable
+payloads/<sha256-prefix>/<sha256>.json files inside the private state directory.
+An input can reference its enclosing request body, so the large source capsules
+are stored once per request. Input hashes, lengths, watch identity and review
+fingerprint remain checked; refs never accept an arbitrary path or selector.
+The state index contains no request/context truncation. Worker inputs and native
+API contracts are unchanged, and official POST authority remains absent.
+
+The first migration preserves the exact original state bytes in an immutable
+legacySnapshotRef. Each payload is fsynced and atomically linked without replacing
+an existing digest path before the state index is replaced. A crash may leave a
+complete unreferenced blob, but cannot publish a ref to a partially written blob.
+Existing corrupt blobs are never overwritten. No blob or historical record is
+garbage-collected by this change. Intent files remain complete and untouched:
+requestDigest, unknown effects and GET-only reconciliation keep their contracts.
+An absent or damaged pending blob blocks the controller; it is not a model failure
+or permission to create a replacement supervisor. Only pending/request consumers
+resolve payloads. Loading the index, observing experiments or saving metadata does
+not hydrate historical inputs. The adapter's watchId/experiments reader remains
+compatible; diagnostic tools reading inline input must use the accessor or export.
+
+The new reader accepts legacy state1. Reading state2 requires the explicit opt-in;
+an old reader must never be pointed at refs. The storage flag changes the existing
+global configuration authority hash, so activation must account for any pending
+review and its original proof. Migration does not upgrade old proofs or make an
+uncertain action repeatable. Coordinate the writer and installer before activation.
+
+For a reviewed rollback or offline inspection, export a fully expanded state1 to
+a NEW private path outside the state directory:
+
+  python3 continuity-watchdog.py export-state /private/config.json \
+    --state-dir /private/watch --output /private/rollback-state.json
+
+The export runs under the existing watch lock, verifies every historical payload,
+creates its output0600 even with a permissive umask, and never sends a request or
+replaces the live index. Verify successful completion and its SHA receipt before
+using the file; an interrupted export may leave an incomplete destination, which
+is never silently overwritten. Rollback also needs the unchanged complete intents
+and a coordinated stopped writer. The preflight conservatively requires the full
+expansion to fit64MiB, matching the bounded adapter reader. If it does not fit,
+export is blocked before hydrating the history; do not truncate history or deploy
+an old reader anyway. Back up index, blobs and intents together. Copying state.json
+alone is no longer a complete backup.
+
+This removes duplicate bulk payloads from the frequently read index; it does not
+promise constant metadata size or lower total disk usage immediately. The initial
+raw snapshot is retained, and payload/intent history still consumes disk. Capacity
+monitoring and a separately reviewed retention policy remain necessary. Tests cover
+legacy migration, byte identity, crash publication order, damaged refs, lost ACKs,
+partial-plan resumption, lazy history, private export and bounded rollback.
+
+Qualification has206 passing server tests. A frozen33-review/33-request snapshot
+shrinks its index from24,331,198 to644,932 bytes (97.35%) while expanding back to
+the exact original canonical SHA. All65 intent files remain byte-identical, and
+the existing bounded adapter reads the same16 experiments. The actual previous
+reader reconciles synthetic lost-ACK, unresolved-intent and partial-dispatch
+exports using GET only. These are isolated storage/recovery results, not evidence
+of live migration, additional model throughput or GPU improvement.
+
+Combined plan2/storage qualification has229 passing server tests. It includes24
+mixed actions with archived inputs, restart after a lost repair acknowledgement,
+and reconciliation of an archived old-control request before a new-control review.
+Uncertain old requests keep their original cycle and block replacement POSTs.
+
+After plan2 has produced work, a storage-only fallback MUST keep the new compatible
+reader, planVersion2 and its control cycle. Expand the CURRENT state and preserve
+every current intent; restoring a pre-rollout snapshot could erase newer ACKs.
+Only remove the storage opt-in. Rebind the adapter's exact watcherConfig pin and
+obtain its real matching observation before resuming; never copy/restamp an old
+status to manufacture freshness. The original plan proofs stay unchanged, so the
+configuration change can close an unstarted remainder while attempted effects are
+reconciled by GET. A synthetic fallback with a distinct new control cycle preserves
+two owners after a lost repair ACK, or one owner plus one uncertain effect when no
+receipt exists, with zero new POSTs. The earlier reader45afb rollback proof applies
+only to the earlier plan contract; it does not authorize that reader over plan2.
+
+A completed review under an old configuration must also receive a fresh identity
+after storage fallback, even when the observed work fingerprint and control cycle
+are unchanged. Version2 review keys, failure budgets and cached outcomes bind the
+current authority digest. The regression test fails when the same old receipt is
+reused and now proves exactly one new review followed by its running state.
+A frozen full-input replay validates23 mixed actions (including one authorized
+repair) alongside one existing owner,16 source capsules and two verified external
+reports. The constructed input is below1MiB and roundtrips through archived state.
+Control/policy bindings in that replay are explicitly synthetic; no plan is sent.
+# QA report reader compatibility
+
+Registered diagnostic CHECKs and repair classification read authenticated QA
+reports up to 1 MiB, matching the native adapter artifact budget. A legitimate
+report larger than 32 KiB therefore no longer stops observation of all boards.
+The reader requires the complete declared bytes and digest, an object root,
+unique JSON keys, and finite numbers, including exponent-overflow rejection.
+Registry ownership, latest attempt, source/candidate lineage, exact boolean
+acceptance fields, and registered transport/receipt bindings remain mandatory.
+
+This is a raw-reader limit, not extra authority or extra model context. The
+64 KiB QA context and 32 KiB prior-QA repair diagnostic limits remain separate.
+Large authenticated reports use the bounded historical projection described below.
+Oversized, corrupt, unbound or malformed registered QA still fails closed; it is
+never skipped to free ownership or manufacture acceptance. No official action
+or performance improvement is implied by reading a registered CHECK report.
+
+Board-scoped planning and deterministic replenishment (opt-in)
+
+Set plannerMode="board-lanes-v1", targetNativeWorkers=8 and
+readyLowWatermark=2 with planVersion=2 and pipelineCapacityVersion=2. This
+requires a newly registered/pinned supervisor definition with concurrency3.
+Experiment cycles retain concurrency1. Without the opt-in, the single-planner
+contract and existing behavior are unchanged.
+Once lane records/outboxes exist, the reader requires this plannerMode. Removing
+the flag or downgrading to an older reader is not a supported rollback: it would
+hide ready reservations. Hold the new controller if recovery is needed; preserve
+its current state, inputs and intents. A pre-resume rollback must prove that no
+lane request or outbox was created before restoring the original configuration.
+
+One watcher owner under watch.lock manages three independent planner lanes:
+Decode, Prefill and Attention. Each planner receives only its board's source
+capsules, outcomes, diagnostics, official jobs and recent dispatches. Scoped
+request namespaces include board, authority and evidence identity. Validators
+reject cross-board actions; a slow planner cannot hold up the other two lanes.
+No fourth LLM manager is added. The deterministic sweep owns replenishment.
+
+The sweep first reconciles all attempted review/action effects using their
+original identities, then collects all finished plans, admits and validates
+the ready buffer, dispatches ready actions, and finally replenishes planners.
+An uncertain POST prevents new writes globally until GET reconciliation proves
+its result. A lost ACK never authorizes retransmission. A legacy global planner
+may finish naturally in the spare session; its old-authority plan cannot be
+newly dispatched under the changed contract. Its effects and output references
+remain recorded. Additional legacy planners reduce the effective worker target.
+
+approvedPlan is the immutable proposed batch; its persisted outbox records
+unadmitted, ready, dispatching, owned or invalidated states per action. Ready
+actions reserve the global24/per-board8 pipeline budget and exact normalized
+hypotheses before any create/run request. A changed source invalidates the
+affected unstarted action; acknowledged effects remain owned. Ready repairs
+cannot duplicate another repair's fixed candidate output. Archived inputs and
+POST receipts retain their existing byte identity and integrity checks.
+
+The target is8 native worker reservations, counting queued/running/unconfirmed
+production and QA. At most3 new experiments are dispatched per sweep, with
+fresh observation before each action; this bounds expensive observation/API
+work while the ready buffer survives between sweeps. With a private30-second
+timer, an initially empty pool can fill in3 sweeps when work is admissible.
+The native cycle engine already claims queued work every2 seconds. GPU waits
+still count against24/8 but do not count as ready CPU work or native workers.
+Planning replenishes below2 ready actions per board when sources, capacity and
+existing failure rules permit. Eight workers plus3 planners leave1 session for
+handover within the deployed12-session ceiling; the global6-request gate is
+unchanged. External account occupancy can reduce actual concurrent execution.
+
+Status distinguishes nativeReserved, nativeQueued, nativeExecuting,
+plannerPending, legacyPlannerPending, readyActions/readyByProblem and GPU or
+other waiting pipelines. An admitted proposal or queued occurrence is not a
+running session, accepted delivery or performance gain. Explicit per-board
+wait reasons explain insufficient source/capacity, pending planners and held
+failure recovery. Do not shorten intervalSeconds to tune the private timer:
+it also controls diagnostic freshness. Validate actual replenishment latency,
+new evidence and accepted deliveries before claiming productivity improvement.
+
+Authenticated large-QA context
+
+QA artifact admission remains limited to 1 MiB of original bytes, with exact
+size/SHA256 verification and strict JSON: duplicate keys, nonfinite numbers,
+numeric overflow and non-object reports are rejected. Context presentation is
+separate: source QA envelopes remain at most 64 KiB and prior-QA repair
+diagnostics at most 32 KiB. Candidate/source, latest attempt, independent QA
+step, stopped boundary, fence and manifest bindings remain mandatory.
+
+Small historical reports stay complete in repairQADiagnostic.report. Larger
+ones carry reportProjection.version=1 and complete=false. Critical flags and
+hashes remain exact; retained fields/sections are complete values with original
+array order. Omitted fields have JSON-pointer, byte-count and digest references,
+with explicit reference coverage and array counts. No partial cases array is
+presented as a complete report. Decisions continue to read the full strict QA;
+a projection is never current acceptance, official authority or a QA artifact.
+Hash domains are explicit: artifact.digest covers original raw bytes;
+reportSHA256/reportBytes and omitted-field references cover canonical JSON of
+the original strict report (original_strict_json_canonical). In contrast,
+selectedReportSHA256 and each section.valueSHA256 cover the transported value
+after the versioned json-numbers-v1 normalization. Their canonicalization
+markers prevent integral floats or signed zero becoming integers in the API
+from invalidating a context hash. Verify original references from the supplied
+original bytes, not by hashing a projection or normalized partial reconstruction.
+
+Projected repairs also receive prior-qa-original.json as a separate material in
+input.experiment.materials. This contains the complete original bytes/base64,
+artifact/attempt identity, size and SHA256, revalidated before any create/run
+POST. Workers must inspect omitted findings/cases in that material and produce
+fresh complete evidence. The independent QA step and finalizer still require
+the full new report; its existing artifact limit is 1 MiB, not the 32 KiB inline
+context budget. Neither original artifacts nor historical request bodies are
+rewritten or reconstructed from a projection.
+
+Complete blockers are never clipped. If blockers or their envelope cannot fit,
+context remains unavailable and repair authorization stays closed. Once the
+original full report has passed its identity/byte guards, that internal report
+still informs completed-work ownership: a presentation error must not turn an
+occupied native-to-unmeasured pipeline into a free slot. Invalid bytes/bindings
+do not obtain this internal identity guarantee. Existing semantic rejection,
+repair exhaustion, quotas, capacity, unknown-effect reconciliation and approval
+rules remain unchanged.
+
+Qualification runs only on an isolated server with in-memory transports. It
+includes exact raw-size bounds, malformed JSON, scope/fence/manifest failures,
+large-context ownership, immutable original-material handoff and independent QA.
+A private frozen replay additionally compares the old and new readers on real
+size-blocked owners without native/official network calls or operational writes.
+Private inputs, identities and execution evidence are not part of this repository.
+
+CPU admission while official quota is unavailable
+
+Capacity v2 distinguishes a proven preflight resource wait from an uncertain
+execution. Only authenticated CHECK_QUOTA status with postAttempted=false,
+jobId=null and the exact candidate/occurrence in the source catalog qualifies.
+The adapter emits that marker only after ruling out durable uncertain effects
+and before creating any submission intent. Missing or legacy markers, unknown
+actors, uncertain receipts, other rate states and unregistered running checks
+continue to block their board.
+
+The quota candidate keeps its original WIP reservation, source identity and
+hypothesis reservations. Independent CPU work may use remaining real capacity;
+the global/per-board hard limits, ready reservations and repair gates are
+unchanged. A full board still admits no work. The serial legacy capacity
+contract is unchanged. This neither repairs a quota-wait candidate nor permits
+an official request: every CHECK still needs the adapter's fresh quota, rule,
+rate and receipt preflight. The supervisor receives the same bounded evidence;
+no counters, ownership or historical reports are rewritten to open a slot.
+
+Historical QA CPU-binding conflicts (2026-11-02)
+
+A historical QA report can quote stale checker/result hashes even when the
+bound producer artifacts are intact. Evidence repair may now describe this
+specific conflict without accepting or rewriting the QA. Both reported hashes
+must be well-formed SHA256 values and at least one must differ. The producer CPU
+candidate/checker bindings must match exactly; its checker, result, verification,
+candidate, base and applicable patch bytes retain their existing identity and
+attempt/fence/manifest guards. Producer verification must bind the exact base
+and candidate and report the required scope/passed/no-GPU/no-official flags.
+QA semantic flags must be strict booleans, positive, without blockers or claims
+of proven GPU performance. Missing producer hashes or contradictory producer
+evidence do not qualify for this path.
+
+The bounded repairQADiagnostic carries evidenceBindingConflict with the original
+QA artifact reference, reported hashes, actual producer artifact references and
+the conflicting field names. currentAcceptance and originalReportBindingValid
+remain false. The report is preserved exactly, including its incorrect claims;
+projection and full-original attachment rules remain unchanged. The marker adds
+instructions only to that new repair execution: keep candidate and canonical
+patch immutable, rerun CPU, and obtain a new independent QA that references the
+actual new checker/result bytes. Existing definitions without this marker remain
+unchanged. No conflicting QA is admitted to official checks by this feature.
+
+This path reuses existing bounded repair attempts, fresh source proofs, capacity,
+quota, policy and uncertain-effect handling. Regression tests cover malformed
+or absent hashes, producer/semantic failures, mutated bytes/patches, incomplete
+attempt proof, projected report transport, independent QA, and exhausted repairs.
+Private frozen replay verifies the five observed conflicts and constructs their
+new requests in memory without executing candidates or making POST requests.
+
+Optional repair-first planning
+-----------------------------
+repairFirstPlanning=true is an opt-in for board-lanes-v1 with planVersion=2.
+Absent or false preserves the existing supervisor definition and normal mixed
+planning. Enabling it changes the bound control definition/config authority;
+existing inputs, request keys, receipts and attempted effects are not rewritten.
+Use the normal reviewed control handover, not an in-place prompt replacement.
+Before a future activation, qualify the exact code/config/control/policy pins
+and replay pending old reviews and uncertain effects offline. New control and
+policy bindings must not erase historical identities or resume an old request
+under new authority. This option is not permission to modify in-flight actors.
+
+When a lane's ready queue is below its existing low watermark, the same refill
+pass checks authenticated evidence repairs through the existing admission
+validator in memory. It offers at most two distinct admissible candidates in
+planningScope.batchPurpose=repair_backlog and repairSourceArtifactIds. Quotas,
+unknown ownership, ready reservations, duplicate repairs and real 24/8 pipeline
+capacity still apply. This selection is not an approved plan or an execution:
+the LLM must publish a valid v2 plan, restricted to those repair_evidence actions.
+The actual per-board capacity remains visible; a small repair batch does not
+invent a lower or higher slot count. Without admissible repairs, normal planning
+continues. Existing deterministic dispatch and refill run while workers execute.
+
+Repair planning stages only the selected candidate and available original-base
+source capsules, related QA/results and compact repair cards. Source read-set
+hashes are computed from the full board evidence before presentation is reduced,
+including same-candidate QA from other origins. Selected-source freshness and
+every normal admission check run again before dispatch. The worker still gets
+the complete required original artifacts and must produce fresh independent QA.
+If no selected candidate capsule can be authenticated, no planner is dispatched.
+
+The purpose is to reduce time until the first useful repair dispatch by avoiding
+optimization research before a repair batch. It does not establish a latency or
+performance gain by itself. Measure time to first dispatch and accepted repair,
+context/read volume and whether the ready buffer is replenished while workers
+run. Session count alone is not delivery, and no GPU authority is added.
+
+Compatibility with terminal diagnostic retention
+
+Repair-first selection consumes the current reader's authenticated repair list.
+Retained diagnostics still require their original observation age, recent native
+identity verification, matching policy/code pins and revalidated original bytes.
+The complete selected-source proof is computed before the planner presentation
+is reduced. Reverification timestamps do not replace that semantic read-set.
+Expired, tampered or differently bound evidence cannot become a short-batch
+repair. A proven no-POST official quota wait keeps its pipeline reservation;
+other admissible CPU repairs may proceed. Unknown submission effects retain
+their existing conservative admission rules.
+
+The opt-in does not change the eight-worker target, three planner lanes, twelve
+physical sessions, six concurrent model requests, or hard 24/8 pipeline limits.
+Nor does it extend policy expiry. A future activation requires a separately
+reviewed supervisor definition/control handover, repairFirstPlanning=true in
+the bound configuration, and the exact code/config/policy/unit pins. Preserve
+existing immutable inputs, outbox entries, receipts and pending actors; never
+reinterpret an in-flight plan under a newly edited control definition. Qualify
+that exact handover offline before activation. The default and false settings
+retain the prior supervisor definition byte for byte.
+
+Server-isolated qualification combines the existing reader suite with short
+batch tests, including cached evidence across three sweeps, changed raw checker
+bytes, quota-versus-uncertain ownership and unchanged independent QA. A private
+frozen replay compares normal and short inputs, validates sample plans and
+constructs worker material packets with in-memory receipts only. These examples
+prove compatibility and input size, not model latency or accepted delivery.
+
+Optional native QA dependency contract
+
+nativeQAContractVersion is absent/1 by default; only integer 1 or 2 is valid.
+Version 1 preserves existing experiment definitions and request bodies byte for
+byte. Version 2 changes only newly constructed independent-qa steps: parameters
+contain nativeQAContractVersion=2, maxAttempts is three, and dependencyEvidence
+binds /cpuEvidence/checkerSHA256 and /cpuEvidence/resultSHA256 in
+qa-verification.json to the completed produce step's cpu-checks.py and
+cpu-result.json artifacts. The producer remains limited to one attempt. Repair
+candidate immutability criteria, original material bytes, semantic QA criteria
+and official-action prohibitions remain unchanged.
+
+Do not enable version 2 until the matching cycle-runtime dependency gate and
+adapter contract are separately qualified and published. JSON transport of the
+definition alone does not establish runtime enforcement. The core must freeze
+the real predecessor evidence and fence, revalidate them at acceptance, and
+limit retry to the authenticated binding failure with confirmed termination;
+semantic/numerical failures must not gain a retry or acceptance through this
+setting. Existing occurrences and attempted requests keep their original v1
+definitions, receipts and recovery keys. A lost acknowledgment is reconciled
+under its original body rather than recreated under v2.
+
+This QA flag alone does not change supervisor_definition or require a new
+supervisor cycle. It does change bound configuration authority and therefore
+still requires the normal reviewed config/policy handover. repairFirstPlanning
+does change the supervisor instructions and definition hash; enabling it needs
+a separately bound control and preserves old pending actors/receipts. The two
+flags are independent: fast planning can be activated while native QA remains
+absent/1, and the combined source then generates exactly the same fast control
+definition and v1 experiment definitions as the separately qualified fast-only
+source. Do not mutate an existing control definition or reinterpret an old plan
+to avoid the handover.
+Bounded unknown CHECK reservations and independent CPU work
+---------------------------------------------------------
+
+The default behavior still blocks a board with an uncertain official effect.
+An operator-reviewed adapter policy may opt in to uncertainCheckReservations v1
+for exact, immutable, individually pinned CHECK intents. This does not reconcile
+the effect, retry its candidate, accept a result, or enlarge quota or WIP limits.
+
+The watcher only scopes the board veto when a fresh, authenticated adapter status
+contains uncertainCheckReservation with exactly: version=1, slots=1, verifiedAt,
+detailSHA256, policySHA256, ownSourceUnretryable=true, effectReconciled=false, and
+intent. The intent must match the current policy pin byte canonically. The full
+current native detail, latest QA identity and candidate identity must match;
+the adapter has already completed NativeAudit and checked all uncertain ledgers
+under its account lock. The own outcome remains uncertain_owned with explicit
+jobId=null and postAttempted=null. Null never means no POST occurred.
+
+That source SHA and all occurrence aliases keep their single WIP reservation,
+are removed from confirmed source choices, and fail plan validation for both new
+experiments and repairs. Other authenticated sources can use genuinely available
+board/global slots. An additional unknown, missing or stale marker, changed pin,
+changed attempt, inactive authority or inconsistent identity retains the veto.
+Neither the 24/8 pipeline limits nor the 12 sessions/6 request limits change.
+The marker's time is checked but excluded from semantic plan identity; repeated
+verification is not counted as progress or a reason to repeat a task.
+
+Activation requires qualified adapter emission, this watcher reader, and the
+matching policy/code pins in one reviewed handover. No controller definition or
+planner schema changes are required. Isolated fake dispatch and frozen native
+proofs establish admission behavior, not a measured throughput or GPU gain.

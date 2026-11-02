@@ -7,7 +7,7 @@ import { classifyProviderError,retryAfterSeconds } from './opencode-provider-err
 import { semanticModelWatchdog, readAbortableModelBody, modelAbortFailure, MODEL_IDLE_TIMEOUT_MS } from './semantic-model-watchdog.mjs';
 import { createModelTransportTelemetry } from './model-transport-telemetry.mjs';
 import { diagnosticFinishReason, observeProtocolTerminal } from './protocol-terminal-diagnostic.mjs';
-import {transportFailureReason,markModelTransportFailure} from './model-transport-failure.mjs';
+import {transportFailureReason,markModelTransportFailure,markModelRateLimitFailure} from './model-transport-failure.mjs';
 
 export const RETRY_ATTEMPTS = 3;
 export const RETRY_BUDGET_MS = 30000;
@@ -221,11 +221,11 @@ async function readCompletionsJson(body, signal, onPartial, telemetry) {
 }
 
 function typedFailure(failure) {
-  return Object.assign(Error(failure.code), {
+  return markModelRateLimitFailure(Object.assign(Error(failure.code), {
     code: failure.code,
     status: failure.status,
     retryAfterSeconds: failure.retryAfterSeconds ?? null,
-  });
+  }));
 }
 const cancelled = () => Object.assign(Error('CANCELLED'), { code: 'CANCELLED' });
 

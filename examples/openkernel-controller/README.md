@@ -123,3 +123,30 @@ the existing submission lane, register fixed actions, and demonstrate a genuine
 check followed by observation and a scored run for the exact approved source.
 Then exercise restart and deduplication against its journal. This example has
 no serving submission, rules-acceptance or withdrawal endpoint.
+
+## Continuity diagnostics across bounded scans
+
+The continuity watcher can consume terminal rejection diagnostics whose native
+identity has been reverified by the pinned adapter. Each cached row carries a
+`diagnosticProof` with `verifyKind: "native_identity"`, its original `observedAt`,
+fresh `verifiedAt`, policy and adapter hashes, full native-detail hash and
+dispatch-receipt hash. This is a historical rejection, not a fresh audit of all
+execution bytes. The original audit expires after one hour; rechecking identity
+does not extend that expiry. The last identity verification must also fit the
+watcher's observation window.
+
+The watcher checks current native detail identity and rereads the candidate,
+base, patch, CPU checker/result, verification and QA bytes before offering an
+evidence repair. Invalid or expired proofs retain the candidate's reservation.
+Observation timestamps are excluded from semantic plan hashes, so a partial
+scan cannot invalidate a plan merely by reobserving unchanged evidence. Every
+repair still requires a new CPU execution and independent QA; no cache entry
+authorizes a CHECK, numerical acceptance or a performance claim.
+
+A typed preflight `account_wait / ACCOUNT_HAS_UNCERTAIN_EFFECT`, or
+`quota_wait / CHECK_QUOTA_SYNC_PENDING`, can reserve a candidate without blocking
+unrelated CPU work. Both require explicit `postAttempted: false`, `jobId: null`
+and a matching known source. An effect owned by that candidate overrides those
+preflight states. An unacknowledged POST remains uncertain, including when a
+transport reports a quota error; it is never silently retried or reclassified
+as a preflight refusal.

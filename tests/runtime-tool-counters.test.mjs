@@ -23,12 +23,12 @@ const counters=value=>({toolCalls:value.toolCalls,toolResults:value.toolResults,
 
 // Run the actual runner and its readline/session handler. Only system, storage,
 // model and collection boundaries are replaced; no tool-counting logic is copied.
-async function runFixture(events,{reason={kind:'completed'},noise=[],generationFailures,unmarked=false,cancelBackoff=false,adapterFailure=false,lateHeaders=false,partialBody=false,providerWait,initialGuidance=false,compositionFixture=false,badPromptReceipt=false}={}){
+async function runFixture(events,{reason={kind:'completed'},noise=[],generationFailures,rateFailures=0,unmarked=false,cancelBackoff=false,adapterFailure=false,lateHeaders=false,partialBody=false,providerWait,initialGuidance=false,compositionFixture=false,badPromptReceipt=false}={}){
   const runId=randomUUID(),receiptId=randomUUID(),emitted=[],saved=[],writes=new Map();
   const controller=new AbortController();
   let gatewayHandler,generations=0,gateActive=0,gateAdmissions=0,fetches=0;
   const wire=[];
-  const providerBodies=[];
+  const providerBodies=[],rateWaits=[];
   const initialPrompts=[];
   const initialPrompt=initialGuidance?'Operator retry guidance: restore original tests; keep database coverage pending for integration CI.':'Counter fixture without a provider call.';
   const retryGuidance=initialGuidance?{bindingId:randomUUID(),requestId:randomUUID(),
@@ -96,6 +96,9 @@ async function runFixture(events,{reason={kind:'completed'},noise=[],generationF
     }},
     'node:path':{default:path},'node:url':{fileURLToPath},
     'node:timers/promises':{setTimeout:async(ms,_value,options)=>{
+      if(rateFailures&&options&&ms>=33000&&ms<=34000){
+        assert.equal(gateActive,0);rateWaits.push(ms);if(cancelBackoff)controller.abort();options.signal.throwIfAborted();return;
+      }
       if(ms===750||ms===1500&&options){if(cancelBackoff)controller.abort();options?.signal.throwIfAborted();return;}
       return new Promise(()=>{});
     }},
@@ -152,6 +155,8 @@ async function runFixture(events,{reason={kind:'completed'},noise=[],generationF
         generations++;assert.equal(gateActive,1);
         assert.equal(input.generationAttempt,generations);
         assert.ok(wire.every(s=>s.startsWith(':')),'Only transport comments may precede a validated completion');
+        if(generations<=rateFailures)throw transportFailures.markModelRateLimitFailure(
+          Object.assign(Error('RATE_LIMIT'),{code:'RATE_LIMIT',status:429,retryAfterSeconds:33}));
         if(adapterFailure){
           let clock=0;
           return openAICompletionsFallback({now:()=>clock,fetch:async(_url,request)=>{
@@ -186,7 +191,7 @@ async function runFixture(events,{reason={kind:'completed'},noise=[],generationF
   assert.equal(saved.at(-1).stopped,true,error?.stack);
   assert.equal(emitted.filter(e=>e.kind==='HARNESS_STOPPED').length,1);
   assert.equal(gateActive,0);
-  return {value,error,saved,emitted,writes,wire,generations,gateAdmissions,fetches,providerBodies,initialPrompts,retryGuidance};
+  return {value,error,saved,emitted,writes,wire,generations,gateAdmissions,fetches,providerBodies,rateWaits,initialPrompts,retryGuidance};
 }
 
 test('delivers bound retry guidance in the initial SDK prompt before generation without claiming compliance',async()=>{
@@ -253,6 +258,20 @@ test('retries only a buffered generation while retaining all earlier tools and r
   assert.equal(f.emitted.filter(e=>e.kind==='MODEL_GENERATION_RETRY').length,1);
   assert.equal(f.emitted.filter(e=>e.kind==='RUNTIME_TRANSPORT_INTERRUPTED').length,0);
   assert.equal(f.wire.filter(s=>s.includes('[DONE]')).length,1);
+});
+test('ten explicit rate waits keep the same native actor and settled tools while physical request identities advance',async()=>{
+  const f=await runFixture([call('before-rate'),result('before-rate')],{generationFailures:0,rateFailures:10});
+  assert.equal(f.error,undefined);assert.equal(f.generations,11);assert.equal(f.gateAdmissions,11);
+  assert.equal(f.rateWaits.length,10);assert.equal(f.value.evidence.toolCalls,1);assert.equal(f.value.evidence.toolResults,1);
+  const waits=f.emitted.filter(e=>e.kind==='MODEL_RATE_LIMIT_WAIT').map(e=>e.payload);
+  assert.deepEqual(waits.map(e=>e.generationAttempt),Array.from({length:10},(_,i)=>i+1));
+  assert.equal(new Set(waits.map(e=>e.requestId)).size,1);assert.equal(f.wire.filter(s=>s.includes('[DONE]')).length,1);
+  assert.equal(f.emitted.filter(e=>e.kind==='MODEL_ERROR').length,0);
+});
+test('cancellation of a native actor during a rate wait releases admission and sends no next request',async()=>{
+  const f=await runFixture([call('before-rate'),result('before-rate')],{generationFailures:0,rateFailures:10,cancelBackoff:true});
+  assert.equal(f.error.code,'CANCELLED');assert.equal(f.generations,1);assert.equal(f.gateAdmissions,1);
+  assert.equal(f.wire.some(s=>s.includes('[DONE]')),false);assert.equal(f.saved.at(-1).stopped,true);
 });
 test('exhausted generation retries preserve the ordinary terminal failure without delivering tool output',async()=>{
   const f=await runFixture([call('a'),result('a')],{generationFailures:99});
