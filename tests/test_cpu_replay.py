@@ -13,6 +13,7 @@ import pathlib
 import subprocess
 import sys
 import unittest
+import tempfile
 import uuid
 from unittest.mock import patch
 
@@ -115,6 +116,53 @@ class Protocol(unittest.TestCase):
 
     def test_symlink_is_not_protected(self):
         with self.assertRaises((ValueError, OSError)): M.protected('/proc/self/exe')
+
+    def test_waiting_proof_binds_request_and_never_claims_a_completed_execution(self):
+        out = M.waiting(self.r, self.sha)
+        self.assertEqual(out['code'], 'CPU_REPLAY_WAITING')
+        self.assertEqual(set(out['admission']), {'version', 'requestId', 'occurrenceId', 'runFence',
+            'requestSHA256', 'registrationSHA256', 'executorSHA256', 'dispatched'})
+        self.assertIs(out['admission']['dispatched'], False)
+        self.assertEqual(out['admission']['requestSHA256'], M.sha(M.canonical(self.r)))
+
+    def test_queue_keeps_original_order_but_an_abandoned_head_expires(self):
+        with tempfile.TemporaryDirectory() as root:
+            state = pathlib.Path(root); folder = state / 'admissions'; folder.mkdir()
+            first, second = str(uuid.uuid4()), str(uuid.uuid4())
+            for request_id, created, updated in [(first, 10, 100), (second, 20, 150)]:
+                (folder / (request_id + '.json')).write_bytes(M.canonical({'proof': {'requestId': request_id},
+                    'createdEpoch': created, 'updatedEpoch': updated}))
+            with patch.object(M, 'read_protected', side_effect=lambda p, limit: p.read_bytes()):
+                self.assertEqual(M.admission_head(state, 155), first)
+                self.assertEqual(M.admission_head(state, 161), second)
+                (state / second).mkdir()
+                self.assertIsNone(M.admission_head(state, 161))
+
+    def test_queue_rejects_future_clock_or_misbound_identity(self):
+        with tempfile.TemporaryDirectory() as root:
+            state = pathlib.Path(root); folder = state / 'admissions'; folder.mkdir()
+            request_id = str(uuid.uuid4()); target = folder / (request_id + '.json')
+            with patch.object(M, 'read_protected', side_effect=lambda p, limit: p.read_bytes()):
+                for proof, timestamp in [({'requestId': request_id}, 200), ({'requestId': str(uuid.uuid4())}, 90)]:
+                    target.write_bytes(M.canonical({'proof': proof, 'createdEpoch': 10, 'updatedEpoch': timestamp}))
+                    with self.assertRaises(ValueError): M.admission_head(state, 100)
+
+    def test_atomic_publication_never_replaces_an_existing_receipt(self):
+        with tempfile.TemporaryDirectory() as root:
+            target = pathlib.Path(root) / 'receipt.json'
+            M.immutable(target, b'original')
+            with self.assertRaises(FileExistsError): M.immutable(target, b'replacement')
+            self.assertEqual(target.read_bytes(), b'original')
+
+    def test_publication_failure_has_no_partial_final_name(self):
+        with tempfile.TemporaryDirectory() as root:
+            target = pathlib.Path(root) / 'intent.json'
+            with patch.object(M, 'rename_exclusive', side_effect=OSError('unsupported filesystem')), self.assertRaises(OSError):
+                M.immutable(target, b'complete staged bytes')
+            self.assertFalse(target.exists())
+            temporary = list(pathlib.Path(root).glob('.intent.json.publish-*'))
+            self.assertEqual(len(temporary), 1)
+            self.assertEqual(temporary[0].read_bytes(), b'complete staged bytes')
 
 
 def sandbox_suite(root):

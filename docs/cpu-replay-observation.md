@@ -80,6 +80,13 @@ it does not run the program again. An uncertain tool in an occurrence blocks a
 second tool invocation in that occurrence. Missing responses never imply that
 the request was not dispatched.
 
+Protected intents, receipts and cancellation tombstones use a fsynced staging
+file and Linux `renameat2(RENAME_NOREPLACE)`, followed by directory fsync. A
+reader sees no final file or all its bytes. Existing destinations are never
+replaced, and unsupported filesystem semantics fail closed without a weaker
+fallback. A killed publisher can leave a staging file, not a partial canonical
+receipt that masks an incomplete execution.
+
 Before launching QA, the controller independently invokes the registered
 inspector and checks the returned receipt against the frozen request, profile,
 registration, executor, unit, producer, occurrence and QA fence. It then checks
@@ -103,9 +110,11 @@ as a dedicated non-root user in its own transient unit and bubblewrap sandbox:
 no external network or credentials, read-only inputs, fixed writable output,
 bounded files/logs, process count, CPU, memory, and wall time. The launcher
 captures metrics and physical termination before releasing the unit. The
-initial executor permits one tool run at a time. It currently refuses a
-concurrent caller; this is not yet a working admission queue. The model's
-existing memory policy and six-request limit are not changed.
+executor permits one tool run at a time. Persistent admissions retain their
+original order and a 60-second polling lease, so a paused controller cannot
+leave an immortal queue head. A request lock protects each identity; the global
+execution lock does not prevent inspection of another completed request. The
+model's existing memory policy and six-request limit are not changed.
 
 This contains the **mediated** replay. Arbitrary additional `bash` programs
 written by QA still execute under the agent's existing sandbox and can exhaust
@@ -116,27 +125,55 @@ The cgroup memory hierarchy still matters: a tool-level limit does not grant
 extra host capacity or defeat a tighter ancestor limit. Do not enable this
 profile without separately reviewing aggregate resource admission.
 
-## Adoption blockers in this isolated revision
+## Preparation, admission and controller recovery
 
-This revision is **not ready for production activation**. Two availability
-limitations are deliberately visible rather than treated as success:
+Before IPC, preparation persists its request hash, registration and executor
+pins, dependency snapshot, authority hash and a claim token. Waiting does not
+create or fail a QA attempt. The bounded engine sweep resumes the same attempt
+and fence with a new token, inspecting the original request first. The token
+is checked before IPC, receipt commit and model dispatch; a superseded handler
+cannot commit or start QA merely because its run fence is unchanged.
 
-- A busy executor returns `CPU_REPLAY_BUSY`, but the controller currently stores
-  uncertainty and fails preparation. Ordinary contention can therefore block
-  an occurrence. Persistent admission, or an authenticated no-dispatch response
-  followed by bounded waiting for the same request, is required.
-- `observeCPUReplay()` can inspect an existing request without rerunning it,
-  but the engine has no automatic path back into that same failed preparation
-  attempt/fence. A new attempt cannot safely substitute for it. Recovery needs
-  a bounded, fair, persisted receipt-only reconciler, preserving the original
-  request, registration, dependency snapshot and failure. It must never launch
-  a tool to resolve an uncertain effect or invent a QA result.
+The executor can return an authenticated no-dispatch proof only under the own
+request lock, with no execution directory/intent. BUSY alone is never that
+proof. A later execute call uses the same request identity and creates the
+exclusive intent before starting a unit; an existing intent always wins and
+prevents rerunning the tool. Waiting claims use persistent bounded backoff and
+fair ordering, not an unbounded in-memory sleep or a new model session.
 
-An orphaned request directory without a completed receipt also blocks new tool
-runs. Recovery must distinguish authenticated no-dispatch, a live tool, an
-unavailable inspector and a physically stopped tool. Missing responses and
-missing metrics are not evidence of absence. Registration changes must retain
-the original inspector authority or fail closed until reviewed reconciliation.
+Immediately before `worker.execute`, one database CAS records `qa_dispatching`.
+CPU recovery never replays that model call. After this boundary, the existing
+harness reconciliation owns the effect. Conversely, generic harness
+reconciliation excludes unfinished CPU preparation: absence of a model process
+cannot become a false `STOP_CONFIRMED` for a tool that is still owned.
+
+A lost response after a full protected receipt was saved can be reconciled by
+inspection. If the launcher dies before saving outputs, recovery does not
+invent empty output or success. After acquiring the own lock and confirming
+physical stop twice, it can persist a separate `cpu-replay-incomplete`
+tombstone. That frees capacity for other request IDs and preserves
+`CPU_REPLAY_RESULT_LOST` for the affected attempt without starting QA. A full
+receipt always takes precedence. A missing intent also requires an absent
+unit and a conservative tombstone; the same ID is never relaunched.
+
+## Remaining adoption boundaries
+
+This revision remains **default OFF and not approved for production activation**.
+Registration changes must retain the original inspector authority or fail
+closed until reviewed reconciliation. Missing metrics remain unavailable.
+Admission history is bounded at 4,096 records; reviewed retention is necessary
+before treating this as an indefinite service. No garbage collection is added
+here. Preparations still reserve native execution capacity while waiting; this
+is not proof of active model calls or of a separately tuned CPU resource pool.
+
+Pausing or cancelling an occurrence prevents launching or resuming QA. A
+cancel continuation uses the same request and a separate no-launch mode. Only
+the own lock, absent execution intent and absent derived unit permit a durable
+cancellation tombstone. Every later execute of that ID returns the tombstone.
+An existing execution intent instead requires its full or incomplete terminal
+receipt; cancellation waits if the unit is still alive or unknown. The
+inspector never implicitly kills it. Preparation cancellation is recorded with
+`modelDispatched: false`, not a fabricated harness stop or QA result.
 
 When explicitly enabled, preparation stages the receipt as a read-only input
 and names it in the QA prompt; it is not merely logged. Isolated tests prove
@@ -164,3 +201,4 @@ Primary runtime references:
 - [systemd service OOM behavior](https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html)
 - [Transient services, exit status and collection](https://www.freedesktop.org/software/systemd/man/latest/systemd-run.html)
 - [Bubblewrap sandbox policy responsibilities](https://github.com/containers/bubblewrap)
+- [Atomic rename and RENAME_NOREPLACE semantics](https://man7.org/linux/man-pages/man2/rename.2.html)

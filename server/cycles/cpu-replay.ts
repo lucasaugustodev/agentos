@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { constants } from 'node:fs';
 import { lstat, open } from 'node:fs/promises';
 import path from 'node:path';
@@ -8,6 +9,7 @@ import { pool, tx, lock } from '../db.js';
 import { hash } from '../memory.js';
 import { DomainError } from '../contracts.js';
 import { assertDependencySnapshot, dependencyArtifactBytes, type DependencySnapshot } from './dependency-evidence.js';
+import { cycleEvent } from './store.js';
 
 const action = 'native.cpu-replay.observe';
 const uuid = z.string().uuid(), sha = z.string().regex(/^[a-f0-9]{64}$/);
@@ -33,6 +35,53 @@ export function cpuReplayArgv(profile: string) {
   return fail('CPU_REPLAY_PROFILE_INVALID');
 }
 const fail = (code: string): never => { throw new DomainError(code, 'CPU replay observation is unavailable or unconfirmed; no acceptance or automatic re-execution.'); };
+export class CPUReplayPending extends DomainError {
+  constructor(public waiting: boolean, public originalCode: string) {
+    super('CPU_REPLAY_PENDING', 'CPU preparation is owned by this same attempt; waiting or inspecting, without a new attempt or acceptance.');
+  }
+}
+const stable = (v: any): string => Array.isArray(v) ? '[' + v.map(stable).join(',') + ']'
+  : v !== null && typeof v === 'object' ? '{' + Object.keys(v).sort().map(k => JSON.stringify(k) + ':' + stable(v[k])).join(',') + '}'
+  : JSON.stringify(v);
+function authorityHash(o: any, s: any, a: any) {
+  return hash(stable([o.id, o.version, o.definition, o.input, s.id, s.definition, a.id, a.number, a.fence, a.account_id, a.model]));
+}
+export async function cpuPreparationOwned(db: any, a: any) {
+  if (!a.cpuReplayLease) return true;
+  const row = (await db.query('SELECT state,owner,fence,context FROM cycle_attempts WHERE id=$1 FOR SHARE', [a.id])).rows[0];
+  return row?.state === 'running' && row.owner === a.owner && row.fence === a.fence &&
+    row.context?.cpuReplayPreparation?.token === a.cpuReplayLease;
+}
+function noDispatch(response: any, request: any, registration: LoadedRegistration) {
+  const proof = response?.admission;
+  return response?.ok === false && response.code === 'CPU_REPLAY_WAITING' && proof &&
+    Object.keys(proof).sort().join(',') === 'dispatched,executorSHA256,occurrenceId,registrationSHA256,requestId,requestSHA256,runFence,version' &&
+    proof.version === 1 && proof.dispatched === false && proof.requestId === request.requestId &&
+    proof.occurrenceId === request.occurrenceId && proof.runFence === request.runFence &&
+    proof.requestSHA256 === hash(cpuReplayCanonical(request)) && proof.registrationSHA256 === registration.digest &&
+    proof.executorSHA256 === registration.value.executorSHA256;
+}
+function terminalIncomplete(response: any, request: any, registration: LoadedRegistration) {
+  const t = response?.terminal;
+  return response?.ok === false && response.code === 'CPU_REPLAY_RESULT_LOST' && t?.version === 1 &&
+    Object.keys(t).sort().join(',') === ['version', 'kind', 'requestId', 'occurrenceId', 'runFence', 'requestSHA256',
+      'registrationSHA256', 'executorSHA256', 'unit', 'stopProof', 'observedAt', 'dispatchIntentPresent',
+      'outputsUnavailable', 'executionOutcomeKnown', 'acceptance'].sort().join(',') &&
+    t.kind === 'cpu-replay-incomplete' && t.requestId === request.requestId && t.occurrenceId === request.occurrenceId &&
+    t.runFence === request.runFence && t.requestSHA256 === hash(cpuReplayCanonical(request)) &&
+    t.registrationSHA256 === registration.digest && t.executorSHA256 === registration.value.executorSHA256 &&
+    t.unit === `agentos-cpu-replay-${request.requestId}.service` && typeof t.dispatchIntentPresent === 'boolean' &&
+    t.outputsUnavailable === true && t.executionOutcomeKnown === false && t.acceptance === false &&
+    t.stopProof?.stopped === true && t.stopProof.mainPID === 0 && t.stopProof.populated === false &&
+    t.stopProof.unit === t.unit && Number.isFinite(Date.parse(t.observedAt));
+}
+function cancelledBeforeDispatch(response: any, request: any, registration: LoadedRegistration) {
+  const proof = response?.cancellation;
+  if (response?.ok !== false || response.code !== 'CPU_REPLAY_CANCELLED_NO_DISPATCH' || proof?.cancelled !== true ||
+      proof.unit !== `agentos-cpu-replay-${request.requestId}.service` || Object.keys(proof).length !== 10) return false;
+  const { cancelled, unit, ...admission } = proof;
+  return noDispatch({ ok: false, code: 'CPU_REPLAY_WAITING', admission }, request, registration);
+}
 
 // Only ASCII identity/base64 fields and finite integers enter this protocol.
 // Explicit key sorting binds Python's canonical JSON without relying on jsonb ordering.
@@ -82,7 +131,7 @@ export const cpuReplayIO = {
       return fail('CPU_REPLAY_REGISTRATION_INVALID');
     }
   },
-  async invoke(mode: 'execute' | 'inspect', registered: LoadedRegistration, request: any, signal: AbortSignal): Promise<any> {
+  async invoke(mode: 'execute' | 'inspect' | 'cancel', registered: LoadedRegistration, request: any, signal: AbortSignal): Promise<any> {
     if (signal.aborted) return fail('CPU_REPLAY_CANCELLED');
     const current = await cpuReplayIO.registration();
     if (!isDeepStrictEqual(current, registered)) return fail('CPU_REPLAY_REGISTRATION_CHANGED');
@@ -160,12 +209,13 @@ export function validateCPUReplayReceipt(receipt: any, request: any, registratio
 }
 
 async function assertReplayAuthority(db: any, o: any, s: any, a: any, snapshot: DependencySnapshot) {
+  if (!await cpuPreparationOwned(db, a)) return fail('CPU_REPLAY_LEASE_LOST');
   await assertDependencySnapshot(db, o, s, a, snapshot);
   const live = (await db.query('SELECT version,definition,input,state FROM cycle_occurrences WHERE id=$1 FOR SHARE', [o.id])).rows[0];
   const step = (await db.query('SELECT definition FROM cycle_steps WHERE id=$1 FOR SHARE', [s.id])).rows[0];
   if (!live || live.version !== o.version || !isDeepStrictEqual(live.definition, o.definition) ||
       !step || !isDeepStrictEqual(step.definition, s.definition) || !isDeepStrictEqual(live.input, o.input) ||
-      !['running', 'queued'].includes(live.state))
+      !(a.cpuReplayCancelOnly ? live.state === 'cancelling' : ['running', 'queued'].includes(live.state)))
     return fail('CPU_REPLAY_AUTHORITY_CHANGED');
 }
 async function frozenBase(o: any, db: any = pool) {
@@ -215,7 +265,25 @@ export async function observeCPUReplay(o: any, s: any, a: any, snapshot: Depende
     registrationSHA256: registration.digest, executorSHA256: registration.value.executorSHA256 };
   const inputHash = hash(cpuReplayCanonical(request)), actionKey = `${o.id}:${a.id}:cpu-replay-v1`;
   const state = await tx(async db => {
-    await lock(db); await assertReplayAuthority(db, o, s, a, snapshot);
+    await lock(db);
+    const own = (await db.query('SELECT owner,fence,state,context FROM cycle_attempts WHERE id=$1 FOR UPDATE', [a.id])).rows[0];
+    const priorPreparation = own?.context?.cpuReplayPreparation;
+    if (!own || own.owner !== a.owner || own.fence !== a.fence || own.state !== 'running') return fail('CPU_REPLAY_LEASE_LOST');
+    if (priorPreparation) {
+      if (!a.cpuReplayLease || priorPreparation.token !== a.cpuReplayLease || priorPreparation.phase !== 'preparing')
+        return fail('CPU_REPLAY_LEASE_LOST');
+      if (priorPreparation.requestSHA256 !== inputHash || priorPreparation.authoritySHA256 !== authorityHash(o, s, a) ||
+          priorPreparation.registrationSHA256 !== registration.digest || priorPreparation.executorSHA256 !== registration.value.executorSHA256 ||
+          !isDeepStrictEqual(priorPreparation.snapshot, snapshot)) return fail('CPU_REPLAY_INPUT_CHANGED');
+    } else {
+      a.cpuReplayLease = randomUUID();
+      const preparation = { version: 1, phase: 'preparing', token: a.cpuReplayLease,
+        requestSHA256: inputHash, registrationSHA256: registration.digest, executorSHA256: registration.value.executorSHA256,
+        authoritySHA256: authorityHash(o, s, a), snapshot, polls: 0 };
+      await db.query("UPDATE cycle_attempts SET context=COALESCE(context,'{}'::jsonb)||$2::jsonb WHERE id=$1",
+        [a.id, JSON.stringify({ cpuReplayPreparation: preparation })]);
+    }
+    await assertReplayAuthority(db, o, s, a, snapshot);
     if (base && !isDeepStrictEqual(base, await frozenBase(o, db))) return fail('CPU_REPLAY_BASE_BINDING');
     if (signal.aborted) return fail('CPU_REPLAY_CANCELLED');
     const prior = (await db.query('SELECT * FROM cycle_action_receipts WHERE action_key=$1', [actionKey])).rows[0];
@@ -223,6 +291,7 @@ export async function observeCPUReplay(o: any, s: any, a: any, snapshot: Depende
       if (prior.input_hash !== inputHash) return fail('CPU_REPLAY_INPUT_CHANGED');
       return 'inspect' as const;
     }
+    if (a.cpuReplayCancelOnly) return fail('CPU_REPLAY_UNCONFIRMED');
     const uncertainty = await db.query("SELECT 1 FROM cycle_action_receipts WHERE occurrence_id=$1 AND action=$2 AND state<>'completed' LIMIT 1", [o.id, action]);
     if (uncertainty.rowCount) return fail('CPU_REPLAY_UNCONFIRMED');
     await db.query("INSERT INTO cycle_action_receipts(action_key,occurrence_id,action,state,input_hash) VALUES($1,$2,$3,'started',$4)",
@@ -230,21 +299,63 @@ export async function observeCPUReplay(o: any, s: any, a: any, snapshot: Depende
     return 'execute' as const;
   });
   // Persisted DB ownership precedes any IPC or executable invocation.
-  await onEvent('CPU_REPLAY_REQUESTED', { requestId: a.id, requestSHA256: inputHash, observationOnly: true, mode: state });
+  await onEvent('CPU_REPLAY_REQUESTED', { requestId: a.id, requestSHA256: inputHash, observationOnly: true, mode: a.cpuReplayCancelOnly ? 'cancel' : state });
   let receipt: any;
   try {
-    const response = await cpuReplayIO.invoke(state, registration, request, signal);
-    if (response?.ok !== true) return fail('CPU_REPLAY_UNCONFIRMED');
+    const beforeIPC = async () => tx(async db => { await lock(db); await assertReplayAuthority(db, o, s, a, snapshot);
+      if (signal.aborted) return fail('CPU_REPLAY_CANCELLED'); });
+    await beforeIPC();
+    let response = await cpuReplayIO.invoke(a.cpuReplayCancelOnly ? 'cancel' : state, registration, request, signal);
+    // Re-entry is inspect-first. Only a current authenticated own-no-intent
+    // proof can admit execute of THIS SAME request; an execution intent wins.
+    if (!a.cpuReplayCancelOnly && state === 'inspect' && noDispatch(response, request, registration)) {
+      await beforeIPC();
+      response = await cpuReplayIO.invoke('execute', registration, request, signal);
+    }
+    if (a.cpuReplayCancelOnly && cancelledBeforeDispatch(response, request, registration)) {
+      await beforeIPC();
+      const confirmed = await cpuReplayIO.invoke('inspect', registration, request, signal);
+      if (!cancelledBeforeDispatch(confirmed, request, registration) || !isDeepStrictEqual(confirmed, response))
+        throw new CPUReplayPending(false, 'CPU_REPLAY_UNCONFIRMED');
+      await tx(async db => {
+        await lock(db); await assertReplayAuthority(db, o, s, a, snapshot);
+        await db.query("UPDATE cycle_action_receipts SET state='cancelled_no_dispatch',receipt=$3,updated_at=now() WHERE action_key=$1 AND input_hash=$2",
+          [actionKey, inputHash, JSON.stringify(response.cancellation)]);
+      });
+      return response.cancellation;
+    }
+    if (terminalIncomplete(response, request, registration)) {
+      await beforeIPC();
+      const confirmed = await cpuReplayIO.invoke('inspect', registration, request, signal);
+      if (!terminalIncomplete(confirmed, request, registration) || !isDeepStrictEqual(confirmed.terminal, response.terminal))
+        throw new CPUReplayPending(false, 'CPU_REPLAY_UNCONFIRMED');
+      await tx(async db => {
+        await lock(db); await assertReplayAuthority(db, o, s, a, snapshot);
+        await db.query("UPDATE cycle_action_receipts SET state='stopped_incomplete',receipt=$3,updated_at=now() WHERE action_key=$1 AND input_hash=$2",
+          [actionKey, inputHash, JSON.stringify(response.terminal)]);
+      });
+      if (a.cpuReplayCancelOnly) return response.terminal;
+      return fail('CPU_REPLAY_RESULT_LOST');
+    }
+    if (response?.ok !== true) throw new CPUReplayPending(noDispatch(response, request, registration), response?.code ?? 'CPU_REPLAY_UNCONFIRMED');
     receipt = validateCPUReplayReceipt(response.receipt, request, registration);
     // An independent inspect call reads the protected receipt and current physical stop.
     // A forged response or a merely exited launcher cannot authorize continuation.
+    await beforeIPC();
     const confirmed = await cpuReplayIO.invoke('inspect', registration, request, signal);
-    if (confirmed?.ok !== true || !isDeepStrictEqual(confirmed.receipt, receipt)) return fail('CPU_REPLAY_UNCONFIRMED');
+    if (confirmed?.ok !== true) throw new CPUReplayPending(false, 'CPU_REPLAY_UNCONFIRMED');
+    if (!isDeepStrictEqual(confirmed.receipt, receipt)) return fail('CPU_REPLAY_RECEIPT_INVALID');
     validateCPUReplayReceipt(confirmed.receipt, request, registration);
   } catch (error) {
-    await pool.query("UPDATE cycle_action_receipts SET state='uncertain',receipt=$3::jsonb,updated_at=now() WHERE action_key=$1 AND input_hash=$2 AND state='started'",
-      [actionKey, inputHash, JSON.stringify({ code: 'CPU_REPLAY_UNCONFIRMED', requestId: a.id })]).catch(() => {});
-    throw error;
+    await tx(async db => {
+      await lock(db);
+      if (await cpuPreparationOwned(db, a)) await db.query("UPDATE cycle_action_receipts SET state=$4,receipt=$3::jsonb,updated_at=now() WHERE action_key=$1 AND input_hash=$2 AND state IN('started','waiting')",
+        [actionKey, inputHash, JSON.stringify({ code: error instanceof CPUReplayPending ? error.originalCode : 'CPU_REPLAY_UNCONFIRMED', requestId: a.id }),
+          error instanceof CPUReplayPending && error.waiting ? 'waiting' : 'uncertain']);
+    }).catch(() => {});
+    if (error instanceof CPUReplayPending || error instanceof DomainError &&
+        !['CPU_REPLAY_TIMEOUT', 'CPU_REPLAY_UNCONFIRMED', 'CPU_REPLAY_CANCELLED'].includes(error.code)) throw error;
+    throw new CPUReplayPending(false, error instanceof DomainError ? error.code : 'CPU_REPLAY_TRANSPORT_LOST');
   }
   await tx(async db => {
     await lock(db); await assertReplayAuthority(db, o, s, a, snapshot);
@@ -258,4 +369,93 @@ export async function observeCPUReplay(o: any, s: any, a: any, snapshot: Depende
     exitCode: receipt.exitCode, signal: receipt.signal, timedOut: receipt.timedOut, oomKilled: receipt.oomKilled,
     memoryPeakBytes: receipt.memoryPeakBytes, rssPeakBytes: receipt.rssPeakBytes, observationOnly: true, acceptance: false });
   return receipt;
+}
+
+/** These are preparation continuations, not new attempts and not model retries. */
+export async function deferCPUPreparation(o: any, s: any, a: any, error: CPUReplayPending) {
+  return tx(async db => {
+    await lock(db);
+    if (!await cpuPreparationOwned(db, a)) return false;
+    const row = (await db.query('SELECT context FROM cycle_attempts WHERE id=$1 FOR UPDATE', [a.id])).rows[0];
+    const p = row.context?.cpuReplayPreparation;
+    if (p?.phase !== 'preparing') return false;
+    const polls = Math.min(1000000, (p.polls ?? 0) + 1), delay = error.waiting ? 3 : polls === 1 ? 5 : polls === 2 ? 15 : 60;
+    await db.query("UPDATE cycle_attempts SET state='reconciling',context=jsonb_set(context,'{cpuReplayPreparation}',$2::jsonb),heartbeat_at=now() WHERE id=$1",
+      [a.id, JSON.stringify({ ...p, phase: 'waiting', polls, lastCode: error.originalCode })]);
+    await db.query("UPDATE cycle_steps SET state='reconciling',reason=$2,next_at=now()+$3*interval '1 second' WHERE id=$1 AND attempt=$4",
+      [s.id, error.waiting ? 'Waiting for the registered CPU executor.' : 'Inspecting the original CPU replay request.', delay, a.number]);
+    await db.query("UPDATE cycle_occurrences SET state='reconciling',reason=$2 WHERE id=$1 AND state NOT IN('paused','cancelling','cancelled')",
+      [o.id, 'CPU preparation pending; the same attempt owns its execution.']);
+    await cycleEvent(db, o.cycle_id, o.id, 'CPU_REPLAY_PREPARATION_DEFERRED',
+      { requestId: a.id, runFence: a.fence, code: error.originalCode, waiting: error.waiting, delaySeconds: delay, newAttempt: false }, s.id, a.id);
+    return true;
+  });
+}
+
+export async function claimCPUPreparations(owner: string, limit = 2) {
+  const cap = Number.isSafeInteger(limit) ? Math.min(2, Math.max(0, limit)) : 0;
+  if (!cap) return [];
+  return tx(async db => {
+    await lock(db);
+    // Maintenance blocks NEW attempts in CycleEngine.claim(). These are already
+    // admitted owners: stopping their continuation would deadlock the drain,
+    // whose guard correctly waits for their terminal physical state.
+    const rows = (await db.query(`SELECT a.id FROM cycle_attempts a JOIN cycle_steps s ON s.id=a.step_id
+      JOIN cycle_occurrences o ON o.id=s.occurrence_id LEFT JOIN accounts ac ON ac.id=a.account_id
+      WHERE a.state='reconciling' AND s.state='reconciling' AND a.number=s.attempt
+        AND o.state IN('running','queued','reconciling','cancelling') AND (ac.enabled=true OR o.state='cancelling')
+        AND a.context#>>'{cpuReplayPreparation,phase}' IN('preparing','waiting')
+        AND (s.next_at IS NULL OR s.next_at<=now())
+        AND NOT EXISTS(SELECT 1 FROM cycle_attempts n WHERE n.step_id=s.id AND n.number>a.number)
+      ORDER BY s.next_at NULLS FIRST,a.heartbeat_at,a.id LIMIT $1 FOR UPDATE OF a,s,o`, [cap])).rows;
+    const jobs = [];
+    for (const row of rows) {
+      const a = (await db.query('SELECT * FROM cycle_attempts WHERE id=$1', [row.id])).rows[0];
+      const s = (await db.query('SELECT * FROM cycle_steps WHERE id=$1', [a.step_id])).rows[0];
+      const o = (await db.query('SELECT * FROM cycle_occurrences WHERE id=$1', [s.occurrence_id])).rows[0];
+      const p = a.context.cpuReplayPreparation;
+      if (p.version !== 1 || !uuid.safeParse(p.token).success || p.authoritySHA256 !== authorityHash(o, s, a)) {
+        // Invalid durable authority is not retried and cannot starve valid rows.
+        await db.query("UPDATE cycle_steps SET next_at=now()+interval '30 minutes' WHERE id=$1", [s.id]); continue;
+      }
+      const token = randomUUID();
+      const changed = (await db.query("UPDATE cycle_attempts SET state='running',owner=$2,heartbeat_at=now(),context=jsonb_set(context,'{cpuReplayPreparation}',$3::jsonb) WHERE id=$1 RETURNING *",
+        [a.id, owner, JSON.stringify({ ...p, phase: 'preparing', token })])).rows[0];
+      await db.query("UPDATE cycle_steps SET state='running',next_at=NULL WHERE id=$1", [s.id]);
+      await db.query("UPDATE cycle_occurrences SET state='running' WHERE id=$1 AND state<>'cancelling'", [o.id]);
+      const account = (await db.query('SELECT * FROM accounts WHERE id=$1', [a.account_id])).rows[0];
+      await cycleEvent(db, o.cycle_id, o.id, 'CPU_REPLAY_PREPARATION_RESUMED',
+        { requestId: a.id, runFence: a.fence, token, inspectFirst: true, newAttempt: false }, s.id, a.id);
+      jobs.push({ o, s, a: { ...changed, cpuReplayLease: token, cpuReplayCancelOnly: o.state === 'cancelling' }, account });
+    }
+    return jobs;
+  });
+}
+
+export async function cancelCPUPreparation(o: any, s: any, a: any, signal: AbortSignal, emit: (kind: string, payload: any) => Promise<void>) {
+  const snapshot: DependencySnapshot = a.context?.cpuReplayPreparation?.snapshot;
+  const evidence = await observeCPUReplay(o, s, a, snapshot, signal, emit);
+  await tx(async db => {
+    await lock(db); await assertReplayAuthority(db, o, s, a, snapshot);
+    await db.query("UPDATE cycle_attempts SET state='cancelled',finished_at=now(),receipt=$2 WHERE id=$1",
+      [a.id, JSON.stringify({ kind: 'cpu-preparation-cancelled', modelDispatched: false, cpu: evidence })]);
+    await db.query("UPDATE cycle_steps SET state='cancelled',reason='Preparation cancelled; no QA model was dispatched.' WHERE id=$1", [s.id]);
+    await cycleEvent(db, o.cycle_id, o.id, 'CPU_REPLAY_PREPARATION_CANCELLED',
+      { requestId: a.id, runFence: a.fence, modelDispatched: false, acceptance: false }, s.id, a.id);
+  });
+}
+
+/** Single model-dispatch boundary: recovery after this marker belongs ONLY to
+ * the existing harness reconciler. CPU preparation must never resend the model. */
+export async function markCPUQADispatch(o: any, s: any, a: any, snapshot: DependencySnapshot, signal: AbortSignal) {
+  await tx(async db => {
+    await lock(db); await assertReplayAuthority(db, o, s, a, snapshot);
+    if (signal.aborted) return fail('CPU_REPLAY_CANCELLED');
+    const changed = await db.query(`UPDATE cycle_attempts SET context=jsonb_set(context,'{cpuReplayPreparation,phase}','"qa_dispatching"'::jsonb)
+      WHERE id=$1 AND context#>>'{cpuReplayPreparation,phase}'='preparing'
+        AND context#>>'{cpuReplayPreparation,token}'=$2 RETURNING id`, [a.id, a.cpuReplayLease]);
+    if (changed.rowCount !== 1) return fail('CPU_REPLAY_LEASE_LOST');
+    await cycleEvent(db, o.cycle_id, o.id, 'CPU_REPLAY_QA_DISPATCH_REQUESTED',
+      { requestId: a.id, runFence: a.fence, token: a.cpuReplayLease, modelResult: false }, s.id, a.id);
+  });
 }

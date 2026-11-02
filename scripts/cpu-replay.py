@@ -5,6 +5,7 @@ Only this launcher is privileged. Every supplied checker/candidate byte runs
 under a non-root systemd user and bubblewrap. No shell or arbitrary argv API.
 """
 import base64
+import ctypes
 import datetime
 import fcntl
 import hashlib
@@ -15,6 +16,7 @@ import pathlib
 import pwd
 import re
 import selectors
+import secrets
 import signal
 import stat
 import subprocess
@@ -97,8 +99,21 @@ def sync_dir(path):
         os.close(fd)
 
 
+def rename_exclusive(source, target):
+    # Linux-only registered executor. No replace or exists+rename fallback:
+    # unsupported filesystem/kernel must fail closed before publication.
+    libc = ctypes.CDLL(None, use_errno=True)
+    operation = libc.renameat2
+    operation.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    operation.restype = ctypes.c_int
+    if operation(-100, os.fsencode(source), -100, os.fsencode(target), 1) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), str(target))
+
+
 def immutable(path, raw, mode=0o600):
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
+    temporary = path.parent / ('.' + path.name + '.publish-' + secrets.token_hex(12))
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
     try:
         os.fchmod(fd, mode)
         with os.fdopen(fd, 'wb', closefd=False) as file:
@@ -107,6 +122,9 @@ def immutable(path, raw, mode=0o600):
             os.fsync(file.fileno())
     finally:
         os.close(fd)
+    # All bytes are durable before the final name is atomically and exclusively
+    # visible. SIGKILL can leave a staging file, never a partially named receipt.
+    rename_exclusive(temporary, path)
     sync_dir(path.parent)
 
 
@@ -207,10 +225,12 @@ def unit_state(unit):
     return data
 
 
-def stopped(unit):
+def stopped(unit, allow_exited=False):
     data = unit_state(unit)
     group = data.get('ControlGroup', '')
-    require(data.get('ActiveState') in ('inactive', 'failed') and data.get('MainPID') == '0'
+    terminal_state = data.get('ActiveState') in ('inactive', 'failed') or (
+        allow_exited and data.get('ActiveState') == 'active' and data.get('SubState') == 'exited')
+    require(terminal_state and data.get('MainPID') == '0'
             and group in ('', '/system.slice/' + unit), 'CPU_REPLAY_UNCONFIRMED')
     if group:
         events = pathlib.Path('/sys/fs/cgroup' + group, 'cgroup.events')
@@ -244,6 +264,13 @@ def metric(data, key):
 
 
 def fresh_receipt(directory, request, registration_sha):
+    if not (directory / 'receipt.json').exists() and (directory / 'incomplete.json').exists():
+        terminal = strict_json(read_protected(directory / 'incomplete.json', 16384))
+        require(terminal['requestSHA256'] == sha(canonical(request)) and terminal['requestId'] == request['requestId']
+                and terminal['runFence'] == request['runFence'] and terminal['registrationSHA256'] == registration_sha,
+                'INTENT_CHANGED')
+        stopped(terminal['unit'], allow_exited=True)
+        return {'ok': False, 'code': 'CPU_REPLAY_RESULT_LOST', 'terminal': terminal}
     intent = strict_json(read_protected(directory / 'intent.json', MAX_REQUEST + 65536))
     require(intent['requestSHA256'] == sha(canonical(request)) and intent['registrationSHA256'] == registration_sha
             and intent['request'] == request, 'INTENT_CHANGED')
@@ -256,6 +283,49 @@ def fresh_receipt(directory, request, registration_sha):
             'RECEIPT_CHANGED')
     stopped(receipt['unit'])
     return {'ok': True, 'receipt': receipt}
+
+
+def recover_incomplete(state, directory):
+    """Caller holds this request's lock. Never launch or terminate a process.
+    A terminal tombstone frees other IDs, but never invents missing outputs."""
+    protected(str(directory), directory=True)
+    unit = 'agentos-cpu-replay-' + directory.name + '.service'
+    if (directory / 'receipt.json').exists():
+        return True
+    if (directory / 'incomplete.json').exists():
+        terminal = strict_json(read_protected(directory / 'incomplete.json', 16384))
+        require(terminal.get('unit') == unit and terminal.get('requestId') == directory.name, 'INCOMPLETE_CHANGED')
+        stopped(unit, allow_exited=True)
+        return True
+    intent_path = directory / 'intent.json'
+    if intent_path.exists():
+        intent = strict_json(read_protected(intent_path, MAX_REQUEST + 65536))
+        request = intent['request']
+        require(intent['unit'] == unit and request['requestId'] == directory.name and
+                intent['requestSHA256'] == sha(canonical(request)) and
+                request['registrationSHA256'] == intent['registrationSHA256'], 'INTENT_CHANGED')
+        identity = {k: request[k] for k in ('requestId', 'occurrenceId', 'runFence', 'registrationSHA256', 'executorSHA256')}
+        identity['requestSHA256'] = intent['requestSHA256']
+    else:
+        admission = strict_json(read_protected(state / 'admissions' / (directory.name + '.json'), 4096))
+        p = admission['proof']
+        require(p['requestId'] == directory.name and p['dispatched'] is False and p['version'] == 1, 'ADMISSION_CHANGED')
+        identity = {k: p[k] for k in ('requestId', 'occurrenceId', 'runFence', 'registrationSHA256', 'executorSHA256', 'requestSHA256')}
+        # Directory absence alone is not a proof. No-intent recovery also
+        # requires that the derived unit never remains registered/running.
+        require(unit_state(unit)['LoadState'] == 'not-found', 'CPU_REPLAY_UNCONFIRMED')
+    proof = stopped(unit, allow_exited=True)
+    time.sleep(0.05)
+    stopped(unit, allow_exited=True)
+    terminal = {**identity, 'version': 1, 'kind': 'cpu-replay-incomplete', 'unit': unit,
+        'stopProof': proof, 'observedAt': utc_now(), 'dispatchIntentPresent': intent_path.exists(),
+        'outputsUnavailable': True, 'executionOutcomeKnown': False, 'acceptance': False}
+    immutable(directory / 'incomplete.json', canonical(terminal))
+    # Release only this bounded output mount after the physical proof. No data
+    # is substituted into stdout/result and no receipt is rewritten.
+    if os.path.ismount(directory / 'output'):
+        require(command(['/usr/bin/umount', str(directory / 'output')]).returncode == 0, 'OUTPUT_UNMOUNT_UNCONFIRMED')
+    return True
 
 
 def execute(directory, request, registration, registration_sha, user, files):
@@ -400,37 +470,147 @@ def execute(directory, request, registration, registration_sha, user, files):
             require(command(['/usr/bin/umount', str(output)]).returncode == 0, 'OUTPUT_UNMOUNT_UNCONFIRMED')
 
 
+def waiting(request, registration_sha):
+    # Only returned while holding this request's lock, after checking that no
+    # execution directory/intent exists. Another request being busy is NOT proof.
+    return {'ok': False, 'code': 'CPU_REPLAY_WAITING', 'admission': {
+        'version': 1, 'requestId': request['requestId'], 'occurrenceId': request['occurrenceId'],
+        'runFence': request['runFence'], 'requestSHA256': sha(canonical(request)),
+        'registrationSHA256': registration_sha, 'executorSHA256': request['executorSHA256'],
+        'dispatched': False}}
+
+
+def cancellation(state, request, registration_sha, create=False):
+    folder = state / 'cancellations'
+    target = folder / (request['requestId'] + '.json')
+    unit = 'agentos-cpu-replay-' + request['requestId'] + '.service'
+    expected = {'ok': False, 'code': 'CPU_REPLAY_CANCELLED_NO_DISPATCH', 'cancellation': {
+        **waiting(request, registration_sha)['admission'], 'cancelled': True, 'unit': unit}}
+    if target.exists():
+        value = strict_json(read_protected(target, 4096))
+        require(value == expected, 'CANCELLATION_CHANGED')
+        require(unit_state(unit)['LoadState'] == 'not-found', 'CPU_REPLAY_UNCONFIRMED')
+        return value
+    if not create:
+        return None
+    # The caller holds the own request lock. No unit/intent can race this
+    # durable tombstone; execute checks it under that very same lock.
+    require(not (state / request['requestId']).exists() and unit_state(unit)['LoadState'] == 'not-found',
+            'CPU_REPLAY_UNCONFIRMED')
+    folder.mkdir(mode=0o700, exist_ok=True)
+    protected(str(folder), directory=True)
+    immutable(target, canonical(expected))
+    return expected
+
+
+def lock_file(path):
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    info = os.fstat(fd)
+    try:
+        require(stat.S_ISREG(info.st_mode) and info.st_uid == 0 and info.st_nlink == 1
+                and not info.st_mode & 0o077, 'LOCK_UNPROTECTED')
+    except Exception:
+        os.close(fd)
+        raise
+    return fd
+
+
+def admission_record(state, request, registration_sha):
+    folder = state / 'admissions'
+    folder.mkdir(mode=0o700, exist_ok=True)
+    protected(str(folder), directory=True)
+    target = folder / (request['requestId'] + '.json')
+    now = time.time()
+    proof = waiting(request, registration_sha)['admission']
+    created = now
+    if target.exists():
+        previous = strict_json(read_protected(target, 4096))
+        require(set(previous) == {'proof', 'createdEpoch', 'updatedEpoch'} and previous['proof'] == proof,
+                'ADMISSION_CHANGED')
+        require(type(previous['createdEpoch']) in (int, float) and
+                0 < previous['createdEpoch'] <= previous['updatedEpoch'] <= now, 'ADMISSION_CLOCK')
+        created = previous['createdEpoch']
+    record = {'proof': proof, 'createdEpoch': created, 'updatedEpoch': now}
+    temp = folder / (request['requestId'] + '.next-' + str(os.getpid()))
+    immutable(temp, canonical(record))
+    os.replace(temp, target)
+    sync_dir(folder)
+    return record
+
+
+def admission_head(state, now):
+    rows = []
+    paths = list((state / 'admissions').glob('*.json'))
+    require(len(paths) <= 4096, 'ADMISSION_SIZE')
+    for file in paths:
+        r = strict_json(read_protected(file, 4096))
+        require(set(r) == {'proof', 'createdEpoch', 'updatedEpoch'} and
+                type(r['proof']) is dict and r['proof'].get('requestId') == file.stem and UUID.fullmatch(file.stem), 'ADMISSION_SCHEMA')
+        require(type(r['createdEpoch']) in (int, float) and type(r['updatedEpoch']) in (int, float) and
+                0 < r['createdEpoch'] <= r['updatedEpoch'] <= now + 1, 'ADMISSION_CLOCK')
+        # A paused/dead controller cannot leave an immortal head in the queue.
+        # Its original ordering remains if the same request returns later.
+        if not (state / file.stem).exists() and now - r['updatedEpoch'] <= 60:
+            if not (state / 'cancellations' / (file.stem + '.json')).exists():
+                rows.append((r['createdEpoch'], file.stem))
+    return min(rows)[1] if rows else None
+
+
 def main(argv):
-    require(len(argv) == 4 and argv[1] in ('execute', 'inspect') and SHA.fullmatch(argv[3]), 'CLI_SCOPE')
+    require(len(argv) == 4 and argv[1] in ('execute', 'inspect', 'cancel') and SHA.fullmatch(argv[3]), 'CLI_SCOPE')
     registration, user = registered(argv[2], argv[3])
     raw = sys.stdin.buffer.read(MAX_REQUEST + 1)
     require(len(raw) <= MAX_REQUEST, 'REQUEST_SIZE')
     request = strict_json(raw)
     files = request_valid(request, registration, argv[3])
     state = pathlib.Path(registration['stateDirectory'])
-    lock_path = state / 'execution.lock'
-    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    directory = state / request['requestId']
+    # Immutable receipts can be inspected while ANY other request is running.
+    # The own directory, even an incomplete one, always defeats no-dispatch.
+    if directory.exists() and (directory / 'receipt.json').exists():
+        protected(str(directory), directory=True)
+        return fresh_receipt(directory, request, argv[3])
+    own_fd = lock_file(state / (request['requestId'] + '.lock'))
     try:
-        info = os.fstat(lock_fd)
-        require(stat.S_ISREG(info.st_mode) and info.st_uid == 0 and info.st_nlink == 1 and not info.st_mode & 0o077, 'LOCK_UNPROTECTED')
-        # A busy initial single-tool executor declines conservatively. The core
-        # keeps uncertain ownership rather than assuming absence of an effect.
         try:
-            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(own_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            return {'ok': False, 'code': 'CPU_REPLAY_BUSY'}
-        directory = state / request['requestId']
+            return {'ok': False, 'code': 'CPU_REPLAY_UNCONFIRMED'}
         if directory.exists():
             protected(str(directory), directory=True)
+            recover_incomplete(state, directory)
             return fresh_receipt(directory, request, argv[3])
+        cancelled = cancellation(state, request, argv[3], create=argv[1] == 'cancel')
+        if cancelled:
+            return cancelled
         if argv[1] == 'inspect':
-            return {'ok': False, 'code': 'CPU_REPLAY_UNCONFIRMED'}
-        for prior in state.iterdir():
-            if prior.is_dir() and UUID.fullmatch(prior.name) and not (prior / 'receipt.json').exists():
-                return {'ok': False, 'code': 'CPU_REPLAY_UNCONFIRMED'}
-        return execute(directory, request, registration, argv[3], user, files)
+            return waiting(request, argv[3])
+        admission_record(state, request, argv[3])
+        lock_fd = lock_file(state / 'execution.lock')
+        try:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return waiting(request, argv[3])
+            if admission_head(state, time.time()) != request['requestId']:
+                return waiting(request, argv[3])
+            for prior in state.iterdir():
+                if prior.is_dir() and UUID.fullmatch(prior.name) and not (prior / 'receipt.json').exists():
+                    prior_fd = lock_file(state / (prior.name + '.lock'))
+                    try:
+                        try:
+                            fcntl.flock(prior_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            recover_incomplete(state, prior)
+                        except (BlockingIOError, ValueError, OSError):
+                            return waiting(request, argv[3])
+                    finally:
+                        os.close(prior_fd)
+            require(not _CANCELLED, 'CPU_REPLAY_CANCELLED')
+            return execute(directory, request, registration, argv[3], user, files)
+        finally:
+            os.close(lock_fd)
     finally:
-        os.close(lock_fd)
+        os.close(own_fd)
 
 
 def cancelled(_signum, _frame):

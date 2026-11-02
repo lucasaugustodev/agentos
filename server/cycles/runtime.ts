@@ -12,7 +12,7 @@ import { actionProfiles, bitrixSnapshot, clean } from './integrations.js';
 import { cycleEvent } from './store.js';
 import { isRegisteredValidation, confirmRegisteredValidationStop } from './validation-action.js';
 import { freezeDependencyEvidence, dependencyArtifactBytes, assertDependencySnapshot } from './dependency-evidence.js';
-import { observeCPUReplay } from './cpu-replay.js';
+import { observeCPUReplay, markCPUQADispatch } from './cpu-replay.js';
 
 export async function readCycleArtifact(id: string) {
   const a = (await pool.query('SELECT * FROM cycle_artifacts WHERE id=$1', [id])).rows[0];
@@ -162,12 +162,15 @@ export async function runCycleAgent(
     },
     content,
   };
-  const contextSaved = await pool.query(dependencySnapshot
+  const contextSaved = await pool.query(cpuReplayObservation
+    ? "UPDATE cycle_attempts SET context=COALESCE(context,'{}'::jsonb)||$2::jsonb WHERE id=$1 AND fence=$3 AND state='running' AND context#>>'{cpuReplayPreparation,token}'=$4 AND context#>>'{cpuReplayPreparation,phase}'='preparing' RETURNING id"
+    : dependencySnapshot
     ? "UPDATE cycle_attempts SET context=$2 WHERE id=$1 AND fence=$3 AND state='running' RETURNING id"
     : 'UPDATE cycle_attempts SET context=$2 WHERE id=$1', [
     a.id,
     JSON.stringify(context),
     ...(dependencySnapshot ? [a.fence] : []),
+    ...(cpuReplayObservation ? [a.cpuReplayLease] : []),
   ]);
   if (dependencySnapshot && contextSaved.rowCount !== 1)
     throw new DomainError('DEPENDENCY_SOURCE_CHANGED', 'The consumer attempt changed before dependency staging.');
@@ -258,6 +261,7 @@ export async function runCycleAgent(
     await assertDependencySnapshot(db, o, s, a, dependencySnapshot);
   });
   let events = Promise.resolve();
+  if (cpuReplayObservation) await markCPUQADispatch(o, s, a, dependencySnapshot!, signal);
   const result = await accountBridge
     .request(
       'worker.execute',

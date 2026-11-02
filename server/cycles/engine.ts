@@ -10,6 +10,7 @@ import { inspectStopped } from '../continuation.js';
 import { collectStoppedArtifacts } from '../artifact-recovery.js';
 import { checkDependencyEvidence, assertDependencySnapshot, DependencyBindingError } from './dependency-evidence.js';
 import { claimCycleTerminationInspections, inspectAndRecordCycleTermination } from './termination-evidence.js';
+import { claimCPUPreparations, CPUReplayPending, deferCPUPreparation, cpuPreparationOwned, cancelCPUPreparation } from './cpu-replay.js';
 
 const terminal = ['completed', 'cancelled'];
 export class CycleEngine {
@@ -63,6 +64,7 @@ export class CycleEngine {
       await this.poll();
       await this.recover();
       await this.reconcile();
+      await this.resumeCPUPreparations();
       for (let i = 0; i < 4; i++) {
         const job = await this.claim();
         if (!job) break;
@@ -79,6 +81,10 @@ export class CycleEngine {
     } finally {
       this.busy = false;
     }
+  }
+  async resumeCPUPreparations() {
+    if (this.stopped) return;
+    for (const job of await claimCPUPreparations(this.ownerId)) void this.execute(job);
   }
   async poll() {
     const due = (
@@ -160,7 +166,7 @@ export class CycleEngine {
             [a.step_id],
           )
         ).rows[0];
-        await db.query("UPDATE cycle_occurrences SET state='reconciling',reason=$2 WHERE id=$1", [
+        await db.query("UPDATE cycle_occurrences SET state='reconciling',reason=$2 WHERE id=$1 AND state IN('queued','running','waiting','recovering','reconciling')", [
           s.occurrence_id,
           s.reason,
         ]);
@@ -386,7 +392,9 @@ export class CycleEngine {
   async reconcile() {
     const rows = (
       await pool.query(
-        `SELECT a.*,s.occurrence_id,s.key,s.definition,o.cycle_id,o.definition cycle_definition,o.state occurrence_state FROM cycle_attempts a JOIN cycle_steps s ON s.id=a.step_id JOIN cycle_occurrences o ON o.id=s.occurrence_id WHERE a.state='reconciling' AND a.account_id IS NOT NULL AND a.heartbeat_at<now()-interval '15 seconds' ORDER BY a.heartbeat_at LIMIT 2`,
+        `SELECT a.*,s.occurrence_id,s.key,s.definition,o.cycle_id,o.definition cycle_definition,o.state occurrence_state FROM cycle_attempts a JOIN cycle_steps s ON s.id=a.step_id JOIN cycle_occurrences o ON o.id=s.occurrence_id WHERE a.state='reconciling' AND a.account_id IS NOT NULL AND a.heartbeat_at<now()-interval '15 seconds'
+          AND COALESCE(a.context#>>'{cpuReplayPreparation,phase}','') NOT IN('preparing','waiting')
+          ORDER BY a.heartbeat_at LIMIT 2`,
       )
     ).rows;
     for (const a of rows) {
@@ -459,21 +467,22 @@ export class CycleEngine {
     }
   }
   async execute({ o, s, a, account }: any) {
+    if (this.active.has(a.id)) return;
     const controller = new AbortController();
     this.active.set(a.id, controller);
     const timer = setInterval(
       () =>
         void pool
           .query(
-            "UPDATE cycle_attempts SET heartbeat_at=now() WHERE id=$1 AND fence=$2 AND state='running' RETURNING state",
-            [a.id, a.fence],
+            "UPDATE cycle_attempts SET heartbeat_at=now() WHERE id=$1 AND fence=$2 AND owner=$3 AND state='running' RETURNING state",
+            [a.id, a.fence, a.owner],
           )
           .then(async (changed) => {
             if (!changed.rowCount) controller.abort();
             const state = (
               await pool.query('SELECT state FROM cycle_occurrences WHERE id=$1', [o.id])
             ).rows[0]?.state;
-            if (state === 'cancelling') controller.abort();
+            if (state === 'cancelling' && !a.cpuReplayCancelOnly) controller.abort();
           })
           .catch(() => controller.abort()),
       3000,
@@ -483,6 +492,10 @@ export class CycleEngine {
     };
     let result: any;
     try {
+      if (a.cpuReplayCancelOnly) {
+        await cancelCPUPreparation(o, s, a, controller.signal, emit);
+        return;
+      }
       result =
         s.definition.kind === 'agent'
           ? await runCycleAgent(o, s, a, account, controller.signal, emit)
@@ -541,7 +554,12 @@ export class CycleEngine {
         await cycleEvent(db, o.cycle_id, o.id, 'STEP_COMPLETED', {}, s.id, a.id);
       });
     } catch (e: any) {
+      if (e instanceof CPUReplayPending) {
+        await deferCPUPreparation(o, s, a, e);
+        return;
+      }
       const code = e.code ?? 'EXECUTION_ERROR';
+      if (code === 'CPU_REPLAY_LEASE_LOST') return;
       const uncertain = code === 'STOP_UNCONFIRMED';
       const retry =
         !uncertain &&
@@ -551,6 +569,7 @@ export class CycleEngine {
         !['APPROVAL_REQUIRED', 'ACTION_SCOPE', 'ACTION_UNAVAILABLE', 'BITRIX_AUTH'].includes(code);
       await tx(async (db) => {
         await lock(db);
+        if (!await cpuPreparationOwned(db, a)) return;
         const changed = await db.query(
           "UPDATE cycle_attempts SET state=$3,finished_at=now(),error_code=$4,summary=$5,receipt=CASE WHEN $6::boolean THEN $7::jsonb ELSE receipt END WHERE id=$1 AND fence=$2 AND state='running' RETURNING id",
           [
