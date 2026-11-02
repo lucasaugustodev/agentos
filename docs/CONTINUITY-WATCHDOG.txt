@@ -740,3 +740,40 @@ large-context ownership, immutable original-material handoff and independent QA.
 A private frozen replay additionally compares the old and new readers on real
 size-blocked owners without native/official network calls or operational writes.
 Private inputs, identities and execution evidence are not part of this repository.
+
+Optional repair-first planning
+-----------------------------
+repairFirstPlanning=true is an opt-in for board-lanes-v1 with planVersion=2.
+Absent or false preserves the existing supervisor definition and normal mixed
+planning. Enabling it changes the bound control definition/config authority;
+existing inputs, request keys, receipts and attempted effects are not rewritten.
+Use the normal reviewed control handover, not an in-place prompt replacement.
+Before a future activation, qualify the exact code/config/control/policy pins
+and replay pending old reviews and uncertain effects offline. New control and
+policy bindings must not erase historical identities or resume an old request
+under new authority. This option is not permission to modify in-flight actors.
+
+When a lane's ready queue is below its existing low watermark, the same refill
+pass checks authenticated evidence repairs through the existing admission
+validator in memory. It offers at most two distinct admissible candidates in
+planningScope.batchPurpose=repair_backlog and repairSourceArtifactIds. Quotas,
+unknown ownership, ready reservations, duplicate repairs and real 24/8 pipeline
+capacity still apply. This selection is not an approved plan or an execution:
+the LLM must publish a valid v2 plan, restricted to those repair_evidence actions.
+The actual per-board capacity remains visible; a small repair batch does not
+invent a lower or higher slot count. Without admissible repairs, normal planning
+continues. Existing deterministic dispatch and refill run while workers execute.
+
+Repair planning stages only the selected candidate and available original-base
+source capsules, related QA/results and compact repair cards. Source read-set
+hashes are computed from the full board evidence before presentation is reduced,
+including same-candidate QA from other origins. Selected-source freshness and
+every normal admission check run again before dispatch. The worker still gets
+the complete required original artifacts and must produce fresh independent QA.
+If no selected candidate capsule can be authenticated, no planner is dispatched.
+
+The purpose is to reduce time until the first useful repair dispatch by avoiding
+optimization research before a repair batch. It does not establish a latency or
+performance gain by itself. Measure time to first dispatch and accepted repair,
+context/read volume and whether the ready buffer is replenished while workers
+run. Session count alone is not delivery, and no GPU authority is added.
