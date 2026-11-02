@@ -1,5 +1,13 @@
 // Private provenance: arbitrary provider text/error JSON cannot opt into retry.
 const failures = new WeakMap();
+const rateLimits = new WeakSet();
+// Called only after the HTTP adapter classified an explicit rejected response.
+// Provider text, worker errors and serialized lookalikes cannot create this mark.
+export function markModelRateLimitFailure(error) {
+  if (error?.code === 'RATE_LIMIT' && error.status === 429) rateLimits.add(error);
+  return error;
+}
+export function isModelRateLimitFailure(error) { return rateLimits.has(error); }
 export function transportFailureReason(error) {
   const code = error?.cause?.code ?? error?.code;
   if (['ECONNRESET', 'EPIPE', 'UND_ERR_SOCKET'].includes(code)) return 'connection_interrupted';
@@ -16,6 +24,6 @@ export function modelTransportFailure(error) { return failures.get(error) ?? nul
 // Observation identity is separate from the provider request body. The HTTP
 // adapter's attempt counter may restart inside a repeated logical generation.
 export function generationObserver(emit,{requestId,generationAttempt}) {
-  const attempt=Number.isInteger(generationAttempt)&&generationAttempt>=1&&generationAttempt<=3?generationAttempt:1;
+  const attempt=Number.isSafeInteger(generationAttempt)&&generationAttempt>=1?generationAttempt:1;
   return (kind,payload)=>emit(kind,{...payload,requestId,generationAttempt:attempt});
 }

@@ -24,7 +24,7 @@ import { deliveryContract, extractPromptJsonFields, prepareDeliveryManifest, col
 import {analyzePollTrace} from './runtime-progress.mjs';
 import {inspectRuntimeProgress,checkpointRuntimeProgress} from './inspect-runtime-progress.mjs';
 import {captureRuntimeHandoff,runtimeHandoffInstruction} from './runtime-handoff.mjs';
-import {modelTransportFailure,generationObserver} from './model-transport-failure.mjs';
+import {modelTransportFailure,isModelRateLimitFailure,generationObserver} from './model-transport-failure.mjs';
 import {harnessMemory} from './runtime-memory.mjs';
 import {stopUnit} from './process-stop.mjs';
 import {inspectUnitExit} from './unit-exit.mjs';
@@ -38,6 +38,33 @@ const uuid = /^[0-9a-f-]{36}$/;
 const key = /^[a-z0-9_-]+\/[a-z0-9_-]+$/;
 const digest = (b) => createHash('sha256').update(b).digest('hex');
 const error = (code, message = code) => Object.assign(new Error(message), { code });
+
+// This boundary is hot-loaded with the runner. Long-lived bridges may retain
+// an older channel module whose text fallback mistakes RATE_LIMIT for quota.
+export function runtimeGenerationFailureCode(channel, failure) {
+  const code = channel.failureCode(failure);
+  if (failure?.code === 'RATE_LIMIT' &&
+      !['CANCELLED', 'MODEL_TIMEOUT', 'MODEL_CLIENT_DISCONNECTED'].includes(code))
+    return 'RATE_LIMIT';
+  return code;
+}
+
+// Only the trusted HTTP adapter's explicit, rejected 429 is replayable here.
+// A provider wait is a minimum: never shorten it to fit our retry deadline.
+export function runtimeRateLimitDelay(failure, attempt, elapsedMs, random = Math.random) {
+  if (!isModelRateLimitFailure(failure) || failure?.code !== 'RATE_LIMIT' || failure.status !== 429 ||
+      !Number.isSafeInteger(attempt) || attempt < 0 ||
+      !Number.isFinite(elapsedMs) || elapsedMs < 0) return null;
+  const seconds = failure.retryAfterSeconds;
+  if (seconds != null && (!Number.isSafeInteger(seconds) || seconds < 0)) return null;
+  const minimum = seconds == null
+    ? Math.min(5000 * 2 ** Math.min(attempt, 4), 60000) : seconds * 1000;
+  const sample = random();
+  const jitter = Number.isFinite(sample) && sample >= 0 && sample <= 1 ? Math.floor(sample * 1000) : 0;
+  const waitMs = Math.max(1000, minimum) + jitter;
+  return Number.isSafeInteger(waitMs) && elapsedMs + waitMs < WORKER_MODEL_TIMEOUT_MS ? waitMs : null;
+}
+
 export async function runState(id) {
   if (!uuid.test(id)) throw error('INVALID_RUN');
   return JSON.parse(await readFile(`${DATA}/${id}/state.json`, 'utf8'));
@@ -237,6 +264,8 @@ export async function runHarness(params, signal, generate, emit = () => {}) {
       // runtime while retaining its original ungated generate callback. Newer
       // bridges recognize the private symbol and do not acquire twice.
       const generationSignal=requestTimeout?AbortSignal.any([channel.signal,requestTimeout]):channel.signal;
+      const generationStarted=performance.now();
+      let rateLimitRetries=0,transportAttempts=0;
       let result;
       for(let generationAttempt=1;;generationAttempt++){
         generationAttempts=generationAttempt;
@@ -253,18 +282,30 @@ export async function runHarness(params, signal, generate, emit = () => {}) {
           // Each rejected generation has fully unwound its transport and gate.
           // Nothing but keepalive comments has reached the SDK; earlier tools
           // are settled. Retry this immutable generation, never the tool loop.
+          const rateLimitWait=runtimeRateLimitDelay(e,rateLimitRetries,performance.now()-generationStarted);
+          if(rateLimitWait!==null&&!generationSignal.aborted&&
+            transportToolTraceComplete&&pendingTransportTools.size===0){
+            emit('MODEL_RATE_LIMIT_WAIT',{requestId,requests:requestSequence,generationAttempt,
+              rateLimitAttempt:++rateLimitRetries,code:'RATE_LIMIT',status:429,
+              retryAfterSeconds:e.retryAfterSeconds??null,delayMs:rateLimitWait,
+              responseDelivered:false,gateReleased:true});
+            await delay(rateLimitWait,undefined,{signal:generationSignal});
+            // Physical generations remain monotonic; the transport budget is separate.
+            continue;
+          }
           const reason=modelTransportFailure(e);
-          if(reason&&generationAttempt===3&&!generationSignal.aborted&&
+          if(reason)transportAttempts++;
+          if(reason&&transportAttempts===3&&!generationSignal.aborted&&
             transportToolTraceComplete&&pendingTransportTools.size===0)
             emit('MODEL_TRANSPORT_EXHAUSTED',{version:1,source:'runtime-generation-boundary',
               runId:params.runId,runFence:params.runFence,contextVersion:params.contextVersion,
-              requestId,generationAttempt,reason,code:channel.failureCode(e),
+              requestId,generationAttempt,transportAttempt:transportAttempts,reason,code:runtimeGenerationFailureCode(channel,e),
               responseDelivered:false,traceComplete:true,pendingTools:0,cancelled:false});
-          if(!reason||generationAttempt>=3||generationSignal.aborted||
+          if(!reason||transportAttempts>=3||generationSignal.aborted||
             !transportToolTraceComplete||pendingTransportTools.size!==0)throw e;
           emit('MODEL_GENERATION_RETRY',{requestId,requests:requestSequence,generationAttempt,
-            reason,delayMs:750*generationAttempt,responseDelivered:false});
-          await delay(750*generationAttempt,undefined,{signal:generationSignal});
+            transportAttempt:transportAttempts,reason,delayMs:750*transportAttempts,responseDelivered:false});
+          await delay(750*transportAttempts,undefined,{signal:generationSignal});
         }
       }
       for (const k of ['input', 'output', 'cacheRead', 'cacheWrite', 'totalTokens'])
@@ -276,7 +317,7 @@ export async function runHarness(params, signal, generate, emit = () => {}) {
       });
       channel.finish(completion(result.message, params.model));
     } catch (e) {
-      gatewayError = channel.failureCode(requestTimeout?.aborted ? requestTimeout.reason : e);
+      gatewayError = runtimeGenerationFailureCode(channel,requestTimeout?.aborted ? requestTimeout.reason : e);
       emit('MODEL_ERROR', { requestId, requests: requestSequence,generationAttempt:generationAttempts,code: gatewayError });
       channel.fail(gatewayError);
       // A broken provider call must not leave an apparently running, idle agent loop.
