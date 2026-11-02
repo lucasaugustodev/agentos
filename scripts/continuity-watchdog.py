@@ -69,6 +69,34 @@ def digest(value):
     return hashlib.sha256(value if isinstance(value, bytes) else canonical(value)).hexdigest()
 
 
+def terminal_diagnostic_current(row, detail, policy, policy_sha, now, maximum_age):
+    """Validate a reobserved terminal rejection without changing its evidence.
+
+    The adapter preserves the original audit time and rechecks native identity
+    before advancing verifiedAt. These observation fields must never enter the
+    semantic material used to approve a plan. Legacy, freshly scanned status
+    rows retain their existing contract; the cache always carries this proof.
+    """
+    if "diagnosticProof" not in row:
+        return True
+    proof = row["diagnosticProof"]
+    if not (type(proof) is dict and proof.get("version") == 1 and proof.get("verifyKind") == "native_identity"
+            and row.get("state") == "rejected_repairable"
+            and "jobId" in row and row["jobId"] is None and row.get("postAttempted") is False):
+        return False
+    observed, verified = proof.get("observedAt"), proof.get("verifiedAt")
+    if not all(type(t) in (int, float) and math.isfinite(t) for t in [observed, verified]):
+        return False
+    if not (0 <= observed <= verified <= now + 5 and now - verified <= maximum_age
+            and now - observed <= 3600 and verified - observed <= 3600):
+        return False
+    hashes = [proof.get(k) for k in ["policySHA256", "adapterSHA256", "detailSHA256", "dispatchSHA256"]]
+    if not all(type(h) is str and re.fullmatch(r"[a-f0-9]{64}", h) for h in hashes):
+        return False
+    return (proof["policySHA256"] == policy_sha and proof["adapterSHA256"] == policy.get("adapterSHA256")
+            and proof["detailSHA256"] == digest(detail))
+
+
 def request_numbers_v1(value):
     """Normalize new native requests before both intent hashing and transport.
 
@@ -1056,7 +1084,7 @@ def pipeline_admission(limit, active, catalog, pending, jobs, diagnostics, confi
         source = row.get("candidateSHA256")
         if (row["problem"], source) in registered:
             continue
-        if row["state"] in ["quota_wait", "uncertain_owned", "check_running"]:
+        if row["state"] in ["quota_wait", "account_wait", "uncertain_owned", "check_running"]:
             key = "source:" + source if source else "occurrence:" + row["occurrenceId"]
             own(row["problem"], key, row["state"], row["occurrenceId"], source, row.get("jobId"))
             # A new, authenticated adapter preflight can prove that quota was
@@ -1064,7 +1092,9 @@ def pipeline_admission(limit, active, catalog, pending, jobs, diagnostics, confi
             # but do not confuse this resource wait with an uncertain effect.
             # Legacy/partial status, possible POSTs and unknown actors remain
             # conservative; this never authorizes an official submission.
-            quota_without_effect = (row["state"] == "quota_wait" and row.get("code") == "CHECK_QUOTA"
+            quota_without_effect = (((row["state"] == "quota_wait" and row.get("code") in
+                    ["CHECK_QUOTA", "CHECK_QUOTA_SYNC_PENDING"])
+                    or (row["state"] == "account_wait" and row.get("code") == "ACCOUNT_HAS_UNCERTAIN_EFFECT"))
                 and row.get("postAttempted") is False and "jobId" in row and row["jobId"] is None
                 and isinstance(source, str) and re.fullmatch(r"[a-f0-9]{64}", source)
                 and any(a["problem"] == row["problem"] and a["occurrenceId"] == row["occurrenceId"]
@@ -1887,17 +1917,24 @@ class Watchdog:
             summary["controllerState"] = "inspection_only_policy_disabled" if policy.get("enabled") is not True else status.get("controllerState")
         summary["repairAuthority"] = repair_authority
         registered = {r["occurrenceId"]: r for r in self.state["experiments"]}
+        seen = set()
         for row in status["outcomes"]:
             oid = row.get("occurrenceId")
+            require(oid not in seen, "AUTO_CHECK_DUPLICATE_OWNER")
+            seen.add(oid)
             require(oid in registered and registered[oid]["problem"] == row.get("problem")
                     and row["problem"] in policy["boards"], "AUTO_CHECK_OWNER_BINDING")
             require(row.get("state") in ["await_native", "eligible", "check_running", "rejected_repairable",
-                    "quota_wait", "uncertain_owned", "paused", "controller_blocked", "observation_wait"], "AUTO_CHECK_STATE_UNKNOWN")
+                    "quota_wait", "account_wait", "uncertain_owned", "paused", "controller_blocked", "observation_wait"], "AUTO_CHECK_STATE_UNKNOWN")
             if oid not in details:
                 continue  # Own already-dispatched actions cannot invalidate a remaining approved action set.
+            if not terminal_diagnostic_current(row, details[oid], policy, digest(policy_raw),
+                                               self.clock(), self.config["intervalSeconds"] * 3):
+                continue  # Retain the candidate's owner; do not reuse stale repair authority.
             item = {k: row.get(k) for k in ["occurrenceId", "problem", "candidateSHA256", "qaArtifactId", "qaSHA256",
                                           "state", "jobId", "code"]}
-            if (row.get("state") == "quota_wait" and row.get("code") == "CHECK_QUOTA"
+            if (((row.get("state") == "quota_wait" and row.get("code") in ["CHECK_QUOTA", "CHECK_QUOTA_SYNC_PENDING"])
+                    or (row.get("state") == "account_wait" and row.get("code") == "ACCOUNT_HAS_UNCERTAIN_EFFECT"))
                     and row.get("postAttempted") is False and "jobId" in row and row["jobId"] is None):
                 item["postAttempted"] = False
             summary["outcomes"].append(item)
@@ -1937,6 +1974,12 @@ class Watchdog:
                     continue
                 producer_artifacts = self.repair_producer_artifacts(detail, qa)
                 by_name = {a["name"]: a for a in producer_artifacts}
+                if "diagnosticProof" in row:
+                    # A cache hit reverified native identity, not historical
+                    # artifact bytes. Re-read the complete repair material set
+                    # before it can become planning or dispatch evidence.
+                    for artifact in producer_artifacts:
+                        self.verified_artifact(artifact)
                 canonical_patch, patch_proof = normalized_repair_patch(self.verified_artifact(base),
                     self.verified_artifact(by_name["candidate.py"]), self.verified_artifact(by_name["implementation.patch"]), row["problem"])
                 cpu = self.repair_cpu_report(by_name["cpu-result.json"])

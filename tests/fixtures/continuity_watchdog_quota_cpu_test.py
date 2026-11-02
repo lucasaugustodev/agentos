@@ -60,6 +60,37 @@ class QuotaCPUAdmissionTests(unittest.TestCase):
         self.assertEqual(got['uncertainProblems'], [self.source['problem']])
         self.assertEqual(got['boardAvailableCandidateSlots'][self.source['problem']], 0)
 
+    def test_another_candidates_account_effect_blocks_check_but_not_independent_cpu(self):
+        waits = [{'state': 'account_wait', 'code': 'ACCOUNT_HAS_UNCERTAIN_EFFECT'},
+                 {'state': 'quota_wait', 'code': 'CHECK_QUOTA_SYNC_PENDING'}]
+        for wait in waits:
+            row = {**self.row, **wait}
+            with self.subTest(wait=wait):
+                got = self.admission([row], pending={self.source['digest']})
+                self.assertEqual(got['pipelineUsed'], 1)
+                self.assertEqual(got['boardAvailableCandidateSlots'][self.source['problem']], 7)
+                self.assertFalse(got['uncertainProblems'])
+                unknown = {**row, 'state': 'uncertain_owned', 'postAttempted': True}
+                got = self.admission([row, unknown])
+                self.assertEqual(got['pipelineUsed'], 1)
+                self.assertEqual(got['boardAvailableCandidateSlots'][self.source['problem']], 0)
+                for change in [{'postAttempted': None}, {'postAttempted': True}, {'postAttempted': 0},
+                               {'code': 'UNCLASSIFIED'}, {'jobId': '0123456789abcdef'}]:
+                    blocked = self.admission([{**row, **change}])
+                    self.assertEqual(blocked['boardAvailableCandidateSlots'][self.source['problem']], 0)
+
+    def test_authenticated_preflight_account_wait_is_not_repair_or_own_post(self):
+        status = self.f.repairable_operation()
+        for state, code in [('account_wait', 'ACCOUNT_HAS_UNCERTAIN_EFFECT'),
+                            ('quota_wait', 'CHECK_QUOTA_SYNC_PENDING')]:
+            self.f.install_diagnostic_fixture([{**status, 'state': state, 'code': code,
+                                                'postAttempted': False, 'jobId': None}])
+            got = self.f.w.observe()
+            self.assertEqual(got['autoCheckDiagnostics']['repairableEvidence'], [])
+            self.assertIs(got['autoCheckDiagnostics']['outcomes'][0]['postAttempted'], False)
+            self.assertEqual(got['pipelineUsed'], 1)
+            self.assertEqual(got['boardAvailableCandidateSlots']['muse_decode_layer'], 7)
+
     def test_unknown_native_actor_cannot_be_hidden_by_quota_observation(self):
         got = self.admission(active=[{'problem': self.source['problem'], 'occurrenceId': B.uid(),
                                       'ownershipUncertain': True}])
