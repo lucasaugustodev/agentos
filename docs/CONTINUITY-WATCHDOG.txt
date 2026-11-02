@@ -628,7 +628,7 @@ acceptance fields, and registered transport/receipt bindings remain mandatory.
 
 This is a raw-reader limit, not extra authority or extra model context. The
 64 KiB QA context and 32 KiB prior-QA repair diagnostic limits remain separate.
-A report can be readable for classification yet unavailable for repair context.
+Large authenticated reports use the bounded historical projection described below.
 Oversized, corrupt, unbound or malformed registered QA still fails closed; it is
 never skipped to free ownership or manufacture acceptance. No official action
 or performance improvement is implied by reading a registered CHECK report.
@@ -690,3 +690,45 @@ wait reasons explain insufficient source/capacity, pending planners and held
 failure recovery. Do not shorten intervalSeconds to tune the private timer:
 it also controls diagnostic freshness. Validate actual replenishment latency,
 new evidence and accepted deliveries before claiming productivity improvement.
+
+Authenticated large-QA context
+
+QA artifact admission remains limited to 1 MiB of original bytes, with exact
+size/SHA256 verification and strict JSON: duplicate keys, nonfinite numbers,
+numeric overflow and non-object reports are rejected. Context presentation is
+separate: source QA envelopes remain at most 64 KiB and prior-QA repair
+diagnostics at most 32 KiB. Candidate/source, latest attempt, independent QA
+step, stopped boundary, fence and manifest bindings remain mandatory.
+
+Small historical reports stay complete in repairQADiagnostic.report. Larger
+ones carry reportProjection.version=1 and complete=false. Critical flags and
+hashes remain exact; retained fields/sections are complete values with original
+array order. Omitted fields have JSON-pointer, byte-count and digest references,
+with explicit reference coverage and array counts. No partial cases array is
+presented as a complete report. Decisions continue to read the full strict QA;
+a projection is never current acceptance, official authority or a QA artifact.
+
+Projected repairs also receive prior-qa-original.json as a separate material in
+input.experiment.materials. This contains the complete original bytes/base64,
+artifact/attempt identity, size and SHA256, revalidated before any create/run
+POST. Workers must inspect omitted findings/cases in that material and produce
+fresh complete evidence. The independent QA step and finalizer still require
+the full new report; its existing artifact limit is 1 MiB, not the 32 KiB inline
+context budget. Neither original artifacts nor historical request bodies are
+rewritten or reconstructed from a projection.
+
+Complete blockers are never clipped. If blockers or their envelope cannot fit,
+context remains unavailable and repair authorization stays closed. Once the
+original full report has passed its identity/byte guards, that internal report
+still informs completed-work ownership: a presentation error must not turn an
+occupied native-to-unmeasured pipeline into a free slot. Invalid bytes/bindings
+do not obtain this internal identity guarantee. Existing semantic rejection,
+repair exhaustion, quotas, capacity, unknown-effect reconciliation and approval
+rules remain unchanged.
+
+Qualification runs only on an isolated server with in-memory transports. It
+includes exact raw-size bounds, malformed JSON, scope/fence/manifest failures,
+large-context ownership, immutable original-material handoff and independent QA.
+A private frozen replay additionally compares the old and new readers on real
+size-blocked owners without native/official network calls or operational writes.
+Private inputs, identities and execution evidence are not part of this repository.

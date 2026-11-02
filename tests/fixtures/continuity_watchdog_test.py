@@ -507,7 +507,7 @@ class WatchTests(unittest.TestCase):
                 self.replace_registered_qa(job, path, raw)
                 with self.assertRaisesRegex(ValueError, code): self.w.registered_jobs()
 
-    def test_large_qa_classification_does_not_expand_repair_authority_or_context(self):
+    def test_large_qa_classification_uses_bounded_authenticated_context_not_size_rejection(self):
         status = self.repairable_operation()
         detail = self.client.occurrences[status['occurrenceId']]
         qa = next(a for a in detail['artifacts'] if a['id'] == status['qaArtifactId'])
@@ -517,10 +517,12 @@ class WatchTests(unittest.TestCase):
         self.client.artifacts[qa['id']] = raw; qa.update(size=len(raw), digest=W.digest(raw))
         status['qaSHA256'] = qa['digest']; self.install_diagnostic_fixture([status])
         observation = self.w.observe(); diagnostic = observation['autoCheckDiagnostics']
-        self.assertEqual(diagnostic['outcomes'][0]['repairContextCode'], 'REPAIR_QA_DIAGNOSTIC_SIZE')
-        self.assertEqual(diagnostic['outcomes'][0]['classification'], 'repair_context_unavailable')
-        self.assertEqual(diagnostic['repairableEvidence'], [])
-        self.assertIn(status['candidateSHA256'], observation['pendingOfficialCandidateSHA256'])
+        self.assertEqual(diagnostic['outcomes'][0]['classification'], 'repair_evidence')
+        projected = diagnostic['repairableEvidence'][0]['repairQADiagnostic']
+        self.assertLessEqual(len(W.canonical(projected)), W.REPAIR_QA_CONTEXT_LIMIT)
+        self.assertFalse(projected['reportProjection']['complete'])
+        self.assertEqual(projected['artifact']['digest'], W.digest(raw))
+        self.assertNotIn(status['candidateSHA256'], observation['pendingOfficialCandidateSHA256'])
         self.assertNotIn('x' * 100, W.canonical(diagnostic).decode())
         report['passed'] = False; raw = W.canonical(report)
         self.client.artifacts[qa['id']] = raw; qa.update(size=len(raw), digest=W.digest(raw))
@@ -1142,7 +1144,8 @@ class WatchTests(unittest.TestCase):
         self.assertIn('Rehash the edited checker and new result', producer['instructions'])
         self.assertIn('Preserve every field, ordered array', producer['instructions'])
         self.assertIn('COMPLETE cases and negativeControls', qa['instructions'])
-        self.assertIn('32768 bytes', qa['instructions'])
+        self.assertIn('1048576 bytes', qa['instructions'])
+        self.assertIn('32768-byte limit applies only to historical inline context', qa['instructions'])
 
     def test_repair_cpu_raw_and_logical_limits_are_independent_and_inclusive(self):
         status = self.repairable_operation()
@@ -1384,7 +1387,8 @@ class WatchTests(unittest.TestCase):
     def test_prior_qa_diagnostic_rejects_artifact_hash_and_size_before_dispatch(self):
         status, detail, qa, latest, _ = self.prior_qa_diagnostic_fixture()
         for field, value, code in [('digest', 'f' * 64, 'ARTIFACT_CORRUPT'),
-                                   ('size', 32769, 'REPAIR_QA_DIAGNOSTIC_SIZE')]:
+                                   ('size', W.QA_ARTIFACT_LIMIT + 1, 'REPAIR_QA_DIAGNOSTIC_SIZE'),
+                                   ('size', 32769, 'ARTIFACT_CORRUPT')]:
             row = {**qa, field: value}; posts = len(self.client.posts)
             with self.assertRaisesRegex(ValueError, code):
                 self.w.repair_qa_diagnostic(detail, row, status['problem'], latest, status['candidateSHA256'])
@@ -2601,7 +2605,8 @@ class WatchTests(unittest.TestCase):
         self.assertNotIn('untrusted-cross-candidate-text', W.canonical(W.compact_outcomes(observed['outcomes'])).decode())
 
     def test_source_qa_oversize_is_explicit_without_truncation_or_global_failure(self):
-        for size, code in [(34000, 'QA_CONTEXT_BLOCKERS_SIZE_EXCEEDED'), (70000, 'QA_CONTEXT_SIZE_EXCEEDED')]:
+        for size, code in [(34000, 'QA_CONTEXT_BLOCKERS_SIZE_EXCEEDED'), (70000, 'QA_CONTEXT_BLOCKERS_SIZE_EXCEEDED'),
+                           (W.QA_ARTIFACT_LIMIT, 'QA_CONTEXT_SIZE_EXCEEDED')]:
             row = self.bind_source_qa_blockers([{'id': 'F01', 'detail': 'X' * size}])
             value = json.loads(self.client.artifacts[row['id']]); value['findings'] = []
             raw = W.canonical(value); self.client.artifacts[row['id']] = raw; row.update(digest=W.digest(raw), size=len(raw))
