@@ -1,0 +1,46 @@
+name: Native CHECK adapter contracts
+
+on:
+  push:
+    paths:
+      - examples/openkernel-controller/tools/native_check_adapter.py
+      - examples/openkernel-controller/tools/qualify_jobs_observation.py
+      - examples/openkernel-controller/tests/test_native_check_adapter.py
+      - .github/workflows/native-check-adapter.yml
+  pull_request:
+    paths:
+      - examples/openkernel-controller/tools/native_check_adapter.py
+      - examples/openkernel-controller/tools/qualify_jobs_observation.py
+      - examples/openkernel-controller/tests/test_native_check_adapter.py
+      - .github/workflows/native-check-adapter.yml
+
+permissions:
+  contents: read
+
+jobs:
+  native-check-adapter:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Run isolated Python adapter suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          ci_root=$(sudo mktemp -d /var/lib/agentos-adapter-ci.XXXXXXXX)
+          trap 'sudo rm -rf -- "$ci_root"' EXIT
+
+          # The artifact guards require root-owned, non-writable ancestors.
+          # Stage only public fixtures; all official-service responses are fake.
+          sudo install -d -m 0700 "$ci_root/tools" "$ci_root/tests" "$ci_root/tmp" "$ci_root/fixtures"
+          sudo install -m 0600 examples/openkernel-controller/tools/native_check_adapter.py "$ci_root/tools/"
+          sudo install -m 0600 examples/openkernel-controller/tools/qualify_jobs_observation.py "$ci_root/tools/"
+          sudo install -m 0600 examples/openkernel-controller/tests/test_native_check_adapter.py "$ci_root/tests/"
+
+          # No provider credentials, network interface, database or live queue.
+          sudo unshare --net -- env -i PATH=/usr/bin:/bin \
+            TMPDIR="$ci_root/tmp" OPENKERNEL_ADAPTER_TEST_ROOT="$ci_root/fixtures" \
+            PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -B -m unittest discover \
+            -s "$ci_root/tests" -p test_native_check_adapter.py
