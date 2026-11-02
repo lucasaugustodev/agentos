@@ -1,0 +1,43 @@
+name: Continuity watcher contracts
+
+on:
+  push:
+    paths:
+      - scripts/continuity-watchdog.py
+      - tests/fixtures/continuity_watchdog*test.py
+      - .github/workflows/continuity-watchdog.yml
+  pull_request:
+    paths:
+      - scripts/continuity-watchdog.py
+      - tests/fixtures/continuity_watchdog*test.py
+      - .github/workflows/continuity-watchdog.yml
+
+permissions:
+  contents: read
+
+jobs:
+  continuity-watchdog:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Run isolated Python contract suites
+        shell: bash
+        run: |
+          set -euo pipefail
+          ci_root=$(sudo mktemp -d /var/lib/agentos-watchdog-ci.XXXXXXXX)
+          trap 'sudo rm -rf -- "$ci_root"' EXIT
+
+          # The artifact guards require root-owned, non-writable ancestors.
+          # Stage only public test inputs; never load a deployment environment.
+          sudo install -d -m 0700 "$ci_root/scripts" "$ci_root/tests/fixtures" "$ci_root/tmp"
+          sudo install -m 0600 scripts/continuity-watchdog.py "$ci_root/scripts/"
+          sudo install -m 0600 tests/fixtures/continuity_watchdog*test.py "$ci_root/tests/fixtures/"
+
+          # No provider credentials, network interface, database or live queue.
+          sudo unshare --net -- env -i PATH=/usr/bin:/bin \
+            TMPDIR="$ci_root/tmp" PYTHONDONTWRITEBYTECODE=1 \
+            /usr/bin/python3 -B -m unittest discover \
+            -s "$ci_root/tests/fixtures" -p 'continuity_watchdog*test.py'
