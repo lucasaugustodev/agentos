@@ -273,3 +273,24 @@ and verify all referenced bytes before replay. It needs atomic publication,
 backward-compatible reads, crash/restart and rollback proofs, with an explicit
 retention policy that preserves historical inputs and uncertain intents. Do not
 silently raise every file ceiling or discard history when the state grows again.
+
+### Native request numbers and invalid evidence
+
+New native requests may declare `requestCanonicalization: json-numbers-v1` in
+their durable intent. Integral floats, including signed zero, are encoded as
+integers before hashing and transport; booleans remain distinct. Nonfinite
+numbers and values outside the safe integer magnitude are rejected before POST.
+Unknown versions are rejected. The adapter still requires the complete request
+digest, original definition, input, lineage and independent QA.
+
+A legacy digest mismatch has one narrow recovery: a complete
+`repairQADiagnostic.report` may be reloaded from its authenticated artifact when
+only safe integral float/int representations differ and the reconstructed full
+body reproduces the original intent hash exactly. Projected reports cannot use
+this path. No receipt, candidate, patch or historical input is rewritten.
+
+Nonfinite values in authenticated producer/QA JSON remain rejected. Their
+diagnostic includes the exact artifact reference and a specific evidence error,
+so a separately validated planner repair contract can request new producer and
+independent QA work. This classification is not acceptance or permission to
+submit. Nonfinite policy, state or unbound payloads remain controller errors.

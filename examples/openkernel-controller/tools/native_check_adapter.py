@@ -9,6 +9,7 @@ Untrusted candidate/checker code is inspected and frozen, never run here.
 import argparse
 import ast
 import base64
+import copy
 import datetime as dt
 import errno
 import fcntl
@@ -31,6 +32,8 @@ BOARDS = {"muse_decode_layer", "muse_prefill_layer", "muse_attention_decode"}
 PRODUCER_FILES = {"candidate.py", "implementation.patch", "cpu-checks.py", "cpu-result.json", "verification.json"}
 QA_FILES = {"qa-verification.json", "review.txt"}
 WATCHER_STATE_MAX_BYTES = 64 * 1024 * 1024
+REQUEST_CANONICALIZATION = "json-numbers-v1"
+MAX_SAFE_INTEGER = 2 ** 53 - 1
 
 
 def require(ok, code):
@@ -72,7 +75,54 @@ def strict_json(raw):
         return value
     def bad_constant(_):
         raise ValueError("JSON_NONFINITE")
-    return json.loads(raw, object_pairs_hook=pairs, parse_constant=bad_constant)
+    def finite_float(text):
+        value = float(text)
+        require(math.isfinite(value), "JSON_NONFINITE")
+        return value
+    return json.loads(raw, object_pairs_hook=pairs, parse_constant=bad_constant, parse_float=finite_float)
+
+
+def request_numbers_v1(value):
+    """Versioned JSON-number representation shared with the native POST writer.
+
+    Booleans stay booleans; signed/integral floating zero becomes integer zero.
+    Reject nonfinite and unsafe numeric values rather than rounding them through
+    the API's JavaScript number representation. Legacy receipts are never edited.
+    """
+    if type(value) in (int, float):
+        require(abs(value) <= MAX_SAFE_INTEGER and math.isfinite(value), "REQUEST_NUMBER_UNSAFE")
+        return int(value) if type(value) is float and value.is_integer() else value
+    if type(value) is dict:
+        require(all(type(key) is str for key in value), "REQUEST_JSON_TYPE")
+        return {key: request_numbers_v1(item) for key, item in value.items()}
+    if type(value) is list:
+        return [request_numbers_v1(item) for item in value]
+    require(value is None or type(value) in (bool, str), "REQUEST_JSON_TYPE")
+    return value
+
+
+def same_json_numeric_representation(left, right):
+    """Only a finite safe integral float/int representation may differ."""
+    if type(left) is not type(right):
+        return (type(left) in (int, float) and type(right) in (int, float)
+                and abs(left) <= MAX_SAFE_INTEGER and abs(right) <= MAX_SAFE_INTEGER
+                and math.isfinite(left) and math.isfinite(right)
+                and left == right)
+    if type(left) is dict:
+        return left.keys() == right.keys() and all(same_json_numeric_representation(left[k], right[k]) for k in left)
+    if type(left) is list:
+        return len(left) == len(right) and all(same_json_numeric_representation(a, b) for a, b in zip(left, right))
+    if type(left) is float:
+        return math.isfinite(left) and math.isfinite(right) and left == right
+    return left == right
+
+
+class EvidenceJSONError(ValueError):
+    """Authenticated worker evidence is rejected, with bounded repair references."""
+    def __init__(self, stage, artifact):
+        super().__init__("QA_EVIDENCE_JSON_NONFINITE" if stage == "independent-qa" else "CPU_EVIDENCE_JSON_NONFINITE")
+        self.evidence_errors = [{"stage": stage, "code": "JSON_NONFINITE",
+                                 "artifact": {key: artifact[key] for key in ("id", "name", "digest", "size")}}]
 
 
 def protected(path, immutable=False, maximum=16 * 1024 * 1024):
@@ -319,6 +369,48 @@ class NativeAudit:
                 else: result.update(qaArtifactId=rows[0]["id"], qaSHA256=rows[0]["digest"])
         return result
 
+    def request_digest(self, receipt, body, *, allow_legacy_diagnostic=False):
+        version = receipt.get("requestCanonicalization")
+        require(version in (None, REQUEST_CANONICALIZATION), "DISPATCH_CANONICALIZATION")
+        if version == REQUEST_CANONICALIZATION:
+            require(canonical(body) == canonical(request_numbers_v1(body)), "DISPATCH_NUMBER_REPRESENTATION")
+        if receipt["requestDigest"] == digest(body):
+            return
+        require(version is None and allow_legacy_diagnostic, "DISPATCH_DIGEST")
+        # An old request embedded a complete authenticated QA report before the
+        # JavaScript API normalized 1.0/0.0 to 1/0. Reconstruct that *exact* body
+        # from its pinned source bytes; never rewrite a receipt or normalize its
+        # stored hash. Projected reports have a different contract and cannot use
+        # this legacy recovery path.
+        experiment = body.get("input", {}).get("experiment", {})
+        diagnostic = experiment.get("repairQADiagnostic")
+        require(type(diagnostic) is dict and "reportProjection" not in diagnostic
+                and type(diagnostic.get("version")) is int and diagnostic["version"] == 1
+                and diagnostic.get("authority") == "prior_qa_diagnostic_only_not_current_acceptance"
+                and diagnostic.get("bindingState") == "verified"
+                and diagnostic.get("currentAcceptance") is False
+                and type(diagnostic.get("report")) is dict, "DISPATCH_DIGEST")
+        ref = diagnostic.get("artifact")
+        require(type(ref) is dict and ref.get("name") == "qa-verification.json", "DISPATCH_DIGEST")
+        original = strict_json(self.artifact(ref))
+        require(type(original) is dict
+                and same_json_numeric_representation(original, diagnostic["report"]), "DISPATCH_DIGEST")
+        reconstructed = copy.deepcopy(body)
+        reconstructed["input"]["experiment"]["repairQADiagnostic"]["report"] = original
+        require(receipt["requestDigest"] == digest(reconstructed), "DISPATCH_DIGEST")
+
+    def evidence_json(self, stage, name, files, artifacts):
+        raw = files[stage][name]
+        try:
+            return strict_json(raw)
+        except ValueError as error:
+            if str(error) != "JSON_NONFINITE":
+                raise
+            rows = [row for row in artifacts[stage] if row["name"] == name]
+            require(len(rows) == 1 and rows[0]["digest"] == digest(raw)
+                    and rows[0]["size"] == len(raw), "ARTIFACT_BYTES_CHANGED")
+            raise EvidenceJSONError(stage, rows[0]) from error
+
     def dispatch(self, occurrence):
         directory = pathlib.Path(self.p["watcherStateDirectory"])
         state = watcher_state(self.p)
@@ -337,7 +429,8 @@ class NativeAudit:
                 and create["result"]["definition"] == occurrence["definition"], "DISPATCH_CHANGED")
         expected_run = {"requestKey": key, "input": occurrence["input"]}
         expected_create = {"requestKey": key[:-4], "definition": occurrence["definition"]}
-        require(run["requestDigest"] == digest(expected_run) and create["requestDigest"] == digest(expected_create), "DISPATCH_DIGEST")
+        self.request_digest(create, expected_create)
+        self.request_digest(run, expected_run, allow_legacy_diagnostic=True)
         require(entries[0]["supervisorOccurrenceId"] == occurrence["input"]["supervisorOccurrenceId"], "SUPERVISOR_LINEAGE")
         return entries[0], {"run": run_raw, "create": create_raw}
 
@@ -424,8 +517,10 @@ class NativeAudit:
         source_screen(producer["candidate.py"])
         require(kernel_code_structure(materials["base-candidate.py"]) != kernel_code_structure(producer["candidate.py"]),
                 "NO_EXECUTABLE_CHANGE")
-        qa = strict_json(files["independent-qa"]["qa-verification.json"])
-        semantic_qa(strict_json(producer["verification.json"]), qa, strict_json(producer["cpu-result.json"]), base_sha, candidate_sha, checker_sha, result_sha)
+        qa = self.evidence_json("independent-qa", "qa-verification.json", files, artifacts)
+        semantic_qa(self.evidence_json("produce", "verification.json", files, artifacts), qa,
+                    self.evidence_json("produce", "cpu-result.json", files, artifacts),
+                    base_sha, candidate_sha, checker_sha, result_sha)
         commands = {key: replay_commands(files[key]["transcript"], checker_sha, candidate_sha) for key in files}
         qa_row = next(r for r in artifacts["independent-qa"] if r["name"] == "qa-verification.json")
         for name, raw in receipts.items():
@@ -916,7 +1011,8 @@ def scan(lane, status_path, mode):
                         break
             outcomes.append({"occurrenceId": occurrence, "problem": row["problem"],
                              **binding, "state": status, "code": code[:120], "jobId": job_id,
-                             "postAttempted": None, "proposedRemediation": remediation})
+                             "postAttempted": None, "proposedRemediation": remediation,
+                             **({"evidenceErrors": error.evidence_errors} if isinstance(error, EvidenceJSONError) else {})})
     doc = {"version": 1, "watchId": lane.p["watchId"], "observedAt": lane.clock(), "mode": mode,
            "policySHA256": lane.policy_sha, "policyExpiresAt": lane.p["expiresAt"],
            "controllerState": "active" if lane.p["enabled"] else "inspection_only_policy_disabled",

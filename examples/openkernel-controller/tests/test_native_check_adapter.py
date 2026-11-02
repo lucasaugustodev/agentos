@@ -190,6 +190,129 @@ class Fixture(unittest.TestCase):
         self.assertEqual(len(list(pathlib.Path(self.paths["stateDirectory"]).iterdir())), 0)
         self.assertEqual(self.runtime.stopped.call_count, 2)
 
+    def dispatch_diagnostic(self, report, *, version=None, projection=None):
+        raw = A.canonical(report)
+        ref = self.artifact("qa-verification.json", raw, "77777777-7777-7777-7777-777777777777")
+        diagnostic = {"version": 1, "authority": "prior_qa_diagnostic_only_not_current_acceptance",
+                      "bindingState": "verified", "currentAcceptance": False,
+                      "artifact": {k: ref[k] for k in ("id", "name", "digest", "size")}, "report": report}
+        if projection is not None: diagnostic["reportProjection"] = projection
+        occurrence = self.detail["occurrence"]
+        occurrence["input"]["experiment"]["repairQADiagnostic"] = diagnostic
+        key = occurrence["source_key"][len("manual:"):]
+        original_body = copy.deepcopy({"requestKey": key, "input": occurrence["input"]})
+        occurrence["input"] = A.request_numbers_v1(occurrence["input"])
+        body = {"requestKey": key, "input": occurrence["input"]}
+        receipt = {"state": "recorded", "kind": "run", "requestKey": key,
+                   "result": copy.deepcopy(occurrence), "requestDigest": A.digest(body if version else original_body)}
+        if version is not None: receipt["requestCanonicalization"] = version
+        path = pathlib.Path(self.paths["watcherStateDirectory"]) / ("intent-" + A.digest(key) + ".json")
+        self.put(path, A.canonical(receipt))
+        for attempt in self.detail["attempts"]:
+            data = A.canonical(occurrence["input"])
+            self.put(pathlib.Path(self.paths["workerRunsDirectory"]) / attempt["id"] / "home" / "inputs" / attempt["id"] / "cycle-input.json", data)
+            attempt["context"]["manifest"]["cycleInput"].update(digest=A.digest(data), size=len(data))
+        return path, ref
+
+    def test_legacy_integral_float_diagnostic_recovers_exact_hash_without_receipt_write(self):
+        path, ref = self.dispatch_diagnostic({"nested": [1.0, 0.0, -0.0, 7244800000.0, 1.25, True]})
+        original = path.read_bytes()
+        self.assertEqual(self.lane.run(OCC, "inspect")["state"], "eligible")
+        self.assertEqual(path.read_bytes(), original)
+        self.assertEqual(self.official.posts, 0)
+        self.assertEqual(len(list(pathlib.Path(self.paths["stateDirectory"]).iterdir())), 0)
+
+    def test_legacy_recovery_requires_original_full_body_digest(self):
+        path, ref = self.dispatch_diagnostic({"value": 1.0})
+        receipt = A.strict_json(path.read_bytes()); receipt["requestDigest"] = "0" * 64
+        self.put(path, A.canonical(receipt))
+        with self.assertRaisesRegex(ValueError, "DISPATCH_DIGEST"):
+            self.audit.dispatch(self.detail["occurrence"])
+
+    def test_legacy_numeric_recovery_never_coerces_boolean_or_different_structure(self):
+        for value in [True, "1", 2, [1], {"nested": 1}]:
+            with self.subTest(value=value):
+                path, ref = self.dispatch_diagnostic({"value": 1.0})
+                self.detail["occurrence"]["input"]["experiment"]["repairQADiagnostic"]["report"]["value"] = value
+                receipt = A.strict_json(path.read_bytes()); receipt["result"] = copy.deepcopy(self.detail["occurrence"])
+                self.put(path, A.canonical(receipt))
+                with self.assertRaisesRegex(ValueError, "DISPATCH_DIGEST"):
+                    self.audit.dispatch(self.detail["occurrence"])
+
+    def test_projected_legacy_diagnostic_cannot_be_hydrated(self):
+        self.dispatch_diagnostic({"value": 1.0}, projection={"version": 1, "complete": False})
+        with self.assertRaisesRegex(ValueError, "DISPATCH_DIGEST"):
+            self.audit.dispatch(self.detail["occurrence"])
+
+    def test_legacy_diagnostic_artifact_bytes_are_reverified(self):
+        path, ref = self.dispatch_diagnostic({"value": 1.0})
+        self.put(pathlib.Path(self.paths["artifactDirectory"]) / ref["digest"], b'{"value":2.0}')
+        with self.assertRaisesRegex(ValueError, "ARTIFACT_BYTES_CHANGED"):
+            self.audit.dispatch(self.detail["occurrence"])
+
+    def test_versioned_numbers_keep_full_native_audit_and_qa(self):
+        path, ref = self.dispatch_diagnostic({"value": [1.0, -0.0, False, 1e-8]}, version=A.REQUEST_CANONICALIZATION,
+                                             projection={"version": 1, "complete": False})
+        self.assertEqual(self.lane.run(OCC, "inspect")["state"], "eligible")
+        self.detail["attempts"][1]["receipt"]["stopped"] = False
+        with self.assertRaisesRegex(ValueError, "ATTEMPT_NOT_STOPPED"):
+            self.lane.run(OCC, "inspect")
+        self.assertEqual(self.official.posts, 0)
+
+    def test_unknown_request_canonicalization_is_rejected_even_with_matching_digest(self):
+        self.dispatch_diagnostic({"value": 1.0}, version="future-unreviewed")
+        with self.assertRaisesRegex(ValueError, "DISPATCH_CANONICALIZATION"):
+            self.audit.dispatch(self.detail["occurrence"])
+
+    def test_versioned_number_contract_rejects_unsafe_values_and_preserves_types(self):
+        self.assertEqual(A.canonical(A.request_numbers_v1({"v": [True, False, None, "1", 1.0, -0.0, 1e-8]})),
+                         b'{"v":[true,false,null,"1",1,0,1e-08]}')
+        for value in [2 ** 53, -(2 ** 53), float(2 ** 53), 10 ** 1000, float('inf'), float('-inf'), float('nan')]:
+            with self.subTest(type=type(value).__name__):
+                with self.assertRaisesRegex(ValueError, "REQUEST_NUMBER_UNSAFE"):
+                    A.request_numbers_v1({"v": value})
+        self.assertEqual(A.request_numbers_v1(A.MAX_SAFE_INTEGER), A.MAX_SAFE_INTEGER)
+        self.assertFalse(A.same_json_numeric_representation(True, 1))
+        self.assertFalse(A.same_json_numeric_representation(2 ** 53, float(2 ** 53)))
+
+    def replace_evidence(self, name, raw, attempt):
+        row = next(r for r in self.detail["artifacts"] if r["name"] == name and r["attempt_id"] == attempt)
+        row.update(digest=A.digest(raw), size=len(raw))
+        self.put(pathlib.Path(self.paths["artifactDirectory"]) / row["digest"], raw)
+        if attempt == IDS[0]:
+            self.put(pathlib.Path(self.paths["workerRunsDirectory"]) / IDS[1] / "home" / "inputs" / row["id"] / name, raw)
+        return row
+
+    def test_cpu_nonfinite_evidence_is_rejected_with_authenticated_repair_reference(self):
+        raw = json.dumps({**self.cpu, "diagnostics": {"end": float('inf')}}).encode()
+        ref = self.replace_evidence("cpu-result.json", raw, IDS[0])
+        row = A.scan(self.lane, self.root / "status.json", "check")["outcomes"][0]
+        self.assertEqual((row["state"], row["code"]), ("rejected_repairable", "CPU_EVIDENCE_JSON_NONFINITE"))
+        self.assertEqual(row["candidateSHA256"], A.digest(self.candidate))
+        self.assertEqual(row["evidenceErrors"], [{"stage": "produce", "code": "JSON_NONFINITE",
+                          "artifact": {k: ref[k] for k in ("id", "name", "digest", "size")}}])
+        self.assertEqual(self.official.posts, 0)
+
+    def test_qa_nonfinite_evidence_is_rejected_without_acceptance(self):
+        self.replace_evidence("qa-verification.json", json.dumps({**self.qa, "diagnostics": float('nan')}).encode(), IDS[1])
+        row = A.scan(self.lane, self.root / "status.json", "check")["outcomes"][0]
+        self.assertEqual((row["state"], row["code"]), ("rejected_repairable", "QA_EVIDENCE_JSON_NONFINITE"))
+        self.assertEqual(self.official.posts, 0)
+
+    def test_nonfinite_outside_authenticated_evidence_remains_controller_blocked(self):
+        self.audit.audit = mock.Mock(side_effect=ValueError("JSON_NONFINITE"))
+        row = A.scan(self.lane, self.root / "status.json", "check")["outcomes"][0]
+        self.assertEqual(row["state"], "controller_blocked")
+        self.assertNotIn("evidenceErrors", row)
+        with self.assertRaisesRegex(ValueError, "JSON_NONFINITE"): A.strict_json(b'{"v":1e999}')
+
+    def test_nonfinite_evidence_does_not_hide_artifact_corruption(self):
+        ref = next(r for r in self.detail["artifacts"] if r["name"] == "cpu-result.json")
+        self.put(pathlib.Path(self.paths["artifactDirectory"]) / ref["digest"], b'{"v":Infinity}')
+        row = A.scan(self.lane, self.root / "status.json", "check")["outcomes"][0]
+        self.assertEqual((row["state"], row["code"]), ("controller_blocked", "ARTIFACT_BYTES_CHANGED"))
+        self.assertNotIn("evidenceErrors", row)
+
     def projected_cpu_evidence(self):
         # Sanitized shape of a real 23-case/9-control report: the producer added
         # diagnostic detail, while QA followed the instructed name/flag schema.
