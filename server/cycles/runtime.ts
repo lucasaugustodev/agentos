@@ -12,6 +12,7 @@ import { actionProfiles, bitrixSnapshot, clean } from './integrations.js';
 import { cycleEvent } from './store.js';
 import { isRegisteredValidation, confirmRegisteredValidationStop } from './validation-action.js';
 import { freezeDependencyEvidence, dependencyArtifactBytes, assertDependencySnapshot } from './dependency-evidence.js';
+import { observeCPUReplay, markCPUQADispatch } from './cpu-replay.js';
 
 export async function readCycleArtifact(id: string) {
   const a = (await pool.query('SELECT * FROM cycle_artifacts WHERE id=$1', [id])).rows[0];
@@ -53,10 +54,19 @@ export async function runCycleAgent(
   const dependencySnapshot = definition.dependencyEvidence ? await freezeDependencyEvidence(o, s, a) : undefined;
   const inputJson = JSON.stringify(o.input ?? {});
   const inputBytes = Buffer.from(inputJson, 'utf8');
-  // The existing bridge accepts at most 8 MiB per file and 24 MiB in total.
-  // Reject explicitly rather than truncating the canonical occurrence input.
+  // Reject the existing external-input boundary before any optional executor.
   if (inputBytes.length > 8 * 1024 * 1024)
     throw new DomainError('INPUTS_TOO_LARGE', 'Entrada externa do ciclo excede 8 MiB.');
+  // Default OFF. A registered observation records execution, never semantic
+  // acceptance, and does not replace any v1/v2 QA evidence or transcript guard.
+  const cpuReplayObservation = definition.parameters?.cpuReplayObservationVersion === 1
+    ? await observeCPUReplay(o, s, a, dependencySnapshot!, signal, onEvent) : undefined;
+  const cpuReplayBytes = cpuReplayObservation ? Buffer.from(JSON.stringify(cpuReplayObservation)) : undefined;
+  const cpuReplayReference = cpuReplayBytes ? { id: a.id, name: 'cpu-replay-observation.json',
+    digest: hash(cpuReplayBytes), size: cpuReplayBytes.length,
+    path: '/home/agent/inputs/' + a.id + '/cpu-replay-observation.json' } : undefined;
+  // The existing bridge accepts at most 8 MiB per file and 24 MiB in total.
+  // Reject explicitly rather than truncating the canonical occurrence input.
   const cycleInput = {
     id: a.id,
     name: 'cycle-input.json',
@@ -142,15 +152,25 @@ export async function runCycleAgent(
         runFence: a.fence,
       },
       ...(dependencySnapshot ? { dependencyEvidence: dependencySnapshot } : {}),
+      ...(cpuReplayObservation ? { cpuReplayObservation: {
+        version: 1, observationOnly: true, acceptance: false, receipt: cpuReplayReference,
+        requestId: a.id, requestSHA256: cpuReplayObservation.requestSHA256,
+        exitCode: cpuReplayObservation.exitCode, signal: cpuReplayObservation.signal,
+        timedOut: cpuReplayObservation.timedOut, oomKilled: cpuReplayObservation.oomKilled,
+        memoryPeakBytes: cpuReplayObservation.memoryPeakBytes, rssPeakBytes: cpuReplayObservation.rssPeakBytes,
+      } } : {}),
     },
     content,
   };
-  const contextSaved = await pool.query(dependencySnapshot
+  const contextSaved = await pool.query(cpuReplayObservation
+    ? "UPDATE cycle_attempts SET context=COALESCE(context,'{}'::jsonb)||$2::jsonb WHERE id=$1 AND fence=$3 AND state='running' AND context#>>'{cpuReplayPreparation,token}'=$4 AND context#>>'{cpuReplayPreparation,phase}'='preparing' RETURNING id"
+    : dependencySnapshot
     ? "UPDATE cycle_attempts SET context=$2 WHERE id=$1 AND fence=$3 AND state='running' RETURNING id"
     : 'UPDATE cycle_attempts SET context=$2 WHERE id=$1', [
     a.id,
     JSON.stringify(context),
     ...(dependencySnapshot ? [a.fence] : []),
+    ...(cpuReplayObservation ? [a.cpuReplayLease] : []),
   ]);
   if (dependencySnapshot && contextSaved.rowCount !== 1)
     throw new DomainError('DEPENDENCY_SOURCE_CHANGED', 'The consumer attempt changed before dependency staging.');
@@ -171,6 +191,10 @@ export async function runCycleAgent(
   }
   const inputs = [cycleInput];
   let size = inputBytes.length;
+  if (cpuReplayBytes && cpuReplayReference) {
+    size += cpuReplayBytes.length;
+    inputs.push({ id: a.id, name: cpuReplayReference.name, digest: cpuReplayReference.digest, base64: cpuReplayBytes.toString('base64') });
+  }
   for (const p of parents.filter((p) => p.id)) {
     const file = await readCycleArtifact(p.id);
     size += file.bytes.length;
@@ -216,6 +240,13 @@ export async function runCycleAgent(
       'Historical input reports are not evidence of this producer. Independently run validation; never copy historical hashes. ' +
       'A binding mismatch retries only this validation, with the producer frozen. A failed semantic or numerical test must remain failed.',
     ] : []),
+    ...(cpuReplayObservation ? [
+      'CPU REPLAY OBSERVATION ONLY: /home/agent/inputs/' + a.id + '/cpu-replay-observation.json. ' +
+      'This controller-owned receipt records a separate bounded CPU execution and its real exit, memory and stop evidence. ' +
+      'It is NOT task acceptance, a proof of checker correctness, GPU validation or performance. ' +
+      'Existing independent QA, report binding, case replay and semantic criteria still apply unchanged. ' +
+      'Do not copy or invent successful cases from this receipt; report failures and limitations honestly.',
+    ] : []),
     'Orientação de retomada: ' + JSON.stringify(s.output ?? null),
     'Entrada externa completa: ' + inputPath + '\nSHA256: ' + cycleInput.digest +
       '\nTamanho UTF-8: ' + inputBytes.length + ' bytes. Leia este arquivo diretamente; ' +
@@ -230,6 +261,7 @@ export async function runCycleAgent(
     await assertDependencySnapshot(db, o, s, a, dependencySnapshot);
   });
   let events = Promise.resolve();
+  if (cpuReplayObservation) await markCPUQADispatch(o, s, a, dependencySnapshot!, signal);
   const result = await accountBridge
     .request(
       'worker.execute',

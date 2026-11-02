@@ -65,6 +65,13 @@ export const stepSchema = z
     if (s.parameters.nativeQAContractVersion !== undefined && s.parameters.nativeQAContractVersion !== 1 &&
         (s.parameters.nativeQAContractVersion !== 2 || !s.dependencyEvidence || s.maxAttempts > 3))
       ctx.addIssue({ code: 'custom', message: 'NativeQA v2 requires dependency evidence and at most three QA attempts.' });
+    if (s.parameters.cpuReplayObservationVersion !== undefined &&
+        (s.parameters.cpuReplayObservationVersion !== 1 || s.kind !== 'agent' ||
+         s.parameters.nativeQAContractVersion !== 2 || !s.dependencyEvidence ||
+         !['python-cpu-argv-v1', 'python-cpu-candidate-base-v1'].includes(s.parameters.cpuReplayProfile as string)))
+      ctx.addIssue({ code: 'custom', message: 'CPU replay observation requires explicit version 1 and a NativeQA v2 consumer.' });
+    if (s.parameters.cpuReplayProfile !== undefined && s.parameters.cpuReplayObservationVersion !== 1)
+      ctx.addIssue({ code: 'custom', message: 'A CPU replay profile alone does not enable execution.' });
   });
 export const cycleSchema = z
   .object({
@@ -92,6 +99,8 @@ export const cycleSchema = z
     if (c.trigger.kind === 'bitrix' && (!c.trigger.groupId || c.trigger.stageId === undefined))
       ctx.addIssue({ code: 'custom', message: 'Informe grupo e etapa do Bitrix.' });
     for (const s of c.steps) {
+      if (s.parameters.cpuReplayObservationVersion === 1 && !c.allowedActions.includes('native.cpu-replay.observe'))
+        ctx.addIssue({ code: 'custom', message: 'CPU replay observation requires its registered action capability.' });
       if (s.dependencyEvidence) {
         const source = c.steps.find(p => p.key === s.dependencyEvidence!.sourceStep);
         if (!source || source.kind !== 'agent' ||
