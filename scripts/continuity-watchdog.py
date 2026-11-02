@@ -2066,7 +2066,11 @@ class Watchdog:
     def submit_supervisor(self, observation):
         failures = [r for r in self.state["supervisions"] if r["fingerprint"] == observation["fingerprint"] and r["state"] == "failed"]
         generation = len(failures) + 1
-        key = self.config["watchId"] + "-review-" + observation["fingerprint"][:32] + "-" + str(generation)
+        namespace = "-review-"
+        if self.config.get("planVersion") == 2:
+            namespace = "-review-v2-" + digest([self.config["controlCycleId"], self.config["controlDefinitionSHA256"],
+                                               self.config.get("controlVersion")])[:16] + "-"
+        key = self.config["watchId"] + namespace + observation["fingerprint"][:32] + "-" + str(generation)
         body = {"requestKey": key, "input": {"version": 1, "watchId": self.config["watchId"],
             "evidenceFingerprint": observation["fingerprint"], "trigger": "stale_progress_diagnostic" if observation["diagnosticOnly"] else "registered_work_reached_boundary",
             "observedIdleSeconds": observation["idleSeconds"], "priorReviewErrors": [r.get("errorCode", "NATIVE_SUPERVISOR_FAILED") for r in failures], **{k: observation[k] for k in
@@ -2134,7 +2138,7 @@ class Watchdog:
             self.save()
         body = self.review_request(key)
         row = self.post_once("run", key, body, self.config["controlCycleId"])
-        record = {"occurrenceId": row["id"], "fingerprint": observation["fingerprint"], "input": body["input"],
+        record = {"occurrenceId": row["id"], "requestKey": key, "fingerprint": observation["fingerprint"], "input": body["input"],
                   "createdAt": self.clock(), "state": "dispatched",
                   "actionEvidence": body["input"].get("actionEvidence")}
         self.state["supervisions"].append(record)
@@ -2142,6 +2146,45 @@ class Watchdog:
         self.save()
         return self.status("supervisor_dispatched", occurrenceId=row["id"], trigger=body["input"]["trigger"],
                            idleSeconds=observation["idleSeconds"], isolatedCandidates=body["input"].get("isolatedCandidates", []))
+
+    def reconcile_review_requests(self):
+        """Recover lost review ACKs under their original cycle before any new work.
+
+        A handover may change the new-review namespace, never an attempted request.
+        Prepared bodies without intents remain historical data and confer no effect.
+        """
+        known = {r["occurrenceId"] for r in self.state["supervisions"]}
+        known_keys = {r["requestKey"] for r in self.state["supervisions"] if r.get("requestKey")}
+        for key in self.state.get("reviewRequests", {}):
+            if key in known_keys:
+                continue
+            marker = self.directory / ("intent-" + digest(key) + ".json")
+            if not marker.exists():
+                continue
+            prior = read_json(marker)
+            if (prior.get("result") or {}).get("id") in known:
+                continue
+            cycle = prior.get("cycleId")
+            require(prior.get("kind") == "run" and prior.get("requestKey") == key
+                    and isinstance(cycle, str) and UUID.fullmatch(cycle), "REVIEW_INTENT_SCOPE")
+            body = self.review_request(key)
+            require(body.get("requestKey") == key and digest(body) == prior["requestDigest"], "POST_IDENTITY_CHANGED")
+            try:
+                row = self.reconcile_existing_post("run", key, cycle)
+            except ValueError as error:
+                if str(error) != "POST_UNCERTAIN_RECONCILE_ONLY":
+                    raise
+                return self.status("owned_review_uncertain", requestKey=key, originalControlCycleId=cycle,
+                                   automaticPostRetry=False, newPostRequests=0)
+            require(row is not None and row["input"] == body["input"], "RUN_RECEIPT")
+            self.state["supervisions"].append({"occurrenceId": row["id"], "requestKey": key,
+                "fingerprint": body["input"]["evidenceFingerprint"], "input": body["input"],
+                "createdAt": self.clock(), "state": "dispatched", "actionEvidence": body["input"].get("actionEvidence"),
+                "reconciledOriginalControlCycleId": cycle})
+            self.save()
+            return self.status("supervisor_reconciled", occurrenceId=row["id"], originalControlCycleId=cycle,
+                               newPostRequests=0)
+        return None
 
     def material_packet(self, experiment, observation):
         source = next(row for row in observation["catalog"] if row["id"] == experiment["sourceArtifactId"])
@@ -2452,7 +2495,7 @@ If complete evidence cannot fit, report the limitation and fail the repair.
         while True:
             result = self._tick_once()
             administrative = result["state"] in {
-                "stale_plan_superseded", "supervisor_failed", "supervisor_plan_rejected"}
+                "stale_plan_superseded", "supervisor_failed", "supervisor_plan_rejected", "supervisor_reconciled"}
             if administrative:
                 transitions.append({k: result[k] for k in ["state", "occurrenceId", "code"] if k in result})
                 if len(transitions) < MAX_ADMINISTRATIVE_TRANSITIONS:
@@ -2475,6 +2518,9 @@ If complete evidence cannot fit, report the limitation and fail the repair.
     def _tick_once(self):
         if self.control()["cycle"]["state"] != "active":
             return self.status("paused_by_control_cycle")
+        recovered = self.reconcile_review_requests()
+        if recovered:
+            return recovered
         pending = next((r for r in reversed(self.state["supervisions"]) if r["state"] in ["dispatched", "dispatching"]), None)
         observation = self.observe(exclude_supervisor=pending["occurrenceId"] if pending else None)
         if pending and pending["state"] == "dispatching":

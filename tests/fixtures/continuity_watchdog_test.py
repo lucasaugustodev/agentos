@@ -2200,14 +2200,16 @@ class WatchTests(unittest.TestCase):
         self.client.timeout_before_commit_number = 1
         with self.assertRaises(TimeoutError): self.w.tick()
         self.reload()
-        with self.assertRaisesRegex(ValueError, 'POST_UNCERTAIN_RECONCILE_ONLY'): self.w.tick()
+        self.assertEqual(self.w.tick()['state'], 'owned_review_uncertain')
         self.assertEqual(len(self.client.posts), 1)
 
     def test_supervisor_response_lost_reconciles_stable_body_after_time_change(self):
         self.client.timeout_after_commit_number = 1
         with self.assertRaises(TimeoutError): self.w.tick()
         self.reload()
-        self.assertEqual(self.w.tick()['state'], 'supervisor_dispatched')
+        result = self.w.tick()
+        self.assertEqual(result['state'], 'supervisor_running')
+        self.assertEqual(result['continuation']['steps'][0]['state'], 'supervisor_reconciled')
         self.assertEqual(len(self.client.posts), 1)
 
     def test_paused_control_blocks_all_post(self):
@@ -2306,7 +2308,7 @@ class WatchTests(unittest.TestCase):
         with self.assertRaises(TimeoutError): self.w.tick()
         requests = copy.deepcopy(self.w.state['reviewRequests'])
         self.assertEqual(len(self.client.posts), 2)
-        self.reload(); self.assertEqual(self.w.tick()['state'], 'supervisor_dispatched')
+        self.reload(); self.assertEqual(self.w.tick()['state'], 'supervisor_running')
         self.assertEqual(len(self.client.posts), 2)
         self.assertEqual(self.w.state['reviewRequests'], requests)
         self.assertEqual(self.w.tick()['state'], 'supervisor_running')
@@ -2315,7 +2317,7 @@ class WatchTests(unittest.TestCase):
         self.w.tick(); self.complete_review({}); self.client.timeout_before_commit_number = 2
         with self.assertRaises(TimeoutError): self.w.tick()
         self.reload()
-        with self.assertRaisesRegex(ValueError, 'POST_UNCERTAIN_RECONCILE_ONLY'): self.w.tick()
+        self.assertEqual(self.w.tick()['state'], 'owned_review_uncertain')
         self.assertEqual(len(self.client.posts), 2)
 
     def test_terminal_drain_limit_preserves_recoverable_persisted_state(self):
@@ -3001,7 +3003,7 @@ class WatchTests(unittest.TestCase):
         original = copy.deepcopy(self.client.posts[0][1]); self.reload()
         source = self.client.occurrences[self.seed]['artifacts'][0]
         self.client.artifacts[source['id']] = b'changed after intent'
-        self.assertEqual(self.w.tick()['state'], 'supervisor_dispatched')
+        self.assertEqual(self.w.tick()['state'], 'supervisor_running')
         self.assertEqual(len(self.client.posts), 1)
         self.assertEqual(self.w.state['supervisions'][-1]['input'], original['input'])
 
@@ -3247,6 +3249,74 @@ class WatchTests(unittest.TestCase):
         owned = self.w.state['supervisions'][-1]['reconciledEffects']
         self.assertEqual(len(owned), 2)
         self.assertEqual(owned[-1]['repairCandidateSHA256'], repair['candidateSHA256'])
+
+    def switch_mixed_control(self):
+        old = self.config['controlCycleId']
+        new = uid()
+        self.client.cycles[new] = {**copy.deepcopy(self.client.cycles[old]), 'id': new}
+        self.config['controlCycleId'] = new
+        self.enable_mixed_plan_contract()
+        return old
+
+    def test_mixed_handover_same_evidence_uses_new_key_without_rewriting_old_review(self):
+        self.parallel_capacity(); self.config.update(maxPendingCandidates=24, maxPipelinesPerProblem=8)
+        self.w.tick(); self.complete_review()
+        old_input = copy.deepcopy(self.w.state['supervisions'][-1]['input'])
+        old_keys = set(self.w.state['reviewRequests'])
+        old_cycle = self.switch_mixed_control()
+        result = self.w.tick()
+        self.assertEqual(result['state'], 'supervisor_dispatched')
+        self.assertEqual(self.w.state['supervisions'][0]['input'], old_input)
+        new = self.w.state['supervisions'][-1]
+        self.assertEqual(new['input']['planVersion'], 2)
+        self.assertNotIn(new['requestKey'], old_keys)
+        self.assertEqual(self.client.occurrences[new['occurrenceId']]['occurrence']['cycle_id'], self.config['controlCycleId'])
+        self.assertEqual(self.client.cycles[old_cycle]['definition'], W.supervisor_definition({**self.config, 'planVersion': 1}))
+
+    def test_mixed_handover_lost_old_review_ack_recovers_original_cycle_by_get(self):
+        self.client.timeout_after_commit_number = 1
+        with self.assertRaises(TimeoutError): self.w.tick()
+        body = copy.deepcopy(next(iter(self.w.state['reviewRequests'].values())))
+        old_cycle = self.switch_mixed_control()
+        self.reload()
+        result = self.w.tick()
+        self.assertEqual(result['state'], 'supervisor_running')
+        self.assertEqual(len(self.client.posts), 1)
+        row = self.w.state['supervisions'][-1]
+        self.assertEqual(row['input'], body['input'])
+        self.assertEqual(row['reconciledOriginalControlCycleId'], old_cycle)
+        self.assertIn('/api/cycles/' + old_cycle, self.client.gets)
+
+    def test_mixed_handover_unknown_old_review_intent_blocks_new_post(self):
+        self.client.timeout_before_commit_number = 1
+        with self.assertRaises(TimeoutError): self.w.tick()
+        old_cycle = self.switch_mixed_control()
+        self.reload()
+        result = self.w.tick()
+        self.assertEqual(result['state'], 'owned_review_uncertain')
+        self.assertEqual(result['originalControlCycleId'], old_cycle)
+        self.assertEqual(len(self.client.posts), 1)
+        self.assertEqual(len(self.w.state['reviewRequests']), 1)
+
+    def test_mixed_handover_prepared_unattempted_body_stays_immutable(self):
+        with mock.patch.object(self.w, 'post_once', side_effect=RuntimeError('crash before intent')):
+            with self.assertRaises(RuntimeError): self.w.tick()
+        original = copy.deepcopy(self.w.state['reviewRequests'])
+        self.switch_mixed_control(); self.reload()
+        self.assertEqual(self.w.tick()['state'], 'supervisor_dispatched')
+        self.assertEqual(len(self.client.posts), 1)
+        for key, body in original.items():
+            self.assertEqual(self.w.state['reviewRequests'][key], body)
+        self.assertEqual(self.client.posts[0][1]['input']['planVersion'], 2)
+
+    def test_mixed_handover_changed_saved_body_cannot_recover_or_dispatch(self):
+        self.client.timeout_after_commit_number = 1
+        with self.assertRaises(TimeoutError): self.w.tick()
+        body = next(iter(self.w.state['reviewRequests'].values()))
+        body['input']['observedIdleSeconds'] += 1
+        self.w.save(); self.switch_mixed_control(); self.reload()
+        with self.assertRaisesRegex(ValueError, 'POST_IDENTITY_CHANGED'): self.w.tick()
+        self.assertEqual(len(self.client.posts), 1)
 
 
 if __name__ == '__main__':

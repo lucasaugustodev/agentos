@@ -511,10 +511,17 @@ control cycle permits a reversible pin handover without changing in-flight
 occurrences. Do not roll back to an old reader while version-2 plans still require
 reconciliation: preserve a compatible reader and the current complete state.
 
-Server qualification has 193 passing tests before the independent payload-storage
-change. Nine new cases cover 24 mixed actions, exact repair routing, invalid kinds
+New version-2 review keys include the control identity and definition pins. Before
+creating a new review, unrecorded review intents are reconciled by GET against
+their ORIGINAL cycle, with the saved body digest and receipt checked. A lost ACK
+recovers the exact input; an unknown effect yields owned_review_uncertain and
+blocks new submissions. Unattempted prepared bodies remain immutable historical
+data. Handover never renames an intent or resends it under the new control cycle.
+
+Server qualification has 198 passing tests before the independent payload-storage
+change. Fourteen new cases cover 24 mixed actions, exact repair routing, invalid kinds
 and capacity reports, unchanged legacy definitions, current capacity admission,
-lost acknowledgements and per-action repair read sets. These are isolated controller
+lost acknowledgements, real control-cycle handover and per-action repair read sets. These are isolated controller
 tests, not evidence that 24 agents have actually started or produced GPU gains.
 
 Immutable private state payloads (separate explicit opt-in)
