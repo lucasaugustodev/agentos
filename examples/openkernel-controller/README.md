@@ -403,3 +403,27 @@ historical hashes never replace current producer evidence.
 Other final failure codes currently cannot provide v2 source provenance; recovery
 from a semantic failure requires a separate contract and is not part of this
 binding-retry change.
+
+### Explicit reservations for a known uncertain CHECK
+
+The default remains an account-wide block while an effect is uncertain. An
+operator can opt into `uncertainCheckReservations: {version: 1, intents: [...]}`
+for individually reviewed intents. Each entry pins `problem`, `sourceSHA256`,
+`occurrenceId`, `intentEpoch`, exact `ledgerSHA256`, and an immutable
+`originPolicy: {path, sha256}`. Unlisted uncertainty still blocks the account.
+
+The native and shared ledgers must retain identical reviewed bytes. Historical
+executor/transport authority, audit, source and complete 429 receipt are checked;
+the transport qualification must demonstrate one POST, without internal retry.
+These pins do not prove the historical identity of the external OKC account.
+The source itself remains unresendable across occurrences and UTC days. No
+receipt is rewritten, no uncertainty is declared resolved, and no SCORE is used.
+
+Other candidates need fresh official quotas and a synchronized local consumption
+floor. Each unresolved pinned intent reserves one extra CHECK on its own problem,
+including after midnight. Reservations are stored separately from the used floor
+to avoid charging the same reservation again after every acknowledged job. The
+existing minimum quota margin, rate checks, lock and pre-intent rechecks remain.
+Changed ledgers, stale observations, UTC rollover or an incomplete/ambiguous jobs
+window require a new observation. A full 50-job window entirely inside the current
+UTC day is deliberately insufficient; availability may wait for adequate coverage.

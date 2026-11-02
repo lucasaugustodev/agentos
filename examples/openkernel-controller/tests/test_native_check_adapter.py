@@ -2046,5 +2046,215 @@ class QuotaSynchronizationTests(unittest.TestCase):
         self.assertEqual(self.official.posts,0)
 
 
+class UncertainCheckReservationTests(unittest.TestCase):
+    def setUp(self):
+        self.f=Fixture();self.f.setUp();self.addCleanup(self.f.tearDown)
+        self.p,self.lane,self.official=self.f.p,self.f.lane,self.f.official
+        self.p['minimumChecksRemaining']=0
+        self.p['transportHelper']={'path':str(self.f.root/'transport.py'),'sha256':'d'*64}
+        self.now=NOW;self.lane.clock=lambda:self.now
+
+    def reserve(self, board=BOARD, own=False, epoch=None, old_change=None):
+        if board not in self.p['boards']:self.p['boards'][board]=copy.deepcopy(self.p['boards'][BOARD])
+        raw=self.f.candidate if own else b'old reviewed candidate\n';sha=A.digest(raw)
+        occurrence=OCC if own else SUPERVISOR;epoch=self.now-120 if epoch is None else epoch
+        old=copy.deepcopy(self.p);old.pop('uncertainCheckReservations',None)
+        old.update(notBefore=epoch-100,expiresAt=epoch+3600)
+        if old_change:old_change(old)
+        old_path=self.f.root/('old-policy-'+str(len(list(self.f.root.glob('old-policy-*'))))+'.json')
+        old_raw=A.canonical(old);IO.immutable_snapshot(old_path,old_raw)
+        audit={'problem':board,'sourceSHA256':sha,'occurrenceId':occurrence}
+        audit_raw=A.canonical(audit);receipt={'error':'daily CHECK cap reached; effect remains unresolved','status':429}
+        row={'state':'submission_outcome_unknown','mode':'check','automaticPostRetry':False,'intentEpoch':epoch,'exitCode':1,
+             'identity':{'origin':'native-diagnostic-check-policy-v1','operatorReviewedCandidate':False,'problem':board,
+                'sourceSha256':sha,'occurrenceId':occurrence,'policySHA256':A.digest(old_raw),'auditSHA256':A.digest(audit_raw)},'receipt':receipt}
+        stem=board+'-'+sha
+        self.native=pathlib.Path(self.p['stateDirectory'])/(stem+'-check.json');self.mirror=pathlib.Path(self.p['legacyLedger'])/self.native.name
+        IO.atomic_record(self.native,row);IO.atomic_record(self.mirror,row)
+        IO.immutable_snapshot(self.native.parent/(stem+'-audit.json'),audit_raw)
+        IO.immutable_snapshot(self.native.parent/(stem+'.py'),raw)
+        folder=self.native.parent/(stem+'-evidence');folder.mkdir(mode=0o700)
+        IO.immutable_snapshot(folder/'stdout.json',A.canonical(receipt))
+        pin={'problem':board,'sourceSHA256':sha,'occurrenceId':occurrence,'intentEpoch':epoch,
+             'ledgerSHA256':A.digest(self.native.read_bytes()),'originPolicy':{'path':str(old_path),'sha256':A.digest(old_raw)}}
+        self.p['uncertainCheckReservations']={'version':1,'intents':[pin]}
+        return row,pin
+
+    def test_default_account_block_and_strict_optin_schema(self):
+        self.reserve();flag=self.p.pop('uncertainCheckReservations')
+        with mock.patch.object(self.official,'fetch',side_effect=AssertionError('no GET')):
+            with self.assertRaises(A.AccountPreflightWait):self.lane.preflight(BOARD)
+        for bad in [True,{'version':True,'intents':flag['intents']},{'version':1,'intents':[]},
+                    {'version':1,'intents':flag['intents']*2},{**flag,'allowAll':True}]:
+            self.p['uncertainCheckReservations']=bad
+            with self.assertRaisesRegex(ValueError,'UNCERTAIN_RESERVATION_POLICY'):A.validate_policy(self.p,NOW,'a'*64)
+
+    def test_mirrors_reserve_once_keep_floor_clean_and_never_rewrite(self):
+        self.reserve();before=(self.native.read_bytes(),self.mirror.read_bytes())
+        result=self.lane.preflight(BOARD)
+        self.assertEqual(result['quotaObservation']['used'],0)
+        self.assertEqual(len(result['uncertainCheckReservations']),1)
+        self.assertEqual(result['uncertainCheckReservations'][0]['slots'],1)
+        self.assertEqual(before,(self.native.read_bytes(),self.mirror.read_bytes()))
+        self.assertEqual(self.official.posts,0)
+
+    def test_remaining_zero_or_one_blocks_before_post_but_two_can_inspect(self):
+        self.reserve()
+        for left,code in [(0,'CHECK_QUOTA'),(1,'CHECK_QUOTA_SYNC_PENDING')]:
+            self.official.left=left
+            with self.assertRaisesRegex(A.PreflightQuotaError,code):self.lane.run(OCC,'check')
+            self.assertEqual(self.official.posts,0)
+        self.official.left=2
+        self.assertEqual(self.lane.run(OCC,'inspect')['state'],'eligible')
+
+    def test_other_board_has_no_reserved_charge(self):
+        self.reserve('muse_prefill_layer');self.official.left=1
+        result=self.lane.preflight(BOARD)
+        self.assertEqual(result['quotaObservation']['used'],9)
+        self.assertEqual(result['uncertainCheckReservations'][0]['problem'],'muse_prefill_layer')
+
+    def test_reservation_preserves_existing_minimum_margin(self):
+        self.reserve();self.p['minimumChecksRemaining']=2;self.official.left=3
+        with self.assertRaises(A.PreflightQuotaError):self.lane.run(OCC,'check')
+        self.official.left=4;self.assertEqual(self.lane.run(OCC,'inspect')['state'],'eligible')
+        self.assertEqual(self.official.posts,0)
+
+    def test_unknown_survives_midnight_without_yesterdays_floor(self):
+        day=int(NOW//86400)*86400;self.reserve(epoch=day-120)
+        result=self.lane.preflight(BOARD)
+        self.assertEqual(result['quotaObservation']['used'],0)
+        self.assertEqual(result['uncertainCheckReservations'][0]['intentEpoch'],day-120)
+
+    def test_two_acknowledgements_do_not_capitalize_the_same_reservation(self):
+        self.reserve();first=self.lane.preflight(BOARD)
+        for number in [1,2]:
+            job=f'{number:016x}';row={'state':'job_recorded','mode':'check','intentEpoch':NOW-1,
+                'identity':{'problem':BOARD,'sourceSha256':str(number)*64},'receipt':{'job_id':job},
+                'quotaObservation':first['quotaObservation']}
+            # The first observation predates the first synthetic ACK. The next
+            # preserves its current floor without adding the uncertainty to used.
+            row['quotaObservation']['checkedAt']=NOW-2
+            for key in ['stateDirectory','legacyLedger']:
+                IO.atomic_record(pathlib.Path(self.p[key])/(BOARD+'-'+str(number)*64+'-check.json'),row)
+            self.official.jobs.append({'job_id':job,'problem':BOARD,'mode':'check','submitted_at':NOW-1})
+            first=self.lane.preflight(BOARD)
+            self.assertEqual(first['quotaObservation']['used'],number)
+            self.assertEqual(len(first['uncertainCheckReservations']),1)
+
+    def test_own_candidate_remains_unresendable_across_days(self):
+        self.reserve(own=True,epoch=NOW-86400)
+        with self.assertRaisesRegex(ValueError,'UNCERTAIN_RECONCILE_NO_RESEND'):self.lane.run(OCC,'check')
+        row=A.scan(self.lane,self.f.root/'status.json','check')['outcomes'][0]
+        self.assertEqual(row['state'],'uncertain_owned');self.assertIsNone(row['postAttempted'])
+        self.assertEqual(self.official.posts,0)
+
+    def test_same_source_from_another_occurrence_is_also_unresendable(self):
+        row,pin=self.reserve(own=True);row['identity']['occurrenceId']=SUPERVISOR
+        IO.atomic_record(self.native,row);IO.atomic_record(self.mirror,row)
+        with self.assertRaisesRegex(ValueError,'SOURCE_PREVIOUS_PROVENANCE'):self.lane.run(OCC,'check')
+        self.assertEqual(self.official.posts,0)
+
+    def test_unlisted_unknown_and_missing_or_changed_mirror_block_globally(self):
+        row,_=self.reserve();original=self.mirror.read_bytes()
+        for change in ['missing','changed','unlisted']:
+            if change=='missing':self.mirror.unlink()
+            elif change=='changed':IO.atomic_record(self.mirror,{**row,'automaticPostRetry':True})
+            else:
+                self.mirror.write_bytes(original)
+                IO.atomic_record(pathlib.Path(self.p['legacyLedger'])/(BOARD+'-'+'e'*64+'-check.json'),{'state':'submission_outcome_unknown'})
+            with self.assertRaises(A.AccountPreflightWait):self.lane.preflight(BOARD)
+        self.assertEqual(self.official.posts,0)
+
+    def test_native_authority_cannot_be_replaced_by_legacy_only(self):
+        self.reserve();self.native.unlink()
+        with self.assertRaises(A.AccountPreflightWait):self.lane.preflight(BOARD)
+
+    def test_only_one_reconciled_mirror_keeps_global_block(self):
+        row,_=self.reserve();IO.atomic_record(self.native,{**row,'state':'job_recorded','receipt':{'job_id':'abcdef0123456789'}})
+        with self.assertRaises(A.AccountPreflightWait):self.lane.preflight(BOARD)
+
+    def test_tampered_historical_proofs_are_not_reservation_authority(self):
+        row,pin=self.reserve();stem=self.native.name[:-11]
+        paths=[pathlib.Path(pin['originPolicy']['path']),self.native.parent/(stem+'-audit.json'),
+               self.native.parent/(stem+'.py'),self.native.parent/(stem+'-evidence')/'stdout.json']
+        for path in paths:
+            old=path.read_bytes();path.chmod(0o600);path.write_bytes(b'{}');path.chmod(0o400)
+            with self.subTest(path=path),self.assertRaises(A.AccountPreflightWait):self.lane.preflight(BOARD)
+            path.chmod(0o600);path.write_bytes(old);path.chmod(0o400)
+
+    def test_origin_account_transport_mode_and_pin_are_not_assumed(self):
+        for change in [lambda p:p.update(accountId='another'),lambda p:p.update(model='another'),
+                       lambda p:p.update(allowedActions=['score']),lambda p:p.update(transportHelper={'path':'/elsewhere','sha256':'e'*64})]:
+            with self.subTest(change=change):
+                fixture=UncertainCheckReservationTests();fixture.setUp()
+                try:
+                    fixture.reserve(old_change=change)
+                    with self.assertRaises(A.AccountPreflightWait):fixture.lane.preflight(BOARD)
+                finally:fixture.doCleanups()
+
+    def test_forged_multiplicity_and_receipt_do_not_become_reservations(self):
+        row,pin=self.reserve()
+        for field,value in [('automaticPostRetry',True),('mode','scored'),('state','submission_intent'),('exitCode',0)]:
+            bad={**row,field:value};IO.atomic_record(self.native,bad);IO.atomic_record(self.mirror,bad)
+            pin['ledgerSHA256']=A.digest(self.native.read_bytes())
+            with self.assertRaises(A.AccountPreflightWait):self.lane.preflight(BOARD)
+
+    def test_later_known_receipt_dominates_old_pin_without_rewrite(self):
+        row,_=self.reserve();job='abcdef0123456789'
+        known={**row,'state':'job_recorded','receipt':{'job_id':job}}
+        IO.atomic_record(self.native,known);IO.atomic_record(self.mirror,known)
+        self.official.jobs=[{'job_id':job,'problem':BOARD,'mode':'check','submitted_at':row['intentEpoch']}]
+        result=self.lane.preflight(BOARD)
+        self.assertEqual(result['uncertainCheckReservations'],[])
+        self.assertEqual(result['quotaObservation']['used'],1)
+
+    def test_new_unknown_during_second_audit_blocks_before_candidate_freeze(self):
+        self.reserve();original=self.lane.audit.audit;calls=[]
+        def changed(oid):
+            result=original(oid);calls.append(oid)
+            if len(calls)==2:IO.atomic_record(pathlib.Path(self.p['legacyLedger'])/(BOARD+'-'+'f'*64+'-check.json'),{'state':'submission_intent'})
+            return result
+        self.lane.audit.audit=changed
+        with self.assertRaises(A.AccountPreflightWait):self.lane.run(OCC,'check')
+        self.assertFalse((pathlib.Path(self.p['stateDirectory'])/(BOARD+'-'+A.digest(self.f.candidate)+'.py')).exists())
+        self.assertEqual(self.official.posts,0)
+
+    def test_midnight_or_stale_get_requires_fresh_observation(self):
+        self.reserve();result=self.lane.preflight(BOARD)
+        self.now+=61
+        with self.assertRaisesRegex(A.PreflightQuotaError,'CHECK_QUOTA_SYNC_PENDING'):self.lane.reservation_read_set(result)
+        self.now=(int(NOW//86400)+1)*86400
+        with self.assertRaisesRegex(A.PreflightQuotaError,'CHECK_QUOTA_SYNC_PENDING'):self.lane.reservation_read_set(result)
+
+    def test_job_window_rejects_duplicate_conflicting_or_truncated_observation(self):
+        self.reserve();row={'job_id':'abcdef0123456789','problem':BOARD,'mode':'check','submitted_at':NOW-1}
+        cases=[{'jobs':[row],'has_more':True},[row,row],[row,{**row,'problem':'muse_prefill_layer'}],
+               [row,{**row,'job_id':'abcdef0123456790','submitted_at':NOW}],
+               [{**row,'job_id':f'{i:016x}'} for i in range(50)]]
+        for response in cases:
+            with self.subTest(response=response),self.assertRaises(A.PreflightQuotaError):self.lane.reservation_jobs_window(response,NOW)
+        self.assertEqual(self.lane.reservation_jobs_window({'jobs':[row]},NOW),[row])
+
+    def test_midnight_during_official_gets_is_not_a_valid_quota_observation(self):
+        self.reserve();self.now=(int(NOW//86400)+1)*86400-1;self.p['expiresAt']=self.now+3600
+        original=self.official.fetch
+        def cross(route,public=False):
+            value=original(route,public)
+            if route=='problems':self.now+=2
+            return value
+        self.official.fetch=cross
+        with self.assertRaises(A.PreflightQuotaError):self.lane.preflight(BOARD)
+        self.assertEqual(self.official.posts,0)
+
+    def test_new_unrelated_intent_preserves_reservation_separate_from_floor(self):
+        self.reserve();before=self.native.read_bytes()
+        result=self.lane.run(OCC,'check');self.assertEqual(result['state'],'job_recorded')
+        path=pathlib.Path(self.p['stateDirectory'])/(BOARD+'-'+A.digest(self.f.candidate)+'-check.json')
+        value=A.strict_json(path.read_bytes())
+        self.assertEqual(value['quotaObservation']['used'],0)
+        self.assertEqual(len(value['uncertainCheckReservations']),1)
+        self.assertEqual(self.native.read_bytes(),before);self.assertEqual(self.official.posts,1)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -207,6 +207,7 @@ def validate_policy(policy, now, adapter_sha, allow_disabled=False):
     require(policy.get("boards") and set(policy["boards"]).issubset(BOARDS), "BOARD_SCOPE")
     require(policy.get("quotaPolicy") == "official-account-limits", "POLICY_QUOTA_SCOPE")
     require(type(policy.get("minimumChecksRemaining")) is int and policy["minimumChecksRemaining"] >= 0, "QUOTA_RESERVE")
+    reservation_policy(policy)
     for key in ("accountId", "model", "stateDirectory", "legacyLedger", "accountLock", "watcherStateDirectory", "registryPath", "artifactDirectory", "workerRunsDirectory"):
         require(isinstance(policy.get(key), str) and policy[key], "POLICY_FIELD_" + key)
     origins = policy.get("nativeSourceOrigins")
@@ -231,6 +232,29 @@ def validate_policy(policy, now, adapter_sha, allow_disabled=False):
             require(isinstance(seed.get("provenance"), list) and bool(seed["provenance"])
                     and isinstance(seed.get("attribution"), str) and bool(seed["attribution"].strip()), "PROVENANCE_ATTRIBUTION_REQUIRED")
     return policy
+
+
+def reservation_policy(policy):
+    value = policy.get("uncertainCheckReservations")
+    if value is None: return None
+    require(type(value) is dict and set(value) == {"version", "intents"}
+            and type(value.get("version")) is int and value["version"] == 1
+            and type(value.get("intents")) is list and 1 <= len(value["intents"]) <= 16,
+            "UNCERTAIN_RESERVATION_POLICY")
+    seen = set()
+    for row in value["intents"]:
+        require(type(row) is dict and set(row) == {"problem", "sourceSHA256", "occurrenceId", "intentEpoch", "ledgerSHA256", "originPolicy"}
+                and row.get("problem") in policy["boards"] and SHA.fullmatch(row.get("sourceSHA256", ""))
+                and UUID.fullmatch(row.get("occurrenceId", "")) and SHA.fullmatch(row.get("ledgerSHA256", ""))
+                and type(row.get("intentEpoch")) in (int, float) and math.isfinite(row["intentEpoch"]) and row["intentEpoch"] > 0,
+                "UNCERTAIN_RESERVATION_POLICY")
+        ref = row["originPolicy"]
+        require(type(ref) is dict and set(ref) == {"path", "sha256"} and type(ref["path"]) is str
+                and pathlib.Path(ref["path"]).is_absolute() and SHA.fullmatch(ref.get("sha256", "")), "UNCERTAIN_RESERVATION_POLICY")
+        key = (row["problem"], row["sourceSHA256"])
+        require(key not in seen, "UNCERTAIN_RESERVATION_POLICY")
+        seen.add(key)
+    return value
 
 
 def source_screen(raw):
@@ -1094,6 +1118,97 @@ class OfficialLane:
                     rows.append(strict_json(raw))
         return rows
 
+    def uncertain_reservations(self, previous):
+        """An explicitly pinned, single POST stays unknown and consumes a slot.
+
+        This is not effect reconciliation. An unlisted or changed unknown still
+        blocks the account. Both the native authority and its legacy mirror must
+        retain the exact reviewed bytes; a legacy-only record grants nothing.
+        """
+        unknown = [r for r in previous if r.get("state") != "job_recorded"]
+        if not unknown: return []
+        try:
+            options = reservation_policy(self.p)
+            require(options is not None, "RESERVATION_DISABLED")
+            pins = {(r["problem"], r["sourceSHA256"]): r for r in options["intents"]}
+            result = {}
+            for row in unknown:
+                identity = row.get("identity", {})
+                key = (identity.get("problem"), identity.get("sourceSha256"))
+                require(key in pins, "RESERVATION_UNKNOWN_NOT_PINNED")
+                pin = pins[key]
+                require(row.get("state") == "submission_outcome_unknown" and row.get("mode") == "check"
+                        and row.get("automaticPostRetry") is False
+                        and identity.get("origin") == "native-diagnostic-check-policy-v1"
+                        and identity.get("operatorReviewedCandidate") is False
+                        and identity.get("occurrenceId") == pin["occurrenceId"]
+                        and type(row.get("intentEpoch")) in (int, float) and row["intentEpoch"] == pin["intentEpoch"]
+                        and row["intentEpoch"] <= self.clock() + 5
+                        and identity.get("policySHA256") == pin["originPolicy"]["sha256"]
+                        and SHA.fullmatch(identity.get("auditSHA256", "")), "RESERVATION_INTENT_IDENTITY")
+                filename = key[0] + "-" + key[1] + "-check.json"
+                native = protected(self.state / filename)
+                mirror = self.io.read_regular(self.legacy / filename, 1024 * 1024)
+                require(native == mirror and digest(native) == pin["ledgerSHA256"]
+                        and canonical(strict_json(native)) == canonical(row), "RESERVATION_MIRROR_PIN")
+                old = strict_json(pinned(pin["originPolicy"]))
+                validate_policy(old, row["intentEpoch"], old.get("adapterSHA256"))
+                require(all(old.get(k) == self.p.get(k) for k in ("accountId", "model", "project", "workspace",
+                        "stateDirectory", "legacyLedger", "accountLock", "artifactDirectory"))
+                        and type(old.get("transportHelper")) is dict
+                        and old["transportHelper"] == self.p.get("transportHelper")
+                        and key[0] in old["boards"], "RESERVATION_ACCOUNT_SCOPE")
+                stem = key[0] + "-" + key[1]
+                audit_raw = protected(self.state / (stem + "-audit.json"), immutable=True)
+                audit = strict_json(audit_raw)
+                require(digest(audit_raw) == identity["auditSHA256"] and audit.get("problem") == key[0]
+                        and audit.get("sourceSHA256") == key[1] and audit.get("occurrenceId") == pin["occurrenceId"],
+                        "RESERVATION_AUDIT_BINDING")
+                require(digest(protected(self.state / (stem + ".py"), immutable=True)) == key[1], "RESERVATION_SOURCE_BINDING")
+                stdout = strict_json(protected(self.state / (stem + "-evidence") / "stdout.json", immutable=True))
+                require(type(row.get("exitCode")) is int and row["exitCode"] == 1
+                        and canonical(stdout) == canonical(row.get("receipt"))
+                        and type(stdout) is dict and set(stdout) == {"error", "status"}
+                        and type(stdout["status"]) is int and stdout["status"] == 429
+                        and type(stdout["error"]) is str and bool(stdout["error"]), "RESERVATION_SINGLE_POST_RECEIPT")
+                result[key] = {"problem": key[0], "sourceSHA256": key[1], "occurrenceId": pin["occurrenceId"],
+                               "intentEpoch": pin["intentEpoch"], "ledgerSHA256": pin["ledgerSHA256"], "slots": 1}
+            return [result[key] for key in sorted(result)]
+        except (ValueError, KeyError, TypeError, OSError) as error:
+            waiting = AccountPreflightWait("ACCOUNT_HAS_UNCERTAIN_EFFECT")
+            waiting.reservation_reason = str(error)[:120]
+            raise waiting from error
+
+    def reservation_read_set(self, checks):
+        if "uncertainCheckReservations" not in checks: return
+        rows = self.records()
+        reservations = self.uncertain_reservations(rows)
+        if (digest(sorted(digest(r) for r in rows)) != checks["ledgerReadSetSHA256"]
+                or reservations != checks["uncertainCheckReservations"]):
+            raise AccountPreflightWait("ACCOUNT_HAS_UNCERTAIN_EFFECT")
+        now = self.clock()
+        if not (0 <= now - checks["reservationReadStartedAt"] <= 60
+                and int(now // 86400) * 86400 == checks["quotaObservation"]["utcDayStart"]):
+            raise PreflightQuotaError("CHECK_QUOTA_SYNC_PENDING")
+
+    def reservation_jobs_window(self, response, now):
+        # The current endpoint is the newest 50 jobs, not a full archive. A
+        # saturated window entirely inside this UTC day cannot prove coverage;
+        # preserve uncertainty rather than treating a missing row as rejection.
+        if type(response) is dict and set(response) != {"jobs"}:
+            raise PreflightQuotaError("CHECK_QUOTA_SYNC_PENDING")
+        jobs = response if type(response) is list else response.get("jobs") if type(response) is dict else None
+        if not (type(jobs) is list and len(jobs) <= 50 and all(type(j) is dict
+                and JOB.fullmatch(j.get("job_id", "")) and type(j.get("problem")) is str
+                and j.get("mode") in {"check", "run"} and type(j.get("submitted_at")) in (int, float)
+                and math.isfinite(j["submitted_at"]) and 0 < j["submitted_at"] <= now + 5 for j in jobs)):
+            raise PreflightQuotaError("CHECK_QUOTA_SYNC_PENDING")
+        stamps = [j["submitted_at"] for j in jobs]
+        if (len({j["job_id"] for j in jobs}) != len(jobs) or stamps != sorted(stamps, reverse=True)
+                or len(jobs) == 50 and stamps[-1] >= int(now // 86400) * 86400):
+            raise PreflightQuotaError("CHECK_QUOTA_SYNC_PENDING")
+        return jobs
+
     def quota_observation(self, previous, jobs, problem, quota, now):
         """A lagging quota GET cannot erase CHECKs acknowledged by this lane.
 
@@ -1145,8 +1260,8 @@ class OfficialLane:
     def preflight(self, problem):
         # NativeAudit has already run. An account wait must not suppress CPU
         # evidence auditing, but needs no official GETs until reconciled.
-        if not all(r.get("state") == "job_recorded" for r in self.records()):
-            raise AccountPreflightWait("ACCOUNT_HAS_UNCERTAIN_EFFECT")
+        reservation_started = self.clock()
+        self.uncertain_reservations(self.records())
         live = self.official.fetch("problems/" + problem)
         require(live.get("name") == problem, "PROBLEM_CHANGED")
         current = {**live["files"], "AGENTS.md": live["agents_md"], "TASK.md": live["task_md"]}
@@ -1164,8 +1279,7 @@ class OfficialLane:
         require(len(rows) == 1, "PROBLEM_UNAVAILABLE")
         q = rows[0]["limits"]["checks"]
         previous = self.records()
-        if not all(r.get("state") == "job_recorded" for r in previous):
-            raise AccountPreflightWait("ACCOUNT_HAS_UNCERTAIN_EFFECT")
+        reservations = self.uncertain_reservations(previous)
         require(all(type(q.get(k)) is int and q[k] >= 0 for k in ("left", "used", "per_day")), "CHECK_QUOTA_SCHEMA")
         if not (q["left"] > self.p["minimumChecksRemaining"] and q["used"] < q["per_day"]):
             raise PreflightQuotaError("CHECK_QUOTA")
@@ -1176,13 +1290,26 @@ class OfficialLane:
         now = self.clock()
         require(sum(r.get("intentEpoch", 0) > now - 60 for r in previous) < maximum, "LOCAL_RATE_WAIT")
         jobs = self.official.fetch("jobs")
-        jobs = jobs if isinstance(jobs, list) else jobs.get("jobs")
+        jobs = (self.reservation_jobs_window(jobs, now) if reservation_policy(self.p) is not None
+                else jobs if isinstance(jobs, list) else jobs.get("jobs"))
         require(isinstance(jobs, list) and all(type(j.get("submitted_at")) in (int, float)
                 and math.isfinite(j["submitted_at"]) for j in jobs), "JOBS_TIME_SCHEMA")
         require(sum(j["submitted_at"] > now - 60 for j in jobs) < maximum, "EXTERNAL_RATE_WAIT")
-        observation = self.quota_observation(previous, jobs, problem, q, now)
-        return {"checkedAt": now, "quota": q, "quotaObservation": observation,
-                "rules": self.p["rulesEvidence"], "effectiveRate": maximum}
+        observation = self.quota_observation([r for r in previous if r.get("state") == "job_recorded"], jobs, problem, q, now)
+        # Keep used/floor free of reservations. Otherwise each acknowledged job
+        # would capitalize the same uncertainty and charge it repeatedly.
+        reserved = sum(r["slots"] for r in reservations if r["problem"] == problem)
+        if min(q["left"], q["per_day"] - observation["used"]) - reserved <= self.p["minimumChecksRemaining"]:
+            raise PreflightQuotaError("CHECK_QUOTA_SYNC_PENDING")
+        result = {"checkedAt": now, "quota": q, "quotaObservation": observation,
+                  "rules": self.p["rulesEvidence"], "effectiveRate": maximum}
+        if reservation_policy(self.p) is not None:
+            if int(reservation_started // 86400) * 86400 != observation["utcDayStart"]:
+                raise PreflightQuotaError("CHECK_QUOTA_SYNC_PENDING")
+            result.update(uncertainCheckReservations=reservations, reservationReadStartedAt=reservation_started,
+                          ledgerReadSetSHA256=digest(sorted(digest(r) for r in previous)))
+            self.reservation_read_set(result)
+        return result
 
     def register(self, receipt_path, value, audit):
         job = value.get("receipt", {}).get("job_id")
@@ -1235,6 +1362,7 @@ class OfficialLane:
             require(fresh == audit and fresh_files == files and fresh_source == source, "AUDIT_CHANGED_DURING_PREFLIGHT")
             require(self.clock() < self.p["expiresAt"], "POLICY_EXPIRED")
             require(self.control_active(), "CONTROL_PAUSED")
+            self.reservation_read_set(checks)
             if int(self.clock() // 86400) * 86400 != checks["quotaObservation"]["utcDayStart"]:
                 raise PreflightQuotaError("CHECK_QUOTA_SYNC_PENDING")
             snapshot = self.state / (key + ".py")
@@ -1249,11 +1377,14 @@ class OfficialLane:
                         "occurrenceId": occurrence_id, "policySHA256": self.policy_sha, "auditSHA256": digest(audit),
                         "operatorReviewedCandidate": False}
             intent_epoch = self.clock()
+            self.reservation_read_set(checks)
             if int(intent_epoch // 86400) * 86400 != checks["quotaObservation"]["utcDayStart"]:
                 raise PreflightQuotaError("CHECK_QUOTA_SYNC_PENDING")
             value = {"createdAt": dt.datetime.now(dt.timezone.utc).isoformat(), "intentEpoch": intent_epoch,
                      "mode": "check", "identity": identity, "state": "submission_intent", "automaticPostRetry": False,
                      "quotaObservation": checks["quotaObservation"]}
+            if "uncertainCheckReservations" in checks:
+                value["uncertainCheckReservations"] = checks["uncertainCheckReservations"]
             self.io.immutable_snapshot(intent, canonical(value))
             self.io.immutable_snapshot(mirror, canonical(value))
             # The single effect boundary. All failures after this point are
@@ -1525,6 +1656,7 @@ def scan(lane, status_path, mode):
                                  or isinstance(error, AccountPreflightWait) and code == "ACCOUNT_HAS_UNCERTAIN_EFFECT"
                                  and status == "account_wait") else None),
                              "proposedRemediation": remediation,
+                             **({"accountWaitReason": error.reservation_reason} if getattr(error, "reservation_reason", None) else {}),
                              **({"evidenceErrors": error.evidence_errors} if getattr(error, "evidence_errors", None) else {})}
             if (isinstance(error, NativeDiagnosticError) and status == "rejected_repairable"
                     and job_id is None and terminal_diagnostic_code(code)
