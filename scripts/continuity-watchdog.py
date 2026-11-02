@@ -36,6 +36,9 @@ SUPERVISOR_DIAGNOSTIC_LIMIT = 64 * 1024
 MAX_ADMINISTRATIVE_TRANSITIONS = 3
 REPAIR_CPU_RAW_LIMIT = 256 * 1024
 REPAIR_CPU_LOGICAL_LIMIT = 128 * 1024
+# Native diagnostic adapter artifact admission is bounded to 1 MiB. Reading
+# that authenticated report does not expand the separate 64 KiB model context.
+QA_ARTIFACT_LIMIT = 1024 * 1024
 STATE_PAYLOAD_STORAGE = "content-addressed-v1"
 STATE_SNAPSHOT_LIMIT = 64 * 1024 * 1024
 STATE_PAYLOAD_LIMIT = 3 * 1024 * 1024
@@ -1377,6 +1380,24 @@ class Watchdog:
             return {"bindingState": "invalid", "classification": "evidence_diagnosis_required",
                     "code": code, "authority": "no_report_content_admitted"}
 
+    def qa_report(self, artifact, schema_code="QA_REPORT_SCHEMA"):
+        raw = self.verified_artifact(artifact, QA_ARTIFACT_LIMIT)
+        def unique(pairs):
+            result = {}
+            for key, value in pairs:
+                require(key not in result, "QA_REPORT_DUPLICATE_KEY")
+                result[key] = value
+            return result
+        def nonfinite(_):
+            raise ValueError("QA_REPORT_NONFINITE")
+        def finite(value):
+            parsed = float(value)
+            require(math.isfinite(parsed), "QA_REPORT_NONFINITE")
+            return parsed
+        report = json.loads(raw, object_pairs_hook=unique, parse_constant=nonfinite, parse_float=finite)
+        require(type(report) is dict, schema_code)
+        return report
+
     def qa_context(self, detail, artifact, problem, latest_attempts):
         """Preserve bounded complete blockers as source-bound report data.
 
@@ -1598,7 +1619,7 @@ class Watchdog:
             require(qa is not None and qa["attempt_id"] in latest and any(a["name"] == "candidate.py"
                     and a["digest"] == row["sourceSHA256"] and a["attempt_id"] in latest
                     for a in detail["artifacts"]), "REGISTERED_JOB_ARTIFACTS")
-            review = json.loads(self.verified_artifact(qa, 32768))
+            review = self.qa_report(qa)
             source = detail["occurrence"].get("input", {}).get("experiment", {}).get("sourceArtifact", {})
             require(review.get("passed") is True and review.get("candidateSHA256") == row["sourceSHA256"]
                     and review.get("sourceSHA256") == source.get("digest") and bool(source.get("digest"))
@@ -1725,7 +1746,7 @@ class Watchdog:
                            and r["problem"] == row["problem"] and r["occurrenceId"] in details]
                 if repairs and repairs[-1]["occurrenceId"] != oid:
                     item["classification"] = "superseded_by_native_repair"; continue
-                review = json.loads(self.verified_artifact(qa, 32768))
+                review = self.qa_report(qa, "REPAIR_QA_REPORT_SCHEMA")
                 require(isinstance(review, dict), "REPAIR_QA_REPORT_SCHEMA")
                 base = detail["occurrence"].get("input", {}).get("experiment", {}).get("sourceArtifact", {})
                 require(review.get("candidateSHA256") == source["digest"] and review.get("sourceSHA256") == base.get("digest")

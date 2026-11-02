@@ -451,6 +451,101 @@ class WatchTests(unittest.TestCase):
         self.assertEqual(self.w.observe()['officialJobs'][0]['id'], job['id'])
         self.assertEqual(self.w.tick()['state'], 'supervisor_dispatched')
 
+    def replace_registered_qa(self, job, registry_path, raw):
+        qa = next(a for a in self.client.occurrences[job['occurrenceId']]['artifacts']
+                  if a['id'] == job['qaArtifactId'])
+        self.client.artifacts[qa['id']] = raw
+        qa.update(size=len(raw), digest=W.digest(raw)); job['qaSHA256'] = qa['digest']
+        receipt = json.loads(pathlib.Path(job['receiptPath']).read_bytes())
+        receipt['qaSHA256'] = qa['digest']; W.atomic(job['receiptPath'], receipt)
+        job['receiptSHA256'] = W.digest(pathlib.Path(job['receiptPath']).read_bytes())
+        W.atomic(registry_path, {'version': 1, 'watchId': self.config['watchId'], 'jobs': [job]})
+        return qa
+
+    def test_registered_qa_accepts_authenticated_49271_bytes_and_exact_one_mib(self):
+        job, path = self.register_completed_job()
+        report = json.loads(self.client.artifacts[job['qaArtifactId']]); report['diagnostic'] = ''
+        posts = len(self.client.posts)
+        for size in [49271, W.QA_ARTIFACT_LIMIT]:
+            with self.subTest(size=size):
+                report['diagnostic'] = ''; report['diagnostic'] = 'x' * (size - len(W.canonical(report)))
+                raw = W.canonical(report); self.assertEqual(len(raw), size)
+                self.replace_registered_qa(job, path, raw)
+                self.assertEqual(self.w.registered_jobs()[-1]['id'], job['id'])
+                self.assertEqual(self.client.artifacts[job['qaArtifactId']], raw)
+        self.assertEqual(len(self.client.posts), posts)
+
+    def test_registered_qa_rejects_over_one_mib_before_fetch(self):
+        job, path = self.register_completed_job()
+        self.replace_registered_qa(job, path, b' ' * (W.QA_ARTIFACT_LIMIT + 1))
+        self.client.gets.clear()
+        with self.assertRaisesRegex(ValueError, 'ARTIFACT_SIZE'): self.w.registered_jobs()
+        self.assertNotIn('/api/cycle-artifacts/' + job['qaArtifactId'], self.client.gets)
+
+    def test_registered_qa_still_requires_exact_hash_bytes_and_typed_bindings(self):
+        job, path = self.register_completed_job()
+        original = json.loads(self.client.artifacts[job['qaArtifactId']])
+        for field, value in [('candidateSHA256', 'e' * 64), ('sourceSHA256', 'e' * 64),
+                             ('passed', 1), ('approvedForOfficialReview', 1), ('gpuValidated', 0)]:
+            with self.subTest(field=field):
+                self.replace_registered_qa(job, path, W.canonical({**original, field: value}))
+                with self.assertRaisesRegex(ValueError, 'REGISTERED_JOB_QA'): self.w.registered_jobs()
+        qa = self.replace_registered_qa(job, path, W.canonical(original))
+        self.client.artifacts[qa['id']] = b'!' + self.client.artifacts[qa['id']][1:]
+        with self.assertRaisesRegex(ValueError, 'ARTIFACT_CORRUPT'): self.w.registered_jobs()
+
+    def test_registered_qa_rejects_duplicate_nonfinite_and_nonobject_json(self):
+        job, path = self.register_completed_job()
+        for raw, code in [(b'{"passed":true,"passed":false}', 'QA_REPORT_DUPLICATE_KEY'),
+                          (b'{"nested":{"a":1,"a":2}}', 'QA_REPORT_DUPLICATE_KEY'),
+                          (b'{"n":NaN}', 'QA_REPORT_NONFINITE'),
+                          (b'{"n":Infinity}', 'QA_REPORT_NONFINITE'),
+                          (b'{"n":-Infinity}', 'QA_REPORT_NONFINITE'),
+                          (b'{"n":1e999}', 'QA_REPORT_NONFINITE'),
+                          (b'[]', 'QA_REPORT_SCHEMA')]:
+            with self.subTest(raw=raw):
+                self.replace_registered_qa(job, path, raw)
+                with self.assertRaisesRegex(ValueError, code): self.w.registered_jobs()
+
+    def test_large_qa_classification_does_not_expand_repair_authority_or_context(self):
+        status = self.repairable_operation()
+        detail = self.client.occurrences[status['occurrenceId']]
+        qa = next(a for a in detail['artifacts'] if a['id'] == status['qaArtifactId'])
+        report = json.loads(self.client.artifacts[qa['id']]); report['diagnostic'] = ''
+        report['diagnostic'] = 'x' * (49271 - len(W.canonical(report)))
+        raw = W.canonical(report); self.assertEqual(len(raw), 49271)
+        self.client.artifacts[qa['id']] = raw; qa.update(size=len(raw), digest=W.digest(raw))
+        status['qaSHA256'] = qa['digest']; self.install_diagnostic_fixture([status])
+        observation = self.w.observe(); diagnostic = observation['autoCheckDiagnostics']
+        self.assertEqual(diagnostic['outcomes'][0]['repairContextCode'], 'REPAIR_QA_DIAGNOSTIC_SIZE')
+        self.assertEqual(diagnostic['outcomes'][0]['classification'], 'repair_context_unavailable')
+        self.assertEqual(diagnostic['repairableEvidence'], [])
+        self.assertIn(status['candidateSHA256'], observation['pendingOfficialCandidateSHA256'])
+        self.assertNotIn('x' * 100, W.canonical(diagnostic).decode())
+        report['passed'] = False; raw = W.canonical(report)
+        self.client.artifacts[qa['id']] = raw; qa.update(size=len(raw), digest=W.digest(raw))
+        status['qaSHA256'] = qa['digest']; self.install_diagnostic_fixture([status])
+        self.assertEqual(self.w.observe()['autoCheckDiagnostics']['outcomes'][0]['classification'],
+                         'new_hypothesis_required')
+
+    def test_repair_classifier_preserves_history_and_withholds_invalid_or_oversized_qa(self):
+        status = self.repairable_operation()
+        detail = self.client.occurrences[status['occurrenceId']]
+        qa = next(a for a in detail['artifacts'] if a['id'] == status['qaArtifactId'])
+        posts = len(self.client.posts); history = copy.deepcopy(self.w.state['experiments'])
+        for raw, code in [(b'{"v":1e999}', 'QA_REPORT_NONFINITE'),
+                          (b'{"v":1,"v":2}', 'QA_REPORT_DUPLICATE_KEY'),
+                          (b'[]', 'REPAIR_QA_REPORT_SCHEMA'),
+                          (b' ' * (W.QA_ARTIFACT_LIMIT + 1), 'ARTIFACT_SIZE')]:
+            with self.subTest(code=code):
+                self.client.artifacts[qa['id']] = raw; qa.update(size=len(raw), digest=W.digest(raw))
+                status['qaSHA256'] = qa['digest']; self.install_diagnostic_fixture([status])
+                observation = self.w.observe(); result = observation['autoCheckDiagnostics']
+                self.assertEqual(result['outcomes'][0]['repairContextCode'], code)
+                self.assertEqual(result['repairableEvidence'], [])
+                self.assertEqual(self.w.state['experiments'], history)
+        self.assertEqual(len(self.client.posts), posts)
+
     def test_registry_rejects_unregistered_owner_wrong_source_and_receipt(self):
         job, path = self.register_completed_job()
         for field, value, error in [('occurrenceId', uid(), 'REGISTERED_JOB_OWNER'),

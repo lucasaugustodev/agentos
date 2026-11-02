@@ -616,3 +616,19 @@ A frozen full-input replay validates23 mixed actions (including one authorized
 repair) alongside one existing owner,16 source capsules and two verified external
 reports. The constructed input is below1MiB and roundtrips through archived state.
 Control/policy bindings in that replay are explicitly synthetic; no plan is sent.
+# QA report reader compatibility
+
+Registered diagnostic CHECKs and repair classification read authenticated QA
+reports up to 1 MiB, matching the native adapter artifact budget. A legitimate
+report larger than 32 KiB therefore no longer stops observation of all boards.
+The reader requires the complete declared bytes and digest, an object root,
+unique JSON keys, and finite numbers, including exponent-overflow rejection.
+Registry ownership, latest attempt, source/candidate lineage, exact boolean
+acceptance fields, and registered transport/receipt bindings remain mandatory.
+
+This is a raw-reader limit, not extra authority or extra model context. The
+64 KiB QA context and 32 KiB prior-QA repair diagnostic limits remain separate.
+A report can be readable for classification yet unavailable for repair context.
+Oversized, corrupt, unbound or malformed registered QA still fails closed; it is
+never skipped to free ownership or manufacture acceptance. No official action
+or performance improvement is implied by reading a registered CHECK report.
