@@ -421,5 +421,29 @@ class BoardLaneTests(unittest.TestCase):
         self.assertEqual([(r['supervisor']['occurrenceId'], r['experiment']) for r in self.w.ready_actions()],
                          [(owner, reserved)])
 
+    def test_lane_state_cannot_be_opened_with_mode_disabled(self):
+        self.f.enable_payloads()
+        self.boot()
+        before = self.w.path.read_bytes()
+        intents = {p.name: p.read_bytes() for p in self.w.directory.glob('intent-*.json')}
+        self.f.config.pop('plannerMode')
+        self.f.config['controlDefinitionSHA256'] = W.digest(W.supervisor_definition(self.f.config))
+        with self.assertRaisesRegex(ValueError, 'PLANNER_LANES_STATE_REQUIRES_MODE'):
+            self.f.reload()
+        self.assertEqual(self.w.path.read_bytes(), before)
+        self.assertEqual({p.name: p.read_bytes() for p in self.w.directory.glob('intent-*.json')}, intents)
+
+    def test_legacy_history_without_lane_outbox_still_opens_without_lane_mode(self):
+        for key in ['plannerMode', 'targetNativeWorkers', 'readyLowWatermark']: self.f.config.pop(key)
+        self.f.config['controlDefinitionSHA256'] = W.digest(W.supervisor_definition(self.f.config))
+        self.client.cycles[self.f.config['controlCycleId']]['definition'] = W.supervisor_definition(self.f.config)
+        self.f.reload(); self.w.tick()
+        self.assertEqual(len(self.w.state['supervisions']), 1)
+        self.assertNotIn('planningProblem', self.w.state['supervisions'][0])
+        self.assertNotIn('outbox', self.w.state['supervisions'][0])
+        before = copy.deepcopy(self.w.state)
+        self.f.reload()
+        self.assertEqual(self.w.state, before)
+
 
 if __name__ == '__main__': unittest.main()
