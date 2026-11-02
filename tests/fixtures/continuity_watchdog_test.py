@@ -1572,7 +1572,7 @@ class WatchTests(unittest.TestCase):
         review = self.w.state['supervisions'][-1]
         plan = self.plan(); plan['experiments'] = []
         for problem, count in counts.items():
-            source = next(a for a in review['input']['catalog'] if a['problem'] == problem)
+            source = next(a for a in self.w.supervision_input(review)['catalog'] if a['problem'] == problem)
             for index in range(count):
                 plan['experiments'].append({'id': 'parallel-' + str(len(plan['experiments'])),
                     'problem': problem, 'sourceArtifactId': source['id'],
@@ -3067,19 +3067,21 @@ class WatchTests(unittest.TestCase):
         if repair:
             exp = next(e for e in plan['experiments'] if e['problem'] == repair['problem'])
             exp.update(kind='repair_evidence', sourceArtifactId=repair['candidateArtifactId'])
-        inp = self.w.state['supervisions'][-1]['input']
+        inp = self.w.supervision_input(self.w.state['supervisions'][-1])
         plan['capacityReview'] = [{'problem': p, 'availableSlots': n, 'plannedActions': counts.get(p, 0),
             'reason': 'Selected distinct source-bound CPU strategies; remaining capacity awaits additional discriminating evidence.'}
             for p, n in inp['boardAvailableCandidateSlots'].items()]
         return plan
 
-    def prepare_mixed_actions(self, counts=None):
+    def prepare_mixed_actions(self, counts=None, archive=False):
         status = self.repairable_operation()
         self.enable_mixed_plan_contract()
         self.add_seed(); self.add_seed('muse_attention_decode', b'# attention\n')
+        if archive:
+            self.enable_payloads()
         self.install_diagnostic_fixture([status])
         self.w.tick()
-        inp = self.w.state['supervisions'][-1]['input']
+        inp = self.w.supervision_input(self.w.state['supervisions'][-1])
         repair = inp['autoCheckDiagnostics']['repairableEvidence'][0]
         return self.mixed_plan(counts or {'muse_prefill_layer': 1, 'muse_decode_layer': 1}, repair), repair
 
@@ -3190,6 +3192,61 @@ class WatchTests(unittest.TestCase):
         self.assertTrue(W.unchanged_action_scope(pending, fresh, self.config))
         fresh['autoCheckDiagnostics']['repairableEvidence'][0]['qaSHA256'] = 'f' * 64
         self.assertFalse(W.unchanged_action_scope(pending, fresh, self.config))
+
+    def test_mixed_archive_dispatches_twenty_four_and_preserves_pending_alias(self):
+        plan, repair = self.prepare_mixed_actions({p: 8 for p in W.PROBLEMS}, archive=True)
+        self.assertEqual(self.w.state['version'], 2)
+        self.assertNotIn('input', self.w.state['supervisions'][-1])
+        self.complete_review(plan)
+        result = self.w.tick()
+        self.assertEqual(result['state'], 'experiments_dispatched')
+        self.assertEqual(len(result['dispatched']), 24)
+        self.assertEqual(sum(r.get('repairCandidateSHA256') == repair['candidateSHA256'] for r in result['dispatched']), 1)
+        self.reload()
+        self.assertEqual(self.w.state['supervisions'][-1]['state'], 'consumed')
+        self.assertEqual(self.w.observe()['pipelineUsed'], 24)
+
+    def test_mixed_archive_lost_repair_ack_reloads_exact_bytes_and_gets_only(self):
+        plan, repair = self.prepare_mixed_actions(archive=True)
+        self.complete_review(plan)
+        self.client.timeout_after_commit_number = len(self.client.posts) + 4
+        with self.assertRaises(TimeoutError): self.w.tick()
+        posts = len(self.client.posts)
+        original_plan = copy.deepcopy(self.w.state['supervisions'][-1]['approvedPlan'])
+        self.reload()
+        self.assertEqual(self.w.tick()['state'], 'experiments_dispatched')
+        self.assertEqual(len(self.client.posts), posts)
+        self.assertEqual(self.w.state['supervisions'][-1]['approvedPlan'], original_plan)
+        self.assertEqual(self.w.state['experiments'][-1]['repairCandidateSHA256'], repair['candidateSHA256'])
+
+    def test_mixed_archive_storage_fallback_preserves_new_ack_and_plan2_reader(self):
+        plan, repair = self.prepare_mixed_actions(archive=True)
+        self.complete_review(plan)
+        self.client.timeout_after_commit_number = len(self.client.posts) + 4
+        with self.assertRaises(TimeoutError): self.w.tick()
+        posts = len(self.client.posts)
+        expanded = self.w.export_legacy_state()
+        original_config = copy.deepcopy(self.config)
+        self.config.pop('statePayloadStorage')
+        # A storage-only config change still requires the adapter's exact config
+        # pin and a matching fresh observation; do not bypass that guard.
+        self.install_diagnostic_fixture([repair])
+        destination = self.root / 'current-reader-fallback'; destination.mkdir()
+        W.atomic(destination / 'state.json', expanded)
+        for path in self.w.directory.glob('intent-*.json'):
+            (destination / path.name).write_bytes(path.read_bytes())
+        self.w = W.Watchdog(self.config, destination, self.client, clock=lambda: 10060)
+        result = self.w.tick()
+        self.assertEqual(result['state'], 'changed_plan_reconciled')
+        self.assertEqual(len(self.client.posts), posts)
+        self.assertEqual(self.w.state['version'], 1)
+        self.assertEqual(self.config['planVersion'], 2)
+        self.assertEqual(self.config['controlCycleId'], original_config['controlCycleId'])
+        self.assertEqual(self.config['controlDefinitionSHA256'], original_config['controlDefinitionSHA256'])
+        self.assertEqual(self.w.state['supervisions'][-1]['approvedPlan']['version'], 2)
+        owned = self.w.state['supervisions'][-1]['reconciledEffects']
+        self.assertEqual(len(owned), 2)
+        self.assertEqual(owned[-1]['repairCandidateSHA256'], repair['candidateSHA256'])
 
 
 if __name__ == '__main__':
