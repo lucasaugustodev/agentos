@@ -45,6 +45,8 @@ REPAIR_QA_CONTEXT_LIMIT = 32 * 1024
 STATE_PAYLOAD_STORAGE = "content-addressed-v1"
 STATE_SNAPSHOT_LIMIT = 64 * 1024 * 1024
 STATE_PAYLOAD_LIMIT = 3 * 1024 * 1024
+REQUEST_CANONICALIZATION = "json-numbers-v1"
+MAX_SAFE_INTEGER = 2 ** 53 - 1
 EVIDENCE_REPAIR_CODES = {"PATCH_HEADER_SCOPE", "CPU_REPLAY_EXECUTION_UNPROVEN", "QA_LIMITATIONS_MISSING", "QA_TEST_BINDING",
     "CPU_RESULT_BINDING", "CPU_MEANINGFUL_cases", "CPU_MEANINGFUL_negativeControls", "CPU_CASES_NOT_REPLAYED",
     "QA_ATTESTATION_MISSING_canonicalPrecisionPreserved", "QA_ATTESTATION_MISSING_evaluatorIndependent",
@@ -65,6 +67,31 @@ def canonical(value):
 
 def digest(value):
     return hashlib.sha256(value if isinstance(value, bytes) else canonical(value)).hexdigest()
+
+
+def request_numbers_v1(value):
+    """Normalize new native requests before both intent hashing and transport.
+
+    The API's JavaScript representation does not preserve integral float syntax
+    or signed zero. Keep booleans distinct and reject nonfinite/unsafe numbers;
+    no existing request body or legacy intent is rewritten by this function.
+    """
+    if type(value) in (int, float):
+        require(abs(value) <= MAX_SAFE_INTEGER and math.isfinite(value), "REQUEST_NUMBER_UNSAFE")
+        return int(value) if type(value) is float and value.is_integer() else value
+    if type(value) is dict:
+        require(all(type(key) is str for key in value), "REQUEST_JSON_TYPE")
+        return {key: request_numbers_v1(item) for key, item in value.items()}
+    if type(value) is list:
+        return [request_numbers_v1(item) for item in value]
+    require(value is None or type(value) in (bool, str), "REQUEST_JSON_TYPE")
+    return value
+
+
+def request_body_for_intent(body, intent):
+    version = intent.get("requestCanonicalization")
+    require(version in (None, REQUEST_CANONICALIZATION), "REQUEST_CANONICALIZATION")
+    return request_numbers_v1(body) if version == REQUEST_CANONICALIZATION else body
 
 
 def evidence_material(value):
@@ -1304,13 +1331,16 @@ class Watchdog:
         marker = self.directory / ("intent-" + digest(key) + ".json")
         if marker.exists():
             prior = read_json(marker)
+            body = request_body_for_intent(body, prior)
             require(prior["requestDigest"] == digest(body), "POST_IDENTITY_CHANGED")
             result = prior.get("result") or self.find_post(kind, cycle_id, key)
             require(result is not None, "POST_UNCERTAIN_RECONCILE_ONLY")
         else:
             require(self.control()["cycle"]["state"] == "active", "CONTROL_NOT_ACTIVE")
+            body = request_numbers_v1(body)
             prior = {"kind": kind, "requestKey": key, "requestDigest": digest(body), "at": now_iso(),
-                     "state": "intent", "cycleId": cycle_id, "automaticRetry": False}
+                     "state": "intent", "cycleId": cycle_id, "automaticRetry": False,
+                     "requestCanonicalization": REQUEST_CANONICALIZATION}
             atomic(marker, prior, exclusive=True)
             route = "/api/cycles" if kind == "create" else "/api/cycles/" + cycle_id + "/run"
             # A crash/timeout leaves the durable intent. Next tick only reconciles GET.
@@ -1320,6 +1350,9 @@ class Watchdog:
         else:
             require(result.get("cycle_id") == cycle_id and result.get("source_key") == "manual:" + key
                     and result.get("input") == body["input"], "RUN_RECEIPT")
+        if prior.get("requestCanonicalization") == REQUEST_CANONICALIZATION:
+            field = "definition" if kind == "create" else "input"
+            require(canonical(result[field]) == canonical(body[field]), "RECEIPT_JSON_REPRESENTATION")
         require(UUID.fullmatch(result.get("id", "")), "RECEIPT_ID")
         atomic(marker, {**prior, "state": "recorded", "result": result})
         return result
@@ -1342,7 +1375,9 @@ class Watchdog:
             require(result.get("cycle_id") == cycle_id and result.get("source_key") == "manual:" + key
                     and type(result.get("input")) is dict, "RUN_RECEIPT")
             body = {"requestKey": key, "input": result["input"]}
-        require(digest(body) == prior["requestDigest"], "RECONCILE_RECEIPT_CHANGED")
+        expected_body = request_body_for_intent(body, prior)
+        require(canonical(body) == canonical(expected_body)
+                and digest(expected_body) == prior["requestDigest"], "RECONCILE_RECEIPT_CHANGED")
         atomic(marker, {**prior, "state": "recorded", "result": result})
         return result
 
@@ -2252,11 +2287,11 @@ class Watchdog:
             packet = self.supply_source_capsules(body["input"], observation)
             if observation["eligibleProblems"] and not packet["sources"] and not observation["diagnosticOnly"]:
                 return self.status("supervisor_sources_unavailable", omitted=packet["omitted"], newPostRequests=0)
-            requests[key] = body
+            requests[key] = request_numbers_v1(body)
             self.save()
         body = self.review_request(key)
         row = self.post_once("run", key, body, self.config["controlCycleId"])
-        record = {"occurrenceId": row["id"], "requestKey": key, "fingerprint": observation["fingerprint"], "input": body["input"],
+        record = {"occurrenceId": row["id"], "requestKey": key, "fingerprint": observation["fingerprint"], "input": row["input"],
                   "createdAt": self.clock(), "state": "dispatched",
                   "actionEvidence": body["input"].get("actionEvidence")}
         if observation.get("planningScope"):
@@ -2288,6 +2323,7 @@ class Watchdog:
             require(prior.get("kind") == "run" and prior.get("requestKey") == key
                     and isinstance(cycle, str) and UUID.fullmatch(cycle), "REVIEW_INTENT_SCOPE")
             body = self.review_request(key)
+            body = request_body_for_intent(body, prior)
             require(body.get("requestKey") == key and digest(body) == prior["requestDigest"], "POST_IDENTITY_CHANGED")
             try:
                 row = self.reconcile_existing_post("run", key, cycle)

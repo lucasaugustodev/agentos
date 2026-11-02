@@ -83,6 +83,97 @@ class FakeClient:
 
 
 class WatchTests(unittest.TestCase):
+    def test_new_native_request_numbers_match_durable_hash_and_api_body(self):
+        body = {'requestKey': 'numbers-v1', 'input': {'v': [1.0, -0.0, 1.25, 1e-8, True, False, None]}}
+        original = copy.deepcopy(body)
+        result = self.w.post_once('run', body['requestKey'], body, self.config['controlCycleId'])
+        sent = self.client.posts[-1][1]
+        marker = self.w.directory / ('intent-' + W.digest(body['requestKey']) + '.json')
+        intent = W.read_json(marker)
+        self.assertEqual(intent['requestCanonicalization'], 'json-numbers-v1')
+        self.assertEqual(intent['requestDigest'], W.digest(sent))
+        self.assertEqual(W.canonical(sent['input']), b'{"v":[1,0,1.25,1e-08,true,false,null]}')
+        self.assertEqual(result['input'], sent['input'])
+        self.assertEqual(W.canonical(body), W.canonical(original))
+
+    def test_new_numeric_request_lost_ack_reconciles_get_without_another_post(self):
+        body = {'requestKey': 'numbers-lost-ack', 'input': {'v': [1.0, -0.0, True]}}
+        self.client.timeout_after_commit_number = 1
+        with self.assertRaises(TimeoutError): self.w.post_once('run', body['requestKey'], body, self.config['controlCycleId'])
+        marker = self.w.directory / ('intent-' + W.digest(body['requestKey']) + '.json')
+        before = W.read_json(marker)
+        result = self.w.reconcile_existing_post('run', body['requestKey'], self.config['controlCycleId'])
+        self.assertEqual(len(self.client.posts), 1)
+        self.assertEqual(W.read_json(marker)['requestDigest'], before['requestDigest'])
+        self.assertEqual(W.canonical(result['input']), b'{"v":[1,0,true]}')
+        self.assertEqual(self.w.post_once('run', body['requestKey'], body, self.config['controlCycleId'])['id'], result['id'])
+        self.assertEqual(len(self.client.posts), 1)
+
+    def test_new_numeric_request_unsafe_values_fail_before_intent_or_post(self):
+        for n, value in enumerate([2 ** 53, -(2 ** 53), float(2 ** 53), 10 ** 1000, float('nan'), float('inf'), float('-inf')]):
+            key = 'unsafe-' + str(n)
+            with self.subTest(index=n), self.assertRaisesRegex(ValueError, 'REQUEST_NUMBER_UNSAFE'):
+                self.w.post_once('run', key, {'requestKey': key, 'input': {'v': value}}, self.config['controlCycleId'])
+            self.assertFalse((self.w.directory / ('intent-' + W.digest(key) + '.json')).exists())
+        self.assertEqual(self.client.posts, [])
+        self.assertEqual(W.request_numbers_v1(W.MAX_SAFE_INTEGER), W.MAX_SAFE_INTEGER)
+
+    def test_numeric_contract_keeps_booleans_distinct_in_returned_receipt(self):
+        original = self.client.request
+        def corrupt(method, route, body=None, binary=False):
+            result = original(method, route, body, binary)
+            if method == 'POST': result['input']['flag'] = 1
+            return result
+        self.client.request = corrupt
+        with self.assertRaisesRegex(ValueError, 'RECEIPT_JSON_REPRESENTATION'):
+            self.w.post_once('run', 'bool-type', {'requestKey': 'bool-type', 'input': {'flag': True}}, self.config['controlCycleId'])
+        self.assertEqual(len(self.client.posts), 1)
+        marker = self.w.directory / ('intent-' + W.digest('bool-type') + '.json')
+        self.assertEqual(W.read_json(marker)['state'], 'intent')
+
+    def test_legacy_intent_body_and_marker_are_not_rewritten_to_new_number_contract(self):
+        key = 'real-legacy-number-body'; body = {'requestKey': key, 'input': {'v': 1.0}}
+        result = self.client.make_occurrence(self.config['controlCycleId'], body)
+        marker = self.w.directory / ('intent-' + W.digest(key) + '.json')
+        W.atomic(marker, {'kind': 'run', 'requestKey': key, 'requestDigest': W.digest(body),
+                          'cycleId': self.config['controlCycleId'], 'state': 'recorded', 'result': result, 'automaticRetry': False})
+        raw = marker.read_bytes()
+        self.assertEqual(self.w.post_once('run', key, body, self.config['controlCycleId'])['id'], result['id'])
+        self.assertEqual(marker.read_bytes(), raw)
+        self.assertEqual(self.client.posts, [])
+        self.assertNotIn('requestCanonicalization', W.read_json(marker))
+
+    def test_legacy_lost_ack_digest_mismatch_is_not_silently_normalized(self):
+        key = 'legacy-normalized-result'; body = {'requestKey': key, 'input': {'v': 1.0}}
+        result = self.client.make_occurrence(self.config['controlCycleId'], W.request_numbers_v1(body))
+        marker = self.w.directory / ('intent-' + W.digest(key) + '.json')
+        W.atomic(marker, {'kind': 'run', 'requestKey': key, 'requestDigest': W.digest(body),
+                          'cycleId': self.config['controlCycleId'], 'state': 'intent', 'automaticRetry': False})
+        raw = marker.read_bytes()
+        with self.assertRaisesRegex(ValueError, 'RECONCILE_RECEIPT_CHANGED'):
+            self.w.reconcile_existing_post('run', key, self.config['controlCycleId'])
+        self.assertEqual(marker.read_bytes(), raw)
+        self.assertEqual(self.client.posts, [])
+
+    def test_unknown_number_contract_never_retries_or_reinterprets_intent(self):
+        body = {'requestKey': 'unknown-contract', 'input': {'v': 1}}
+        self.w.post_once('run', body['requestKey'], body, self.config['controlCycleId'])
+        marker = self.w.directory / ('intent-' + W.digest(body['requestKey']) + '.json')
+        value = W.read_json(marker); value['requestCanonicalization'] = 'unreviewed-v2'; W.atomic(marker, value)
+        with self.assertRaisesRegex(ValueError, 'REQUEST_CANONICALIZATION'):
+            self.w.post_once('run', body['requestKey'], body, self.config['controlCycleId'])
+        self.assertEqual(len(self.client.posts), 1)
+
+    def test_number_contract_does_not_expand_projected_qa_report(self):
+        report = {'report': {'cost': 1.0}, 'artifact': {'digest': 'a' * 64, 'size': 60000},
+                  'reportProjection': {'version': 1, 'complete': False, 'reportSHA256': 'b' * 64}}
+        body = {'requestKey': 'projected-numbers', 'input': {'repairQADiagnostic': report}}
+        self.w.post_once('run', body['requestKey'], body, self.config['controlCycleId'])
+        sent = self.client.posts[-1][1]['input']['repairQADiagnostic']
+        self.assertEqual(sent['reportProjection'], report['reportProjection'])
+        self.assertEqual(sent['artifact'], report['artifact'])
+        self.assertEqual(W.canonical(sent['report']), b'{"cost":1}')
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = pathlib.Path(self.tmp.name)
