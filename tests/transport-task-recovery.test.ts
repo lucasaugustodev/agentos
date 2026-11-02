@@ -98,6 +98,17 @@ it.each(['pending','delivered','trace','cancelled','foreignFence','foreignContex
   await fixture({payload,marker:kind!=='noMarker'});const inspect=vi.fn();
   expect(await recoverTransportTasks(inspect)).toEqual([]);expect(inspect).not.toHaveBeenCalled();
 });
+it('retains transport recovery after rate waits raised the physical generation counter',async()=>{
+  const f=await fixture({payload:{generationAttempt:13,transportAttempt:3}});
+  expect(await recoverTransportTasks(async()=>f.proof())).toEqual([f.id]);
+});
+it.each([{generationAttempt:4},{generationAttempt:3,transportAttempt:2},
+  {generationAttempt:4,transportAttempt:4},{generationAttempt:2,transportAttempt:3},
+  {generationAttempt:3.5,transportAttempt:3},{generationAttempt:4,transportAttempt:null}])
+  ('rejects invalid exhaustion counters %j',async payload=>{
+    await fixture({payload});const inspect=vi.fn();
+    expect(await recoverTransportTasks(inspect)).toEqual([]);expect(inspect).not.toHaveBeenCalled();
+  });
 it.each(['paused','manual','user','lease','cancel','dependency','input','source','contract','race'])('preserves %s authority and refuses automatic retry',async kind=>{
   const f=await fixture();
   if(kind==='paused')await pool.query("UPDATE goals SET state='paused' WHERE id=$1",[f.goal]);

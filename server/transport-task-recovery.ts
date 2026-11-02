@@ -52,8 +52,10 @@ export async function transportCause(db:DB,run:any){
     AND kind='MODEL_TRANSPORT_EXHAUSTED' AND payload->>'runId'=$2 ORDER BY id LIMIT 2`,[run.task_id,run.id])).rows;
   if(rows.length!==1)return null;
   const p=rows[0].payload;
+  const exhausted=p.transportAttempt===undefined?p.generationAttempt===3:
+    p.transportAttempt===3&&Number.isSafeInteger(p.generationAttempt)&&p.generationAttempt>=3;
   if(p.version!==1||p.source!=='runtime-generation-boundary'||p.runId!==run.id||p.runFence!==run.fence||
-    p.contextVersion!==run.context_id||!uuid.test(p.requestId??'')||p.generationAttempt!==3||p.code!==run.error_code||
+    p.contextVersion!==run.context_id||!uuid.test(p.requestId??'')||!exhausted||p.code!==run.error_code||
     !['connection_interrupted','connection_timeout','provider_unavailable'].includes(p.reason)||
     p.responseDelivered!==false||p.traceComplete!==true||p.pendingTools!==0||p.cancelled!==false)return null;
   return {eventId:rows[0].id,...p};
