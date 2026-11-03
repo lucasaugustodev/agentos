@@ -14,6 +14,7 @@ import {
 import { resolveCycleStep } from './engine.js';
 import { availableActions } from './integrations.js';
 import { readCycleArtifact } from './runtime.js';
+import { nativeQA3Evidence } from './native-qa3.js';
 const key = z.string().min(8).max(160);
 export function cycleRoutes(app: FastifyInstance) {
   app.get('/api/cycles', async () => ({
@@ -47,6 +48,10 @@ export function cycleRoutes(app: FastifyInstance) {
   app.get('/api/cycle-runs/:id', async (req) =>
     occurrenceDetail(z.uuid().parse((req.params as any).id)),
   );
+  app.get('/api/cycle-runs/:id/attempts/:attemptId/cpu-replay', async (req) => {
+    const params = z.object({ id: z.uuid(), attemptId: z.uuid() }).parse(req.params);
+    return nativeQA3Evidence(params.id, params.attemptId);
+  });
   app.post('/api/cycle-runs/:id/command', async (req) =>
     commandOccurrence(
       z.uuid().parse((req.params as any).id),

@@ -101,6 +101,31 @@ class Protocol(unittest.TestCase):
             out = M.fresh_receipt(pathlib.Path('/isolated/request'), self.r, self.sha)
             self.assertEqual(out, {'ok': True, 'receipt': receipt}); stopped.assert_called_once_with('fixed'); execute.assert_not_called()
 
+    def test_api_verify_is_readonly_even_when_another_request_owns_execution(self):
+        receipt = {'requestId': self.r['requestId'], 'unit': 'fixed'}
+        with patch.object(M, 'registered', return_value=(self.reg, object())), \
+             patch.object(M, 'protected', return_value=pathlib.Path('/isolated/state')), \
+             patch.object(sys, 'stdin', type('Input', (), {'buffer': io.BytesIO(M.canonical(self.r))})()), \
+             patch.object(pathlib.Path, 'exists', return_value=True), \
+             patch.object(M, 'fresh_receipt', return_value={'ok': True, 'receipt': receipt}), \
+             patch.object(M, 'stopped', return_value={'stopped': True, 'unit': 'fixed', 'mainPID': 0, 'populated': False}), \
+             patch.object(M, 'lock_file') as lock, patch.object(M, 'execute') as execute, \
+             patch.object(M, 'recover_incomplete') as recover, patch.object(M, 'immutable') as write:
+            result = M.main(['launcher', 'verify', '/isolated/registration', self.sha])
+            self.assertTrue(result['ok'])
+            self.assertEqual(result['physicalInspection']['receiptSHA256'], M.sha(M.canonical(receipt)))
+            lock.assert_not_called(); execute.assert_not_called(); recover.assert_not_called(); write.assert_not_called()
+
+    def test_api_verify_missing_receipt_never_creates_tombstone_or_admission(self):
+        with patch.object(M, 'registered', return_value=(self.reg, object())), \
+             patch.object(M, 'protected', return_value=pathlib.Path('/isolated/state')), \
+             patch.object(sys, 'stdin', type('Input', (), {'buffer': io.BytesIO(M.canonical(self.r))})()), \
+             patch.object(pathlib.Path, 'exists', return_value=False), patch.object(M, 'lock_file') as lock, \
+             patch.object(M, 'recover_incomplete') as recover, patch.object(M, 'immutable') as write:
+            with self.assertRaisesRegex(ValueError, 'CPU_REPLAY_UNCONFIRMED'):
+                M.main(['launcher', 'verify', '/isolated/registration', self.sha])
+            lock.assert_not_called(); recover.assert_not_called(); write.assert_not_called()
+
     def test_lost_receipt_is_uncertain_never_rerun(self):
         intent = {'request': self.r, 'requestSHA256': M.sha(M.canonical(self.r)), 'registrationSHA256': self.sha}
         with patch.object(M, 'read_protected', return_value=M.canonical(intent)), \

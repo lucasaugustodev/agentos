@@ -11,8 +11,9 @@ import { importRecall } from '../recall.js';
 import { actionProfiles, bitrixSnapshot, clean } from './integrations.js';
 import { cycleEvent } from './store.js';
 import { isRegisteredValidation, confirmRegisteredValidationStop } from './validation-action.js';
-import { freezeDependencyEvidence, dependencyArtifactBytes, assertDependencySnapshot } from './dependency-evidence.js';
-import { observeCPUReplay, markCPUQADispatch } from './cpu-replay.js';
+import { freezeDependencyEvidence, dependencyArtifactBytes, assertDependencySnapshot, nativeQA3 } from './dependency-evidence.js';
+import { observeCPUReplay, markCPUQADispatch, cpuReplayCanonical } from './cpu-replay.js';
+import { nativeQA3Handoff, prepareNativeQA3 } from './native-qa3.js';
 
 export async function readCycleArtifact(id: string) {
   const a = (await pool.query('SELECT * FROM cycle_artifacts WHERE id=$1', [id])).rows[0];
@@ -61,10 +62,15 @@ export async function runCycleAgent(
   // acceptance, and does not replace any v1/v2 QA evidence or transcript guard.
   const cpuReplayObservation = definition.parameters?.cpuReplayObservationVersion === 1
     ? await observeCPUReplay(o, s, a, dependencySnapshot!, signal, onEvent) : undefined;
-  const cpuReplayBytes = cpuReplayObservation ? Buffer.from(JSON.stringify(cpuReplayObservation)) : undefined;
+  const mediatedQA = nativeQA3(definition);
+  if (mediatedQA) await prepareNativeQA3(o, s, a);
+  const cpuReplayBytes = cpuReplayObservation ? Buffer.from(mediatedQA ? cpuReplayCanonical(cpuReplayObservation) : JSON.stringify(cpuReplayObservation)) : undefined;
   const cpuReplayReference = cpuReplayBytes ? { id: a.id, name: 'cpu-replay-observation.json',
     digest: hash(cpuReplayBytes), size: cpuReplayBytes.length,
     path: '/home/agent/inputs/' + a.id + '/cpu-replay-observation.json' } : undefined;
+  const originalRegistration = mediatedQA ? (await pool.query('SELECT context FROM cycle_attempts WHERE id=$1', [a.id]))
+    .rows[0]?.context?.cpuReplayPreparation?.registration : undefined;
+  if (mediatedQA && !originalRegistration) throw new DomainError('NATIVE_QA3_REGISTRATION_MISSING', 'Original executor registration is missing.');
   // The existing bridge accepts at most 8 MiB per file and 24 MiB in total.
   // Reject explicitly rather than truncating the canonical occurrence input.
   const cycleInput = {
@@ -152,6 +158,7 @@ export async function runCycleAgent(
         runFence: a.fence,
       },
       ...(dependencySnapshot ? { dependencyEvidence: dependencySnapshot } : {}),
+      ...(mediatedQA ? { nativeQA3: nativeQA3Handoff(cpuReplayObservation, cpuReplayReference, originalRegistration) } : {}),
       ...(cpuReplayObservation ? { cpuReplayObservation: {
         version: 1, observationOnly: true, acceptance: false, receipt: cpuReplayReference,
         requestId: a.id, requestSHA256: cpuReplayObservation.requestSHA256,
@@ -234,18 +241,28 @@ export async function runCycleAgent(
       summary: previous.summary, error_code: previous.error_code,
       ...(dependencySnapshot ? { dependencyEvidenceValidation: previous.context?.dependencyEvidenceValidation } : {}),
     } : null),
-    ...(dependencySnapshot ? [
+    ...(dependencySnapshot && !mediatedQA ? [
       'CURRENT DEPENDENCY EVIDENCE (controller-pinned): ' + JSON.stringify(dependencySnapshot) +
       '\nUse only these exact current producer artifact IDs and bytes for the dependency report. ' +
       'Historical input reports are not evidence of this producer. Independently run validation; never copy historical hashes. ' +
       'A binding mismatch retries only this validation, with the producer frozen. A failed semantic or numerical test must remain failed.',
     ] : []),
-    ...(cpuReplayObservation ? [
+    ...(cpuReplayObservation && !mediatedQA ? [
       'CPU REPLAY OBSERVATION ONLY: /home/agent/inputs/' + a.id + '/cpu-replay-observation.json. ' +
       'This controller-owned receipt records a separate bounded CPU execution and its real exit, memory and stop evidence. ' +
       'It is NOT task acceptance, a proof of checker correctness, GPU validation or performance. ' +
       'Existing independent QA, report binding, case replay and semantic criteria still apply unchanged. ' +
       'Do not copy or invent successful cases from this receipt; report failures and limitations honestly.',
+    ] : []),
+    ...(mediatedQA ? [
+      'NATIVEQA v3: read the controller-owned CPU execution receipt at ' + cpuReplayReference!.path + '. ' +
+      'The controller executed the pinned candidate/checker/base once in an isolated CPU sandbox. Review the ORIGINAL receipt and raw result, source and checker. ' +
+      'Do not rerun tests merely to transcribe evidence, and do not copy hashes, cases, negative-control arrays or shell commands into your report. ' +
+      'Assess checker validity, discriminating controls, scope, precision, evaluator independence and attribution. A successful process does not prove meaningful tests. ' +
+      'Return the original qa-verification.json with version:3, decision:approve_for_check|reject, boolean scopePreserved,canonicalPrecisionPreserved,evaluatorIndependent,upstreamAttributionPreserved, ' +
+      'checkerReview:{casesMeaningful,negativeControlsDiscriminating,noTautologicalPass,rationale}, blockingFindings/findings/limitations string arrays, ' +
+      'gpuValidated:false,performanceGainProven:false,officialActionsPerformed:false. Every unknown or failed check must remain a rejection or limitation. ' +
+      'Receipt failures/OOM/timeout remain failures. No CPU evidence proves GPU correctness or performance. The controller separately binds your unmodified report to the frozen execution.',
     ] : []),
     'Orientação de retomada: ' + JSON.stringify(s.output ?? null),
     'Entrada externa completa: ' + inputPath + '\nSHA256: ' + cycleInput.digest +

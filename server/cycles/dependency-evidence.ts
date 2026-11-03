@@ -22,10 +22,12 @@ const invalid = (code = 'DEPENDENCY_EVIDENCE_INVALID'): never => {
   throw new DomainError(code, 'Dependency evidence is missing, changed or invalid; no automatic acceptance or producer retry.');
 };
 export const nativeQA2 = (step: CycleStep) => step.parameters.nativeQAContractVersion === 2;
+export const nativeQA3 = (step: CycleStep) => step.parameters?.nativeQAContractVersion === 3;
 
 // Contract hashing is independent of jsonb key order.
 function contractHash(step: CycleStep) {
   const c = step.dependencyEvidence!;
+  if (c.version === 2) return hash(JSON.stringify([2, c.kind, c.sourceStep, c.reportArtifact]));
   return hash(JSON.stringify([c.version, c.sourceStep,
     c.bindings.map(b => [b.reportArtifact, b.jsonPointer, b.dependencyArtifact])]));
 }
@@ -57,8 +59,11 @@ export async function freezeDependencyEvidence(o: any, s: any, a: any): Promise<
   return tx(async db => {
     await lock(db);
     const identity = await sourceIdentity(db, o.id, s.definition.dependencyEvidence.sourceStep);
-    for (const b of s.definition.dependencyEvidence.bindings)
-      if (!identity.artifacts.some(f => f.name === b.dependencyArtifact)) return invalid();
+    const required = s.definition.dependencyEvidence.version === 2
+      ? ['candidate.py', 'cpu-checks.py', 'cpu-result.json', 'implementation.patch']
+      : s.definition.dependencyEvidence.bindings.map((b: any) => b.dependencyArtifact);
+    for (const name of required)
+      if (!identity.artifacts.some(f => f.name === name)) return invalid();
     const snapshot: DependencySnapshot = {
       version: 1, contractSHA256: contractHash(s.definition), occurrenceId: o.id,
       consumer: { stepId: s.id, key: s.key, attemptId: a.id, attemptNumber: a.number, runFence: a.fence },
@@ -76,22 +81,25 @@ export async function freezeDependencyEvidence(o: any, s: any, a: any): Promise<
     return snapshot;
   });
 }
-export async function assertDependencySnapshot(db: DB, o: any, s: any, a: any, snapshot: DependencySnapshot) {
+export async function assertFrozenDependencySource(db: DB, o: any, s: any, a: any, snapshot: DependencySnapshot) {
   if (!snapshot || snapshot.version !== 1 || snapshot.contractSHA256 !== contractHash(s.definition) || snapshot.occurrenceId !== o.id ||
       !isDeepStrictEqual(snapshot.consumer, { stepId: s.id, key: s.key, attemptId: a.id, attemptNumber: a.number, runFence: a.fence }))
     return invalid();
+  const current = await sourceIdentity(db, o.id, s.definition.dependencyEvidence.sourceStep);
+  if (!isDeepStrictEqual(current.source, snapshot.source) || !isDeepStrictEqual(current.artifacts, snapshot.artifacts))
+    return invalid('DEPENDENCY_SOURCE_CHANGED');
+}
+export async function assertDependencySnapshot(db: DB, o: any, s: any, a: any, snapshot: DependencySnapshot) {
+  await assertFrozenDependencySource(db, o, s, a, snapshot);
   const own = (await db.query(`SELECT s.state,s.attempt,r.state attempt_state,r.fence
     FROM cycle_steps s JOIN cycle_attempts r ON r.step_id=s.id AND r.id=$2
     WHERE s.id=$1 FOR SHARE OF s,r`, [s.id, a.id])).rows[0];
   if (!own || own.state !== 'running' || own.attempt !== a.number || own.attempt_state !== 'running' || own.fence !== a.fence)
     return invalid('DEPENDENCY_SOURCE_CHANGED');
-  const current = await sourceIdentity(db, o.id, s.definition.dependencyEvidence.sourceStep);
-  if (!isDeepStrictEqual(current.source, snapshot.source) || !isDeepStrictEqual(current.artifacts, snapshot.artifacts))
-    return invalid('DEPENDENCY_SOURCE_CHANGED');
 }
 
 // Bounded, unambiguous JSON: JSON.parse alone accepts duplicate keys and 1e999.
-function reportJSON(bytes: Buffer): any {
+export function reportJSON(bytes: Buffer): any {
   if (!bytes.length || bytes.length > 1024 * 1024) return invalid('DEPENDENCY_REPORT_INVALID');
   const text = bytes.toString('utf8');
   if (!Buffer.from(text).equals(bytes)) return invalid('DEPENDENCY_REPORT_INVALID');
@@ -143,6 +151,7 @@ function reportJSON(bytes: Buffer): any {
 }
 
 export async function checkDependencyEvidence(o: any, s: any, a: any) {
+  if (s.definition.dependencyEvidence?.version !== 1) return invalid();
   const context = (await pool.query('SELECT context FROM cycle_attempts WHERE id=$1', [a.id])).rows[0]?.context;
   const snapshot: DependencySnapshot = context?.manifest?.dependencyEvidence;
   await tx(async db => { await lock(db); await assertDependencySnapshot(db, o, s, a, snapshot); });

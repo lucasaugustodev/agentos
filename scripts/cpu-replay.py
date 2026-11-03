@@ -557,7 +557,7 @@ def admission_head(state, now):
 
 
 def main(argv):
-    require(len(argv) == 4 and argv[1] in ('execute', 'inspect', 'cancel') and SHA.fullmatch(argv[3]), 'CLI_SCOPE')
+    require(len(argv) == 4 and argv[1] in ('execute', 'inspect', 'cancel', 'verify') and SHA.fullmatch(argv[3]), 'CLI_SCOPE')
     registration, user = registered(argv[2], argv[3])
     raw = sys.stdin.buffer.read(MAX_REQUEST + 1)
     require(len(raw) <= MAX_REQUEST, 'REQUEST_SIZE')
@@ -565,6 +565,17 @@ def main(argv):
     files = request_valid(request, registration, argv[3])
     state = pathlib.Path(registration['stateDirectory'])
     directory = state / request['requestId']
+    # API verification is strictly read-only: no lock/admission/tombstone creation,
+    # recovery, execute, stop, or reinterpretation of incomplete observations.
+    if argv[1] == 'verify':
+        protected(str(directory), directory=True)
+        require((directory / 'receipt.json').exists(), 'CPU_REPLAY_UNCONFIRMED')
+        result = fresh_receipt(directory, request, argv[3])
+        require(result.get('ok') is True, 'CPU_REPLAY_UNCONFIRMED')
+        proof = stopped(result['receipt']['unit'])
+        result['physicalInspection'] = {'version': 1, 'observedAt': utc_now(),
+            'receiptSHA256': sha(canonical(result['receipt'])), 'stopProof': proof}
+        return result
     # Immutable receipts can be inspected while ANY other request is running.
     # The own directory, even an incomplete one, always defeats no-dispatch.
     if directory.exists() and (directory / 'receipt.json').exists():
