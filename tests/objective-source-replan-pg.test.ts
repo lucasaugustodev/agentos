@@ -2,6 +2,7 @@ import {afterAll,afterEach,beforeAll,beforeEach,expect,it,vi} from 'vitest';
 import {createHash,randomUUID} from 'node:crypto';
 import {migrate,pool} from '../server/db.js';
 import {config} from '../server/config.js';
+import {installTaskExecutionMetadata} from '../server/task-execution-metadata.js';
 import {seedRegistry} from '../server/registry.js';
 import {accountBridge} from '../server/bridge.js';
 import * as service from '../server/service.js';
@@ -22,7 +23,7 @@ const decision={kind:'delivery',requirementId:'req-1',title:'Preserve accepted c
  action:'Port every canonical accepted contribution onto the pinned published root and resolve all conflicts explicitly.',
  verification:'Verify the original complete requirement on the newly composed candidate.',agentId:'engineering.backend.node',
  sourceContract:{version:1,required:[],preserve:[],noSourceReason:'Synthetic controller fixture verifies immutable source and input authority without claiming feature delivery.'}};
-beforeAll(async()=>{expect(new URL(config.databaseUrl).pathname).toBe('/agentos_test');await migrate();});
+beforeAll(async()=>{expect(new URL(config.databaseUrl).pathname).toBe('/agentos_test');await migrate();await installTaskExecutionMetadata();});
 beforeEach(async()=>{
  await pool.query('TRUNCATE goals,agents,accounts,events CASCADE');await seedRegistry();
  await pool.query("DELETE FROM settings WHERE id LIKE 'planning-source-preparation:%' OR id LIKE 'candidate-validation:%' OR id LIKE 'workforce:%'");
@@ -110,6 +111,22 @@ it('records source replan from protected operator receipts and preserves all acc
  expect((await pool.query('SELECT count(*)::int n FROM acceptances')).rows[0].n).toBe(9);
  expect((await pool.query('SELECT instruction_snapshot FROM runs WHERE id=$1',[f.cancelledRun])).rows[0].instruction_snapshot).toEqual(f.frozen);
  expect((await f.register()).duplicate).toBe(true);
+});
+
+it('retains guarded adoption and original CI references when replanning, without rebinding historical attempts',async()=>{
+ const f=await fixture();
+ f.baseline.publicationProofRef='/var/lib/agentos-operator-releases/adoption-fixture/'+'a'.repeat(40)+'/publish-output.json';
+ f.baseline.validationProofRef='/var/lib/agentos-operator-releases/qualification-fixture/'+'b'.repeat(64)+'/validation.stdout.json';
+ const receipt=await f.register(),queued=await f.plan();
+ const saved=(await pool.query('SELECT source_replan FROM objective_feedback WHERE id=$1',[receipt.feedbackId])).rows[0].source_replan;
+ expect(saved.payload.publishedBaseline).toEqual(f.baseline);
+ expect(saved.payload.inputs.contributors).toHaveLength(6);
+ expect(queued.feedback.sourceReplan.receiptDigest).toBe(receipt.receiptDigest);
+ expect((await pool.query('SELECT instruction_snapshot FROM runs WHERE id=$1',[f.cancelledRun])).rows[0].instruction_snapshot).toEqual(f.frozen);
+ for(const invalid of [f.baseline.publicationProofRef.replace('/publish-output.json','/../publish-output.json'),
+   f.baseline.publicationProofRef.replace('a'.repeat(40),'arbitrary'),f.baseline.publicationProofRef.replace('/var/lib/agentos-operator-releases','/workspace/data')]){
+  expect(()=>publication.validatePublishedBaseline({baseline:{...f.baseline,publicationProofRef:invalid}})).toThrow('REBASE_PUBLISHED_BASE_UNAVAILABLE');
+ }
 });
 
 it('records one immutable feedback under concurrent replay and retains the receipt after revision/pause/publication changes',async()=>{

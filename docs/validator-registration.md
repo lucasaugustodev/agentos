@@ -39,7 +39,7 @@ temporarily permitting unknown executors. Failed attempts retain their original
 receipts and require a new attempt identity after this capacity change.
 
 `scripts/validator_provenance.py inspect` reads the active immutable publication.
-It accepts two explicit formats, without manufacturing historical sidecars:
+It accepts three explicit formats, without manufacturing historical sidecars:
 
 - Operator guard receipts: matching `release-input.json`, validate/publish
   intents, their actual output receipts, and the native publication record under
@@ -52,6 +52,17 @@ It accepts two explicit formats, without manufacturing historical sidecars:
   reviewed execution registration, and the guard's subsequently published record.
   This recognizes later releases automatically when they retain reviewed executor
   bytes. A boolean or log without the bound publication record is insufficient.
+- Guarded adoption receipts: the original protected `adoption-plan.private.json`,
+  publication intent, exit record and `publish-output.json`. The plan pins a
+  separate immutable qualification capsule containing the original validation
+  input, intent, process completion, stdout and native validation receipt. The
+  reader verifies those bytes, complete CI output and artifact digests against
+  the subsequently published native record, release bytes, stopped validation
+  unit and historical executor registration. Both phases must use the same
+  registered executor in this format; executor transitions still use the
+  existing explicit formats. Missing output or an uncertain exit is rejected.
+  The inspector and source-replan consumer retain these original paths; they
+  never create compatibility copies or rewrite old task snapshots.
 
 An operator reviews the inspection result, then calls `register` as root with a
 JSON object containing `registrationId`, `expectedRegisteredSha256`,

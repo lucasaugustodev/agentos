@@ -1,5 +1,6 @@
 import base64
 import copy
+import datetime
 import hashlib
 import importlib.util
 import json
@@ -349,6 +350,136 @@ class ValidatorProvenanceTests(unittest.TestCase):
         self.put(folder/'agentos-release-action.py',self.reviewed)
         self.put(folder/'candidate_origin.py',self.helper)
         return self.request() | {'executorSha256':p.REVIEWED_SHA,'sourceCommit':p.REVIEWED_COMMIT}
+
+    def native_adoption(self):
+        pointer=self.register(self.staged_request())
+        now=time.time()+0.25
+        self.executor_declaration={'path':str(self.layout.control),'sha256':p.REVIEWED_SHA,
+            'sourceCommit':p.REVIEWED_COMMIT,'registration':pointer}
+        unit='agentos-validation-'+self.attempt+'.service'
+        self.stop={'unit':unit,'mainPID':0,'populated':False,'controlGroup':'',
+                   'activeState':'inactive','loadState':'not-found'}
+        report='{"testResults":[]}'
+        self.validated.update(validatedAt=now+0.1,executorSha256=p.REVIEWED_SHA,
+            sourceCandidateDigest='a'*64,sourceManifestDigest='b'*64,buildInputManifestDigest='c'*64,
+            testReportDigest=p.sha(report.encode()),validationExecution={'unit':unit,'stopProof':self.stop})
+        self.output['artifacts'].append({'name':'vitest-results.json','content':report})
+        self.record={**self.validated,'previous':str(self.base),'publishedAt':now+0.4,
+                     'workersPendingRestart':True,'publicationExecutor':copy.deepcopy(self.executor_declaration)}
+        self.native_dir=self.layout.operator_records/'guarded-adoption'/('d'*40)
+        self.qual_dir=self.layout.operator_records/'qualified-ci'/('a'*64)
+        self.validation_intent={'version':1,'phase':'registered-validation','occurrenceId':self.occurrence,
+            'attemptId':self.attempt,'automaticRetry':False,'publish':False,'startedAt':now,
+            'helperSHA256':p.REVIEWED_SHA}
+        self.validation_completion={'automaticRetry':False,'publish':False,'exitCode':0,'finishedAt':now+0.2}
+        iso=lambda t:datetime.datetime.fromtimestamp(t,datetime.timezone.utc).isoformat()
+        self.publication_intent={'at':iso(now+0.3),'automaticRetry':False,'candidate':str(self.current),'occurrenceId':self.occurrence}
+        self.publication_completion={'at':iso(now+0.5),'exitCode':0}
+        self.save_native()
+        # There is deliberately no canonical-name compatibility copy.
+        shutil.rmtree(self.directory)
+
+    def save_native(self):
+        self.validation_intent['inputSHA256']=p.sha(p.canonical(self.input))
+        self.validation_completion['stdoutSHA256']=p.sha(p.canonical(self.output))
+        values={'validate-input.json':self.input,'validation.stdout.json':self.output,
+            'validation-intent.private.json':self.validation_intent,
+            'validation-process-completion.private.json':self.validation_completion,
+            'registered-validation-receipt.json':self.validated}
+        refs=[]
+        for name,value in values.items():
+            path=self.qual_dir/name;self.js(path,value)
+            refs.append({'path':str(path),'sha256':p.sha(path.read_bytes()),'bytes':path.stat().st_size})
+        self.qualification={'passed':True,'publication':False,'candidateOriginEligible':True,
+            'candidate':str(self.current),'sourceCandidateDigest':self.validated['sourceCandidateDigest'],
+            'releaseDigest':self.validated['digest'],'references':refs,'stopProof':copy.deepcopy(self.stop)}
+        self.js(self.qual_dir/'qualification.private.json',self.qualification)
+        self.plan={'version':1,'candidate':str(self.current),'base':str(self.base),
+            'occurrenceId':self.occurrence,'attemptId':self.attempt,
+            'qualificationPath':str(self.qual_dir/'qualification.private.json'),
+            'qualificationSHA256':p.sha((self.qual_dir/'qualification.private.json').read_bytes()),
+            'validationReceiptPath':str(self.layout.receipts/(self.occurrence+'.json')),
+            'validationReceiptSnapshot':str(self.qual_dir/'registered-validation-receipt.json'),
+            'sourceCandidateDigest':self.validated['sourceCandidateDigest'],'releaseDigest':self.validated['digest'],
+            'publisherSHA256':p.REVIEWED_SHA,'publisherPath':str(self.layout.control)}
+        self.js(self.native_dir/'adoption-plan.private.json',self.plan)
+        self.publication_intent['planSHA256']=p.sha((self.native_dir/'adoption-plan.private.json').read_bytes())
+        self.js(self.native_dir/'publication-intent.private.json',self.publication_intent)
+        self.js(self.native_dir/'publish-output.json',{'ok':True,'output':self.record})
+        self.publication_completion['outputSHA256']=p.sha((self.native_dir/'publish-output.json').read_bytes())
+        self.js(self.native_dir/'publication-exit.private.json',self.publication_completion)
+        self.js(self.layout.receipts/(self.occurrence+'.json'),self.record)
+
+    def test_guarded_adoption_reads_original_ci_and_publication_without_compatibility_copies(self):
+        self.native_adoption()
+        before={str(x):x.read_bytes() for x in self.layout.operator_records.rglob('*') if x.is_file()}
+        proof=p.publication(self.layout)
+        self.assertEqual(proof['kind'],'registered_adoption_receipts')
+        self.assertEqual(proof['publicationRef']['path'],str(self.native_dir/'publish-output.json'))
+        self.assertEqual(proof['validationRef']['path'],str(self.qual_dir/'validation.stdout.json'))
+        self.assertEqual(before,{str(x):x.read_bytes() for x in self.layout.operator_records.rglob('*') if x.is_file()})
+        self.assertFalse(list(self.layout.operator_records.rglob('publish.receipt.json')))
+
+    def test_guarded_adoption_rejects_changed_ci_bytes_qualification_and_plan(self):
+        self.native_adoption()
+        for path in [self.qual_dir/'validation.stdout.json',self.qual_dir/'qualification.private.json',self.native_dir/'adoption-plan.private.json']:
+            with self.subTest(path=path):
+                raw=path.read_bytes();self.put(path,raw+b' ')
+                with self.assertRaises(ValueError):p.publication(self.layout)
+                self.put(path,raw)
+
+    def test_guarded_adoption_rejects_lost_failed_or_cross_attempt_publication(self):
+        self.native_adoption()
+        for field,value in [('exitCode',1),('outputSHA256','0'*64)]:
+            raw=(self.native_dir/'publication-exit.private.json').read_bytes()
+            self.js(self.native_dir/'publication-exit.private.json',{**self.publication_completion,field:value})
+            with self.assertRaisesRegex(ValueError,'EXECUTION_UNBOUND'):p.publication(self.layout)
+            self.put(self.native_dir/'publication-exit.private.json',raw)
+        self.publication_intent['occurrenceId']=str(uuid.uuid4());self.save_native()
+        with self.assertRaisesRegex(ValueError,'EXECUTION_UNBOUND'):p.publication(self.layout)
+
+    def test_guarded_adoption_rejects_unconfirmed_stop_even_with_complete_ci(self):
+        self.native_adoption()
+        original=copy.deepcopy(self.stop)
+        for key,value in [('mainPID',123),('mainPID',False),('populated',True),('loadState','loaded'),('unit','other.service')]:
+            with self.subTest(key=key,value=value):
+                self.stop=original|{key:value};self.validated['validationExecution']['stopProof']=self.stop
+                self.record.update(self.validated);self.save_native()
+                with self.assertRaisesRegex(ValueError,'STOP_UNCONFIRMED'):p.publication(self.layout)
+
+    def test_guarded_adoption_rejects_unbound_executor_transition_and_late_intent(self):
+        self.native_adoption();original=copy.deepcopy(self.validation_intent)
+        self.validation_intent['helperSHA256']='f'*64;self.save_native()
+        with self.assertRaisesRegex(ValueError,'TRANSITION_UNSUPPORTED'):p.publication(self.layout)
+        self.validation_intent=original;self.validation_intent['startedAt']=self.record['publishedAt']+1;self.save_native()
+        with self.assertRaisesRegex(ValueError,'TIME_UNBOUND'):p.publication(self.layout)
+
+    def test_guarded_adoption_rejects_symlink_qualification_and_release_byte_drift(self):
+        self.native_adoption()
+        path=self.qual_dir/'qualification.private.json';raw=path.read_bytes()
+        saved=self.qual_dir/'saved.json';self.put(saved,raw);path.unlink();path.symlink_to(saved)
+        with self.assertRaisesRegex(ValueError,'UNPROTECTED'):p.publication(self.layout)
+        path.unlink();self.put(path,raw)
+        self.put(self.current/'server/fixture.ts',b'changed source')
+        with self.assertRaisesRegex(ValueError,'PUBLISHED_BYTES_CHANGED'):p.publication(self.layout)
+
+    def test_native_receipt_without_original_validation_capsule_is_not_sufficient(self):
+        self.native_adoption()
+        (self.qual_dir/'validation.stdout.json').unlink()
+        with self.assertRaises(FileNotFoundError):p.publication(self.layout)
+
+    def test_guarded_adoption_rejects_qualification_parent_traversal_and_ambiguous_reference(self):
+        self.native_adoption()
+        original=copy.deepcopy(self.plan)
+        self.plan['qualificationPath']=str(self.layout.operator_records/'..'/('a'*64)/'qualification.private.json')
+        self.js(self.native_dir/'adoption-plan.private.json',self.plan)
+        with self.assertRaisesRegex(ValueError,'QUALIFICATION_PATH'):p.publication(self.layout)
+        self.plan=original;self.save_native()
+        self.qualification['references'].append(copy.deepcopy(self.qualification['references'][0]))
+        self.js(self.qual_dir/'qualification.private.json',self.qualification)
+        self.plan['qualificationSHA256']=p.sha((self.qual_dir/'qualification.private.json').read_bytes())
+        self.js(self.native_dir/'adoption-plan.private.json',self.plan)
+        with self.assertRaisesRegex(ValueError,'FILE_CHANGED'):p.publication(self.layout)
 
     def test_reviewed_public_source_registration_precedes_its_publication_honestly(self):
         request=self.staged_request()

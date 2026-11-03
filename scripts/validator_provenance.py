@@ -6,6 +6,7 @@ Operator receipts and native broker receipts are distinct proof formats; neither
 is rewritten into a historical framework-general sidecar.
 """
 import contextlib
+import datetime
 import fcntl
 import hashlib
 import json
@@ -314,6 +315,123 @@ def operator_proof(layout, current, directory):
             'registeredReceipt': r, 'evidence': [p, v, vir, pir, ir, r]}
 
 
+def adoption_proof(layout, current, directory):
+    """Read the original guarded-adoption capsule without inventing receipts.
+
+    This narrow format binds the immutable CI response and its execution intent
+    through the reviewed adoption plan. It supports one registered executor
+    across validation/publication; historical transition readers stay separate.
+    """
+    plan, plan_ref = document(directory / 'adoption-plan.private.json')
+    if plan.get('candidate') != str(current):
+        return None
+    if plan.get('version') != 1:
+        fail('VALIDATOR_ADOPTION_PLAN_INVALID')
+    occurrence = str(uuid.UUID(plan.get('occurrenceId', '')))
+    attempt = str(uuid.UUID(plan.get('attemptId', '')))
+    if current.name != 'managed-' + attempt:
+        fail('VALIDATOR_ADOPTION_IDENTITY_CHANGED')
+    qpath = pathlib.Path(plan.get('qualificationPath', ''))
+    if (not qpath.is_relative_to(layout.operator_records) or
+            len(qpath.relative_to(layout.operator_records).parts) != 3 or
+            not re.fullmatch(r'[A-Za-z0-9_-]+', qpath.relative_to(layout.operator_records).parts[0]) or
+            not re.fullmatch(r'[a-f0-9]{64}', qpath.parent.name) or
+            qpath.name != 'qualification.private.json'):
+        fail('VALIDATOR_ADOPTION_QUALIFICATION_PATH')
+    qualification, qr = document(qpath)
+    if (qr['sha256'] != plan.get('qualificationSHA256') or
+            qualification.get('passed') is not True or
+            qualification.get('publication') is not False or
+            qualification.get('candidateOriginEligible') is not True or
+            qualification.get('candidate') != str(current) or
+            qualification.get('sourceCandidateDigest') != plan.get('sourceCandidateDigest') or
+            qualification.get('releaseDigest') != plan.get('releaseDigest')):
+        fail('VALIDATOR_ADOPTION_QUALIFICATION_CHANGED')
+
+    def bound(path, refs):
+        raw = read(path)
+        matches = [r for r in refs if isinstance(r, dict) and r.get('path') == str(path)]
+        if (len(matches) != 1 or matches[0].get('sha256') != sha(raw) or
+                matches[0].get('bytes') != len(raw)):
+            fail('VALIDATOR_ADOPTION_FILE_CHANGED')
+        return json.loads(raw), {'path': str(path), 'sha256': sha(raw)}
+
+    files = qualification.get('references')
+    if not isinstance(files, list) or not files or len(files) > 256:
+        fail('VALIDATOR_ADOPTION_REFERENCES_INVALID')
+    qdir = qpath.parent
+    validated, vr = bound(qdir/'validation.stdout.json', files)
+    vi, vir = bound(qdir/'validation-intent.private.json', files)
+    completion, cr = bound(qdir/'validation-process-completion.private.json', files)
+    inp, ir = bound(qdir/'validate-input.json', files)
+    before, br = bound(qdir/'registered-validation-receipt.json', files)
+    pi, pir = document(directory/'publication-intent.private.json')
+    published, pr = document(directory/'publish-output.json')
+    finished, fr = document(directory/'publication-exit.private.json')
+    record_path = layout.receipts/(occurrence+'.json')
+    record, rr = document(record_path)
+    if (plan.get('validationReceiptPath') != str(record_path) or
+            plan.get('validationReceiptSnapshot') != str(qdir/'registered-validation-receipt.json') or
+            inp.get('occurrenceId') != occurrence or inp.get('attemptId') != attempt or
+            vi.get('version') != 1 or vi.get('phase') != 'registered-validation' or
+            vi.get('occurrenceId') != occurrence or vi.get('attemptId') != attempt or
+            vi.get('inputSHA256') != ir['sha256'] or vi.get('publish') is not False or
+            vi.get('automaticRetry') is not False or completion.get('automaticRetry') is not False or
+            completion.get('publish') is not False or type(completion.get('exitCode')) is not int or
+            completion['exitCode'] != 0 or completion.get('stdoutSHA256') != vr['sha256'] or
+            pi.get('planSHA256') != plan_ref['sha256'] or pi.get('candidate') != str(current) or
+            pi.get('occurrenceId') != occurrence or pi.get('automaticRetry') is not False or
+            type(finished.get('exitCode')) is not int or finished['exitCode'] != 0 or
+            finished.get('outputSHA256') != pr['sha256']):
+        fail('VALIDATOR_ADOPTION_EXECUTION_UNBOUND')
+    if (published.get('ok') is not True or published.get('output') != record or
+            before != validated.get('output') or
+            plan.get('releaseDigest') != record.get('digest') or
+            plan.get('sourceCandidateDigest') != record.get('sourceCandidateDigest') or
+            plan.get('base') != record.get('base')):
+        fail('VALIDATOR_PUBLICATION_RECEIPT_MISMATCH')
+    record_matches(layout, current, record, before)
+    declaration = record.get('publicationExecutor')
+    executor = registered_executor_at(layout, declaration, record['publishedAt'])
+    # The original validation intent records an executor hash, not a different
+    # historical registration. Fail closed on transitions in this format.
+    if (record.get('executorSha256') != executor or vi.get('helperSHA256') != executor or
+            plan.get('publisherSHA256') != executor or
+            plan.get('publisherPath') != str(layout.control)):
+        fail('VALIDATOR_ADOPTION_EXECUTOR_TRANSITION_UNSUPPORTED')
+    registered_executor_at(layout, declaration, record['validatedAt'])
+    for key in ['sourceCandidateDigest', 'sourceManifestDigest', 'buildInputManifestDigest']:
+        if not re.fullmatch(r'[a-f0-9]{64}', record.get(key, '')):
+            fail('VALIDATOR_ADOPTION_SOURCE_UNBOUND')
+    execution = record.get('validationExecution', {})
+    stop = execution.get('stopProof', {})
+    unit = 'agentos-validation-' + attempt + '.service'
+    if (execution.get('unit') != unit or stop.get('unit') != unit or
+            type(stop.get('mainPID')) is not int or stop['mainPID'] != 0 or
+            stop.get('populated') is not False or stop.get('controlGroup') != '' or
+            stop.get('activeState') != 'inactive' or stop.get('loadState') != 'not-found' or
+            qualification.get('stopProof') != stop):
+        fail('VALIDATOR_ADOPTION_STOP_UNCONFIRMED')
+    try:
+        started = vi['startedAt']
+        ended = completion['finishedAt']
+        publish_started = datetime.datetime.fromisoformat(pi['at']).timestamp()
+        publish_ended = datetime.datetime.fromisoformat(finished['at']).timestamp()
+        if (type(started) not in (int, float) or type(ended) not in (int, float) or
+                not all(math.isfinite(x) for x in [started, ended, publish_started, publish_ended]) or
+                not 0 < started <= record['validatedAt'] <= ended <= publish_started <= record['publishedAt'] <= publish_ended <= time.time()+5 or
+                (directory/'adoption-plan.private.json').stat().st_mtime > publish_started+2):
+            raise ValueError()
+    except (KeyError, ValueError, TypeError, OverflowError):
+        fail('VALIDATOR_ADOPTION_TIME_UNBOUND')
+    complete_output(validated, layout.validation_builds/attempt/'.local-test/vitest-results.json')
+    executor_artifacts(validated, executor)
+    return {'version': 3, 'kind': 'registered_adoption_receipts', 'release': record,
+            'validationExecutorSha256': executor, 'publicationRef': pr,
+            'validationRef': vr, 'registeredReceipt': rr,
+            'evidence': [plan_ref, qr, vr, vir, cr, ir, br, pir, pr, fr, rr]}
+
+
 def registration_record(layout, identity):
     if set(identity) != {'version', 'registrationId', 'registrationDigest'} or identity.get('version') != 1:
         fail('VALIDATOR_REGISTRATION_REFERENCE_INVALID')
@@ -474,6 +592,17 @@ def publication(layout):
         value = broker_proof(layout, current, path.parent)
         if value:
             found.append(value)
+    for path in sorted(layout.operator_records.glob('*/*/adoption-plan.private.json')):
+        if (not re.fullmatch(r'[a-f0-9]{40}', path.parent.name) or
+                not re.fullmatch(r'[A-Za-z0-9_-]+', path.parent.parent.name)):
+            continue
+        try:
+            advertised, _ = document(path)
+        except (OSError, ValueError):
+            continue
+        if advertised.get('candidate') != str(current):
+            continue
+        found.append(adoption_proof(layout, current, path.parent))
     if not found:
         fail('PUBLISHED_SOURCE_MANIFEST_UNAVAILABLE')
     identities = {(x['release']['digest'], x['validationExecutorSha256']) for x in found}

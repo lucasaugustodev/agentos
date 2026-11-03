@@ -48,7 +48,11 @@ function publishedProofReferences(publication: unknown, validation: unknown) {
   const legacy = /^\/var\/lib\/agentos-build\/(?:[A-Za-z0-9_-][A-Za-z0-9_.-]*\/)*[A-Za-z0-9_-][A-Za-z0-9_.-]*\.json$/;
   if (legacy.test(publication) && legacy.test(validation)) return true;
   const operator = /^\/var\/lib\/agentos-operator-releases\/([A-Za-z0-9_-]+)\/publish\.receipt\.json$/.exec(publication);
-  return operator !== null && validation === `/var/lib/agentos-operator-releases/${operator[1]}/validate.receipt.json`;
+  if(operator !== null && validation === `/var/lib/agentos-operator-releases/${operator[1]}/validate.receipt.json`) return true;
+  // The protected broker verifies the plan linking these two immutable
+  // capsules. Neither path is selected by the task or rewritten as a receipt.
+  return /^\/var\/lib\/agentos-operator-releases\/[A-Za-z0-9_-]+\/[a-f0-9]{40}\/publish-output\.json$/.test(publication) &&
+    /^\/var\/lib\/agentos-operator-releases\/[A-Za-z0-9_-]+\/[a-f0-9]{64}\/validation\.stdout\.json$/.test(validation);
 }
 
 /** Shared validation of the protected publication broker's response. */
