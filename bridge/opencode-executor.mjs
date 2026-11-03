@@ -78,7 +78,7 @@ export function openCodeCompletionPayload(payload, route) {
   const profile=operatorModelProfile(route.accountId,route.model);
   if (profile.compat?.thinkingFormat!=='deepseek') return payload;
   const {max_completion_tokens, ...rest}=payload;
-  return {...rest,max_tokens:32768,thinking:{type:'enabled'},reasoning_effort:'high'};
+  return {...rest,max_tokens:profile.maxTokens,thinking:{type:'enabled'},reasoning_effort:'high'};
 }
 
 export async function runOpenCode(params, signal, emit = () => {}) {
