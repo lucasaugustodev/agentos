@@ -53,7 +53,7 @@ class NativeQAV2Tests(unittest.TestCase):
         self.assertTrue(all('nativeQAContractVersion' not in s['parameters'] for s in steps))
 
     def test_invalid_versions_are_rejected_before_dispatch(self):
-        for value in [None, False, True, 0, 3, '2', 2.0, {}, []]:
+        for value in [None, False, True, 0, 4, '2', 2.0, {}, []]:
             with self.subTest(value=value), self.assertRaisesRegex(ValueError, 'NATIVE_QA_CONTRACT_VERSION'):
                 W.validate_config({**self.f.config, 'nativeQAContractVersion': value})
         for value in [1, 2]: W.validate_config({**self.f.config, 'nativeQAContractVersion': value})

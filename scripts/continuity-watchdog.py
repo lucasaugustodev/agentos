@@ -69,6 +69,58 @@ def digest(value):
     return hashlib.sha256(value if isinstance(value, bytes) else canonical(value)).hexdigest()
 
 
+def native_qa3_canonical(value):
+    """The controller's ASCII/safe-integer wire domain, not report JSON."""
+    def check(v):
+        if v is None or type(v) is bool: return
+        if type(v) is int:
+            require(abs(v) <= 9007199254740991, "NATIVE_QA3_CANONICAL"); return
+        if type(v) is str:
+            require(all(32 <= ord(c) <= 126 for c in v), "NATIVE_QA3_CANONICAL"); return
+        if type(v) is list:
+            for item in v: check(item)
+            return
+        require(type(v) is dict, "NATIVE_QA3_CANONICAL")
+        for key, item in v.items(): check(key); check(item)
+    check(value)
+    return canonical(value)
+
+
+def native_qa3_json(raw):
+    def unique(pairs):
+        out = {}
+        for key, value in pairs:
+            require(key not in out, "NATIVE_QA3_JSON_DUPLICATE"); out[key] = value
+        return out
+    def nonfinite(_): raise ValueError("NATIVE_QA3_JSON_NONFINITE")
+    def finite(value):
+        result = float(value)
+        require(math.isfinite(result), "NATIVE_QA3_JSON_NONFINITE")
+        return result
+    return json.loads(raw, object_pairs_hook=unique, parse_constant=nonfinite, parse_float=finite)
+
+
+def native_qa3_semantic_report(report):
+    flags = ["scopePreserved", "canonicalPrecisionPreserved", "evaluatorIndependent", "upstreamAttributionPreserved"]
+    negatives = ["gpuValidated", "performanceGainProven", "officialActionsPerformed"]
+    arrays = ["blockingFindings", "findings", "limitations"]
+    require(type(report) is dict and set(report) == set(["version", "decision", "checkerReview", *flags, *negatives, *arrays])
+        and type(report.get("version")) is int and report["version"] == 3
+        and report.get("decision") in ["approve_for_check", "reject"]
+        and all(type(report[k]) is bool for k in flags)
+        and all(report[k] is False for k in negatives), "NATIVE_QA3_SEMANTIC_SCHEMA")
+    checker = report["checkerReview"]; checks = ["casesMeaningful", "negativeControlsDiscriminating", "noTautologicalPass"]
+    require(type(checker) is dict and set(checker) == set([*checks, "rationale"])
+        and all(type(checker[k]) is bool for k in checks)
+        and type(checker["rationale"]) is str and 0 < len(checker["rationale"].strip()) <= 8000,
+        "NATIVE_QA3_SEMANTIC_SCHEMA")
+    require(all(type(report[k]) is list and len(report[k]) <= 100
+        and all(type(v) is str and 0 < len(v.strip()) <= 8000 for v in report[k]) for k in arrays),
+        "NATIVE_QA3_SEMANTIC_SCHEMA")
+    return (report["decision"] == "approve_for_check" and all(report[k] for k in flags)
+        and all(checker[k] for k in checks) and not report["blockingFindings"])
+
+
 _OFFICIAL_DIAGNOSTIC_TOKEN = object()
 OFFICIAL_DIAGNOSTIC_LIMIT = 2048
 
@@ -383,6 +435,8 @@ def compact_outcomes(outcomes, diagnostic_omissions=None):
         row = {k: outcome[k] for k in ["occurrenceId", "problem", "state", "finishedAt", "failures"]}
         if outcome.get("executionEvidence"):
             row["executionEvidence"] = dict(outcome["executionEvidence"])
+        if outcome.get("controllerEvidence"):
+            row["controllerEvidence"] = outcome["controllerEvidence"]
         row["artifacts"] = []
         for artifact in outcome["artifacts"]:
             if artifact["name"] not in ["candidate.py", "qa-verification.json", "cpu-result.json"]:
@@ -786,7 +840,7 @@ def validate_config(config, bound=True):
     require(config.get("model") == "deepseek-v4-pro-0813", "MODEL_SCOPE")
     require(config.get("statePayloadStorage") in [None, STATE_PAYLOAD_STORAGE], "STATE_PAYLOAD_STORAGE")
     require(type(config.get("nativeQAContractVersion", 1)) is int
-            and config.get("nativeQAContractVersion", 1) in [1, 2], "NATIVE_QA_CONTRACT_VERSION")
+            and config.get("nativeQAContractVersion", 1) in [1, 2, 3], "NATIVE_QA_CONTRACT_VERSION")
     require(config.get("plannerMode") in [None, "board-lanes-v1"], "PLANNER_MODE")
     require(type(config.get("repairFirstPlanning", False)) is bool, "REPAIR_FIRST_CONFIG")
     require(not config.get("repairFirstPlanning") or
@@ -1096,6 +1150,9 @@ def source_action_evidence(observation, config):
                                   execution.get("candidateSHA256") == candidate)
             if relevant_execution or same_origin and execution.get("bindingState") != "verified":
                 reports.append({"occurrenceId": outcome["occurrenceId"], "executionEvidence": execution})
+            controller = outcome.get("controllerEvidence") or {}
+            if controller and (controller.get("candidateSHA256") == candidate or same_origin):
+                reports.append({"occurrenceId": outcome["occurrenceId"], "controllerEvidence": controller})
             for artifact in outcome["artifacts"]:
                 if artifact["name"] != "qa-verification.json":
                     continue
@@ -1473,8 +1530,10 @@ class Watchdog:
         return {"state": "legacy_exported", "sha256": digest(raw), "bytes": len(raw), "newPostRequests": 0}
 
     def status(self, state, **facts):
+        failures = getattr(self, "_official_observation_failures", [])
         value = {"observedAt": now_iso(), "state": state, "watchId": self.config["watchId"],
-                 "controlCycleId": self.config["controlCycleId"], "officialPostAuthority": False, **facts}
+                 "controlCycleId": self.config["controlCycleId"], "officialPostAuthority": False,
+                 **({"officialObservationFailures": failures} if failures else {}), **facts}
         atomic(self.directory / "latest.json", value)
         return value
 
@@ -1685,6 +1744,269 @@ class Watchdog:
         require(type(report) is dict, schema_code)
         return report
 
+    def native_qa3_evidence(self, detail, attempt):
+        """Authenticate controller evidence for context, never manufacture QA.
+
+        The endpoint verifies the protected executor. This reader independently
+        binds its policy pins, frozen producer, original request and receipt.
+        Fresh physical inspection is checked here and omitted only from the
+        returned stable view. No execute/inspect/cancel or official call occurs.
+        """
+        occurrence = detail["occurrence"]
+        steps = [s for s in detail["steps"] if s["id"] == attempt["step_id"]]
+        require(len(steps) == 1, "NATIVE_QA3_STEP")
+        step = steps[0]; definition = step.get("definition") or {}
+        require(definition.get("parameters", {}).get("nativeQAContractVersion") == 3
+            and type(definition["parameters"]["nativeQAContractVersion"]) is int
+            and definition["parameters"] == {"nativeQAContractVersion": 3, "cpuReplayObservationVersion": 1,
+                "cpuReplayProfile": "python-cpu-candidate-base-v1"}
+            and occurrence["definition"].get("allowedActions") == ["native.cpu-replay.observe"]
+            and definition.get("dependencyEvidence") == {"version": 2, "kind": "controller-cpu-replay",
+                "sourceStep": "produce", "reportArtifact": "qa-verification.json"}
+            and definition.get("maxAttempts") == 1 and attempt["number"] == step["attempt"] == 1
+            and step["key"] == "independent-qa" and definition["key"] == step["key"]
+            and [s for s in occurrence["definition"]["steps"] if s["key"] == step["key"]] == [definition],
+            "NATIVE_QA3_DEFINITION")
+        policy_raw = protected_bytes(self.config.get("autoCheckPolicyPath", ""), 262144)
+        policy = json.loads(policy_raw)
+        require(policy.get("watchId") == self.config["watchId"]
+            and policy.get("controlCycleId") == self.config["controlCycleId"], "NATIVE_QA3_POLICY")
+        code_ref, config_ref = policy.get("watcherCode", {}), policy.get("watcherConfig", {})
+        require(digest(protected_bytes(code_ref.get("path", ""), 1048576)) == code_ref.get("sha256")
+            == digest(pathlib.Path(__file__).read_bytes())
+            and digest(protected_bytes(config_ref.get("path", ""), 262144)) == config_ref.get("sha256")
+            and json.loads(protected_bytes(config_ref["path"], 262144)) == self.config, "NATIVE_QA3_POLICY")
+        allowed = policy.get("nativeQA3Registrations") or {}
+        require(type(allowed.get("version")) is int and allowed["version"] == 1
+            and type(allowed.get("registrations")) is list and 0 < len(allowed["registrations"]) <= 32,
+            "NATIVE_QA3_REGISTRATION")
+        evidence = self.client.request("GET", "/api/cycle-runs/" + occurrence["id"]
+            + "/attempts/" + attempt["id"] + "/cpu-replay")
+        require(type(evidence) is dict and len(canonical(evidence)) <= 2 * 1024 * 1024
+            and type(evidence.get("version")) is int and evidence["version"] == 1
+            and evidence.get("kind") == "native-qa3-controller-evidence"
+            and evidence.get("state") in ["evidence", "diagnostic"]
+            and evidence.get("occurrenceId") == occurrence["id"]
+            and evidence.get("attemptId") == attempt["id"] and evidence.get("runFence") == attempt["fence"]
+            and evidence.get("definitionVersion") == occurrence["version"], "NATIVE_QA3_IDENTITY")
+        registration = evidence.get("registration") or {}
+        require(set(registration) == {"path", "digest", "executorPath", "executorSHA256", "profile"}
+            and registration in allowed["registrations"]
+            and registration.get("profile") == "python-cpu-candidate-base-v1", "NATIVE_QA3_REGISTRATION")
+        registration_raw = protected_bytes(registration["path"], 16384)
+        require(digest(registration_raw) == registration["digest"]
+            and digest(protected_bytes(registration["executorPath"], 1048576)) == registration["executorSHA256"],
+            "NATIVE_QA3_REGISTRATION")
+        registered = json.loads(registration_raw)
+        require(registered.get("version") == 1 and registered.get("enabled") is True
+            and registered.get("executorPath") == registration["executorPath"]
+            and registered.get("executorSHA256") == registration["executorSHA256"]
+            and occurrence["definition"]["project"] in registered.get("projects", [])
+            and registration["profile"] in registered.get("profiles", []), "NATIVE_QA3_REGISTRATION")
+        context = attempt.get("context") or {}; preparation = context.get("cpuReplayPreparation") or {}
+        manifest = context.get("manifest") or {}; snapshot = evidence.get("snapshot") or {}
+        require(snapshot == (manifest.get("dependencyEvidence") or preparation.get("snapshot"))
+            and snapshot == preparation.get("snapshot") and registration == preparation.get("registration")
+            and type(snapshot.get("version")) is int and snapshot["version"] == 1
+            and snapshot.get("occurrenceId") == occurrence["id"]
+            and snapshot.get("contractSHA256") == digest([2, "controller-cpu-replay", "produce", "qa-verification.json"])
+            and snapshot.get("consumer") == {"stepId": step["id"], "key": step["key"], "attemptId": attempt["id"],
+                "attemptNumber": attempt["number"], "runFence": attempt["fence"]}, "NATIVE_QA3_SNAPSHOT")
+        sources = [s for s in detail["steps"] if s["key"] == "produce"]
+        require(len(sources) == 1, "NATIVE_QA3_PRODUCER")
+        source_step = sources[0]
+        source_attempts = [a for a in detail["attempts"] if a["step_id"] == source_step["id"]
+            and a["number"] == source_step["attempt"]]
+        require(len(source_attempts) == 1, "NATIVE_QA3_PRODUCER")
+        producer = source_attempts[0]
+        require(source_step["state"] == producer["state"] == "completed"
+            and producer.get("finished_at") and producer["number"] == source_step["attempt"] == 1
+            and [s for s in occurrence["definition"]["steps"] if s["key"] == "produce"] == [source_step.get("definition")]
+            and source_step["definition"].get("maxAttempts") == 1
+            and (producer.get("receipt") or {}).get("stopped") is True
+            and snapshot.get("source") == {"stepId": source_step["id"], "key": "produce", "attemptId": producer["id"],
+                "attemptNumber": producer["number"], "runFence": producer["fence"]}, "NATIVE_QA3_PRODUCER")
+        inventory = [{k: a[k] for k in ["id", "name", "digest", "size"]}
+            for a in detail["artifacts"] if a["attempt_id"] == producer["id"]]
+        require(sorted(inventory, key=lambda a: (a["name"], a["id"])) == snapshot.get("artifacts"), "NATIVE_QA3_INVENTORY")
+        request = evidence.get("request") or {}; request_sha = evidence.get("requestSHA256")
+        method = "cpu-replay-ascii-integers-v1"
+        require(evidence.get("requestCanonicalization") == method and re.fullmatch(r"[a-f0-9]{64}", request_sha or "")
+            and request_sha == preparation.get("requestSHA256")
+            and evidence.get("action") == {"key": occurrence["id"] + ":" + attempt["id"] + ":cpu-replay-v1",
+                "state": evidence.get("action", {}).get("state"), "inputHash": request_sha}
+            and request.get("version") == 1 and request.get("requestId") == attempt["id"]
+            and request.get("occurrenceId") == occurrence["id"] and request.get("runFence") == attempt["fence"]
+            and request.get("definitionVersion") == occurrence["version"] and request.get("source") == snapshot["source"]
+            and request.get("project") == occurrence["definition"]["project"]
+            and request.get("profile") == registration["profile"]
+            and request.get("registrationSHA256") == registration["digest"]
+            and request.get("executorSHA256") == registration["executorSHA256"], "NATIVE_QA3_REQUEST")
+        names = ["candidate.py", "cpu-checks.py", "cpu-result.json", "implementation.patch"]
+        refs = []
+        for name in names:
+            found = [a for a in inventory if a["name"] == name]
+            require(len(found) == 1, "NATIVE_QA3_REQUEST_ARTIFACTS")
+            refs.append(found[0])
+        base = occurrence["input"]["experiment"]["sourceArtifact"]
+        base_ref = {k: base[k] for k in ["id", "name", "digest", "size"]}
+        require(request.get("artifacts") == refs + [{**base_ref, "name": "base-candidate.py"}]
+            and (request.get("baseSource") or {}).get("artifact") == base_ref,
+            "NATIVE_QA3_REQUEST_ARTIFACTS")
+        full_request = {**request, "artifacts": [{**r, "base64": base64.b64encode(
+            self.verified_artifact(r, 1048576)).decode()} for r in request["artifacts"]]}
+        require(digest(native_qa3_canonical(full_request)) == request_sha, "NATIVE_QA3_REQUEST_DIGEST")
+        stable = {"version": 3, "authority": "controller_cpu_evidence_not_official_acceptance",
+            "occurrenceId": occurrence["id"], "attemptId": attempt["id"], "runFence": attempt["fence"],
+            "candidateSHA256": refs[0]["digest"], "sourceSHA256": base_ref["digest"],
+            "snapshotContractSHA256": snapshot["contractSHA256"], "requestSHA256": request_sha,
+            "registration": registration, "modelDispatched": evidence.get("modelDispatched"),
+            "physicalConfirmed": False, "bindingState": "verified", "state": evidence["state"]}
+        if evidence["state"] == "diagnostic":
+            require(evidence.get("physicalConfirmed") is False and evidence.get("modelDispatched") is False
+                and all(evidence.get(k) is None for k in ["receipt", "receiptSHA256", "handoff", "physicalInspection", "semanticReport"]),
+                "NATIVE_QA3_DIAGNOSTIC")
+            return {**stable, "classification": "cpu_preparation_unconfirmed", "diagnostic": evidence.get("diagnostic")}, None
+        receipt = evidence.get("receipt") or {}; receipt_sha = evidence.get("receiptSHA256")
+        require(evidence.get("receiptCanonicalization") == method and receipt_sha == digest(native_qa3_canonical(receipt))
+            and evidence["action"]["state"] == "completed" and receipt.get("version") == 1
+            and receipt.get("kind") == "cpu-replay-observation" and receipt.get("observationOnly") is True
+            and receipt.get("acceptance") is False and receipt.get("requestSHA256") == request_sha
+            and all(receipt.get(k) == request.get(k) for k in ["requestId", "occurrenceId", "runFence", "source",
+                "project", "profile", "baseSource", "registrationSHA256", "executorSHA256"]), "NATIVE_QA3_RECEIPT")
+        unit = "agentos-cpu-replay-" + attempt["id"] + ".service"
+        physical = evidence.get("physicalInspection") or {}; stop = physical.get("stopProof") or {}
+        observed = dt.datetime.fromisoformat(str(physical.get("observedAt", "")).replace("Z", "+00:00")).timestamp()
+        require(type(physical.get("version")) is int and physical["version"] == 1
+            and physical.get("receiptSHA256") == receipt_sha and self.clock() - 15 <= observed <= self.clock() + 1
+            and evidence.get("physicalConfirmed") is True and receipt.get("unit") == unit
+            and stop.get("stopped") is True and type(stop.get("mainPID")) is int and stop["mainPID"] == 0
+            and stop.get("populated") is False and stop.get("unit") == unit
+            and all((receipt.get("stopProof") or {}).get(k) == stop[k] for k in ["stopped", "mainPID", "populated", "unit"])
+            and receipt.get("argv") == ["/usr/bin/python3", "-I", "-B", "/output/cpu-checks.py",
+                "/output/candidate.py", "/inputs/base-candidate.py"], "NATIVE_QA3_PHYSICAL_STOP")
+        limit = registered.get("limits", {}).get("maxOutputBytes")
+        require(type(limit) is int and 1024 <= limit <= 262144, "NATIVE_QA3_OUTPUT_LIMIT")
+        outputs = receipt.get("outputs") or {}; result = None
+        require(set(outputs) == {"result", "stdout", "stderr"}, "NATIVE_QA3_OUTPUTS")
+        for name, value in outputs.items():
+            if name == "result" and value is None: continue
+            require(type(value) is dict and set(value) == {"size", "digest", "base64"}
+                and type(value["size"]) is int and 0 <= value["size"] <= limit, "NATIVE_QA3_OUTPUTS")
+            raw = base64.b64decode(value["base64"], validate=True)
+            require(len(raw) == value["size"] and digest(raw) == value["digest"], "NATIVE_QA3_OUTPUTS")
+            if name == "result":
+                try: result = native_qa3_json(raw)
+                except (ValueError, UnicodeError, RecursionError): result = None
+        execution_passed = (receipt.get("exitCode") == 0 and type(receipt.get("exitCode")) is int
+            and receipt.get("signal") is None and receipt.get("outputsComplete") is True
+            and all(receipt.get(k) is False for k in ["timedOut", "oomKilled", "cancelled", "outputLimitExceeded"])
+            and outputs.get("result") is not None)
+        technical = (execution_passed and type(result) is dict and result.get("passed") is True
+            and result.get("candidateSHA256") == refs[0]["digest"] and result.get("checkerSHA256") == refs[1]["digest"])
+        for name, flag in [("cases", "passed"), ("negativeControls", "detected")]:
+            rows = result.get(name) if type(result) is dict else None
+            technical = technical and (type(rows) is list and 0 < len(rows) <= 10000
+                and all(type(r) is dict and type(r.get("name")) is str and bool(r["name"].strip())
+                    and r.get(flag) is True for r in rows)
+                and len({r["name"] for r in rows}) == len(rows))
+        stable.update(physicalConfirmed=True, receiptSHA256=receipt_sha, receiptCanonicalization=method,
+            technicalPassed=bool(technical), cpuOutcome={k: receipt.get(k) for k in
+                ["exitCode", "signal", "timedOut", "oomKilled", "cancelled", "outputsComplete", "outputLimitExceeded"]})
+        if evidence.get("modelDispatched") is False:
+            failure = context.get("nativeQA3PreparationFailure") or {}
+            terminal = failure.get("terminal") or {}; cpu_terminal = terminal.get("cpu") or {}
+            require(not technical and failure == evidence.get("preparationFailure") == evidence.get("diagnostic")
+                and type(failure.get("version")) is int and failure["version"] == 1 and failure.get("status") == "rejected"
+                and failure.get("code") == ("NATIVE_QA3_CPU_RESULT_INVALID" if execution_passed else "NATIVE_QA3_CPU_EXECUTION_FAILED")
+                and failure.get("modelDispatched") is False and failure.get("snapshotContractSHA256") == snapshot["contractSHA256"]
+                and failure.get("source") == snapshot["source"] and failure.get("requestSHA256") == request_sha
+                and failure.get("receiptSHA256") == receipt_sha and failure.get("receiptCanonicalization") == method
+                and failure.get("terminal") == attempt.get("receipt")
+                and (attempt.get("receipt") or {}).get("kind") == "cpu-preparation-terminal"
+                and "stopped" not in attempt["receipt"]
+                and set(terminal) == {"kind", "modelDispatched", "cpu"} and terminal["modelDispatched"] is False
+                and set(cpu_terminal) == {"requestId", "requestSHA256", "receiptSHA256", "stopProof"}
+                and cpu_terminal["requestId"] == attempt["id"] and cpu_terminal["requestSHA256"] == request_sha
+                and cpu_terminal["receiptSHA256"] == receipt_sha
+                and all((cpu_terminal["stopProof"] or {}).get(k) == stop[k] for k in ["stopped", "mainPID", "populated", "unit"])
+                and evidence.get("handoff") is None and evidence.get("semanticReport") is None,
+                "NATIVE_QA3_PREPARATION_FAILURE")
+            return {**stable, "classification": "cpu_preparation_failed", "code": failure.get("code"),
+                "diagnostic": failure, "qaApproval": False}, None
+        require(evidence.get("modelDispatched") is True and preparation.get("phase") == "qa_dispatching"
+            and technical and confirmed_boundary(detail), "NATIVE_QA3_QA_BOUNDARY")
+        handoff = evidence.get("handoff") or {}; receipt_bytes = canonical(receipt)
+        expected_handoff = {"version": 1, "contractVersion": 3, "requestId": attempt["id"],
+            "requestSHA256": request_sha, "receiptSHA256": receipt_sha, "receiptCanonicalization": method,
+            "registration": registration, "receipt": {"id": attempt["id"], "name": "cpu-replay-observation.json",
+                "digest": digest(receipt_bytes), "size": len(receipt_bytes),
+                "path": "/home/agent/inputs/" + attempt["id"] + "/cpu-replay-observation.json"}}
+        require(handoff == manifest.get("nativeQA3") == expected_handoff, "NATIVE_QA3_HANDOFF")
+        reports = [r for r in detail["artifacts"] if r["attempt_id"] == attempt["id"] and r["name"] == "qa-verification.json"]
+        require(len(reports) == 1 and evidence.get("semanticReport") == {k: reports[0][k] for k in ["id", "name", "digest", "size"]},
+            "NATIVE_QA3_SEMANTIC_ARTIFACT")
+        raw_report = self.verified_artifact(reports[0], QA_ARTIFACT_LIMIT)
+        report = None; approval = False; report_valid = False
+        try:
+            report = native_qa3_json(raw_report)
+            approval = native_qa3_semantic_report(report); report_valid = True
+        except (ValueError, TypeError, KeyError, UnicodeError, RecursionError):
+            report = None  # Original bytes remain the only historical report.
+        validation = evidence.get("validation") or {}
+        require(validation == context.get("nativeQA3Validation") and validation.get("version") == 1
+            and validation.get("contractVersion") == 3 and validation.get("status") in ["matched", "rejected"]
+            and validation.get("snapshotContractSHA256") == snapshot["contractSHA256"] and validation.get("source") == snapshot["source"]
+            and validation.get("requestSHA256") == request_sha and validation.get("receiptSHA256") == receipt_sha
+            and validation.get("handoff") == handoff and validation.get("semanticReport") == evidence["semanticReport"]
+            and validation.get("receiptCanonicalization") == method
+            and validation.get("candidateExecutedByController") is True
+            and validation.get("gpuValidated") is False and validation.get("performanceGainProven") is False
+            and validation.get("semanticDecision") == (report["decision"] if report_valid else None),
+            "NATIVE_QA3_VALIDATION")
+        if not report_valid:
+            require(validation["status"] == "rejected" and validation.get("code") == "NATIVE_QA3_REPORT_INVALID",
+                "NATIVE_QA3_INVALID_REPORT_GATE")
+            return {**stable, "classification": "report_invalid", "semanticArtifact": evidence["semanticReport"],
+                "qaApproval": False, "reportSchemaValid": False, "validationCode": validation["code"],
+                "snapshotSHA256": digest(snapshot), "validationSHA256": digest(validation)}, None
+        accepted = approval and validation["status"] == "matched" and validation.get("code") is None
+        require(accepted or not approval and validation["status"] == "rejected"
+            and validation.get("code") == "NATIVE_QA3_SEMANTIC_REJECT", "NATIVE_QA3_VALIDATION")
+        return {**stable, "classification": "candidate_reviewed" if accepted else "new_hypothesis_required",
+            "semanticArtifact": evidence["semanticReport"], "qaApproval": accepted, "reportSchemaValid": True,
+            "snapshotSHA256": digest(snapshot), "validationSHA256": digest(validation),
+            "reportedDecision": report["decision"], "blockingFindingsCount": len(report["blockingFindings"]),
+            "validationCode": validation.get("code")}, report
+
+    def native_qa3_terminal(self, detail):
+        """Separate CPU preparation stop from a model execution stop."""
+        steps = [s for s in detail["steps"] if (s.get("definition") or {}).get("parameters", {}).get("nativeQAContractVersion") == 3]
+        if not steps: return None
+        attempts = [a for a in detail["attempts"] if a["step_id"] == steps[0]["id"] and a["number"] == steps[0]["attempt"]]
+        if len(steps) != 1 or len(attempts) != 1 or attempts[0]["state"] not in ["completed", "failed"]: return None
+        try:
+            view, _ = self.native_qa3_evidence(detail, attempts[0])
+            return view
+        except (ValueError, KeyError, TypeError, OSError, UnicodeError, RecursionError) as error:
+            code = str(error) if isinstance(error, ValueError) and re.fullmatch(r"[A-Z][A-Z0-9_]+", str(error)) else "NATIVE_QA3_EVIDENCE_UNAVAILABLE"
+            return {"version": 3, "occurrenceId": detail["occurrence"]["id"], "attemptId": attempts[0]["id"],
+                "bindingState": "unavailable", "physicalConfirmed": False, "code": code}
+
+    def native_boundary(self, detail, view=None):
+        if view is not None and (view.get("bindingState") != "verified"
+                or view.get("classification") == "cpu_preparation_unconfirmed"):
+            return False
+        if confirmed_boundary(detail): return True
+        if not view or view.get("classification") != "cpu_preparation_failed" or view.get("bindingState") != "verified": return False
+        if detail["occurrence"]["state"] in LIVE: return False
+        for a in detail["attempts"]:
+            if a["state"] not in ["completed", "failed"] or not a.get("finished_at"): return False
+            if a["id"] == view["attemptId"]:
+                if view.get("modelDispatched") is not False or view.get("physicalConfirmed") is not True: return False
+            elif (a.get("receipt") or {}).get("stopped") is not True: return False
+        return bool(detail["attempts"])
+
     def qa_context(self, detail, artifact, problem, latest_attempts):
         """Preserve bounded complete blockers as source-bound report data.
 
@@ -1708,6 +2030,21 @@ class Watchdog:
             require(UUID.fullmatch(attempt.get("fence", "")), "QA_CONTEXT_FENCE")
             envelope.update(stepId=step["id"], stepKey=step.get("key"), runFence=attempt["fence"],
                 emitterProvenance="legacy_report_independence_not_established")
+            if (step.get("definition") or {}).get("parameters", {}).get("nativeQAContractVersion") == 3:
+                view, review = self.native_qa3_evidence(detail, attempt)
+                require(view.get("semanticArtifact") == envelope["artifact"], "NATIVE_QA3_CONTEXT_ARTIFACT")
+                candidates = [a for a in detail["artifacts"] if a["name"] == "candidate.py"
+                    and a["attempt_id"] == attempt["context"]["cpuReplayPreparation"]["snapshot"]["source"]["attemptId"]]
+                verified = {**envelope, "bindingState": "verified", "nativeQAContractVersion": 3,
+                    "emitterProvenance": "registered_independent_qa_step", "controllerEvidence": view,
+                    "candidateSHA256": view["candidateSHA256"], "sourceSHA256": view["sourceSHA256"],
+                    "candidateArtifactIds": sorted(a["id"] for a in candidates),
+                    "reportedDecision": view.get("reportedDecision"), "reportSchemaValid": view["reportSchemaValid"],
+                    "blockingFindingsState": "complete" if review is not None else "invalid_original_report",
+                    "blockingFindings": review["blockingFindings"] if review is not None else None}
+                require(review is None or len(canonical(review["blockingFindings"])) <= 32768, "QA_CONTEXT_BLOCKERS_SIZE_EXCEEDED")
+                require(len(canonical(verified)) <= QA_CONTEXT_LIMIT, "QA_CONTEXT_SIZE_EXCEEDED")
+                return verified, review
             registered = any(r["occurrenceId"] == detail["occurrence"]["id"] for r in self.state["experiments"])
             if registered:
                 definition = step.get("definition") or {}
@@ -1761,7 +2098,8 @@ class Watchdog:
         require(type(artifact.get("size")) is int and 0 < artifact["size"] <= QA_ARTIFACT_LIMIT,
                 "REPAIR_QA_DIAGNOSTIC_SIZE")
         context, report = self.qa_context(detail, artifact, problem, latest_attempts)
-        require(report is not None and context.get("bindingState") == "verified",
+        require((report is not None or context.get("nativeQAContractVersion") == 3
+                    and context.get("reportSchemaValid") is False) and context.get("bindingState") == "verified",
                 context.get("code", "REPAIR_QA_CONTEXT_UNVERIFIED"))
         require(context.get("emitterProvenance") == "registered_independent_qa_step",
                 "REPAIR_QA_EMITTER_UNVERIFIED")
@@ -1783,6 +2121,14 @@ class Watchdog:
                 "cycleInputSHA256": binding["digest"]}
         if binding_conflict is not None:
             envelope["evidenceBindingConflict"] = binding_conflict
+        if context.get("nativeQAContractVersion") == 3:
+            view = context["controllerEvidence"]
+            envelope.update(nativeQAContractVersion=3, controllerEvidence={"version": 1, "contractVersion": 3,
+                **{k: view[k] for k in ["requestSHA256", "receiptSHA256", "snapshotSHA256", "validationSHA256", "registration"]}})
+            if report is None:
+                envelope.update(report=None, reportState="invalid_original_json_or_schema", originalArtifact=envelope["artifact"])
+                require(len(canonical(envelope)) <= REPAIR_QA_CONTEXT_LIMIT, "REPAIR_QA_PROJECTION_SIZE")
+                return envelope
         return compact_qa_diagnostic(envelope, report)
 
     def source_external_evidence(self, catalog, details):
@@ -1907,9 +2253,16 @@ class Watchdog:
             require(qa is not None and qa["attempt_id"] in latest and any(a["name"] == "candidate.py"
                     and a["digest"] == row["sourceSHA256"] and a["attempt_id"] in latest
                     for a in detail["artifacts"]), "REGISTERED_JOB_ARTIFACTS")
-            review = self.qa_report(qa)
             source = detail["occurrence"].get("input", {}).get("experiment", {}).get("sourceArtifact", {})
-            require(review.get("passed") is True and review.get("candidateSHA256") == row["sourceSHA256"]
+            qa_attempt = next(a for a in detail["attempts"] if a["id"] == qa["attempt_id"])
+            qa_step = next(s for s in detail["steps"] if s["id"] == qa_attempt["step_id"])
+            if (qa_step.get("definition") or {}).get("parameters", {}).get("nativeQAContractVersion") == 3:
+                view, _ = self.native_qa3_evidence(detail, qa_attempt)
+                require(view.get("qaApproval") is True and view.get("candidateSHA256") == row["sourceSHA256"]
+                    and view.get("sourceSHA256") == source.get("digest"), "REGISTERED_JOB_QA")
+            else:
+                review = self.qa_report(qa)
+                require(review.get("passed") is True and review.get("candidateSHA256") == row["sourceSHA256"]
                     and review.get("sourceSHA256") == source.get("digest") and bool(source.get("digest"))
                     and review.get("approvedForOfficialReview") is True and review.get("cpuReplayPassed") is True
                     and review.get("scopePreserved") is True and review.get("gpuValidated") is False
@@ -2129,8 +2482,25 @@ class Watchdog:
                     "AUTO_CHECK_UNCERTAIN_EFFECT")
             try:
                 detail = details[oid]
-                require(detail["occurrence"]["state"] == "completed" and confirmed_boundary(detail), "REPAIR_BOUNDARY_UNCONFIRMED")
-                source = next((r for r in catalog if r["occurrenceId"] == oid and r["digest"] == row.get("candidateSHA256")), None)
+                qa3 = self.native_qa3_terminal(detail)
+                require((detail["occurrence"]["state"] == "completed" or qa3 and qa3.get("classification") in
+                    ["report_invalid", "new_hypothesis_required", "cpu_preparation_failed"])
+                    and self.native_boundary(detail, qa3), "REPAIR_BOUNDARY_UNCONFIRMED")
+                if qa3 and qa3.get("classification") in ["new_hypothesis_required", "cpu_preparation_failed"]:
+                    item.update(classification=qa3["classification"], controllerEvidence=qa3)
+                    continue
+                # QA3 failed review copies are historical diagnostics, not
+                # selectable base aliases. Choose the actual completed
+                # producer even when an equal-SHA QA artifact sorts first.
+                producer_candidates = None
+                if qa3:
+                    producer_ids = {a["id"] for a in detail["attempts"] if a["state"] == "completed" and any(
+                        s["key"] == "produce" and s["state"] == "completed" and s["id"] == a["step_id"]
+                        and s["attempt"] == a["number"] for s in detail["steps"])}
+                    producer_candidates = {a["id"] for a in detail["artifacts"]
+                        if a["name"] == "candidate.py" and a["attempt_id"] in producer_ids}
+                source = next((r for r in catalog if r["occurrenceId"] == oid and r["digest"] == row.get("candidateSHA256")
+                    and (producer_candidates is None or r["id"] in producer_candidates)), None)
                 latest = {a["id"] for a in detail["attempts"] if any(s["id"] == a["step_id"]
                           and s["attempt"] == a["number"] for s in detail["steps"])}
                 qa = next((a for a in detail["artifacts"] if a["id"] == row.get("qaArtifactId") and
@@ -2141,17 +2511,19 @@ class Watchdog:
                            and r["problem"] == row["problem"] and r["occurrenceId"] in details]
                 if repairs and repairs[-1]["occurrenceId"] != oid:
                     item["classification"] = "superseded_by_native_repair"; continue
-                review = self.qa_report(qa, "REPAIR_QA_REPORT_SCHEMA")
-                require(isinstance(review, dict), "REPAIR_QA_REPORT_SCHEMA")
+                raw_only_v3 = qa3 and qa3.get("classification") == "report_invalid"
+                review = None if raw_only_v3 else self.qa_report(qa, "REPAIR_QA_REPORT_SCHEMA")
+                require(raw_only_v3 or isinstance(review, dict), "REPAIR_QA_REPORT_SCHEMA")
                 base = detail["occurrence"].get("input", {}).get("experiment", {}).get("sourceArtifact", {})
-                require(review.get("candidateSHA256") == source["digest"] and review.get("sourceSHA256") == base.get("digest")
+                lineage = qa3 if raw_only_v3 else review
+                require(lineage.get("candidateSHA256") == source["digest"] and lineage.get("sourceSHA256") == base.get("digest")
                         and bool(base.get("digest")), "REPAIR_SOURCE_LINEAGE")
                 code = row.get("code") or ""
-                semantic_failure = any(review.get(k) is False for k in ["passed", "scopePreserved", "cpuReplayPassed",
+                semantic_failure = not raw_only_v3 and any(review.get(k) is False for k in ["passed", "scopePreserved", "cpuReplayPassed",
                     "canonicalPrecisionPreserved", "evaluatorIndependent", "upstreamAttributionPreserved"])
-                semantic_failure = semantic_failure or bool(review.get("blockingFindings"))
+                semantic_failure = semantic_failure or bool((review or {}).get("blockingFindings"))
                 item["classification"] = "new_hypothesis_required" if semantic_failure or code in SEMANTIC_REJECTION_CODES else "diagnosis_required"
-                if code not in EVIDENCE_REPAIR_CODES or semantic_failure:
+                if (code not in EVIDENCE_REPAIR_CODES and not (raw_only_v3 and code == "QA_V3_REPORT_INVALID")) or semantic_failure:
                     continue
                 producer_artifacts = self.repair_producer_artifacts(detail, qa)
                 by_name = {a["name"]: a for a in producer_artifacts}
@@ -2164,7 +2536,7 @@ class Watchdog:
                 canonical_patch, patch_proof = normalized_repair_patch(self.verified_artifact(base),
                     self.verified_artifact(by_name["candidate.py"]), self.verified_artifact(by_name["implementation.patch"]), row["problem"])
                 cpu = self.repair_cpu_report(by_name["cpu-result.json"])
-                evidence = review.get("cpuEvidence", {})
+                evidence = (review or {}).get("cpuEvidence", {})
                 require(isinstance(evidence, dict), "REPAIR_CPU_EVIDENCE_SCHEMA")
                 for container, key, expected in [(cpu, "candidateSHA256", source["digest"]),
                         (cpu, "checkerSHA256", by_name["cpu-checks.py"]["digest"])]:
@@ -2260,6 +2632,8 @@ class Watchdog:
             require(all(a["state"] in {"running", "completed", "failed", "cancelling", "reconciling"}
                         for a in detail["attempts"]), "ATTEMPT_STATE_UNKNOWN")
             live_attempts = [a for a in detail["attempts"] if a["state"] in LIVE]
+            controller_evidence = self.native_qa3_terminal(detail)
+            boundary = self.native_boundary(detail, controller_evidence)
             if self.config.get("pipelineCapacityVersion") == 2:
                 identity = native_experiment_identity(detail, record["problem"])
                 if identity:
@@ -2285,7 +2659,7 @@ class Watchdog:
                                "attemptIds": [a["id"] for a in live_attempts], "progress": progress_ref,
                                "activity": {"kind": activity["kind"], "at": activity["created_at"]} if activity else None,
                                "stale": self.clock() - progress_epoch >= 600})
-            elif not confirmed_boundary(detail):
+            elif not boundary:
                 active.append({"occurrenceId": oid, "problem": record["problem"], "state": "boundary_unconfirmed_or_review_owned", "attemptIds": [],
                                "progress": progress_ref, "stale": self.clock() - progress_epoch >= 600})
             if self.config.get("pipelineCapacityVersion") == 2 and active and active[-1]["occurrenceId"] == oid:
@@ -2309,11 +2683,17 @@ class Watchdog:
                     artifacts.append(item)
                     if row["name"] == "candidate.py":
                         catalog.append(item)
-                        if confirmed_boundary(detail):
+                        producer_ids = {a["id"] for a in detail["attempts"] if any(s["key"] == "produce" and s["id"] == a["step_id"] for s in detail["steps"])}
+                        if boundary and (controller_evidence is None or row["attempt_id"] in producer_ids):
                             confirmed_sources.add(item["id"])
                     if row["name"] == "qa-verification.json":
                         context, review = self.qa_context(detail, row, record["problem"], latest_attempts)
                         item["qaEvidence"] = context
+                        if context.get("nativeQAContractVersion") == 3:
+                            item["semanticReview"] = ({k: review[k] for k in ["version", "decision", "scopePreserved",
+                                "canonicalPrecisionPreserved", "evaluatorIndependent", "upstreamAttributionPreserved",
+                                "gpuValidated", "performanceGainProven", "officialActionsPerformed"]} if review is not None else None)
+                            continue  # Do not turn a semantic-only report into legacy QA.
                         if review is None:
                             continue
                         qa_reviews.append({k: review.get(k) for k in ["passed", "verificationPassed", "candidateSHA256",
@@ -2324,6 +2704,8 @@ class Watchdog:
                 eligible = any(q.get("passed") is True and q.get("candidateSHA256") == candidate["digest"] and
                     (q.get("approvedForOfficialReview") is True or q.get("approvedForRootCheckReview") is True)
                     and q.get("gpuValidated") is False for q in qa_reviews)
+                eligible = eligible or bool(controller_evidence and controller_evidence.get("qaApproval") is True
+                    and controller_evidence.get("candidateSHA256") == candidate["digest"])
                 if occurrence["state"] == "completed" and eligible and candidate["digest"] not in tested:
                     pending_origins.add((record["problem"], oid, candidate["digest"]))
             outcomes.append({"occurrenceId": oid, "problem": record["problem"], "state": occurrence["state"],
@@ -2331,10 +2713,34 @@ class Watchdog:
                 "executionEvidence": self.execution_evidence(detail),
                 "progress": progress_ref,
                 "failures": [{"attemptId": a["id"], "code": a.get("error_code")} for a in detail["attempts"] if a["state"] == "failed"]})
+            if controller_evidence is not None:
+                outcomes[-1]["controllerEvidence"] = controller_evidence
         jobs, pending_jobs = [], []
+        self._official_observation_failures = []
         for job in registered_jobs:
             cached = self.state["official"].get(job["id"])
-            raw = cached or self.client.official(job)
+            if cached:
+                raw = cached
+            else:
+                try:
+                    raw = self.client.official(job)
+                except ValueError as error:
+                    failure = official_error_fields(error, self.config).get("officialObservationFailure")
+                    # Contain only an authenticated diagnostic from this CLI
+                    # lookup. The registered job/transport receipt still owns
+                    # its slot; this response supplies no result or receipt.
+                    if not (failure and failure.get("origin") == "cli"
+                            and failure.get("cliExitCode") == 0
+                            and failure.get("responseEncoding") == "cli-stdout"
+                            and failure.get("expectedId", {}).get("value") == job["id"]
+                            and failure.get("expectedBoard", {}).get("value") == job["problem"]):
+                        raise
+                    self._official_observation_failures.append(failure)
+                    pending_jobs.append(job["id"])
+                    jobs.append({**{k: job[k] for k in ["id", "problem", "sourceSHA256"]},
+                        "status": "observation_unavailable", "observationCode": "OFFICIAL_IDENTITY",
+                        "result": {}, "caseCounts": None})
+                    continue
             official_identity_guard(raw, job, "cache" if cached else "client")
             if raw.get("status") not in ["done", "failed"]:
                 pending_jobs.append(job["id"])
@@ -2804,6 +3210,61 @@ proof of correctness. Any candidate, patch, semantic or numerical defect fails.
 """
                 producer += conflict_instructions
                 qa += conflict_instructions
+        if self.config.get("nativeQAContractVersion", 1) == 3:
+            # A new explicit ABI replaces mechanical transcript/copy duties;
+            # legacy definitions, including their persisted request bytes, do
+            # not pass through this branch.
+            producer = producer.split("cpu-result.json must contain passed,")[0] + """NativeQA v3 uses a registered controller CPU replay before independent QA.
+Publish all five producer artifacts. cpu-checks.py must accept exactly two
+positional arguments: candidate.py and base-candidate.py. It must run without
+network, CUDA or third-party packages using Python's standard library only.
+It writes cpu-result.json alongside itself. Keep extra outputs within 16 MiB
+total and 2 MiB per file; the result must fit 262144 bytes. Stream cases to avoid
+retaining large arrays. Preserve coverage and independent negative controls.
+The result contains passed, exact candidateSHA256/checkerSHA256, nonempty cases
+[{name,passed,...}] and negativeControls [{name,detected,...}], with unique names.
+Run your checker while developing and publish its actual raw cpu-result.json;
+the controller separately executes the frozen checker/candidate/base/patch.
+No particular shell spelling or copied tool transcript is acceptance evidence.
+verification.json still binds the actual base/candidate and declares CPU-only
+scope. Never call a producer report or controller receipt semantic approval.
+"""
+            qa = COMMON + """NativeQA v3: independently review the supplied checker, candidate,
+base, patch and original CPU evidence, including cpu-replay-observation.json.
+That read-only receipt comes from the registered controller. Inspect its raw
+result and limitations; the controller verifies execution and hash bindings.
+Do not run a second mechanical replay or copy hashes, commands, cases or control
+tables into your report. A receipt with failed execution or negative cases is
+diagnostic evidence; reject it, even if the producer claimed success. Evaluate
+whether the checks distinguish this hypothesis from the base and whether mutant
+controls would detect a wrong implementation. Tautological/static-only claims
+must not be promoted to numerical correctness or GPU performance.
+Publish review.txt and original qa-verification.json with EXACTLY these fields:
+{version:3,decision:"approve_for_check"|"reject",scopePreserved:boolean,
+canonicalPrecisionPreserved:boolean,evaluatorIndependent:boolean,
+upstreamAttributionPreserved:boolean,checkerReview:{casesMeaningful:boolean,
+negativeControlsDiscriminating:boolean,noTautologicalPass:boolean,rationale:string},
+blockingFindings:string[],findings:string[],limitations:string[],gpuValidated:false,
+performanceGainProven:false,officialActionsPerformed:false}.
+Use strict finite JSON, at most 1 MiB. Strings are nonempty and at most 8000
+characters, each array at most 100 items. Include a nonempty limitations array
+explaining CPU-only evidence and unmeasured GPU correctness/performance.
+Approval requires every review boolean true and no blocking finding. Otherwise
+reject candidly with concrete findings; this single QA attempt is not retried to
+turn a semantic rejection into approval. Typed failures go to supervision for
+bounded correction. Your report cannot dispatch any official action.
+"""
+            if repair:
+                repair_v3 = """\nIMMUTABLE EVIDENCE REPAIR: preserve repairTarget candidate.py and the
+supplied canonicalPatch byte for byte; the base is unchanged. Review the complete
+historical QA diagnostic and prior-qa-original.json when a projection is present.
+Those reports are historical evidence, not acceptance. Fix only authorized
+checker/transport/report defects and publish fresh outputs. Any kernel, semantic
+or numerical defect must be rejected and sent to supervision as a new hypothesis.
+Do not relabel old receipts, hashes or findings as a fresh controlled execution.
+"""
+                producer += repair_v3
+                qa += repair_v3
         steps = [native_step(self.config, "produce", "Implementar experiência: " + experiment["id"], producer,
                  ["candidate.py", "implementation.patch", "cpu-checks.py", "cpu-result.json", "verification.json"]),
                  native_step(self.config, "independent-qa", "Revisar e reproduzir a experiência", qa,
@@ -2819,20 +3280,32 @@ proof of correctness. Any candidate, patch, semantic or numerical defect fails.
                  "dependencyArtifact": "cpu-checks.py"},
                 {"reportArtifact": "qa-verification.json", "jsonPointer": "/cpuEvidence/resultSHA256",
                  "dependencyArtifact": "cpu-result.json"}]}
+        if self.config.get("nativeQAContractVersion", 1) == 3:
+            steps[1]["parameters"] = {"nativeQAContractVersion": 3, "cpuReplayObservationVersion": 1,
+                                      "cpuReplayProfile": "python-cpu-candidate-base-v1"}
+            steps[1]["dependencyEvidence"] = {"version": 2, "kind": "controller-cpu-replay",
+                                              "sourceStep": "produce", "reportArtifact": "qa-verification.json"}
         for step, file, fields in [(steps[0], "verification.json", {"passed": True, "scopePreserved": True,
                 "gpuValidated": False, "officialActionsPerformed": False}),
                 (steps[1], "qa-verification.json", {"passed": True, "cpuReplayPassed": True, "scopePreserved": True,
                 "approvedForOfficialReview": True, "gpuValidated": False, "officialActionsPerformed": False})]:
+            if step["key"] == "independent-qa" and self.config.get("nativeQAContractVersion", 1) == 3:
+                fields = {"version": 3, "decision": "approve_for_check", "scopePreserved": True,
+                          "canonicalPrecisionPreserved": True, "evaluatorIndependent": True,
+                          "upstreamAttributionPreserved": True, "gpuValidated": False,
+                          "performanceGainProven": False, "officialActionsPerformed": False}
             step["criteria"].extend({"id": field, "label": field, "type": "json_field", "name": file,
                                      "field": field, "equals": value} for field, value in fields.items())
         d = definition(self.config, "OpenKernel — " + experiment["id"], steps)
+        if self.config.get("nativeQAContractVersion", 1) == 3:
+            d["allowedActions"] = ["native.cpu-replay.observe"]
         key = self.config["watchId"] + "-experiment-" + digest([supervisor["occurrenceId"], experiment])[:32]
         packet = self.material_packet(experiment if not repair else {**experiment,
             "sourceArtifactId": repair["originalBaseArtifact"]["id"]}, observation)
         if repair:
             artifacts = repair["producerArtifacts"]
             packet["repairQADiagnostic"] = repair["repairQADiagnostic"]
-            if "reportProjection" in packet["repairQADiagnostic"]:
+            if "reportProjection" in packet["repairQADiagnostic"] or packet["repairQADiagnostic"].get("reportState") == "invalid_original_json_or_schema":
                 original_qa = repair["qaArtifact"]
                 original_raw = self.verified_artifact(original_qa, QA_ARTIFACT_LIMIT)
                 packet["materials"].append({"name": "prior-qa-original.json", "artifactId": original_qa["id"],
@@ -2845,6 +3318,8 @@ proof of correctness. Any candidate, patch, semantic or numerical defect fails.
                     "sha256": a["digest"], "bytes": a["size"], "base64": base64.b64encode(self.verified_artifact(a)).decode()}
                     for a in artifacts]}
             for step, name in [(steps[0], "verification.json"), (steps[1], "qa-verification.json")]:
+                if step["key"] == "independent-qa" and self.config.get("nativeQAContractVersion", 1) == 3:
+                    continue  # Frozen controller request binds the repair bytes.
                 step["criteria"].append({"id": "immutable-repair-candidate", "label": "Preserve original candidate bytes",
                     "type": "json_field", "name": name, "field": "candidateSHA256", "equals": repair["candidateSHA256"]})
         created = self.post_once("create", key, {"requestKey": key, "definition": d})
