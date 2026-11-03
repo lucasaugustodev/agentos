@@ -112,10 +112,10 @@ def native_qa3_semantic_report(report):
     checker = report["checkerReview"]; checks = ["casesMeaningful", "negativeControlsDiscriminating", "noTautologicalPass"]
     require(type(checker) is dict and set(checker) == set([*checks, "rationale"])
         and all(type(checker[k]) is bool for k in checks)
-        and type(checker["rationale"]) is str and 0 < len(checker["rationale"]) <= 8000,
+        and type(checker["rationale"]) is str and 0 < len(checker["rationale"].strip()) <= 8000,
         "NATIVE_QA3_SEMANTIC_SCHEMA")
     require(all(type(report[k]) is list and len(report[k]) <= 100
-        and all(type(v) is str and 0 < len(v) <= 8000 for v in report[k]) for k in arrays),
+        and all(type(v) is str and 0 < len(v.strip()) <= 8000 for v in report[k]) for k in arrays),
         "NATIVE_QA3_SEMANTIC_SCHEMA")
     return (report["decision"] == "approve_for_check" and all(report[k] for k in flags)
         and all(checker[k] for k in checks) and not report["blockingFindings"])

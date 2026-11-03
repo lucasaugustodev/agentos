@@ -326,6 +326,31 @@ class NativeQAV3EvidenceTests(unittest.TestCase):
         self.assertEqual(base64.b64decode(original['base64']), raw); self.assertEqual(original['sha256'], W.digest(raw))
         self.assertEqual(self.f.client.posts, [])
 
+    def test_whitespace_only_semantics_remain_raw_report_invalid_without_rewriting(self):
+        for field in ['rationale', 'blockingFindings', 'findings', 'limitations']:
+            report = copy.deepcopy(self.report)
+            if field == 'rationale': report['checkerReview']['rationale'] = ' \t\n '
+            else: report[field] = [' \t\n ']
+            raw = W.canonical(report)
+            self.replace_report(raw, 'NATIVE_QA3_REPORT_INVALID', None)
+            self.qa['state'] = 'failed'; self.detail['steps'][1]['state'] = 'attention'; self.detail['occurrence']['state'] = 'attention'
+            with self.subTest(field=field):
+                view, parsed = self.read()
+                self.assertEqual(view['bindingState'], 'verified')
+                self.assertEqual(view['validationCode'], 'NATIVE_QA3_REPORT_INVALID')
+                self.assertFalse(view['reportSchemaValid'])
+                self.assertIsNone(parsed)
+                self.assertEqual(self.f.client.artifacts[self.qa_ref['id']], raw)
+        self.assertEqual(self.f.client.posts, [])
+
+    def test_semantic_text_limits_validate_trimmed_view_but_preserve_raw_report(self):
+        report = copy.deepcopy(self.report)
+        report['checkerReview']['rationale'] = ' ' * 8001 + 'reviewed' + ' ' * 8001
+        report['findings'] = [' padded finding ']
+        raw = W.canonical(report)
+        self.assertTrue(W.native_qa3_semantic_report(report))
+        self.assertEqual(W.canonical(report), raw)
+
     def test_repair_selects_actual_producer_when_failed_qa_alias_sorts_first(self):
         oid = self.install_owned(); self.replace_report(b'{"version":3,"version":3}', 'NATIVE_QA3_REPORT_INVALID', None)
         self.qa['state'] = 'failed'; self.detail['steps'][1]['state'] = 'attention'; self.detail['occurrence']['state'] = 'attention'
