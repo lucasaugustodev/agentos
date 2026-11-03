@@ -1560,6 +1560,8 @@ class NativeAudit:
         require(len(selected) == 1 and all(selected[0].get(k) == source_artifact.get(k) for k in ("id", "name", "digest", "size"))
                 and selected[0]["attempt_id"] in {a["id"] for a in attempts.values()}
                 and self.artifact(selected[0]) == candidate, "SOURCE_ORIGIN_ARTIFACT_ALIAS")
+        if contract_v3 and qa_attempt and selected[0]["attempt_id"] == qa_attempt["id"]:
+            require(qa_attempt["state"] == "completed", "SOURCE_ORIGIN_QA_ALIAS_UNCONFIRMED")
         # A QA-published copy is a transport alias, not independent source. The
         # producer artifact and exact handed-off bytes must both be established.
         if qa_attempt:

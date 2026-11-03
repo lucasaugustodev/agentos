@@ -3059,6 +3059,16 @@ class NativeQA3Tests(unittest.TestCase):
         self.f.put(pathlib.Path(self.f.paths['workerRunsDirectory'])/IDS[1]/'home/inputs'/producer['id']/'candidate.py',b'changed')
         with self.assertRaises(ValueError):self.f.origin(ref)
 
+    def test_failed_v3_qa_alias_is_not_a_new_base_but_actual_producer_origin_survives(self):
+        self.rejected_report(b'{"version":3,')
+        row=self.f.artifact('candidate.py',self.f.candidate,IDS[1]);self.d['artifacts'].append(row)
+        with self.assertRaisesRegex(ValueError,'SOURCE_ORIGIN_QA_ALIAS_UNCONFIRMED'):
+            self.f.origin({**row,'occurrenceId':OCC,'problem':BOARD})
+        producer=next(r for r in self.d['artifacts'] if r['name']=='candidate.py' and r['attempt_id']==IDS[0])
+        report=A.strict_json(A.pinned(self.f.origin({**producer,'occurrenceId':OCC,'problem':BOARD})[0]))
+        self.assertFalse(report['qualityAccepted']);self.assertEqual(report['selectedArtifactId'],producer['id'])
+        self.assertEqual(self.f.official.posts,0)
+
     def test_registration_scope_cannot_self_authorize_new_profile_or_duplicate_entry(self):
         for value in ({'version':True,'registrations':[self.binding]}, {'version':1,'registrations':[self.binding,self.binding]},
                       {'version':1,'registrations':[{**self.binding,'profile':'model-command'}]}):
