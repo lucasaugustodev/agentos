@@ -3,7 +3,7 @@ import { DomainError, criterionSchema, validateDag } from '../contracts.js';
 import { checkMemoryContent } from '../memory.js';
 
 const artifactName = z.string().regex(/^[\w][\w.-]{0,150}$/);
-export const dependencyEvidenceSchema = z.object({
+const dependencyHashEvidenceSchema = z.object({
   version: z.literal(1),
   sourceStep: z.string().regex(/^[a-z0-9_-]{1,60}$/),
   bindings: z.array(z.object({
@@ -19,6 +19,10 @@ export const dependencyEvidenceSchema = z.object({
     seen.add(key);
   }
 });
+export const dependencyEvidenceSchema = z.union([dependencyHashEvidenceSchema, z.object({
+  version: z.literal(2), kind: z.literal('controller-cpu-replay'),
+  sourceStep: z.literal('produce'), reportArtifact: z.literal('qa-verification.json'),
+}).strict()]);
 
 export const stepSchema = z
   .object({
@@ -62,12 +66,17 @@ export const stepSchema = z
     if (s.dependencyEvidence && (s.kind !== 'agent' || s.repairStep ||
         !s.dependsOn.includes(s.dependencyEvidence.sourceStep)))
       ctx.addIssue({ code: 'custom', message: 'Dependency evidence requires a direct agent dependency and consumer-only retries.' });
-    if (s.parameters.nativeQAContractVersion !== undefined && s.parameters.nativeQAContractVersion !== 1 &&
-        (s.parameters.nativeQAContractVersion !== 2 || !s.dependencyEvidence || s.maxAttempts > 3))
+    if (s.parameters.nativeQAContractVersion !== undefined && ![1, 2, 3].includes(s.parameters.nativeQAContractVersion as number))
+      ctx.addIssue({ code: 'custom', message: 'Unknown NativeQA contract version.' });
+    if (s.parameters.nativeQAContractVersion === 2 && (s.dependencyEvidence?.version !== 1 || s.maxAttempts > 3))
       ctx.addIssue({ code: 'custom', message: 'NativeQA v2 requires dependency evidence and at most three QA attempts.' });
+    if ((s.parameters.nativeQAContractVersion === 3 || s.dependencyEvidence?.version === 2) &&
+        (s.parameters.nativeQAContractVersion !== 3 || s.dependencyEvidence?.version !== 2 || s.maxAttempts !== 1 ||
+         s.parameters.cpuReplayObservationVersion !== 1 || s.parameters.cpuReplayProfile !== 'python-cpu-candidate-base-v1'))
+      ctx.addIssue({ code: 'custom', message: 'NativeQA v3 requires its explicit controller contract, positional replay and one QA attempt.' });
     if (s.parameters.cpuReplayObservationVersion !== undefined &&
         (s.parameters.cpuReplayObservationVersion !== 1 || s.kind !== 'agent' ||
-         s.parameters.nativeQAContractVersion !== 2 || !s.dependencyEvidence ||
+         ![2, 3].includes(s.parameters.nativeQAContractVersion as number) || !s.dependencyEvidence ||
          !['python-cpu-argv-v1', 'python-cpu-candidate-base-v1'].includes(s.parameters.cpuReplayProfile as string)))
       ctx.addIssue({ code: 'custom', message: 'CPU replay observation requires explicit version 1 and a NativeQA v2 consumer.' });
     if (s.parameters.cpuReplayProfile !== undefined && s.parameters.cpuReplayObservationVersion !== 1)
@@ -101,10 +110,13 @@ export const cycleSchema = z
     for (const s of c.steps) {
       if (s.parameters.cpuReplayObservationVersion === 1 && !c.allowedActions.includes('native.cpu-replay.observe'))
         ctx.addIssue({ code: 'custom', message: 'CPU replay observation requires its registered action capability.' });
+      if (s.parameters.nativeQAContractVersion === 3 &&
+          (c.allowedActions.length !== 1 || c.allowedActions[0] !== 'native.cpu-replay.observe'))
+        ctx.addIssue({ code: 'custom', message: 'NativeQA v3 permits only its controller replay capability.' });
       if (s.dependencyEvidence) {
         const source = c.steps.find(p => p.key === s.dependencyEvidence!.sourceStep);
         if (!source || source.kind !== 'agent' ||
-            (s.parameters.nativeQAContractVersion === 2 && source.maxAttempts !== 1))
+            ([2, 3].includes(s.parameters.nativeQAContractVersion as number) && source.maxAttempts !== 1))
           ctx.addIssue({ code: 'custom', message: 'NativeQA dependency must be an agent with one producer attempt.' });
       }
       if (

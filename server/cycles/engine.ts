@@ -8,7 +8,8 @@ import { listBitrix, clean } from './integrations.js';
 import { runCycleAction, runCycleAgent, saveCycleArtifacts, readCycleArtifact } from './runtime.js';
 import { inspectStopped } from '../continuation.js';
 import { collectStoppedArtifacts } from '../artifact-recovery.js';
-import { checkDependencyEvidence, assertDependencySnapshot, DependencyBindingError } from './dependency-evidence.js';
+import { checkDependencyEvidence, assertDependencySnapshot, DependencyBindingError, nativeQA3 } from './dependency-evidence.js';
+import { checkNativeQA3, assertNativeQA3Commit, NativeQA3PreparationError } from './native-qa3.js';
 import { claimCycleTerminationInspections, inspectAndRecordCycleTermination } from './termination-evidence.js';
 import { claimCPUPreparations, CPUReplayPending, deferCPUPreparation, cpuPreparationOwned, cancelCPUPreparation } from './cpu-replay.js';
 
@@ -503,6 +504,9 @@ export class CycleEngine {
       await saveCycleArtifacts(a.id, result.artifacts ?? []);
       if (s.definition.action === 'agentos.validate' && result.output?.passed === false)
         throw new DomainError('VALIDATION_CHECKS_FAILED', 'A validação terminou e registrou testes ou cobertura obrigatória sem aprovação.');
+      // v3 records the controller/report binding even for a semantic rejection;
+      // generic display criteria must not erase that diagnostic provenance.
+      const nativeQA3Gate = nativeQA3(s.definition) ? await checkNativeQA3(o, s, a) : undefined;
       for (const criterion of s.definition.criteria) {
         const artifact = (
           await pool.query('SELECT id FROM cycle_artifacts WHERE attempt_id=$1 AND name=$2', [
@@ -521,13 +525,14 @@ export class CycleEngine {
             throw new DomainError('DELIVERY_INVALID', 'Critério não atendido: ' + criterion.label);
         }
       }
-      const dependencySnapshot = s.definition.dependencyEvidence
-        ? await checkDependencyEvidence(o, s, a) : undefined;
+      const dependencySnapshot = nativeQA3Gate?.snapshot ?? (s.definition.dependencyEvidence
+        ? await checkDependencyEvidence(o, s, a) : undefined);
       await tx(async (db) => {
         await lock(db);
         if (dependencySnapshot) {
           if (controller.signal.aborted) throw new DomainError('DEPENDENCY_EXECUTION_CANCELLED', 'Validation was cancelled.');
           await assertDependencySnapshot(db, o, s, a, dependencySnapshot);
+          if (nativeQA3Gate) await assertNativeQA3Commit(db, o, s, a, nativeQA3Gate);
         }
         const changed = await db.query(
           "UPDATE cycle_attempts SET state='completed',finished_at=now(),summary=$3,usage=$4,receipt=$5 WHERE id=$1 AND fence=$2 AND state='running' RETURNING id",
@@ -578,8 +583,8 @@ export class CycleEngine {
             uncertain ? 'reconciling' : controller.signal.aborted ? 'cancelled' : 'failed',
             code,
             clean(e.code ? e.message : 'A execução não produziu um resultado válido.'),
-            !!s.definition.dependencyEvidence && result?.evidence?.stopped === true,
-            JSON.stringify(result?.evidence ?? null),
+            e instanceof NativeQA3PreparationError || !!s.definition.dependencyEvidence && result?.evidence?.stopped === true,
+            JSON.stringify(e instanceof NativeQA3PreparationError ? e.terminal : result?.evidence ?? null),
           ],
         );
         if (!changed.rowCount) return;

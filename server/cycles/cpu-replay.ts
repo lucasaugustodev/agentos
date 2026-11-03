@@ -8,7 +8,7 @@ import { z } from 'zod';
 import { pool, tx, lock } from '../db.js';
 import { hash } from '../memory.js';
 import { DomainError } from '../contracts.js';
-import { assertDependencySnapshot, dependencyArtifactBytes, type DependencySnapshot } from './dependency-evidence.js';
+import { assertDependencySnapshot, assertFrozenDependencySource, dependencyArtifactBytes, type DependencySnapshot } from './dependency-evidence.js';
 import { cycleEvent } from './store.js';
 
 const action = 'native.cpu-replay.observe';
@@ -25,7 +25,13 @@ const registrationSchema = z.object({
     maxOutputBytes: z.number().int().min(1024).max(262144) }).strict(),
 }).strict();
 export type CPUReplayRegistration = z.infer<typeof registrationSchema>;
-type LoadedRegistration = { value: CPUReplayRegistration; path: string; digest: string };
+export type LoadedRegistration = { value: CPUReplayRegistration; path: string; digest: string };
+const registrationBindingSchema = z.object({ path: absolute, digest: sha, executorPath: absolute,
+  executorSHA256: sha, profile: profileSchema }).strict();
+export function cpuReplayRegistrationBinding(r: LoadedRegistration, profile: string) {
+  return registrationBindingSchema.parse({ path: r.path, digest: r.digest,
+    executorPath: r.value.executorPath, executorSHA256: r.value.executorSHA256, profile });
+}
 const artifactNames = ['candidate.py', 'cpu-checks.py', 'cpu-result.json'];
 export function cpuReplayArgv(profile: string) {
   if (profile === 'python-cpu-candidate-base-v1')
@@ -117,8 +123,7 @@ async function protectedBytes(file: string, maxBytes: number) {
 
 export const cpuReplayIO = {
   spawn,
-  async registration(): Promise<LoadedRegistration> {
-    const file = process.env.AGENTOS_CPU_REPLAY_REGISTRATION;
+  async registration(file = process.env.AGENTOS_CPU_REPLAY_REGISTRATION): Promise<LoadedRegistration> {
     if (!file) return fail('CPU_REPLAY_DISABLED');
     try {
       const raw = await protectedBytes(file, 16384);
@@ -131,9 +136,26 @@ export const cpuReplayIO = {
       return fail('CPU_REPLAY_REGISTRATION_INVALID');
     }
   },
-  async invoke(mode: 'execute' | 'inspect' | 'cancel', registered: LoadedRegistration, request: any, signal: AbortSignal): Promise<any> {
+  async verificationRegistration(input: unknown): Promise<LoadedRegistration> {
+    const binding = registrationBindingSchema.parse(input);
+    let permitted = false;
+    if (binding.path === process.env.AGENTOS_CPU_REPLAY_REGISTRATION) {
+      const current = await cpuReplayIO.registration(binding.path);
+      permitted = isDeepStrictEqual(cpuReplayRegistrationBinding(current, binding.profile), binding);
+    }
+    if (!permitted && process.env.AGENTOS_CPU_REPLAY_VERIFICATION_REGISTRATIONS) {
+      const allow = z.object({ version: z.literal(1), registrations: z.array(registrationBindingSchema).max(32) }).strict()
+        .parse(JSON.parse((await protectedBytes(process.env.AGENTOS_CPU_REPLAY_VERIFICATION_REGISTRATIONS, 32768)).toString('utf8')));
+      permitted = allow.registrations.some(entry => isDeepStrictEqual(entry, binding));
+    }
+    if (!permitted) return fail('CPU_REPLAY_VERIFICATION_NOT_REGISTERED');
+    const original = await cpuReplayIO.registration(binding.path);
+    if (!isDeepStrictEqual(cpuReplayRegistrationBinding(original, binding.profile), binding)) return fail('CPU_REPLAY_REGISTRATION_CHANGED');
+    return original;
+  },
+  async invoke(mode: 'execute' | 'inspect' | 'cancel' | 'verify', registered: LoadedRegistration, request: any, signal: AbortSignal): Promise<any> {
     if (signal.aborted) return fail('CPU_REPLAY_CANCELLED');
-    const current = await cpuReplayIO.registration();
+    const current = await cpuReplayIO.registration(mode === 'verify' ? registered.path : undefined);
     if (!isDeepStrictEqual(current, registered)) return fail('CPU_REPLAY_REGISTRATION_CHANGED');
     if (signal.aborted) return fail('CPU_REPLAY_CANCELLED');
     return new Promise((resolve, reject) => {
@@ -150,7 +172,7 @@ export const cpuReplayIO = {
       };
       const unavailable = () => new DomainError('CPU_REPLAY_UNCONFIRMED', 'CPU executor response was lost. Reconcile the persisted execution; do not repeat it.');
       const abort = () => { child.kill('SIGTERM'); finish(unavailable()); };
-      const timer = setTimeout(abort, (registered.value.limits.timeoutSeconds + 45) * 1000);
+      const timer = setTimeout(abort, mode === 'verify' ? 15000 : (registered.value.limits.timeoutSeconds + 45) * 1000);
       signal.addEventListener('abort', abort, { once: true });
       if (signal.aborted) { abort(); return; }
       child.stdin.on('error', () => finish(unavailable()));
@@ -218,7 +240,7 @@ async function assertReplayAuthority(db: any, o: any, s: any, a: any, snapshot: 
       !(a.cpuReplayCancelOnly ? live.state === 'cancelling' : ['running', 'queued'].includes(live.state)))
     return fail('CPU_REPLAY_AUTHORITY_CHANGED');
 }
-async function frozenBase(o: any, db: any = pool) {
+async function frozenBase(o: any, db: any = pool, allowQAAlias = false) {
   const experiment = o.input?.experiment, ref = experiment?.sourceArtifact;
   const candidates = Array.isArray(experiment?.materials) ? experiment.materials.filter((m: any) => m.name === 'base-candidate.py') : [];
   if (candidates.length !== 1 || !ref || ref.name !== 'candidate.py' || !uuid.safeParse(ref.id).success ||
@@ -229,24 +251,41 @@ async function frozenBase(o: any, db: any = pool) {
   if (bytes.toString('base64') !== material.base64 || material.bytes !== ref.size || bytes.length !== ref.size ||
       material.sha256 !== ref.digest || hash(bytes) !== ref.digest) return fail('CPU_REPLAY_BASE_BINDING');
   const row = (await db.query(`SELECT ar.id,ar.name,ar.digest,ar.size,a.id attempt_id,a.fence,a.state,a.receipt,
-    s.key,o.id occurrence_id,o.definition->>'project' project FROM cycle_artifacts ar
+    a.number,a.context,s.id step_id,s.attempt,s.state step_state,s.definition step_definition,
+    s.key,o.id occurrence_id,o.version definition_version,o.definition->>'project' project FROM cycle_artifacts ar
     JOIN cycle_attempts a ON a.id=ar.attempt_id JOIN cycle_steps s ON s.id=a.step_id
     JOIN cycle_occurrences o ON o.id=s.occurrence_id WHERE ar.id=$1 FOR SHARE OF ar,a,s,o`, [ref.id])).rows[0];
   const artifact = { id: ref.id, name: ref.name, digest: ref.digest, size: ref.size };
-  if (!row || row.occurrence_id !== ref.occurrenceId || row.project !== o.definition.project || row.key !== 'produce' ||
+  if (!row || row.occurrence_id !== ref.occurrenceId || row.project !== o.definition.project ||
       row.state !== 'completed' || row.receipt?.stopped !== true ||
       !isDeepStrictEqual({ id: row.id, name: row.name, digest: row.digest, size: row.size }, artifact) ||
       !(await dependencyArtifactBytes(artifact)).equals(bytes)) return fail('CPU_REPLAY_BASE_BINDING');
+  if (row.key !== 'produce') {
+    const snapshot = row.context?.manifest?.dependencyEvidence;
+    const qaVersion = row.step_definition?.parameters?.nativeQAContractVersion;
+    const validation = qaVersion === 3 ? row.context?.nativeQA3Validation : row.context?.dependencyEvidenceValidation;
+    if (!allowQAAlias || ![2, 3].includes(qaVersion) || row.step_state !== 'completed' || row.attempt !== row.number ||
+        row.context?.manifest?.definitionVersion !== row.definition_version ||
+        row.context?.manifest?.cycleInput?.attemptId !== row.attempt_id ||
+        row.context?.manifest?.cycleInput?.occurrenceId !== row.occurrence_id ||
+        row.context?.manifest?.cycleInput?.runFence !== row.fence || snapshot?.source?.key !== 'produce' ||
+        validation?.status !== 'matched' || !isDeepStrictEqual(validation.source, snapshot.source))
+      return fail('CPU_REPLAY_BASE_ALIAS_UNPROVEN');
+    await assertFrozenDependencySource(db, { id: row.occurrence_id },
+      { id: row.step_id, key: row.key, definition: row.step_definition },
+      { id: row.attempt_id, number: row.number, fence: row.fence }, snapshot);
+    const canonical = snapshot.artifacts.filter((f: any) => f.name === 'candidate.py');
+    if (canonical.length !== 1 || canonical[0].digest !== artifact.digest || canonical[0].size !== artifact.size ||
+        !(await dependencyArtifactBytes(canonical[0])).equals(bytes)) return fail('CPU_REPLAY_BASE_ALIAS_UNPROVEN');
+  }
   return { input: { ...artifact, name: 'base-candidate.py', base64: bytes.toString('base64') },
     proof: { artifact, source: { occurrenceId: row.occurrence_id, attemptId: row.attempt_id, runFence: row.fence },
       inputSHA256: hash(JSON.stringify(o.input ?? {})) } };
 }
 
-export async function observeCPUReplay(o: any, s: any, a: any, snapshot: DependencySnapshot,
-  signal: AbortSignal, onEvent: (kind: string, payload: any) => Promise<void>) {
-  if (s.definition.parameters.cpuReplayObservationVersion !== 1 || s.definition.parameters.nativeQAContractVersion !== 2 ||
+export async function buildCPUReplayRequest(o: any, s: any, a: any, snapshot: DependencySnapshot, registration: LoadedRegistration) {
+  if (s.definition.parameters.cpuReplayObservationVersion !== 1 || ![2, 3].includes(s.definition.parameters.nativeQAContractVersion) ||
       !o.definition.allowedActions.includes(action)) return fail('CPU_REPLAY_SCOPE');
-  const registration = await cpuReplayIO.registration();
   const profile = profileSchema.parse(s.definition.parameters.cpuReplayProfile);
   if (!registration.value.projects.includes(o.definition.project) || !registration.value.profiles.includes(profile)) return fail('CPU_REPLAY_SCOPE');
   if (!uuid.safeParse(a.id).success || !uuid.safeParse(a.fence).success || !uuid.safeParse(o.id).success)
@@ -257,12 +296,18 @@ export async function observeCPUReplay(o: any, s: any, a: any, snapshot: Depende
     if (refs.length !== 1 || refs[0].size <= 0 || refs[0].size > 1024 * 1024) return fail('CPU_REPLAY_INPUT_INVALID');
     artifacts.push({ ...refs[0], base64: (await dependencyArtifactBytes(refs[0])).toString('base64') });
   }
-  const base = profile === 'python-cpu-candidate-base-v1' ? await frozenBase(o) : null;
+  const base = profile === 'python-cpu-candidate-base-v1' ? await frozenBase(o, pool, s.definition.parameters.nativeQAContractVersion === 3) : null;
   if (base) artifacts.push(base.input);
   const request = { version: 1, requestId: a.id, occurrenceId: o.id, runFence: a.fence,
     definitionVersion: o.version, project: o.definition.project, source: snapshot.source, artifacts,
     profile, baseSource: base?.proof ?? null,
     registrationSHA256: registration.digest, executorSHA256: registration.value.executorSHA256 };
+  return { request, base };
+}
+export async function observeCPUReplay(o: any, s: any, a: any, snapshot: DependencySnapshot,
+  signal: AbortSignal, onEvent: (kind: string, payload: any) => Promise<void>) {
+  const registration = await cpuReplayIO.registration();
+  const { request, base } = await buildCPUReplayRequest(o, s, a, snapshot, registration);
   const inputHash = hash(cpuReplayCanonical(request)), actionKey = `${o.id}:${a.id}:cpu-replay-v1`;
   const state = await tx(async db => {
     await lock(db);
@@ -279,12 +324,14 @@ export async function observeCPUReplay(o: any, s: any, a: any, snapshot: Depende
       a.cpuReplayLease = randomUUID();
       const preparation = { version: 1, phase: 'preparing', token: a.cpuReplayLease,
         requestSHA256: inputHash, registrationSHA256: registration.digest, executorSHA256: registration.value.executorSHA256,
-        authoritySHA256: authorityHash(o, s, a), snapshot, polls: 0 };
+        authoritySHA256: authorityHash(o, s, a), snapshot, polls: 0,
+        ...(s.definition.parameters.nativeQAContractVersion === 3
+          ? { registration: cpuReplayRegistrationBinding(registration, request.profile) } : {}) };
       await db.query("UPDATE cycle_attempts SET context=COALESCE(context,'{}'::jsonb)||$2::jsonb WHERE id=$1",
         [a.id, JSON.stringify({ cpuReplayPreparation: preparation })]);
     }
     await assertReplayAuthority(db, o, s, a, snapshot);
-    if (base && !isDeepStrictEqual(base, await frozenBase(o, db))) return fail('CPU_REPLAY_BASE_BINDING');
+    if (base && !isDeepStrictEqual(base, await frozenBase(o, db, s.definition.parameters.nativeQAContractVersion === 3))) return fail('CPU_REPLAY_BASE_BINDING');
     if (signal.aborted) return fail('CPU_REPLAY_CANCELLED');
     const prior = (await db.query('SELECT * FROM cycle_action_receipts WHERE action_key=$1', [actionKey])).rows[0];
     if (prior) {
@@ -359,7 +406,7 @@ export async function observeCPUReplay(o: any, s: any, a: any, snapshot: Depende
   }
   await tx(async db => {
     await lock(db); await assertReplayAuthority(db, o, s, a, snapshot);
-    if (base && !isDeepStrictEqual(base, await frozenBase(o, db))) return fail('CPU_REPLAY_BASE_BINDING');
+    if (base && !isDeepStrictEqual(base, await frozenBase(o, db, s.definition.parameters.nativeQAContractVersion === 3))) return fail('CPU_REPLAY_BASE_BINDING');
     if (signal.aborted) return fail('CPU_REPLAY_CANCELLED');
     const changed = await db.query("UPDATE cycle_action_receipts SET state='completed',receipt=$3::jsonb,updated_at=now() WHERE action_key=$1 AND input_hash=$2 RETURNING action_key",
       [actionKey, inputHash, JSON.stringify(receipt)]);
