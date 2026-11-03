@@ -1530,8 +1530,10 @@ class Watchdog:
         return {"state": "legacy_exported", "sha256": digest(raw), "bytes": len(raw), "newPostRequests": 0}
 
     def status(self, state, **facts):
+        failures = getattr(self, "_official_observation_failures", [])
         value = {"observedAt": now_iso(), "state": state, "watchId": self.config["watchId"],
-                 "controlCycleId": self.config["controlCycleId"], "officialPostAuthority": False, **facts}
+                 "controlCycleId": self.config["controlCycleId"], "officialPostAuthority": False,
+                 **({"officialObservationFailures": failures} if failures else {}), **facts}
         atomic(self.directory / "latest.json", value)
         return value
 
@@ -2703,9 +2705,31 @@ class Watchdog:
             if controller_evidence is not None:
                 outcomes[-1]["controllerEvidence"] = controller_evidence
         jobs, pending_jobs = [], []
+        self._official_observation_failures = []
         for job in registered_jobs:
             cached = self.state["official"].get(job["id"])
-            raw = cached or self.client.official(job)
+            if cached:
+                raw = cached
+            else:
+                try:
+                    raw = self.client.official(job)
+                except ValueError as error:
+                    failure = official_error_fields(error, self.config).get("officialObservationFailure")
+                    # Contain only an authenticated diagnostic from this CLI
+                    # lookup. The registered job/transport receipt still owns
+                    # its slot; this response supplies no result or receipt.
+                    if not (failure and failure.get("origin") == "cli"
+                            and failure.get("cliExitCode") == 0
+                            and failure.get("responseEncoding") == "cli-stdout"
+                            and failure.get("expectedId", {}).get("value") == job["id"]
+                            and failure.get("expectedBoard", {}).get("value") == job["problem"]):
+                        raise
+                    self._official_observation_failures.append(failure)
+                    pending_jobs.append(job["id"])
+                    jobs.append({**{k: job[k] for k in ["id", "problem", "sourceSHA256"]},
+                        "status": "observation_unavailable", "observationCode": "OFFICIAL_IDENTITY",
+                        "result": {}, "caseCounts": None})
+                    continue
             official_identity_guard(raw, job, "cache" if cached else "client")
             if raw.get("status") not in ["done", "failed"]:
                 pending_jobs.append(job["id"])
