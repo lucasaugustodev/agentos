@@ -406,6 +406,64 @@ Other final failure codes currently cannot provide v2 source provenance; recover
 from a semantic failure requires a separate contract and is not part of this
 binding-retry change.
 
+### NativeQA v3: controller CPU evidence and semantic review
+
+This contract is opt-in for new definitions and requires the matching core,
+watcher and adapter. It does not reinterpret any existing v1/v2 attempt. Both
+producer and QA have one attempt. Transport and preparation recovery retains
+that same attempt and fence; a semantic rejection is not retried until it passes.
+
+The QA step declares `nativeQAContractVersion: 3`,
+`cpuReplayObservationVersion: 1` and the fixed
+`python-cpu-candidate-base-v1` profile. Its dependency contract is version 2,
+kind `controller-cpu-replay`, source step `produce`, report artifact
+`qa-verification.json`. The definition allows only `native.cpu-replay.observe`.
+Execution additionally needs a separately reviewed protected registration.
+The adapter policy's `nativeQA3Registrations: {version: 1, registrations: [...]}`
+pins each exact `{path, digest, executorPath, executorSHA256, profile}`. This
+verification allowlist does not install or enable an executor.
+
+The core freezes the producer, consumer fence, candidate, checker, original CPU
+result, patch and actual base artifact. A non-root executor runs the registered
+fixed CPU command with bounded memory, time and output. The authenticated
+`GET /api/cycle-runs/:occurrenceId/attempts/:attemptId/cpu-replay` returns the
+original request metadata, protected receipt, handoff and validation. The adapter
+reconstructs the request from immutable bytes and independently calls only the
+pinned launcher's read-only `verify` mode. A copied model file cannot supply this
+authority. Request and receipt hashes use `cpu-replay-ascii-integers-v1`; the base
+input hash separately binds the original raw task-input bytes.
+
+The model reviews the checker, meaningful cases, discriminating controls, scope,
+precision and attribution. Its version 3 report contains `decision`, semantic
+flags, `checkerReview`, findings and limitations. It does not copy tool commands,
+hashes or CPU result tables. GPU validation, performance gains and official actions
+remain explicitly false. The original report and the controller receipt are
+separate evidence; an executor's `passed` field is never semantic approval.
+
+Technical CPU failure blocks before the QA model. The typed terminal receipt
+proves only the stopped CPU process; no harness stop or absent QA report is
+fabricated. Incomplete execution, cancellation before dispatch or unavailable
+physical proof remains unconfirmed. A valid semantic rejection preserves the
+report and requires a new hypothesis. A malformed original report can be carried
+into a separately planned repair as raw historical bytes plus authenticated
+controller references, never as a fabricated decision or approval. A new attempt
+must acquire its own CPU receipt and independent review.
+
+Source provenance remains separate from quality acceptance. A completed producer
+can supply the exact source bytes after an authenticated QA3 rejection. A QA copy
+is an alias only with its real completed actor, frozen producer chain and identical
+handed-off bytes. Legacy QA aliases without that proof remain closed; new tasks
+can select the actual authenticated producer artifact instead. Cyclic ancestry,
+changed bindings, stale physical proof and modified raw artifacts fail closed.
+
+Terminal QA3 rejections may use the existing bounded diagnostic cache, including
+an explicitly absent QA artifact after CPU preparation failure. Every reuse
+verifies the current native chain and protected receipt; original observation
+age, one-hour TTL, authority pins and effect-ledger precedence remain unchanged.
+This does not cache acceptance or authorize CHECK. Subsequent CHECK admission
+still requires a fresh complete audit, independent semantic approval, physical
+stops, current rules/quota and the existing no-resend ledger.
+
 ### Explicit reservations for a known uncertain CHECK
 
 The default remains an account-wide block while an effect is uncertain. An

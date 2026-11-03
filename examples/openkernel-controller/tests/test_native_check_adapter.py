@@ -2798,5 +2798,398 @@ class OptionalArtifactBoundsTests(unittest.TestCase):
         self.assertEqual(self.f.official.posts, 0)
 
 
+class NativeQA3Tests(unittest.TestCase):
+    def setUp(self):
+        self.f = Fixture(); self.f.setUp(); self.addCleanup(self.f.tearDown)
+        self.d, self.a = self.f.detail, self.f.audit
+        self.f.origin_fixture(failed_qa=False)
+        o = self.d['occurrence']; o['version'] = 1
+        o['definition']['allowedActions'] = ['native.cpu-replay.observe']
+        o['definition']['steps'][1].update(parameters={'nativeQAContractVersion':3,
+            'cpuReplayObservationVersion':1,'cpuReplayProfile':A.QA3_PROFILE}, dependencyEvidence={
+            'version':2,'kind':'controller-cpu-replay','sourceStep':'produce','reportArtifact':'qa-verification.json'})
+        for s in self.d['steps']: s['attempt'] = 1
+        base = o['input']['experiment']['sourceArtifact']
+        base.update(occurrenceId='aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',problem=BOARD)
+        self.origin_detail = {'occurrence':{'id':base['occurrenceId'],'definition':{'project':'openkernel'}},
+            'artifacts':[base], 'steps':[{'id':'base-step','key':'produce'}],
+            'attempts':[{'id':base['attempt_id'],'step_id':'base-step','state':'completed','receipt':{'stopped':True},
+                         'fence':'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'}]}
+        self.f.refresh_current_input()
+        key=o['source_key'][len('manual:'):-4]
+        self.f.put(pathlib.Path(self.f.paths['watcherStateDirectory'])/('intent-'+A.digest(key)+'.json'), A.canonical({
+            'state':'recorded','kind':'create','requestKey':key,'result':{'id':CYCLE,'definition':o['definition']},
+            'requestDigest':A.digest({'requestKey':key,'definition':o['definition']})}))
+        self.semantic = {'version':3,'decision':'approve_for_check','scopePreserved':True,'canonicalPrecisionPreserved':True,
+            'evaluatorIndependent':True,'upstreamAttributionPreserved':True,'checkerReview':{'casesMeaningful':True,
+            'negativeControlsDiscriminating':True,'noTautologicalPass':True,'rationale':'Independent discriminating arithmetic review.'},
+            'blockingFindings':[],'findings':[],'limitations':['CPU-only fixture, GPU performance unmeasured.'],
+            'gpuValidated':False,'performanceGainProven':False,'officialActionsPerformed':False}
+        executor=self.f.root/'readonly-verifier.py';self.f.put(executor,b'# Fake process is never executed by this fixture.\n');executor.chmod(0o400)
+        registration={'version':1,'enabled':True,'executorPath':str(executor),'executorSHA256':A.digest(executor.read_bytes()),
+            'stateDirectory':str(self.f.root/'replays'),'user':'nobody','projects':['openkernel'],'profiles':[A.QA3_PROFILE],
+            'limits':{'memoryMiB':128,'timeoutSeconds':30,'maxOutputBytes':262144}}
+        file=self.f.root/'registration.json';self.f.put(file,A.canonical(registration));file.chmod(0o400)
+        self.binding={'path':str(file),'digest':A.digest(file.read_bytes()),'executorPath':str(executor),
+            'executorSHA256':registration['executorSHA256'],'profile':A.QA3_PROFILE}
+        self.f.p['nativeQA3Registrations']={'version':1,'registrations':[self.binding]}
+        self.cpu=copy.deepcopy(self.f.cpu)
+        self.make_evidence()
+        self.a.qa3_verify=mock.Mock(side_effect=lambda binding,request:copy.deepcopy(self.verified))
+        self.f.runtime.api=self.route
+        # No copied shell command is required in either actor's transcript.
+        for actor in self.d['attempts']:
+            self.f.put(pathlib.Path(self.f.paths['workerRunsDirectory'])/actor['id']/'home/sessions/--workspace--'/actor['id']/'session.v3.jsonl',b'{}\n')
+
+    def route(self, method, path):
+        self.assertEqual(method,'GET')
+        if path.endswith('/cpu-replay'): return copy.deepcopy(self.evidence)
+        if path.endswith(self.origin_detail['occurrence']['id']): return copy.deepcopy(self.origin_detail)
+        if path.endswith(OCC): return copy.deepcopy(self.d)
+        self.fail('Unexpected native route')
+
+    def make_evidence(self):
+        producer, qa=self.d['attempts'];o=self.d['occurrence'];ref=lambda row:{k:row[k] for k in ('id','name','digest','size')}
+        qa_row=next(r for r in self.d['artifacts'] if r['name']=='qa-verification.json')
+        raw=A.canonical(self.semantic);qa_row.update(digest=A.digest(raw),size=len(raw));self.f.put(pathlib.Path(self.f.paths['artifactDirectory'])/qa_row['digest'],raw)
+        refs=sorted([ref(r) for r in self.d['artifacts'] if r['attempt_id']==producer['id']],key=lambda r:(r['name'],r['id']))
+        source={'stepId':self.d['steps'][0]['id'],'key':'produce','attemptId':producer['id'],'attemptNumber':1,'runFence':producer['fence']}
+        snapshot={'version':1,'contractSHA256':A.digest([2,'controller-cpu-replay','produce','qa-verification.json']),
+            'occurrenceId':OCC,'source':source,'artifacts':refs,'consumer':{'stepId':self.d['steps'][1]['id'],'key':'independent-qa',
+            'attemptId':qa['id'],'attemptNumber':1,'runFence':qa['fence']}}
+        qa['context']['manifest']['dependencyEvidence']=copy.deepcopy(snapshot)
+        inputs=[]
+        for name in ('candidate.py','cpu-checks.py','cpu-result.json','implementation.patch'):
+            row=next(r for r in refs if r['name']==name)
+            inputs.append({**row,'base64':base64.b64encode((pathlib.Path(self.f.paths['artifactDirectory'])/row['digest']).read_bytes()).decode()})
+        base=o['input']['experiment']['sourceArtifact'];base_actor=self.origin_detail['attempts'][0]
+        inputs.append({**ref(base),'name':'base-candidate.py','base64':base64.b64encode(self.f.source).decode()})
+        base_source={'artifact':ref(base),'source':{'occurrenceId':base['occurrenceId'],'attemptId':base_actor['id'],'runFence':base_actor['fence']},
+            'inputSHA256':qa['context']['manifest']['cycleInput']['digest']}
+        self.request={'version':1,'requestId':qa['id'],'occurrenceId':OCC,'runFence':qa['fence'],'definitionVersion':1,
+            'project':'openkernel','source':source,'artifacts':inputs,'profile':A.QA3_PROFILE,'baseSource':base_source,
+            'registrationSHA256':self.binding['digest'],'executorSHA256':self.binding['executorSHA256']}
+        request_sha=A.digest(A.qa3_canonical(self.request));out=lambda raw:{'digest':A.digest(raw),'size':len(raw),'base64':base64.b64encode(raw).decode()}
+        self.receipt={k:self.request[k] for k in ('requestId','occurrenceId','runFence','project','source','profile','baseSource')}
+        unit='agentos-cpu-replay-'+qa['id']+'.service';stop={'stopped':True,'mainPID':0,'populated':False,'unit':unit}
+        self.receipt.update(version=1,kind='cpu-replay-observation',requestSHA256=request_sha,registrationSHA256=self.binding['digest'],
+            executorSHA256=self.binding['executorSHA256'],observationOnly=True,acceptance=False,
+            argv=['/usr/bin/python3','-I','-B','/output/cpu-checks.py','/output/candidate.py','/inputs/base-candidate.py'],
+            startedAt='2026-01-01T00:00:00Z',finishedAt='2026-01-01T00:00:01Z',exitCode=0,signal=None,timedOut=False,
+            oomKilled=False,cancelled=False,outputLimitExceeded=False,outputsComplete=True,memoryPeakBytes=100,rssPeakBytes=None,
+            unit=unit,stopProof=stop,outputs={'stdout':out(b''),'stderr':out(b''),'result':out(A.canonical(self.cpu))})
+        self.finish_evidence(snapshot,ref(qa_row))
+
+    def finish_evidence(self,snapshot=None,report_ref=None):
+        qa=self.d['attempts'][1]
+        snapshot=snapshot or qa['context']['manifest']['dependencyEvidence']
+        report_ref=report_ref or self.evidence['semanticReport']
+        request_sha=self.receipt['requestSHA256'];raw=A.qa3_canonical(self.receipt);receipt_sha=A.digest(raw)
+        handoff={'version':1,'contractVersion':3,'requestId':qa['id'],'requestSHA256':request_sha,'receiptSHA256':receipt_sha,
+            'receiptCanonicalization':A.QA3_CANONICALIZATION,'registration':self.binding,'receipt':{'id':qa['id'],
+            'name':'cpu-replay-observation.json','digest':receipt_sha,'size':len(raw),'path':'/home/agent/inputs/'+qa['id']+'/cpu-replay-observation.json'}}
+        reason=None if A.qa3_semantic(self.semantic) else 'NATIVE_QA3_SEMANTIC_REJECT'
+        validation={'version':1,'contractVersion':3,'status':'rejected' if reason else 'matched','code':reason,
+            'snapshotContractSHA256':snapshot['contractSHA256'],'source':snapshot['source'],'requestSHA256':request_sha,
+            'receiptSHA256':receipt_sha,'receiptCanonicalization':A.QA3_CANONICALIZATION,'handoff':handoff,
+            'semanticReport':report_ref,'semanticDecision':self.semantic['decision'],'candidateExecutedByController':True,
+            'gpuValidated':False,'performanceGainProven':False}
+        qa['context'].update(cpuReplayPreparation={'version':1,'registration':self.binding,'requestSHA256':request_sha,
+            'snapshot':snapshot,'phase':'qa_dispatching'},nativeQA3Validation=copy.deepcopy(validation))
+        qa['context']['manifest']['nativeQA3']=copy.deepcopy(handoff)
+        self.f.put(pathlib.Path(self.f.paths['workerRunsDirectory'])/qa['id']/'home/inputs'/qa['id']/'cpu-replay-observation.json',raw)
+        physical={'version':1,'observedAt':A.dt.datetime.now(A.dt.timezone.utc).isoformat(),'receiptSHA256':receipt_sha,'stopProof':self.receipt['stopProof']}
+        self.evidence={'version':1,'kind':'native-qa3-controller-evidence','state':'evidence','occurrenceId':OCC,'attemptId':qa['id'],
+            'runFence':qa['fence'],'definitionVersion':1,'request':{**self.request,'artifacts':[{k:v for k,v in r.items() if k!='base64'} for r in self.request['artifacts']]},
+            'requestSHA256':request_sha,'requestCanonicalization':A.QA3_CANONICALIZATION,'registration':self.binding,'snapshot':snapshot,
+            'action':{'key':OCC+':'+qa['id']+':cpu-replay-v1','state':'completed','inputHash':request_sha},'modelDispatched':True,
+            'semanticReport':report_ref,'validation':validation,'receipt':self.receipt,'receiptSHA256':receipt_sha,
+            'receiptCanonicalization':A.QA3_CANONICALIZATION,'physicalConfirmed':True,'diagnostic':None,'handoff':handoff,'physicalInspection':physical}
+        self.verified={'ok':True,'receipt':copy.deepcopy(self.receipt),'physicalInspection':copy.deepcopy(physical)}
+
+    def test_controlled_cpu_and_semantic_report_pass_full_audit_without_manual_replay(self):
+        report,files,_=self.a.audit(OCC)
+        self.assertEqual(report['nativeQAContractVersion'],3);self.assertTrue(report['candidateExecutedByController'])
+        self.assertEqual(report['cpuExecutionEvidence']['kind'],'controller-cpu-replay')
+        self.assertIn('controller-cpu-evidence.json',files);self.assertEqual(self.f.official.posts,0)
+        self.assertNotIn('cpuEvidence',self.semantic);self.assertNotIn('candidateSHA256',self.semantic)
+
+    def test_source_origin_semantic_rejection_is_preserved_never_accepted(self):
+        self.semantic.update(decision='reject',blockingFindings=['The base already implements this hypothesis.'])
+        self.d['attempts'][1].update(state='failed',error_code='NATIVE_QA3_SEMANTIC_REJECT')
+        self.d['steps'][1]['state']='attention';self.d['occurrence']['state']='attention';self.make_evidence()
+        source={**next(r for r in self.d['artifacts'] if r['name']=='candidate.py'),'occurrenceId':OCC,'problem':BOARD}
+        report=A.strict_json(A.pinned(self.f.origin(source)[0]))
+        self.assertFalse(report['qualityAccepted']);self.assertEqual(report['qa']['semanticDecision'],'reject')
+        self.assertEqual(report['qa']['controllerValidation']['code'],'NATIVE_QA3_SEMANTIC_REJECT')
+        with self.assertRaises(ValueError):self.a.audit(OCC)
+        self.assertEqual(self.f.official.posts,0)
+
+    def test_missing_registration_or_shadow_contract_cannot_upgrade(self):
+        self.f.p.pop('nativeQA3Registrations')
+        with self.assertRaisesRegex(ValueError,'NATIVE_QA3_REGISTRATION'):self.a.audit(OCC)
+
+    def test_receipt_api_or_protected_copy_tampering_fails(self):
+        self.verified['receipt']['exitCode']=1
+        with self.assertRaisesRegex(ValueError,'NATIVE_QA3_PROTECTED_RECEIPT'):self.a.audit(OCC)
+
+    def test_fresh_physical_stop_is_required_independently(self):
+        for field,value in [('mainPID',99),('populated',True),('stopped',False)]:
+            old=self.verified['physicalInspection']['stopProof'][field];self.verified['physicalInspection']['stopProof'][field]=value
+            with self.subTest(field=field),self.assertRaisesRegex(ValueError,'NATIVE_QA3_PHYSICAL_PROOF'):self.a.audit(OCC)
+            self.verified['physicalInspection']['stopProof'][field]=old
+        self.verified['physicalInspection']['observedAt']='2020-01-01T00:00:00Z'
+        with self.assertRaisesRegex(ValueError,'NATIVE_QA3_PHYSICAL_STALE'):self.a.audit(OCC)
+
+    def test_fresh_physical_timestamp_does_not_change_stable_audit(self):
+        first=self.a.audit(OCC)
+        value=A.dt.datetime.now(A.dt.timezone.utc).isoformat()
+        self.evidence['physicalInspection']['observedAt']=value;self.verified['physicalInspection']['observedAt']=value
+        self.assertEqual(first,self.a.audit(OCC))
+
+    def test_raw_controller_handoff_must_match(self):
+        qa=self.d['attempts'][1]
+        self.f.put(pathlib.Path(self.f.paths['workerRunsDirectory'])/qa['id']/'home/inputs'/qa['id']/'cpu-replay-observation.json',b'{}')
+        with self.assertRaisesRegex(ValueError,'NATIVE_QA3_HANDOFF_CHANGED'):self.a.audit(OCC)
+
+    def test_snapshot_fence_and_current_artifact_identity_are_required(self):
+        self.evidence['snapshot']=copy.deepcopy(self.evidence['snapshot']);self.evidence['snapshot']['source']['runFence']=IDS[1]
+        with self.assertRaisesRegex(ValueError,'NATIVE_QA3_ENVELOPE_BINDING'):self.a.audit(OCC)
+
+    def test_cpu_result_changed_raw_bytes_never_accepts_report_claim(self):
+        self.receipt['outputs']['result']['base64']=base64.b64encode(b'{}').decode();self.finish_evidence()
+        with self.assertRaisesRegex(ValueError,'NATIVE_QA3_OUTPUTS'):self.a.audit(OCC)
+
+    def test_unknown_semantic_fields_and_false_official_claims_rejected(self):
+        for change in ({'candidateSHA256':'a'*64},{'gpuValidated':True},{'version':True},{'limitations':[]}):
+            report={**self.semantic,**change}
+            with self.subTest(change=change),self.assertRaises(ValueError):A.qa3_semantic(report,approval=True)
+
+    def test_cpu_nonfinite_duplicate_negative_flags_and_empty_controls_rejected(self):
+        for raw in (b'{"passed":true,"passed":true}',b'{"passed":NaN}',A.canonical({**self.cpu,'passed':False}),
+                    A.canonical({**self.cpu,'negativeControls':[]})):
+            receipt=copy.deepcopy(self.receipt);receipt['outputs']['result']['base64']=base64.b64encode(raw).decode()
+            with self.subTest(raw=raw[:30]),self.assertRaises(ValueError):A.qa3_cpu_result(receipt,A.digest(self.f.candidate),A.digest(self.f.checker))
+
+    def test_new_contract_keeps_one_producer_one_qa_no_implicit_retry(self):
+        self.d['occurrence']['definition']['steps'][1]['maxAttempts']=2
+        with self.assertRaisesRegex(ValueError,'DISPATCH_CHANGED'):self.a.audit(OCC)
+        with self.assertRaisesRegex(ValueError,'NATIVE_QA_CONTRACT'):self.a.qa_contract(self.d['occurrence']['definition'])
+
+    def rejected_report(self, raw):
+        qa=self.d['attempts'][1];row=next(r for r in self.d['artifacts'] if r['name']=='qa-verification.json')
+        row.update(digest=A.digest(raw),size=len(raw));self.f.put(pathlib.Path(self.f.paths['artifactDirectory'])/row['digest'],raw)
+        ref={k:row[k] for k in ('id','name','digest','size')}
+        self.evidence['semanticReport']=ref
+        self.evidence['validation'].update(status='rejected',code='NATIVE_QA3_REPORT_INVALID',semanticDecision=None,semanticReport=ref)
+        qa['context']['nativeQA3Validation']=copy.deepcopy(self.evidence['validation'])
+        qa.update(state='failed',error_code='NATIVE_QA3_REPORT_INVALID')
+        self.d['steps'][1]['state']='attention';self.d['occurrence']['state']='attention'
+
+    def test_malformed_original_report_keeps_origin_and_typed_repair_diagnosis(self):
+        self.rejected_report(b'{"version":3,')
+        source={**next(r for r in self.d['artifacts'] if r['name']=='candidate.py'),'occurrenceId':OCC,'problem':BOARD}
+        report=A.strict_json(A.pinned(self.f.origin(source)[0]))
+        self.assertFalse(report['qualityAccepted']);self.assertFalse(report['qa']['reportSchemaValid'])
+        self.assertIsNone(report['qa']['semanticDecision'])
+        self.assertEqual(report['qa']['controllerValidation']['code'],'NATIVE_QA3_REPORT_INVALID')
+        with self.assertRaisesRegex(ValueError,'QA_V3_REPORT_INVALID'):self.a.audit(OCC)
+        self.assertEqual(self.f.official.posts,0)
+
+    def test_unknown_report_field_does_not_become_approval_or_cpu_failure(self):
+        self.rejected_report(A.canonical({**self.semantic,'modelInventedReceipt':True}))
+        with self.assertRaisesRegex(ValueError,'QA_V3_REPORT_INVALID'):self.a.audit(OCC)
+        self.assertEqual(self.evidence['receipt']['exitCode'],0)
+        self.assertEqual(self.f.official.posts,0)
+
+    def prepare_negative_cpu(self, kind='exit'):
+        if kind=='exit':self.receipt['exitCode']=1
+        elif kind=='oom':self.receipt.update(exitCode=None,signal=9,oomKilled=True)
+        elif kind=='negative':
+            raw=A.canonical({**self.cpu,'passed':False});self.receipt['outputs']['result']={
+                'digest':A.digest(raw),'size':len(raw),'base64':base64.b64encode(raw).decode()}
+        self.finish_evidence()
+        qa=self.d['attempts'][1];sha=self.evidence['receiptSHA256']
+        terminal={'kind':'cpu-preparation-terminal','modelDispatched':False,'cpu':{'requestId':qa['id'],
+            'requestSHA256':self.evidence['requestSHA256'],'receiptSHA256':sha,'stopProof':copy.deepcopy(self.receipt['stopProof'])}}
+        code='NATIVE_QA3_CPU_RESULT_INVALID' if kind=='negative' else 'NATIVE_QA3_CPU_EXECUTION_FAILED'
+        failure={'version':1,'status':'rejected','code':code,'modelDispatched':False,
+            'snapshotContractSHA256':self.evidence['snapshot']['contractSHA256'],'source':self.evidence['snapshot']['source'],
+            'requestSHA256':self.evidence['requestSHA256'],'receiptSHA256':sha,'receiptCanonicalization':A.QA3_CANONICALIZATION,'terminal':terminal}
+        self.evidence.update(modelDispatched=False,handoff=None,semanticReport=None,validation=None,diagnostic=failure,preparationFailure=failure)
+        qa['context'].pop('manifest');qa['context'].pop('nativeQA3Validation');qa['context']['nativeQA3PreparationFailure']=copy.deepcopy(failure)
+        qa['context']['cpuReplayPreparation']['phase']='preparing';qa.update(state='failed',error_code=code,receipt=terminal)
+        self.d['steps'][1]['state']='attention';self.d['occurrence']['state']='attention'
+        self.d['artifacts']=[r for r in self.d['artifacts'] if r['attempt_id']!=qa['id']]
+        shutil.rmtree(pathlib.Path(self.f.paths['workerRunsDirectory'])/qa['id'])
+
+    def test_failed_cpu_without_qa_model_keeps_producer_origin_and_no_harness_stop_claim(self):
+        self.prepare_negative_cpu()
+        source={**next(r for r in self.d['artifacts'] if r['name']=='candidate.py'),'occurrenceId':OCC,'problem':BOARD}
+        report=A.strict_json(A.pinned(self.f.origin(source)[0]))
+        self.assertEqual(report['qa']['state'],'cpu_preparation_failed');self.assertFalse(report['qa']['modelDispatched'])
+        self.assertFalse(report['qualityAccepted']);self.assertIsNone(report['qa']['artifactId'])
+        self.assertNotIn(mock.call(IDS[1]),self.f.runtime.stopped.call_args_list)
+        with self.assertRaisesRegex(ValueError,'CPU_V3_EXECUTION_FAILED'):self.a.audit(OCC)
+        self.assertEqual(self.f.official.posts,0)
+
+    def test_negative_case_without_qa_has_distinct_result_diagnostic(self):
+        self.prepare_negative_cpu('negative')
+        with self.assertRaisesRegex(ValueError,'CPU_V3_RESULT_INVALID'):self.a.audit(OCC)
+        self.assertEqual(self.f.official.posts,0)
+
+    def test_oom_terminal_requires_real_current_cpu_stop_not_fake_qa_stop(self):
+        self.prepare_negative_cpu('oom');self.verified['physicalInspection']['stopProof']['populated']=True
+        with self.assertRaisesRegex(ValueError,'NATIVE_QA3_PHYSICAL_PROOF'):self.a.audit(OCC)
+        self.assertNotIn(mock.call(IDS[1]),self.f.runtime.stopped.call_args_list)
+
+    def test_incomplete_or_cancelled_receipt_never_becomes_executed_source(self):
+        self.prepare_negative_cpu()
+        self.evidence.update(state='diagnostic',receipt=None,receiptSHA256=None,physicalConfirmed=False,physicalInspection=None)
+        with self.assertRaisesRegex(ValueError,'CPU_V3_EXECUTION_UNCONFIRMED'):self.a.audit(OCC)
+        self.assertEqual(self.f.official.posts,0)
+
+    def test_qa_copy_is_alias_only_with_exact_v3_handoff(self):
+        row=self.f.artifact('candidate.py',self.f.candidate,IDS[1]);self.d['artifacts'].append(row)
+        ref={**row,'occurrenceId':OCC,'problem':BOARD}
+        report=A.strict_json(A.pinned(self.f.origin(ref)[0]))
+        self.assertEqual(report['selectedArtifactId'],row['id']);self.assertNotEqual(report['producerArtifactId'],row['id'])
+        self.assertFalse(report['qualityAccepted'])
+        producer=next(r for r in self.d['artifacts'] if r['name']=='candidate.py' and r['attempt_id']==IDS[0])
+        self.f.put(pathlib.Path(self.f.paths['workerRunsDirectory'])/IDS[1]/'home/inputs'/producer['id']/'candidate.py',b'changed')
+        with self.assertRaises(ValueError):self.f.origin(ref)
+
+    def test_failed_v3_qa_alias_is_not_a_new_base_but_actual_producer_origin_survives(self):
+        self.rejected_report(b'{"version":3,')
+        row=self.f.artifact('candidate.py',self.f.candidate,IDS[1]);self.d['artifacts'].append(row)
+        with self.assertRaisesRegex(ValueError,'SOURCE_ORIGIN_QA_ALIAS_UNCONFIRMED'):
+            self.f.origin({**row,'occurrenceId':OCC,'problem':BOARD})
+        producer=next(r for r in self.d['artifacts'] if r['name']=='candidate.py' and r['attempt_id']==IDS[0])
+        report=A.strict_json(A.pinned(self.f.origin({**producer,'occurrenceId':OCC,'problem':BOARD})[0]))
+        self.assertFalse(report['qualityAccepted']);self.assertEqual(report['selectedArtifactId'],producer['id'])
+        self.assertEqual(self.f.official.posts,0)
+
+    def test_registration_scope_cannot_self_authorize_new_profile_or_duplicate_entry(self):
+        for value in ({'version':True,'registrations':[self.binding]}, {'version':1,'registrations':[self.binding,self.binding]},
+                      {'version':1,'registrations':[{**self.binding,'profile':'model-command'}]}):
+            policy={**self.f.p,'nativeQA3Registrations':value}
+            with self.subTest(value=value),self.assertRaisesRegex(ValueError,'NATIVE_QA3_REGISTRATION_POLICY'):
+                A.validate_policy(policy,NOW,'a'*64)
+
+    def historical_v3_repair(self):
+        raw=b'{"version":3,';self.rejected_report(raw)
+        qa=self.d['attempts'][1];ref=self.evidence['semanticReport'];ev=self.evidence
+        target={'occurrenceId':OCC,'candidateSHA256':A.digest(self.f.candidate),'qaArtifactId':ref['id'],'qaSHA256':ref['digest']}
+        diagnostic={'version':1,'authority':'prior_qa_diagnostic_only_not_current_acceptance','currentAcceptance':False,
+            'bindingState':'verified','problem':BOARD,'occurrenceId':OCC,'stepKey':'independent-qa','stepId':qa['step_id'],
+            'attemptId':qa['id'],'runFence':qa['fence'],'cycleInputSHA256':qa['context']['manifest']['cycleInput']['digest'],
+            'artifact':ref,'originalArtifact':ref,'candidateSHA256':A.digest(self.f.candidate),'sourceSHA256':A.digest(self.f.source),
+            'nativeQAContractVersion':3,'report':None,'reportState':'invalid_original_json_or_schema',
+            'controllerEvidence':{'version':1,'contractVersion':3,'requestSHA256':ev['requestSHA256'],
+                'receiptSHA256':ev['receiptSHA256'],'snapshotSHA256':A.digest(ev['snapshot']),
+                'validationSHA256':A.digest(ev['validation']),'registration':ev['registration']}}
+        exp=copy.deepcopy(self.d['occurrence']['input']['experiment']);exp.update(repairTarget=target,repairQADiagnostic=diagnostic)
+        exp['materials'].append({'name':'prior-qa-original.json','artifactId':ref['id'],'attemptId':qa['id'],
+            'sha256':ref['digest'],'bytes':len(raw),'base64':base64.b64encode(raw).decode()})
+        materials={r['name']:base64.b64decode(r['base64']) for r in exp['materials']}
+        dispatch={'repairOf':OCC,'repairCandidateSHA256':A.digest(self.f.candidate)}
+        return exp,materials,dispatch
+
+    def test_raw_only_historical_report_repair_preserves_original_and_requires_gate(self):
+        exp,materials,dispatch=self.historical_v3_repair()
+        self.a.material_set(exp,materials,BOARD,dispatch,A.digest(self.f.candidate))
+        self.assertIsNone(exp['repairQADiagnostic']['report'])
+        self.assertEqual(materials['prior-qa-original.json'],b'{"version":3,')
+        self.assertEqual(self.f.official.posts,0)
+        with self.assertRaisesRegex(ValueError,'QA_V3_REPORT_INVALID'):self.a.audit(OCC)
+
+    def test_raw_only_repair_never_copies_or_rebinds_previous_controller_proof(self):
+        exp,materials,dispatch=self.historical_v3_repair()
+        exp['repairQADiagnostic']['controllerEvidence']['receiptSHA256']='a'*64
+        with self.assertRaisesRegex(ValueError,'REPAIR_QA3_CONTROLLER_BINDING'):
+            self.a.material_set(exp,materials,BOARD,dispatch,A.digest(self.f.candidate))
+        self.assertEqual(self.f.official.posts,0)
+
+    def test_raw_only_repair_source_and_attachments_cannot_change(self):
+        exp,materials,dispatch=self.historical_v3_repair();materials['prior-qa-original.json']=b'{}'
+        with self.assertRaisesRegex(ValueError,'REPAIR_QA3_ORIGINAL_BYTES'):
+            self.a.material_set(exp,materials,BOARD,dispatch,A.digest(self.f.candidate))
+        self.assertEqual(self.f.official.posts,0)
+
+    def terminal_scan(self, cache_only=False):
+        if cache_only:
+            with mock.patch.object(A,'scan_selection',return_value=([],{'version':1,'lastUnregisteredOccurrenceId':None})):
+                return A.scan(self.f.lane,self.f.root/'qa3-status.json','inspect')
+        return A.scan(self.f.lane,self.f.root/'qa3-status.json','inspect')
+
+    def test_rejected_v3_report_survives_three_partial_sweeps_without_age_reset(self):
+        self.rejected_report(b'{"version":3,')
+        first=self.terminal_scan()['outcomes'][0]
+        self.assertEqual(first['code'],'QA_V3_REPORT_INVALID');self.assertFalse(first['postAttempted'])
+        self.assertIn('diagnosticProof',first)
+        for age in [120,240]:
+            self.f.lane.clock=lambda age=age:NOW+age
+            with mock.patch.object(self.a,'audit',side_effect=AssertionError('no repeated acceptance audit')):
+                row=self.terminal_scan(True)['outcomes'][0]
+            self.assertEqual(row['diagnosticProof']['observedAt'],NOW)
+            self.assertEqual(row['diagnosticProof']['verifiedAt'],NOW+age)
+            self.assertEqual(row['qaSHA256'],first['qaSHA256'])
+        self.assertEqual(self.f.official.posts,0)
+
+    def test_stopped_cpu_failure_cache_never_fabricates_qa_artifact(self):
+        self.prepare_negative_cpu('oom')
+        row=self.terminal_scan()['outcomes'][0]
+        self.assertEqual(row['code'],'CPU_V3_EXECUTION_FAILED');self.assertIn('diagnosticProof',row)
+        self.assertIsNone(row['qaArtifactId']);self.assertIsNone(row['qaSHA256'])
+        again=self.terminal_scan(True)['outcomes'][0]
+        self.assertEqual(again['diagnosticProof']['observedAt'],row['diagnosticProof']['observedAt'])
+        for code in ['QA_V3_REPORT_INVALID','CPU_REPLAY_EXECUTION_UNPROVEN']:
+            with self.assertRaisesRegex(ValueError,'DIAGNOSTIC_CACHE_BINDING'):
+                A.diagnostic_cache_entry({**row,'code':code},self.f.lane,NOW)
+        self.assertNotIn(mock.call(IDS[1]),self.f.runtime.stopped.call_args_list)
+        self.assertEqual(self.f.official.posts,0)
+
+    def test_v3_cache_rechecks_raw_handoff_and_current_physical_stop(self):
+        self.rejected_report(b'{"version":3,');self.terminal_scan()
+        row=next(r for r in self.d['artifacts'] if r['name']=='cpu-checks.py')
+        path=pathlib.Path(self.f.paths['workerRunsDirectory'])/IDS[1]/'home/inputs'/row['id']/row['name']
+        raw=path.read_bytes();self.f.put(path,b'changed')
+        result=self.terminal_scan(True)['outcomes'][0]
+        self.assertEqual(result['state'],'observation_wait');self.assertNotIn('diagnosticProof',result)
+        self.f.put(path,raw);self.terminal_scan()
+        self.verified['physicalInspection']['observedAt']='2020-01-01T00:00:00Z'
+        self.assertEqual(self.terminal_scan(True)['outcomes'][0]['state'],'observation_wait')
+        self.assertEqual(self.f.official.posts,0)
+
+    def test_v3_cache_changed_actor_fence_or_original_bytes_never_renews_proof(self):
+        self.rejected_report(b'{"version":3,');self.terminal_scan()
+        fence=self.d['attempts'][0]['fence'];self.d['attempts'][0]['fence']=IDS[1]
+        self.assertEqual(self.terminal_scan(True)['outcomes'][0]['state'],'observation_wait')
+        self.d['attempts'][0]['fence']=fence;self.terminal_scan()
+        row=next(r for r in self.d['artifacts'] if r['name']=='qa-verification.json')
+        self.f.put(pathlib.Path(self.f.paths['artifactDirectory'])/row['digest'],b'bad')
+        self.assertEqual(self.terminal_scan(True)['outcomes'][0]['state'],'observation_wait')
+        self.assertEqual(self.f.official.posts,0)
+
+    def test_v3_cache_expiry_and_uncertain_effect_keep_owner_without_resend(self):
+        self.rejected_report(b'{"version":3,');self.terminal_scan()
+        self.f.lane.clock=lambda:NOW+3601
+        row=self.terminal_scan(True)['outcomes'][0]
+        self.assertEqual(row['state'],'observation_wait');self.assertNotIn('diagnosticProof',row)
+        self.f.lane.clock=lambda:NOW;self.terminal_scan()
+        path=pathlib.Path(self.f.p['stateDirectory'])/(BOARD+'-'+A.digest(self.f.candidate)+'-check.json')
+        self.f.put(path,A.canonical({'state':'unknown','receipt':{},'identity':{'occurrenceId':OCC}}))
+        row=self.terminal_scan(True)['outcomes'][0]
+        self.assertEqual(row['state'],'uncertain_owned');self.assertNotIn('diagnosticProof',row)
+        self.assertEqual(self.f.official.posts,0)
+
+    def test_unconfirmed_cpu_receipt_cannot_enter_terminal_cache(self):
+        self.prepare_negative_cpu()
+        self.evidence.update(state='diagnostic',receipt=None,receiptSHA256=None,physicalConfirmed=False,physicalInspection=None)
+        row=self.terminal_scan()['outcomes'][0]
+        self.assertNotIn('diagnosticProof',row);self.assertIsNone(row['postAttempted'])
+        self.assertEqual(self.f.official.posts,0)
+
+
 if __name__ == "__main__":
     unittest.main()
