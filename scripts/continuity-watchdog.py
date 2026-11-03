@@ -2489,7 +2489,18 @@ class Watchdog:
                 if qa3 and qa3.get("classification") in ["new_hypothesis_required", "cpu_preparation_failed"]:
                     item.update(classification=qa3["classification"], controllerEvidence=qa3)
                     continue
-                source = next((r for r in catalog if r["occurrenceId"] == oid and r["digest"] == row.get("candidateSHA256")), None)
+                # QA3 failed review copies are historical diagnostics, not
+                # selectable base aliases. Choose the actual completed
+                # producer even when an equal-SHA QA artifact sorts first.
+                producer_candidates = None
+                if qa3:
+                    producer_ids = {a["id"] for a in detail["attempts"] if a["state"] == "completed" and any(
+                        s["key"] == "produce" and s["state"] == "completed" and s["id"] == a["step_id"]
+                        and s["attempt"] == a["number"] for s in detail["steps"])}
+                    producer_candidates = {a["id"] for a in detail["artifacts"]
+                        if a["name"] == "candidate.py" and a["attempt_id"] in producer_ids}
+                source = next((r for r in catalog if r["occurrenceId"] == oid and r["digest"] == row.get("candidateSHA256")
+                    and (producer_candidates is None or r["id"] in producer_candidates)), None)
                 latest = {a["id"] for a in detail["attempts"] if any(s["id"] == a["step_id"]
                           and s["attempt"] == a["number"] for s in detail["steps"])}
                 qa = next((a for a in detail["artifacts"] if a["id"] == row.get("qaArtifactId") and

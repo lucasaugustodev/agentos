@@ -326,6 +326,25 @@ class NativeQAV3EvidenceTests(unittest.TestCase):
         self.assertEqual(base64.b64decode(original['base64']), raw); self.assertEqual(original['sha256'], W.digest(raw))
         self.assertEqual(self.f.client.posts, [])
 
+    def test_repair_selects_actual_producer_when_failed_qa_alias_sorts_first(self):
+        oid = self.install_owned(); self.replace_report(b'{"version":3,"version":3}', 'NATIVE_QA3_REPORT_INVALID', None)
+        self.qa['state'] = 'failed'; self.detail['steps'][1]['state'] = 'attention'; self.detail['occurrence']['state'] = 'attention'
+        alias = {**self.refs[0], 'id': '00000000-0000-4000-8000-000000000001', 'attempt_id': self.qa['id']}
+        self.detail['artifacts'].append(alias)
+        self.f.client.artifacts[alias['id']] = self.f.client.artifacts[self.refs[0]['id']]
+        row = {'occurrenceId': oid, 'problem': 'muse_decode_layer', 'candidateSHA256': self.refs[0]['digest'],
+            'qaArtifactId': self.qa_ref['id'], 'qaSHA256': self.qa_ref['digest'], 'state': 'rejected_repairable',
+            'jobId': None, 'postAttempted': False, 'code': 'QA_V3_REPORT_INVALID'}
+        self.f.install_diagnostic_fixture([row]); p = W.read_json(self.f.config['autoCheckPolicyPath'])
+        p['nativeQA3Registrations'] = {'version': 1, 'registrations': [self.registration]}; W.atomic(self.f.config['autoCheckPolicyPath'], p)
+        status = W.read_json(self.f.config['autoCheckStatusPath']); status['policySHA256'] = W.digest(p); W.atomic(self.f.config['autoCheckStatusPath'], status)
+        observation = self.f.w.observe(); repairs = observation['autoCheckDiagnostics']['repairableEvidence']
+        self.assertEqual(len(repairs), 1, observation['autoCheckDiagnostics'])
+        self.assertEqual(repairs[0]['candidateArtifactId'], self.refs[0]['id'])
+        self.assertIn(self.refs[0]['id'], observation['confirmedSourceArtifactIds'])
+        self.assertNotIn(alias['id'], observation['confirmedSourceArtifactIds'])
+        self.assertEqual(self.f.client.posts, [])
+
     def test_original_report_and_fresh_controller_proof_are_separate(self):
         view, report = self.read()
         self.assertTrue(view['qaApproval']); self.assertEqual(report, self.report)
